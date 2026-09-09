@@ -278,8 +278,10 @@ jobs:
         env:
           GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
         run: |
-          # Copy new packages
+          # Replace this package's debs rather than adding to them, so the
+          # pool holds one version per package and the Pages site stays small
           mkdir -p apt-repo/pool/main
+          rm -f apt-repo/pool/main/claudear_*.deb
           cp debs/*.deb apt-repo/pool/main/
 
           cd apt-repo
@@ -296,13 +298,13 @@ jobs:
           # Generate Release file
           cd dists/stable
           cat > Release << EOF
-          Origin: claudear
-          Label: claudear
+          Origin: abnegate
+          Label: abnegate
           Suite: stable
           Codename: stable
           Architectures: amd64 arm64
           Components: main
-          Description: Claudear APT Repository
+          Description: APT repository for abnegate packages
           EOF
 
           # Add checksums
