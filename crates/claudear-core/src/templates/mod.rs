@@ -22,6 +22,13 @@ You are working in the repository: {{repo_name}}
 Before starting any work, verify this is the correct repository for this issue by checking that the file paths, modules, or stack traces reference code in this codebase.
 If this is NOT the correct repository, set "wrong_repo" in your response to the name of the repository you believe is correct (in "org/repo" format) and do NOT attempt any fixes.
 {{/if}}
+{{#if mcp_instructions}}
+## Live telemetry
+
+You have MCP tools connected to the services below. Use them to gather real evidence before settling on a root cause, and say in your summary what the telemetry showed - including when it contradicts what the stack trace implies.
+
+{{mcp_instructions}}
+{{/if}}
 Your task:
 1. Analyze the issue/error and any stack traces
 2. Find the relevant code in this codebase
@@ -62,6 +69,14 @@ Description:
 
 {{context}}
 
+{{#if mcp_instructions}}
+## Live telemetry
+
+You have MCP tools connected to the services below. Use them to gather real evidence before settling on a root cause, and say in your summary what the telemetry showed - including when it contradicts what the stack trace implies.
+
+{{mcp_instructions}}
+{{/if}}
+
 IMPORTANT: Use a test-driven development (TDD) approach for bug fixes. Before changing any application code, write a failing test that reproduces the issue. Then implement the minimal fix to make the test pass and verify all existing tests still pass.
 
 Create a PR that addresses this issue. Include "{{short_id}}" in the PR title.
@@ -86,6 +101,14 @@ URL: {{url}}
 Event count: {{event_count}}
 
 {{context}}
+
+{{#if mcp_instructions}}
+## Live telemetry
+
+You have MCP tools connected to the services below. Use them to gather real evidence before settling on a root cause, and say in your summary what the telemetry showed - including when it contradicts what the stack trace implies.
+
+{{mcp_instructions}}
+{{/if}}
 
 Analyze the stack trace and error context to identify the root cause.
 

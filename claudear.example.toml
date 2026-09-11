@@ -146,6 +146,9 @@ sandbox = ""
 # MCP servers attached to agent runs, keyed by server name.
 # Gated per-run by `sources` against the issue source. Default here: HelpScout only.
 # Add "discord" to enable there; set sources = [] to enable for all sources.
+# Note `sources` gates on the issue's source, not the kind of run, so a server
+# listed for "sentry" attaches to Sentry fix, verify, and reply runs alike.
+# Classification runs never attach MCP servers.
 # Keep secrets out of this file: reference them via ${VAR} from the daemon/provider env.
 # [agent.providers.claude.mcp.appwrite]
 # command = "uvx"
@@ -153,27 +156,61 @@ sandbox = ""
 # sources = ["helpscout"]
 # tools: tool names to allow (empty/omitted grants all of the server's tools).
 # tools   = ["databases_list_documents", "databases_get_document"]
+# instructions: optional guidance added to the prompt whenever this server
+# attaches, telling the agent what the tools cover and when to reach for them.
+# instructions = "Look up the customer's document by the ID in the ticket."
 # [agent.providers.claude.mcp.appwrite.env]
 # APPWRITE_ENDPOINT   = "https://fra.cloud.appwrite.io/v1"
 # APPWRITE_PROJECT_ID = "monitoring-fra"
 # APPWRITE_API_KEY    = "${APPWRITE_API_KEY}"   # read-only key, set in daemon env
 
-# Grafana (mcp-grafana) — query dashboards, datasources, and metrics so the
-# agent can pull live telemetry when triaging an issue.
+# Grafana (mcp-grafana) — reach Prometheus metrics and Loki logs through Grafana
+# as datasources, so the agent can check what production was actually doing when
+# an error fired rather than reasoning from the stack trace alone.
+# The Docker image ships the mcp-grafana binary. Installing from a deb/tarball?
+# Grab it from https://github.com/grafana/mcp-grafana/releases and put it on PATH.
 # [agent.providers.claude.mcp.grafana]
-# command = "uvx"
-# args    = ["mcp-grafana"]
+# command = "mcp-grafana"
+# --disable-write drops every mutating tool (dashboards, incidents, alert rules).
+# args    = ["--disable-write"]
 # sources = ["sentry"]
 # tools: tool names to allow (empty/omitted grants all of the server's tools).
-# tools   = ["search_dashboards", "query_prometheus", "list_datasources"]
+# Listing them explicitly keeps the grant read-only even if a future mcp-grafana
+# release adds tools --disable-write does not cover.
+# tools   = [
+#   "list_datasources", "get_datasource",
+#   "query_prometheus", "list_prometheus_metric_names", "list_prometheus_label_names",
+#   "list_prometheus_label_values", "query_prometheus_histogram",
+#   "query_loki_logs", "list_loki_label_names", "list_loki_label_values",
+#   "query_loki_stats", "query_loki_patterns",
+#   "search_dashboards",
+# ]
+# instructions: injected into the agent's prompt whenever this server attaches.
+# Without it the agent holds the tools but is never told they exist. Put your
+# deployment's specifics here — datasource UIDs, label conventions, limits.
+# Per-repo detail (which service label a repo maps to) belongs in that repo's
+# AGENT.md, which is already prepended to every prompt.
+# instructions = """
+# You have read-only Grafana access covering Prometheus metrics and Loki logs.
+# Before settling on a root cause, correlate the error against production telemetry:
+# - Bound every query to the issue's First Seen / Last Seen window. Never query open-ended ranges.
+# - Check whether the error rate tracks a deploy, a traffic spike, or resource saturation.
+# - Pull the Loki lines around the failure for the affected service to see what preceded it.
+# Call list_datasources once to find datasource UIDs. Keep result sets small: prefer
+# aggregations and short windows over raw log dumps, which will crowd out your context.
+# """
 # [agent.providers.claude.mcp.grafana.env]
 # GRAFANA_URL                   = "https://telemetry.example.com/"
-# Env values are written to .mcp.json verbatim, so you can inline literals here
-# or reference ${VAR} from the daemon env (Claude Code expands ${VAR}).
-# GRAFANA_SERVICE_ACCOUNT_TOKEN = "glsa_xxxxxxxxxxxx"   # or "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"
+# Reference secrets as ${VAR} from the daemon env — Claude Code expands them when
+# it reads the generated .mcp.json. Inlining a literal here puts the secret in a
+# file the dashboard's config editor can read, so prefer ${VAR} for anything secret.
+# GRAFANA_SERVICE_ACCOUNT_TOKEN = "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"
 # When Grafana sits behind Cloudflare Access, pass the service-token headers as a
-# JSON string (inline literals or ${VAR} both work).
-# GRAFANA_EXTRA_HEADERS         = "{\"CF-Access-Client-Id\": \"your-cf-access-client-id\", \"CF-Access-Client-Secret\": \"your-cf-access-client-secret\"}"
+# JSON string. Keep the whole bundle in one env var rather than inlining the secret.
+# GRAFANA_EXTRA_HEADERS         = "${GRAFANA_EXTRA_HEADERS}"
+#
+# Give the Grafana service account the Viewer role: the query tools need
+# datasources:query and datasources:read, and search_dashboards needs dashboards:read.
 
 # A/B Experiments (optional)
 # Test different providers or configurations against each other.

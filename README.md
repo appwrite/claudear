@@ -25,6 +25,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+  - [MCP Servers](#mcp-servers)
 - [Usage](#usage)
   - [Daemon Mode](#daemon-mode)
   - [Polling Mode](#polling-mode-foreground)
@@ -255,6 +256,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 | | Codex | CLI | OpenAI Codex runner |
 | | Gemini | CLI | Google Gemini *(planned)* |
 | | Copilot | CLI | GitHub Copilot *(planned)* |
+| **Telemetry** | Grafana | MCP (stdio) | Prometheus metrics + Loki logs, pulled by the agent while triaging |
 | **Storage** | SQLite | Local file | WAL mode, Vectorlite extension |
 | **Embeddings** | Nomic | ONNX | Default model, local inference |
 | | MiniLM | ONNX | Lightweight alternative |
@@ -412,6 +414,59 @@ All config values can be overridden with environment variables, useful for keepi
 | `CLAUDEAR_TLS_HTTP_REDIRECT_PORT` | `tls.http_redirect_port` |
 | `CLAUDEAR_DISCORD_BOT_TOKEN` | `notifiers.discord.bot_token` |
 | `CLAUDEAR_SLACK_BOT_TOKEN` | `notifiers.slack.bot_token` |
+| `GRAFANA_URL` | Grafana base URL (see [MCP Servers](#mcp-servers)) |
+| `GRAFANA_SERVICE_ACCOUNT_TOKEN` | Grafana service account token |
+| `GRAFANA_EXTRA_HEADERS` | Extra Grafana request headers, as a JSON object |
+
+The `GRAFANA_*` variables are read by the MCP server rather than by Claudear itself,
+so they are not `CLAUDEAR_`-prefixed and do not map onto a config path. Reference them
+as `${VAR}` from the server's `env` block.
+
+### MCP Servers
+
+Agent runs can be given [MCP](https://modelcontextprotocol.io) servers, letting the
+agent reach systems the issue payload does not describe. Servers are declared per
+provider and gated by issue source:
+
+```toml
+[agent.providers.claude.mcp.grafana]
+command = "mcp-grafana"
+args    = ["--disable-write"]
+sources = ["sentry"]
+tools   = ["list_datasources", "query_prometheus", "query_loki_logs"]
+instructions = "Bound every query to the issue's First Seen / Last Seen window."
+
+[agent.providers.claude.mcp.grafana.env]
+GRAFANA_URL                   = "https://grafana.example.com/"
+GRAFANA_SERVICE_ACCOUNT_TOKEN = "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"
+```
+
+| Key | Meaning |
+|-----|---------|
+| `command` / `args` | stdio transport: the server process to spawn |
+| `url` / `headers` / `type` | HTTP or SSE transport, as an alternative to `command` |
+| `env` | Environment for the server process; `${VAR}` is expanded at run time |
+| `sources` | Issue sources this server attaches for; empty means all |
+| `tools` | Tool names to allow; empty grants every tool the server exposes |
+| `instructions` | Guidance added to the agent's prompt whenever this server attaches |
+
+Notes:
+
+- `sources` gates on the issue's source, not the kind of run. A server listed for
+  `sentry` attaches to Sentry fix, verify, and reply runs alike. Classification runs
+  never attach MCP servers.
+- Without `instructions` the agent holds the tools but is never told they exist, so it
+  will usually ignore them. Put your datasource UIDs and label conventions there.
+  Per-repo detail belongs in that repo's `AGENT.md`, already prepended to every prompt.
+- Keep secrets out of `claudear.toml` — reference them as `${VAR}` from the daemon
+  environment. The rendered config is written to a private temp file (mode 0600) that
+  is deleted when the run ends, and the repo's own `.mcp.json` is ignored.
+- **Grafana** gives the agent Prometheus metrics and Loki logs through Grafana's
+  datasources, so it can check what production was doing when an error fired instead of
+  reasoning from the stack trace alone. The Docker image ships the `mcp-grafana` binary;
+  for other installs, take it from
+  [grafana/mcp-grafana releases](https://github.com/grafana/mcp-grafana/releases) and put
+  it on `PATH`. A Viewer-role service account is enough.
 
 ### Minimal Configuration
 
