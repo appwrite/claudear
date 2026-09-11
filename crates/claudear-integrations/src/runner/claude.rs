@@ -335,6 +335,38 @@ impl ClaudeAgentRunner {
         self.execute(prompt, None, project_dir).await
     }
 
+    /// Guidance for the MCP servers attaching to this run, joined into one block.
+    ///
+    /// Servers with no `instructions` contribute nothing: the tools are still
+    /// allowlisted, they just go unadvertised. Returns `None` when nothing matched,
+    /// which leaves `{{#if mcp_instructions}}` false for operators running no MCP.
+    fn mcp_instructions_for(&self, source: Option<&str>) -> Option<String> {
+        let mut blocks: Vec<(&str, &str)> = self
+            .matched_mcp_servers(source)
+            .into_iter()
+            .filter_map(|(name, cfg)| {
+                cfg.instructions
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| (name.as_str(), text))
+            })
+            .collect();
+        if blocks.is_empty() {
+            return None;
+        }
+        // HashMap iteration order is arbitrary; sort so the prompt is stable across
+        // runs and prompt-hashing stays comparable between attempts.
+        blocks.sort_by_key(|(name, _)| *name);
+        Some(
+            blocks
+                .iter()
+                .map(|(name, text)| format!("### {}\n\n{}", name, text))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    }
+
     fn build_prompt(&self, issue: &Issue, context: &str, project_dir: &Path) -> String {
         // Try to use template system
         let template_loader = TemplateLoader::new(project_dir);
@@ -344,6 +376,10 @@ impl ClaudeAgentRunner {
                 TemplateContext::new(issue.clone(), context.to_string()).with_agent_md(agent_md);
             if let Some(repo_name) = issue.get_metadata::<String>("target_repo_name") {
                 template_context = template_context.with_variable("repo_name", repo_name);
+            }
+            if let Some(mcp_instructions) = self.mcp_instructions_for(Some(&issue.source)) {
+                template_context =
+                    template_context.with_variable("mcp_instructions", mcp_instructions);
             }
             return self.template_renderer.render(&template, &template_context);
         }
@@ -363,11 +399,15 @@ If this is NOT the correct repository, set "wrong_repo" in your response to the 
                 )
             })
             .unwrap_or_default();
+        let mcp_section = self
+            .mcp_instructions_for(Some(&issue.source))
+            .map(|text| format!("\n## Live telemetry\n\n{}\n", text))
+            .unwrap_or_default();
         format!(
             r#"You are fixing an issue from {}. Here is the issue context:
 
 {}
-{}
+{}{}
 Your task:
 1. Analyze the issue/error and any stack traces
 2. Find the relevant code in this codebase
@@ -379,7 +419,7 @@ Your task:
 
 The PR title should include the issue ID: {}
 "#,
-            issue.source, context, repo_name_section, issue.short_id
+            issue.source, context, repo_name_section, mcp_section, issue.short_id
         )
     }
 
@@ -786,6 +826,32 @@ The PR title should include the issue ID: {}
         }
     }
 
+    /// MCP servers configured to attach for a run from `source`, skipping any whose
+    /// transport is ambiguous (strict MCP loading would reject those outright).
+    ///
+    /// Shared by prompt building and process spawning so the guidance the agent reads
+    /// can never describe a server it was not actually handed. Deliberately silent:
+    /// it runs more than once per run, and `unusable_mcp_servers` does the reporting
+    /// at the single point where the run label is in scope.
+    fn matched_mcp_servers(&self, source: Option<&str>) -> Vec<(&String, &McpServerConfig)> {
+        self.config
+            .mcp
+            .iter()
+            .filter(|(_, cfg)| cfg.matches_source(source))
+            .filter(|(_, cfg)| cfg.has_valid_transport())
+            .collect()
+    }
+
+    /// Servers that `source` selected but which cannot be attached, for reporting.
+    fn unusable_mcp_servers(&self, source: Option<&str>) -> Vec<&String> {
+        self.config
+            .mcp
+            .iter()
+            .filter(|(_, cfg)| cfg.matches_source(source) && !cfg.has_valid_transport())
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     /// Render matched MCP servers into a private temp file (claudear-mcp-*.json,
     /// 0600 on Unix) passed to the CLI via --mcp-config and deleted when the handle
     /// drops. `${VAR}` in env is expanded by the CLI.
@@ -922,27 +988,17 @@ The PR title should include the issue ID: {}
         }));
         self.tracker.record_activity(&activity).ok();
 
-        // Attach MCP servers whose sources match this run; held until return so the
-        // temp file outlives the child, then auto-deleted. Require exactly one of
-        // `command`/`url` so strict MCP loading never rejects an ambiguous server.
-        let matched_mcp: Vec<(&String, &McpServerConfig)> = self
-            .config
-            .mcp
-            .iter()
-            .filter(|(_, cfg)| cfg.matches_source(source))
-            .filter(|(name, cfg)| {
-                let valid = cfg.has_valid_transport();
-                if !valid {
-                    tracing::warn!(
-                        component = "claude",
-                        label = label,
-                        server = name.as_str(),
-                        "Skipping MCP server: set exactly one of `command`/`url` with a matching `type`"
-                    );
-                }
-                valid
-            })
-            .collect();
+        // Attach MCP servers whose sources match this run; the temp file is held
+        // until return so it outlives the child, then auto-deleted.
+        for name in self.unusable_mcp_servers(source) {
+            tracing::warn!(
+                component = "claude",
+                label = label,
+                server = name.as_str(),
+                "Skipping MCP server: set exactly one of `command`/`url` with a matching `type`"
+            );
+        }
+        let matched_mcp = self.matched_mcp_servers(source);
         let mut mcp_config_file: Option<tempfile::NamedTempFile> = None;
         if !matched_mcp.is_empty() {
             match Self::render_mcp_config(&matched_mcp) {
@@ -3194,6 +3250,101 @@ mod tests {
             std::path::Path::new("/tmp"),
         );
         assert!(!prompt.is_empty());
+    }
+
+    /// Build a runner whose only MCP server is a Grafana-style one gated to Sentry.
+    fn runner_with_grafana_mcp(instructions: Option<&str>) -> ClaudeAgentRunner {
+        let mut mcp = HashMap::new();
+        mcp.insert(
+            "grafana".to_string(),
+            McpServerConfig {
+                command: Some("mcp-grafana".to_string()),
+                args: vec!["--disable-write".to_string()],
+                sources: vec!["sentry".to_string()],
+                tools: vec!["query_loki_logs".to_string()],
+                instructions: instructions.map(str::to_string),
+                ..Default::default()
+            },
+        );
+        let config = ClaudeRunnerConfig {
+            mcp,
+            ..Default::default()
+        };
+        ClaudeAgentRunner::new(config, Arc::new(claudear_storage::NoopTracker))
+    }
+
+    #[test]
+    fn test_mcp_instructions_gated_by_source() {
+        let runner = runner_with_grafana_mcp(Some("Query Loki for the failing service."));
+        // The server is gated to Sentry, so only Sentry runs get told it exists.
+        let sentry = runner
+            .mcp_instructions_for(Some("sentry"))
+            .expect("sentry run gets guidance");
+        assert!(sentry.contains("Query Loki for the failing service."));
+        assert!(sentry.contains("### grafana"));
+        assert_eq!(runner.mcp_instructions_for(Some("linear")), None);
+        // Runs with no issue never attach MCP, so they never advertise it either.
+        assert_eq!(runner.mcp_instructions_for(None), None);
+    }
+
+    #[test]
+    fn test_mcp_instructions_absent_when_not_configured() {
+        // A server with tools but no guidance stays unadvertised: the prompt's
+        // telemetry block must not appear as an empty heading.
+        let runner = runner_with_grafana_mcp(None);
+        assert_eq!(runner.mcp_instructions_for(Some("sentry")), None);
+        // Blank guidance is treated the same as none.
+        let blank = runner_with_grafana_mcp(Some("   \n  "));
+        assert_eq!(blank.mcp_instructions_for(Some("sentry")), None);
+    }
+
+    #[test]
+    fn test_build_prompt_includes_telemetry_block_for_matching_source() {
+        let runner = runner_with_grafana_mcp(Some("Bound queries to First Seen / Last Seen."));
+        let dir = std::path::Path::new("/tmp");
+
+        let sentry_issue = Issue::new("1", "PROJ-1", "Boom", "https://example.com", "sentry");
+        let prompt = runner.build_prompt(&sentry_issue, "stack trace here", dir);
+        assert!(prompt.contains("## Live telemetry"), "prompt: {}", prompt);
+        assert!(prompt.contains("Bound queries to First Seen / Last Seen."));
+        // The conditional must be consumed, not left as literal template syntax.
+        assert!(!prompt.contains("{{#if mcp_instructions}}"));
+        assert!(!prompt.contains("{{mcp_instructions}}"));
+
+        // A source the server is not gated to gets no telemetry section at all.
+        let linear_issue = Issue::new("2", "PROJ-2", "Boom", "https://example.com", "linear");
+        let other = runner.build_prompt(&linear_issue, "context", dir);
+        assert!(!other.contains("## Live telemetry"));
+        assert!(!other.contains("{{mcp_instructions}}"));
+    }
+
+    #[test]
+    fn test_matched_mcp_servers_skips_invalid_transport() {
+        let mut mcp = HashMap::new();
+        // Neither command nor url: strict MCP loading would reject this outright.
+        mcp.insert(
+            "broken".to_string(),
+            McpServerConfig {
+                sources: vec!["sentry".to_string()],
+                instructions: Some("never shown".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = ClaudeRunnerConfig {
+            mcp,
+            ..Default::default()
+        };
+        let runner = ClaudeAgentRunner::new(config, Arc::new(claudear_storage::NoopTracker));
+        assert!(runner.matched_mcp_servers(Some("sentry")).is_empty());
+        // And an unusable server is never advertised in the prompt.
+        assert_eq!(runner.mcp_instructions_for(Some("sentry")), None);
+        // It is still reported, so a misconfiguration is not silently dropped.
+        assert_eq!(
+            runner.unusable_mcp_servers(Some("sentry")),
+            vec![&"broken".to_string()]
+        );
+        // A source the server was never gated to has nothing to report.
+        assert!(runner.unusable_mcp_servers(Some("linear")).is_empty());
     }
 
     #[test]

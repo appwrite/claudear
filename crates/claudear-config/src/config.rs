@@ -197,6 +197,12 @@ pub struct McpServerConfig {
     /// server's tools (`mcp__<server>`). Applies to every run that attaches this
     /// server.
     pub tools: Vec<String>,
+    /// Guidance injected into the agent's prompt whenever this server attaches.
+    /// Without it the agent is handed the server's tools but never told they
+    /// exist, what they cover, or when reaching for them is worthwhile. Put the
+    /// deployment-specific detail here: datasource UIDs, label conventions, and
+    /// any limits worth respecting.
+    pub instructions: Option<String>,
 }
 
 impl McpServerConfig {
@@ -3617,6 +3623,38 @@ mod tests {
             appwrite.env.get("APPWRITE_API_KEY").map(String::as_str),
             Some("${APPWRITE_API_KEY}")
         );
+        // Omitted `instructions` must stay None rather than defaulting to a string,
+        // so the prompt's telemetry block stays absent for servers without guidance.
+        assert_eq!(appwrite.instructions, None);
+    }
+
+    #[test]
+    fn test_mcp_config_parses_instructions() {
+        let toml = r#"
+            [agent.providers.claude.mcp.grafana]
+            command = "mcp-grafana"
+            args = ["--disable-write"]
+            sources = ["sentry"]
+            tools = ["query_loki_logs", "query_prometheus"]
+            instructions = """
+Bound every query to the issue's First Seen / Last Seen window.
+Call list_datasources once to find datasource UIDs.
+"""
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let grafana = cfg
+            .agent
+            .providers
+            .get("claude")
+            .expect("provider")
+            .mcp
+            .get("grafana")
+            .expect("mcp server");
+        assert_eq!(grafana.command.as_deref(), Some("mcp-grafana"));
+        assert_eq!(grafana.args, vec!["--disable-write".to_string()]);
+        let instructions = grafana.instructions.as_deref().expect("instructions");
+        assert!(instructions.contains("First Seen / Last Seen"));
+        assert!(instructions.contains("list_datasources"));
     }
 
     #[test]

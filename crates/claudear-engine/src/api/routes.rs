@@ -2568,9 +2568,18 @@ struct ConfigUpdateRequest {
 }
 
 /// Redact values of keys that look like secrets in raw TOML content.
+///
+/// `headers` is in the list because MCP servers carry auth in header bundles whose
+/// key names say nothing about their contents - e.g. a Cloudflare Access client
+/// secret inside `GRAFANA_EXTRA_HEADERS`, which none of the other patterns match.
+///
+/// The value alternatives are ordered longest-form first, and the basic-string arm
+/// understands backslash escapes. A naive `"[^"]*"` stops at the first escaped quote
+/// inside the string, replacing only the opening fragment and leaving the rest of the
+/// secret in the response - exactly the shape a JSON header bundle has.
 fn redact_secrets(content: &str) -> String {
     let re = regex_lite::Regex::new(
-        r#"(?im)^(\s*(?:[a-z_]*(?:token|secret|password|api_key|auth)[a-z_]*)\s*=\s*)("[^"]*"|'[^']*'|[^\n]*)"#,
+        r#"(?im)^(\s*(?:[a-z_]*(?:token|secret|password|api_key|auth|headers)[a-z_]*)\s*=\s*)("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\]|\\.)*"|'[^']*'|[^\n]*)"#,
     )
     .expect("valid regex");
     re.replace_all(content, r#"${1}"[REDACTED]""#).into_owned()
@@ -5317,6 +5326,49 @@ mod tests {
         let (result, truncated) = tail_utf8("", 100);
         assert_eq!(result, "");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn test_redact_secrets_header_bundle() {
+        // An MCP server's header bundle carries a secret under a key name that matches
+        // none of the other patterns, and wraps it in a JSON blob full of escaped
+        // quotes. Both parts have to work or GET /api/config leaks it to the dashboard.
+        let content = r#"GRAFANA_EXTRA_HEADERS = "{\"CF-Access-Client-Secret\": \"real-secret\"}"
+"#;
+        let redacted = redact_secrets(content);
+        assert!(!redacted.contains("real-secret"), "redacted: {}", redacted);
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_redact_secrets_multiline_string() {
+        // TOML multi-line strings must be consumed whole; matching the ordinary
+        // basic-string arm first would stop at the opening delimiter.
+        let content =
+            "auth_token = \"\"\"\nline-one-secret\nline-two-secret\n\"\"\"\nport = 3100\n";
+        let redacted = redact_secrets(content);
+        assert!(
+            !redacted.contains("line-one-secret"),
+            "redacted: {}",
+            redacted
+        );
+        assert!(
+            !redacted.contains("line-two-secret"),
+            "redacted: {}",
+            redacted
+        );
+        // Non-secret keys after the multi-line value survive untouched.
+        assert!(redacted.contains("port = 3100"));
+    }
+
+    #[test]
+    fn test_redact_secrets_leaves_instructions_intact() {
+        // `instructions` on an MCP server is prompt guidance, not a credential; it
+        // must survive redaction so the config editor round-trips it unchanged.
+        let content = "instructions = \"Call list_datasources once to find UIDs.\"\n";
+        let redacted = redact_secrets(content);
+        assert!(redacted.contains("Call list_datasources once to find UIDs."));
+        assert!(!redacted.contains("[REDACTED]"));
     }
 
     #[test]
