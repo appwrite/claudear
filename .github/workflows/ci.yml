@@ -176,6 +176,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
+      # The workflow-level RUSTFLAGS ask rustc for clang + mold, which neither
+      # the macOS nor the MSVC toolchain has.
       RUSTFLAGS: "-Dwarnings"
     strategy:
       fail-fast: false
@@ -223,6 +225,10 @@ jobs:
     name: Test (Windows)
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      # The workflow-level RUSTFLAGS ask rustc for clang + mold, which the MSVC
+      # toolchain has neither of.
+      RUSTFLAGS: "-Dwarnings"
     steps:
       - name: Configure git
         run: git config --global core.autocrlf false
