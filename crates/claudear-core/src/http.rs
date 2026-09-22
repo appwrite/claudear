@@ -91,6 +91,8 @@ pub struct ReqwestHttpClient {
 impl ReqwestHttpClient {
     /// Create a new reqwest-based HTTP client.
     pub fn new() -> Self {
+        crate::tls::ensure_crypto_provider();
+
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))

@@ -25,13 +25,14 @@
 //! claudear webhook
 //! ```
 
-/// Install the ring crypto provider for all rustls consumers (reqwest, axum-server, etc.).
+/// Install the ring crypto provider for all rustls consumers (reqwest,
+/// axum-server, rustls-acme).
 ///
-/// Must be called once before any TLS connections are made.  Subsequent calls
-/// are harmless (the function is idempotent).
+/// Library code reaches the same installer through
+/// `claudear_core::tls::ensure_crypto_provider`, which the shared HTTP client
+/// calls; this is the entry point for the binary, which also serves TLS.
 pub fn init_tls() {
-    // `install_default` returns Err if a provider is already installed – that's fine.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    claudear_core::tls::ensure_crypto_provider();
 }
 
 // Re-exported from claudear-core

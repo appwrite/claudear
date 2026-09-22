@@ -26,6 +26,7 @@ tokio = { workspace = true }
 
 # HTTP
 reqwest = { workspace = true }
+rustls = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
