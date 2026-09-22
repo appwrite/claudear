@@ -58,11 +58,16 @@ jobs:
       - name: Resolve version
         id: version
         shell: bash
+        # The tag is attacker-controlled text. Reach it through env so the shell
+        # never sees it expanded into the script itself.
+        env:
+          UNIX_VERSION: ${{ steps.version_unix.outputs.version }}
+          WINDOWS_VERSION: ${{ steps.version_windows.outputs.version }}
         run: |
-          if [ -n "${{ steps.version_unix.outputs.version }}" ]; then
-            echo "version=${{ steps.version_unix.outputs.version }}" >> $GITHUB_OUTPUT
+          if [ -n "${UNIX_VERSION}" ]; then
+            echo "version=${UNIX_VERSION}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=${{ steps.version_windows.outputs.version }}" >> $GITHUB_OUTPUT
+            echo "version=${WINDOWS_VERSION}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Install Rust toolchain

@@ -68,6 +68,14 @@ impl IpcClient {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
 
+        // Windows has no socket mode to restrict a loopback port, so the
+        // endpoint file's secret is what proves we are the same user.
+        if let Some(secret) = transport::client_secret(&self.socket_path)
+            .map_err(|e| Error::Other(format!("Failed to read the daemon endpoint: {}", e)))?
+        {
+            writer.write_all(format!("{}\n", secret).as_bytes()).await?;
+        }
+
         // Send command
         let json = serde_json::to_string(&command)? + "\n";
         writer.write_all(json.as_bytes()).await?;

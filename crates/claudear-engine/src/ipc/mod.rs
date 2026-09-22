@@ -35,16 +35,12 @@ fn ipc_runtime_dir() -> PathBuf {
                         dir,
                         e
                     );
-                    return std::env::temp_dir().join("claudear");
+                    return windows_temp_dir();
                 }
             }
             return dir;
         }
-        let dir = std::env::temp_dir().join("claudear");
-        if !dir.exists() {
-            let _ = std::fs::create_dir_all(&dir);
-        }
-        dir
+        windows_temp_dir()
     }
 
     #[cfg(not(windows))]
@@ -74,6 +70,27 @@ fn ipc_runtime_dir() -> PathBuf {
         }
         dir
     }
+}
+
+/// The Windows fallback runtime directory, created if it does not exist.
+///
+/// It has to exist before it is returned: every caller writes into it, and a
+/// first run on a machine where it is missing would otherwise fail with
+/// NotFound the moment the daemon writes its pid file.
+#[cfg(windows)]
+fn windows_temp_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("claudear");
+    if !dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::error!(
+                "Failed to create the fallback IPC runtime dir {:?}: {}",
+                dir,
+                e
+            );
+            return std::env::temp_dir();
+        }
+    }
+    dir
 }
 
 /// Default socket path for the IPC server (Unix) or port file path (Windows).
@@ -150,31 +167,76 @@ pub fn cleanup_stale_files() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_default_socket_path_has_expected_extension() {
-        let path = default_socket_path();
-        #[cfg(windows)]
+    #[tokio::test]
+    async fn an_endpoint_round_trips_a_message_on_this_platform() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let endpoint = dir.path().join("round-trip");
+
+        let listener = transport::bind(&endpoint).expect("bind");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read");
+            writer
+                .write_all(format!("echo:{}", line.trim()).as_bytes())
+                .await
+                .expect("write");
+        });
+
+        let mut client = transport::connect(&endpoint).await.expect("connect");
+        client.write_all(b"hello\n").await.expect("send");
+
+        let mut echoed = String::new();
+        client.read_to_string(&mut echoed).await.expect("receive");
+
+        assert_eq!(echoed, "echo:hello");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_reports_whether_anyone_is_listening() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let endpoint = dir.path().join("liveness");
+
         assert!(
-            path.ends_with("claudear.port"),
-            "Expected socket path to end with 'claudear.port', got: {:?}",
-            path
+            !transport::check_connection(&endpoint),
+            "nothing exists yet"
         );
-        #[cfg(not(windows))]
         assert!(
-            path.ends_with("claudear.sock"),
-            "Expected socket path to end with 'claudear.sock', got: {:?}",
-            path
+            !transport::is_stale(&endpoint),
+            "a missing file is not stale"
+        );
+
+        let listener = transport::bind(&endpoint).expect("bind");
+
+        assert!(
+            transport::check_connection(&endpoint),
+            "a bound endpoint answers"
+        );
+        assert!(!transport::is_stale(&endpoint));
+
+        drop(listener);
+
+        assert!(
+            !transport::check_connection(&endpoint),
+            "a dropped listener stops answering"
         );
     }
 
+    /// The secret is what stands in for a socket's owner-only mode, so an
+    /// unrelated local process presenting the wrong one must get nowhere.
     #[test]
-    fn test_default_pid_path_ends_with_claudear_pid() {
-        let path = default_pid_path();
-        assert!(
-            path.ends_with("claudear.pid"),
-            "Expected pid path to end with 'claudear.pid', got: {:?}",
-            path
-        );
+    fn a_wrong_secret_is_never_accepted() {
+        let secret = "0123456789abcdef";
+
+        assert!(transport::secret_matches(secret, secret));
+        assert!(!transport::secret_matches("", secret));
+        assert!(!transport::secret_matches("0123456789abcdee", secret));
+        assert!(!transport::secret_matches("0123456789abcdef0", secret));
     }
 
     #[test]

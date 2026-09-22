@@ -139,13 +139,57 @@ mod tests {
         assert!(!command_exists("__nonexistent_binary_12345__"));
     }
 
+    /// The outcome that matters is that a secret written through these helpers
+    /// is not readable by anyone else, however the platform expresses that.
     #[test]
-    fn test_set_file_permissions_secure_nonexistent_path() {
-        let result = set_file_permissions_secure(Path::new("/tmp/__does_not_exist_12345__"));
-        // On Unix this should fail; on Windows it's a no-op (Ok).
+    fn a_secured_file_is_not_readable_by_other_users() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let secret = dir.path().join("token");
+        std::fs::write(&secret, "s3cret").expect("write");
+
+        set_file_permissions_secure(&secret).expect("secure the file");
+
         #[cfg(unix)]
-        assert!(result.is_err());
-        #[cfg(not(unix))]
-        assert!(result.is_ok());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&secret)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "group and other must hold no bits, got {:o}",
+                mode
+            );
+        }
+
+        assert_eq!(std::fs::read_to_string(&secret).expect("read"), "s3cret");
+    }
+
+    #[test]
+    fn a_secured_directory_is_not_traversable_by_other_users() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let dir = parent.path().join("private");
+        std::fs::create_dir(&dir).expect("create");
+
+        set_dir_permissions_secure(&dir).expect("secure the dir");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "group and other must hold no bits, got {:o}",
+                mode
+            );
+        }
+
+        std::fs::write(dir.join("inside"), "ok").expect("the owner can still write");
     }
 }

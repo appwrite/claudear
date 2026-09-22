@@ -328,6 +328,19 @@ async fn handle_connection(
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
+    // Where the transport cannot restrict who connects (a loopback TCP port on
+    // Windows), the first line must be the secret from the endpoint file, which
+    // only this user can read. Unix sockets answer None and skip this.
+    if let Some(expected) = transport::expected_secret() {
+        if reader.read_line(&mut line).await? == 0
+            || !transport::secret_matches(line.trim(), expected)
+        {
+            tracing::warn!("Rejected an IPC connection that did not present the daemon secret");
+            return Ok(());
+        }
+        line.clear();
+    }
+
     while reader.read_line(&mut line).await? > 0 {
         let command: IpcCommand = match serde_json::from_str(line.trim()) {
             Ok(cmd) => cmd,
