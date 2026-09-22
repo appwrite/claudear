@@ -10,6 +10,28 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
 
+/// Map a Sentry severity level and event count to an issue priority.
+pub(crate) fn map_priority(level: &str, event_count: i64) -> IssuePriority {
+    if level == "fatal" || (level == "error" && event_count > 1000) {
+        IssuePriority::Critical
+    } else if level == "error" {
+        IssuePriority::High
+    } else if level == "warning" {
+        IssuePriority::Medium
+    } else {
+        IssuePriority::Low
+    }
+}
+
+/// Map a Sentry status string to an `IssueStatus`.
+pub(crate) fn map_status(status: &str) -> IssueStatus {
+    match status {
+        "resolved" => IssueStatus::Resolved,
+        "ignored" => IssueStatus::Ignored,
+        _ => IssueStatus::Open,
+    }
+}
+
 /// Webhook handler for Sentry.
 pub struct SentryWebhookHandler {
     config: SentryConfig,
@@ -19,26 +41,6 @@ impl SentryWebhookHandler {
     /// Create a new Sentry webhook handler.
     pub fn new(config: SentryConfig) -> Self {
         Self { config }
-    }
-
-    fn map_priority(level: &str, event_count: i64) -> IssuePriority {
-        if level == "fatal" || (level == "error" && event_count > 1000) {
-            IssuePriority::Critical
-        } else if level == "error" {
-            IssuePriority::High
-        } else if level == "warning" {
-            IssuePriority::Medium
-        } else {
-            IssuePriority::Low
-        }
-    }
-
-    fn map_status(status: &str) -> IssueStatus {
-        match status {
-            "resolved" => IssueStatus::Resolved,
-            "ignored" => IssueStatus::Ignored,
-            _ => IssueStatus::Open,
-        }
     }
 }
 
@@ -204,8 +206,8 @@ impl WebhookHandler for SentryWebhookHandler {
 
         let mut issue = Issue::new(&id, &short_id, &title, &url, "sentry");
         issue.description = error_value.clone();
-        issue.priority = Self::map_priority(level, count);
-        issue.status = Self::map_status(status);
+        issue.priority = map_priority(level, count);
+        issue.status = map_status(status);
         issue.created_at = first_seen;
         issue.updated_at = last_seen;
 
@@ -239,7 +241,7 @@ impl WebhookHandler for SentryWebhookHandler {
         let level: String = issue.get_metadata("level").unwrap_or_default();
 
         // Check minimum event count
-        if event_count < self.config.min_event_count as i64 {
+        if event_count < i64::try_from(self.config.min_event_count).unwrap_or(i64::MAX) {
             return MatchResult::not_matched(format!(
                 "Event count {} below threshold {}",
                 event_count, self.config.min_event_count
@@ -474,49 +476,49 @@ mod tests {
 
     #[test]
     fn test_map_priority_fatal() {
-        let priority = SentryWebhookHandler::map_priority("fatal", 1);
+        let priority = map_priority("fatal", 1);
         assert_eq!(priority, IssuePriority::Critical);
     }
 
     #[test]
     fn test_map_priority_error_high_count() {
-        let priority = SentryWebhookHandler::map_priority("error", 1001);
+        let priority = map_priority("error", 1001);
         assert_eq!(priority, IssuePriority::Critical);
     }
 
     #[test]
     fn test_map_priority_error_normal() {
-        let priority = SentryWebhookHandler::map_priority("error", 100);
+        let priority = map_priority("error", 100);
         assert_eq!(priority, IssuePriority::High);
     }
 
     #[test]
     fn test_map_priority_warning() {
-        let priority = SentryWebhookHandler::map_priority("warning", 50);
+        let priority = map_priority("warning", 50);
         assert_eq!(priority, IssuePriority::Medium);
     }
 
     #[test]
     fn test_map_priority_info() {
-        let priority = SentryWebhookHandler::map_priority("info", 10);
+        let priority = map_priority("info", 10);
         assert_eq!(priority, IssuePriority::Low);
     }
 
     #[test]
     fn test_map_status_resolved() {
-        let status = SentryWebhookHandler::map_status("resolved");
+        let status = map_status("resolved");
         assert_eq!(status, IssueStatus::Resolved);
     }
 
     #[test]
     fn test_map_status_ignored() {
-        let status = SentryWebhookHandler::map_status("ignored");
+        let status = map_status("ignored");
         assert_eq!(status, IssueStatus::Ignored);
     }
 
     #[test]
     fn test_map_status_unresolved() {
-        let status = SentryWebhookHandler::map_status("unresolved");
+        let status = map_status("unresolved");
         assert_eq!(status, IssueStatus::Open);
     }
 

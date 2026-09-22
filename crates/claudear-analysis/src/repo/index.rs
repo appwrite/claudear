@@ -8,6 +8,7 @@
 
 pub use claudear_core::types::{IndexedRepo, RepoIndex};
 
+use super::GitOps;
 use claudear_core::error::Result;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -49,7 +50,9 @@ pub fn build_repo_index(known_orgs: &[String], paths: &[String]) -> Result<RepoI
                             "Found repository from known org"
                         );
 
-                        let mut repo = IndexedRepo::new(&repo_name, entry_path);
+                        let default_branch = GitOps::detect_default_branch_sync(entry_path);
+                        let mut repo = IndexedRepo::new(&repo_name, entry_path)
+                            .with_default_branch(&default_branch);
                         repo = index_files(repo);
                         index.add_repo(repo);
                     }

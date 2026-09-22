@@ -54,7 +54,7 @@ pub async fn build_error_reference_embeddings(
 
     let result: Vec<(String, Vec<f32>)> = categories
         .iter()
-        .zip(embeddings.into_iter())
+        .zip(embeddings)
         .map(|((name, _), embedding)| (name.to_string(), embedding))
         .collect();
 
@@ -136,7 +136,7 @@ impl OutcomeTracker {
         }
 
         let mut counts: Vec<_> = error_counts.into_iter().collect();
-        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts.sort_by_key(|b| std::cmp::Reverse(b.1));
         counts.truncate(limit);
         counts
     }

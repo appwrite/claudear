@@ -605,7 +605,7 @@ impl RepoInferrer {
 
         let new_embeddings: Vec<RepoEmbedding> = new_repos
             .iter()
-            .zip(vectors.into_iter())
+            .zip(vectors)
             .map(|(repo, vector)| RepoEmbedding {
                 name: repo.name.clone(),
                 embedding: vector,
@@ -779,8 +779,17 @@ impl RepoInferrer {
 
             let pull_results: Vec<_> = stream::iter(repos_to_pull)
                 .map(|(name, path, scm_url)| async move {
-                    if let Err(e) = GitOps::ensure_repo_fetched(&path, &scm_url).await {
-                        tracing::warn!(repo = %name, error = %e, "Failed to fetch repository");
+                    match GitOps::ensure_repo_synced(&path, &scm_url).await {
+                        Ok(default_branch) => {
+                            tracing::debug!(
+                                repo = %name,
+                                default_branch = %default_branch,
+                                "Synced repository to origin default branch"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(repo = %name, error = %e, "Failed to sync repository");
+                        }
                     }
                     name
                 })
@@ -1652,7 +1661,7 @@ pub async fn build_repo_embeddings(
 
     let vectors = embedding_client.embed_batch(&text_refs).await?;
 
-    for (repo, vector) in repos.iter().zip(vectors.into_iter()) {
+    for (repo, vector) in repos.iter().zip(vectors) {
         embeddings.push(RepoEmbedding {
             name: repo.name.clone(),
             embedding: vector,

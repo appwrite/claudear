@@ -1320,7 +1320,7 @@ impl WebhookConfigurator {
         let payload = serde_json::json!({
             "name": "web",
             "active": true,
-            "events": ["pull_request_review", "pull_request_review_comment"],
+            "events": ["pull_request_review", "pull_request_review_comment", "pull_request"],
             "config": {
                 "url": callback_url,
                 "content_type": "json",
@@ -1691,6 +1691,7 @@ mod tests {
             processing_delay_ms: 5000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
+            debug_logging: false,
             agent: claudear_config::config::AgentConfig::default(),
             scm: claudear_config::config::ScmConfig::default(),
             issues: claudear_config::config::IssuesConfig::default(),
@@ -1703,6 +1704,7 @@ mod tests {
             learning: claudear_config::config::LearningConfig::default(),
             prioritisation: claudear_config::config::PrioritisationConfig::default(),
             code_index: claudear_config::config::CodeIndexConfig::default(),
+            retrieval_eval: Default::default(),
             evaluation: claudear_config::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: claudear_config::config::DashboardConfig::default(),
@@ -1710,6 +1712,9 @@ mod tests {
             tls: claudear_config::config::TlsConfig::default(),
             llm: claudear_config::config::LlmModelConfig::default(),
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
+            qa: claudear_config::config::QaConfig::default(),
+            knowledgebase: claudear_config::config::KnowledgebasesConfig::default(),
+            reports: claudear_config::config::ReportsConfig::default(),
         }
     }
 

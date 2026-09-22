@@ -2,17 +2,18 @@
 
 use claudear_config::config::SentryConfig;
 use claudear_core::error::{Error, Result};
+use claudear_core::secret::SecretValue;
 use serde::{Deserialize, Serialize};
 
 /// Client for Sentry REST API webhook operations.
 pub struct SentryApiClient {
-    auth_token: String,
+    auth_token: SecretValue,
     org_slug: String,
     client: reqwest::Client,
 }
 
 /// Result of a webhook registration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SentryWebhookRegistration {
     /// The webhook/hook ID.
     pub id: String,
@@ -24,6 +25,18 @@ pub struct SentryWebhookRegistration {
     pub events: Vec<String>,
     /// The project slug this hook is for.
     pub project_slug: String,
+}
+
+impl std::fmt::Debug for SentryWebhookRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SentryWebhookRegistration")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("secret", &"[REDACTED]")
+            .field("events", &self.events)
+            .field("project_slug", &self.project_slug)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -79,7 +92,7 @@ impl SentryApiClient {
     const BASE_URL: &'static str = "https://sentry.io/api/0";
 
     /// Create a new Sentry API client.
-    pub fn new(auth_token: String, org_slug: String) -> Self {
+    pub fn new(auth_token: SecretValue, org_slug: String) -> Self {
         Self {
             auth_token,
             org_slug,
@@ -93,10 +106,7 @@ impl SentryApiClient {
 
     /// Create from a SentryConfig.
     pub fn from_config(config: &SentryConfig) -> Self {
-        Self::new(
-            config.auth_token.expose().to_string(),
-            config.org_slug.clone(),
-        )
+        Self::new(config.auth_token.clone(), config.org_slug.clone())
     }
 
     /// Get the organization slug.
@@ -116,7 +126,10 @@ impl SentryApiClient {
         let response = self
             .client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.auth_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.auth_token.expose()),
+            )
             .send()
             .await
             .map_err(|e| Error::api(format!("Failed to send request to Sentry API: {}", e)))?;
@@ -173,7 +186,10 @@ impl SentryApiClient {
         let response = self
             .client
             .post(&api_url)
-            .header("Authorization", format!("Bearer {}", self.auth_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.auth_token.expose()),
+            )
             .header("Content-Type", "application/json")
             .json(&request_body)
             .send()
@@ -222,6 +238,8 @@ impl SentryApiClient {
         &self,
         project_slug: &str,
     ) -> Result<Vec<(String, String, Vec<String>)>> {
+        validate_slug(&self.org_slug, "organization")?;
+        validate_slug(project_slug, "project")?;
         let url = format!(
             "{}/projects/{}/{}/hooks/",
             Self::BASE_URL,
@@ -232,7 +250,10 @@ impl SentryApiClient {
         let response = self
             .client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.auth_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.auth_token.expose()),
+            )
             .send()
             .await
             .map_err(|e| Error::api(format!("Failed to send request to Sentry API: {}", e)))?;
@@ -265,6 +286,14 @@ impl SentryApiClient {
 
     /// Delete a webhook by ID for a project.
     pub async fn delete_webhook(&self, project_slug: &str, hook_id: &str) -> Result<()> {
+        validate_slug(&self.org_slug, "organization")?;
+        validate_slug(project_slug, "project")?;
+        if hook_id.is_empty() || !hook_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
+            return Err(Error::config(format!(
+                "hook ID contains invalid characters: {}",
+                hook_id
+            )));
+        }
         let url = format!(
             "{}/projects/{}/{}/hooks/{}/",
             Self::BASE_URL,
@@ -276,7 +305,10 @@ impl SentryApiClient {
         let response = self
             .client
             .delete(&url)
-            .header("Authorization", format!("Bearer {}", self.auth_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.auth_token.expose()),
+            )
             .send()
             .await
             .map_err(|e| Error::api(format!("Failed to send request to Sentry API: {}", e)))?;
@@ -341,12 +373,11 @@ impl SentryApiClient {
 mod tests {
     use super::*;
     use claudear_config::config::TopIssuesPeriod;
-    use claudear_core::secret::SecretValue;
 
     #[test]
     fn test_sentry_api_client_new() {
-        let client = SentryApiClient::new("token".to_string(), "my-org".to_string());
-        assert_eq!(client.auth_token, "token");
+        let client = SentryApiClient::new(SecretValue::new("token"), "my-org".to_string());
+        assert_eq!(client.auth_token.expose(), "token");
         assert_eq!(client.org_slug, "my-org");
     }
 
@@ -365,13 +396,13 @@ mod tests {
             ..Default::default()
         };
         let client = SentryApiClient::from_config(&config);
-        assert_eq!(client.auth_token, "sentry_token");
+        assert_eq!(client.auth_token.expose(), "sentry_token");
         assert_eq!(client.org_slug, "test-org");
     }
 
     #[test]
     fn test_sentry_api_client_org_slug() {
-        let client = SentryApiClient::new("token".to_string(), "my-org".to_string());
+        let client = SentryApiClient::new(SecretValue::new("token"), "my-org".to_string());
         assert_eq!(client.org_slug(), "my-org");
     }
 

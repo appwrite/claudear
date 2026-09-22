@@ -369,8 +369,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "context", Path::new("/tmp"));
@@ -379,8 +378,7 @@ mod tests {
 
     #[test]
     fn test_capabilities() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
         let caps = runner.capabilities();
         assert!(!caps.structured_output);
@@ -390,16 +388,14 @@ mod tests {
 
     #[test]
     fn test_codex_name() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
         assert_eq!(runner.name(), "codex");
     }
 
     #[test]
     fn test_codex_capabilities_no_structured_output() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
         let caps = runner.capabilities();
         assert!(!caps.structured_output);
@@ -463,8 +459,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_codex_execute_nonexistent_binary_returns_error() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let config = CodexRunnerConfig {
             binary: "nonexistent-codex-binary-xyz-12345".to_string(),
             ..CodexRunnerConfig::default()
@@ -484,8 +479,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_contains_source_and_context() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
         let issue = Issue::new(
             "42",
@@ -515,8 +509,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_for_issue_delegates_to_build_prompt() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
         let issue = Issue::new("1", "LIN-1", "Feature", "url", "linear");
         let p1 = runner.build_prompt(&issue, "ctx", Path::new("/tmp"));

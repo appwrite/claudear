@@ -1,22 +1,22 @@
 //! SQLite-based fix attempt tracker and analytics storage.
 
 use super::types::{
-    ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
-    InferenceStats, StoredDependency, StoredIndexedRepo, StoredPrReviewComment, StoredRepository,
-    UserRow,
+    ConfidenceBreakdown, DiagnosticCounts, DiscordKnowledgebaseStats, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, PurgeResult, StoredDependency, StoredDiscordChannel,
+    StoredIndexedRepo, StoredPrReviewComment, StoredRepository, UserRow,
 };
 use super::{
     is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
-    EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
-    SimilarityStore, UserStore, WebhookStore,
+    DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
+    RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
 };
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
     ExperimentProviderStats, FixAttempt, FixAttemptStats, FixAttemptStatus, FixOutcome,
-    IssueEmbedding, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment, QaKnowledgeEntry,
-    QaMatch, SimilarIssue, SourceStats,
+    IssueEmbedding, IssueTimeline, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment,
+    QaKnowledgeEntry, QaMatch, RetrievalUsageRecord, SimilarIssue, SourceStats, TimelineEvent,
 };
 use rand::RngExt;
 use rusqlite::OptionalExtension;
@@ -39,6 +39,9 @@ const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
 const CODE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
+const DISCORD_MESSAGE_CHUNK_VECTOR_TABLE: &str = "discord_message_chunk_vectors";
+const DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
+const DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
 /// Maximum allowed embedding dimension to prevent malformed data from generating
 /// unbounded DDL strings. Covers all common embedding models (up to 8192-dim).
@@ -1321,6 +1324,113 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
+    fn mark_answered(
+        &self,
+        source: &str,
+        issue_id: &str,
+        summary: &str,
+        intent: Option<&str>,
+    ) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            "Marking attempt as answered"
+        );
+        let conn = self.acquire_lock()?;
+        // COALESCE keeps any previously-stored intent when this call omits one.
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'answered', error_message = ?, routing_intent = COALESCE(?, routing_intent)
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![summary, intent, source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    /// Read the routing intent classified for an attempt, if one was stored.
+    fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let intent = conn
+            .query_row(
+                "SELECT routing_intent FROM fix_attempts WHERE source = ? AND issue_id = ?",
+                params![source, issue_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(intent)
+    }
+
+    fn record_answer_message_ids(
+        &self,
+        source: &str,
+        issue_id: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.acquire_lock()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT answer_message_ids FROM fix_attempts WHERE source = ?1 AND issue_id = ?2",
+                params![source, issue_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        let mut ids: Vec<String> = existing
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        for id in message_ids {
+            if !ids.iter().any(|existing| existing == id) {
+                ids.push(id.clone());
+            }
+        }
+        let packed = format!(",{},", ids.join(","));
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET answer_message_ids = ?
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![packed, source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn lookup_answer_issue(&self, message_id: &str) -> Result<Option<(String, String)>> {
+        if message_id.is_empty() {
+            return Ok(None);
+        }
+        let escaped = message_id
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%,{},%", escaped);
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare_cached(
+            r#"
+            SELECT source, issue_id
+            FROM fix_attempts
+            WHERE answer_message_ids LIKE ? ESCAPE '\'
+            LIMIT 1
+            "#,
+        )?;
+        let result = stmt
+            .query_row(params![pattern], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok();
+        Ok(result)
+    }
+
     fn get_retryable_issues(&self, max_retries: u32) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare_cached(
@@ -1465,6 +1575,26 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::record_activity(self, entry)
     }
 
+    fn record_action_run(
+        &self,
+        source: &str,
+        issue_id: &str,
+        short_id: &str,
+        action_kind: &str,
+        status: &str,
+        detail: &str,
+    ) -> Result<()> {
+        SqliteTracker::record_action_run(
+            self,
+            source,
+            issue_id,
+            short_id,
+            action_kind,
+            status,
+            detail,
+        )
+    }
+
     fn get_recent_activities(&self, limit: usize) -> Result<Vec<ActivityLogEntry>> {
         SqliteTracker::get_recent_activities(self, limit, None)
     }
@@ -1495,6 +1625,14 @@ impl ActivityStore for SqliteTracker {
         source_filter: Option<&str>,
     ) -> Result<Vec<ActivityLogEntry>> {
         SqliteTracker::get_recent_activities(self, limit, source_filter)
+    }
+
+    fn get_activities_for_issue(
+        &self,
+        source: &str,
+        issue_id: &str,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        SqliteTracker::get_activities_for_issue(self, source, issue_id)
     }
 
     fn get_attempt_by_id(&self, id: i64) -> Result<Option<FixAttempt>> {
@@ -1560,6 +1698,31 @@ impl ActivityStore for SqliteTracker {
 
     fn get_repo_leaderboard(&self) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
         SqliteTracker::get_repo_leaderboard(self)
+    }
+
+    fn get_commit_trend(&self, days: usize) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
+        SqliteTracker::get_commit_trend(self, days)
+    }
+
+    fn list_support_replies(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::SupportReply>> {
+        SqliteTracker::list_support_replies(self, limit)
+    }
+
+    fn record_reply_rating(
+        &self,
+        action_run_id: i64,
+        rating: i32,
+        note: Option<&str>,
+        rated_by: &str,
+    ) -> Result<()> {
+        SqliteTracker::record_reply_rating(self, action_run_id, rating, note, rated_by)
+    }
+
+    fn get_support_rating_summary(&self) -> Result<claudear_core::types::SupportRatingSummary> {
+        SqliteTracker::get_support_rating_summary(self)
     }
 
     fn get_complexity_time_savings(
@@ -1672,9 +1835,10 @@ impl ActivityStore for SqliteTracker {
             INSERT INTO pr_review_states (
                 pr_url, repo, pr_number, issue_id, source,
                 last_review_id, last_review_time, last_comment_id, last_comment_time,
+                last_issue_comment_id, last_issue_comment_time,
                 is_active, created_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))
             ON CONFLICT(pr_url) DO UPDATE SET
                 repo = excluded.repo,
                 pr_number = excluded.pr_number,
@@ -1684,6 +1848,8 @@ impl ActivityStore for SqliteTracker {
                 last_review_time = excluded.last_review_time,
                 last_comment_id = excluded.last_comment_id,
                 last_comment_time = excluded.last_comment_time,
+                last_issue_comment_id = excluded.last_issue_comment_id,
+                last_issue_comment_time = excluded.last_issue_comment_time,
                 is_active = excluded.is_active
             "#,
             params![
@@ -1696,6 +1862,8 @@ impl ActivityStore for SqliteTracker {
                 state.last_review_time,
                 state.last_comment_id,
                 state.last_comment_time,
+                state.last_issue_comment_id,
+                state.last_issue_comment_time,
                 state.is_active as i32,
             ],
         )?;
@@ -1716,6 +1884,7 @@ impl ActivityStore for SqliteTracker {
             r#"
             SELECT pr_url, repo, pr_number, issue_id, source,
                    last_review_id, last_review_time, last_comment_id, last_comment_time,
+                   last_issue_comment_id, last_issue_comment_time,
                    is_active
             FROM pr_review_states
             WHERE is_active = 1
@@ -1760,19 +1929,30 @@ impl ActivityStore for SqliteTracker {
     ) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
+        // Conversation comments (issues/{n}/comments) carry no file path; inline
+        // review comments (pulls/{n}/comments) always do. The two are separate
+        // GitHub id sequences, so uniqueness is keyed on (comment_kind, id) to keep
+        // a colliding id in one namespace from overwriting the other's row.
+        let comment_kind = if comment.path.is_empty() {
+            "conversation"
+        } else {
+            "inline"
+        };
+
         conn.execute(
             r#"
             INSERT INTO pr_review_comments (
-                scm_comment_id, pr_url, review_id, path, position, line,
+                scm_comment_id, comment_kind, pr_url, review_id, path, position, line,
                 body, author, created_at, updated_at, html_url
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            ON CONFLICT(scm_comment_id) DO UPDATE SET
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(comment_kind, scm_comment_id) DO UPDATE SET
                 body = excluded.body,
                 updated_at = excluded.updated_at
             "#,
             params![
                 comment.id,
+                comment_kind,
                 pr_url,
                 comment.pull_request_review_id,
                 comment.path,
@@ -1810,6 +1990,153 @@ impl ActivityStore for SqliteTracker {
         }
 
         Ok(results)
+    }
+
+    fn get_unhandled_pr_review_comments(
+        &self,
+        pr_url: &str,
+    ) -> Result<Vec<claudear_core::types::ReviewComment>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT scm_comment_id, review_id, path, position, line,
+                   body, author, created_at, updated_at, html_url
+            FROM pr_review_comments
+            WHERE pr_url = ? AND handled_at IS NULL
+            ORDER BY scm_comment_id ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![pr_url], |row| {
+            Ok(claudear_core::types::ReviewComment {
+                id: row.get(0)?,
+                pull_request_review_id: row.get(1)?,
+                path: row.get(2)?,
+                position: row.get(3)?,
+                line: row.get(4)?,
+                body: row.get(5)?,
+                user: claudear_core::types::ReviewUser {
+                    id: 0,
+                    login: row.get(6)?,
+                    user_type: None,
+                },
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                html_url: row.get(9)?,
+                original_position: None,
+                start_line: None,
+                side: None,
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows.flatten() {
+            results.push(row);
+        }
+        Ok(results)
+    }
+
+    fn mark_pr_review_comments_handled(&self, pr_url: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE pr_review_comments SET handled_at = datetime('now') \
+             WHERE pr_url = ? AND handled_at IS NULL",
+            params![pr_url],
+        )?;
+        Ok(())
+    }
+
+    fn mark_pr_review_comments_handled_by_ids(
+        &self,
+        pr_url: &str,
+        comments: &[(i64, &str)],
+    ) -> Result<()> {
+        if comments.is_empty() {
+            return Ok(());
+        }
+        let conn = self.acquire_lock()?;
+        // Match (comment_kind, scm_comment_id) pairs so a colliding id in the other
+        // namespace is not acknowledged by mistake.
+        let pair_clause =
+            vec!["(comment_kind = ? AND scm_comment_id = ?)"; comments.len()].join(" OR ");
+        let sql = format!(
+            "UPDATE pr_review_comments SET handled_at = datetime('now') \
+             WHERE pr_url = ? AND handled_at IS NULL AND ({})",
+            pair_clause
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(comments.len() * 2 + 1);
+        binds.push(Box::new(pr_url.to_string()));
+        for (id, kind) in comments {
+            binds.push(Box::new(kind.to_string()));
+            binds.push(Box::new(*id));
+        }
+        conn.execute(&sql, rusqlite::params_from_iter(binds.iter().map(|b| &**b)))?;
+        Ok(())
+    }
+
+    fn note_pr_review_comment_failure_by_ids(
+        &self,
+        pr_url: &str,
+        comments: &[(i64, &str)],
+        max_attempts: i64,
+    ) -> Result<()> {
+        if comments.is_empty() {
+            return Ok(());
+        }
+        let conn = self.acquire_lock()?;
+        // Match (comment_kind, scm_comment_id) pairs so a colliding id in the other
+        // namespace is not charged by mistake.
+        let pair_clause =
+            vec!["(comment_kind = ? AND scm_comment_id = ?)"; comments.len()].join(" OR ");
+
+        // Count this failed cycle against exactly the comments we tried.
+        let bump_sql = format!(
+            "UPDATE pr_review_comments SET attempts = attempts + 1 \
+             WHERE pr_url = ? AND handled_at IS NULL AND ({})",
+            pair_clause
+        );
+        // Give up on at most ONE comment per failed cycle: the single worst
+        // offender (most attempts) that has hit the cap. A batch failure can't be
+        // attributed to a specific comment, so retiring the whole over-cap set at
+        // once would drop valid comments that merely co-occur with a poison one.
+        // Retiring one per cycle lets a poison comment drain out first, after which
+        // the remaining comments get a fresh batch that can succeed.
+        let giveup_sql = format!(
+            "UPDATE pr_review_comments SET handled_at = datetime('now') \
+             WHERE id = ( \
+                 SELECT id FROM pr_review_comments \
+                 WHERE pr_url = ? AND handled_at IS NULL AND attempts >= ? AND ({}) \
+                 ORDER BY attempts DESC, scm_comment_id ASC \
+                 LIMIT 1 \
+             )",
+            pair_clause
+        );
+
+        let mut bump_binds: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(comments.len() * 2 + 1);
+        bump_binds.push(Box::new(pr_url.to_string()));
+        for (id, kind) in comments {
+            bump_binds.push(Box::new(kind.to_string()));
+            bump_binds.push(Box::new(*id));
+        }
+        conn.execute(
+            &bump_sql,
+            rusqlite::params_from_iter(bump_binds.iter().map(|b| &**b)),
+        )?;
+
+        let mut giveup_binds: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(comments.len() * 2 + 2);
+        giveup_binds.push(Box::new(pr_url.to_string()));
+        giveup_binds.push(Box::new(max_attempts));
+        for (id, kind) in comments {
+            giveup_binds.push(Box::new(kind.to_string()));
+            giveup_binds.push(Box::new(*id));
+        }
+        conn.execute(
+            &giveup_sql,
+            rusqlite::params_from_iter(giveup_binds.iter().map(|b| &**b)),
+        )?;
+        Ok(())
     }
 
     /// Get metric row counts grouped by name since a timestamp.
@@ -1996,6 +2323,95 @@ impl ActivityStore for SqliteTracker {
         )?;
 
         Ok(deleted)
+    }
+
+    fn purge_operational_data(&self) -> Result<PurgeResult> {
+        let conn = self.acquire_lock()?;
+
+        // Detach feedback_outcomes from attempts (preserve learnings/embeddings).
+        // Set attempt_id to NULL so the FK constraint doesn't block deleting fix_attempts.
+        // FixOutcome.attempt_id is i64 so NULLs deserialize as 0 via row.get().
+        let feedback_outcomes_detached = conn.execute(
+            "UPDATE feedback_outcomes SET attempt_id = NULL WHERE attempt_id IS NOT NULL",
+            [],
+        )?;
+
+        // Temporarily disable FK enforcement so we can bulk-delete without
+        // worrying about ordering across every referencing table.
+        // PRAGMA foreign_keys cannot be changed inside a transaction, so we
+        // run it outside, do all deletes, then re-enable.
+        conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+
+        let result = (|| -> Result<PurgeResult> {
+            // Regression tracking
+            let release_tracking = conn.execute("DELETE FROM release_tracking", [])?;
+            let regression_checks = conn.execute("DELETE FROM regression_checks", [])?;
+            let regression_watches = conn.execute("DELETE FROM regression_watches", [])?;
+
+            // PR review data
+            let pr_review_comments = conn.execute("DELETE FROM pr_review_comments", [])?;
+            let pr_reviews = conn.execute("DELETE FROM pr_reviews", [])?;
+            let pr_review_states = conn.execute("DELETE FROM pr_review_states", [])?;
+
+            // Execution & strategy data
+            let claude_executions = conn.execute("DELETE FROM claude_executions", [])?;
+            let strategy_fingerprints = conn.execute("DELETE FROM strategy_fingerprints", [])?;
+            let diff_analyses = conn.execute("DELETE FROM diff_analyses", [])?;
+            let qa_usage = conn.execute("DELETE FROM qa_usage", [])?;
+
+            // Evaluation data
+            let eval_snapshots = conn.execute("DELETE FROM eval_snapshots", [])?;
+            let eval_deltas = conn.execute("DELETE FROM eval_deltas", [])?;
+
+            // PRs
+            let prs = conn.execute("DELETE FROM prs", [])?;
+
+            // Clustering & prioritisation
+            let issue_cluster_members = conn.execute("DELETE FROM issue_cluster_members", [])?;
+            let issue_clusters = conn.execute("DELETE FROM issue_clusters", [])?;
+            let content_clusters = conn.execute("DELETE FROM content_clusters", [])?;
+            let severity_scores = conn.execute("DELETE FROM severity_scores", [])?;
+            let suppression_log = conn.execute("DELETE FROM suppression_log", [])?;
+
+            // Operational logs & metrics
+            let activity_log = conn.execute("DELETE FROM activity_log", [])?;
+            let processing_metrics = conn.execute("DELETE FROM processing_metrics", [])?;
+            let webhook_deliveries = conn.execute("DELETE FROM webhook_deliveries", [])?;
+
+            // Fix attempts (root entity)
+            let fix_attempts = conn.execute("DELETE FROM fix_attempts", [])?;
+
+            Ok(PurgeResult {
+                fix_attempts,
+                prs,
+                pr_reviews,
+                pr_review_comments,
+                pr_review_states,
+                claude_executions,
+                strategy_fingerprints,
+                diff_analyses,
+                regression_watches,
+                release_tracking,
+                regression_checks,
+                qa_usage,
+                activity_log,
+                processing_metrics,
+                webhook_deliveries,
+                issue_clusters,
+                issue_cluster_members,
+                content_clusters,
+                severity_scores,
+                suppression_log,
+                eval_snapshots,
+                eval_deltas,
+                feedback_outcomes_detached,
+            })
+        })();
+
+        // Always re-enable FK enforcement
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+
+        result
     }
 
     /// Get diagnostic counts for all major tables.
@@ -2599,6 +3015,17 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::get_success_rate(self)
     }
 
+    fn get_issue_timeline(&self, source: &str, issue_id: &str) -> Result<IssueTimeline> {
+        // `get_activities_for_issue` returns newest-first.
+        let mut rows = self.get_activities_for_issue(source, issue_id)?;
+        rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id)));
+
+        Ok(IssueTimeline {
+            issue: issue_id.to_owned(),
+            events: rows.into_iter().map(TimelineEvent::from).collect(),
+        })
+    }
+
     // --- Code Indexing ---
 }
 
@@ -2665,6 +3092,30 @@ impl KnowledgeStore for SqliteTracker {
         SqliteTracker::record_qa_usage(self, attempt_id, qa_id, usage_type, similarity_score)
     }
 
+    fn record_retrieval_usage(&self, rows: &[RetrievalUsageRecord]) -> Result<()> {
+        SqliteTracker::record_retrieval_usage(self, rows)
+    }
+
+    fn set_retrieval_quality(
+        &self,
+        attempt_id: i64,
+        source_kind: &str,
+        chunk_ref: &str,
+        quality_score: f64,
+    ) -> Result<()> {
+        SqliteTracker::set_retrieval_quality(
+            self,
+            attempt_id,
+            source_kind,
+            chunk_ref,
+            quality_score,
+        )
+    }
+
+    fn get_retrieval_usage(&self, attempt_id: i64) -> Result<Vec<RetrievalUsageRecord>> {
+        SqliteTracker::get_retrieval_usage(self, attempt_id)
+    }
+
     fn update_qa_outcome_stats(&self, qa_id: i64, success: bool) -> Result<()> {
         SqliteTracker::update_qa_outcome_stats(self, qa_id, success)
     }
@@ -2701,6 +3152,28 @@ impl KnowledgeStore for SqliteTracker {
         repo: &str,
     ) -> Result<Vec<claudear_core::types::PromotedInstruction>> {
         SqliteTracker::get_promoted_instructions(self, repo)
+    }
+
+    fn upsert_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+        text: &str,
+        updated_by: Option<&str>,
+    ) -> Result<i64> {
+        SqliteTracker::upsert_agent_instruction(self, scope, repo, text, updated_by)
+    }
+
+    fn get_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+    ) -> Result<Option<claudear_core::types::AgentInstruction>> {
+        SqliteTracker::get_agent_instruction(self, scope, repo)
+    }
+
+    fn resolve_agent_instructions(&self, repo: Option<&str>) -> Result<Option<String>> {
+        SqliteTracker::resolve_agent_instructions(self, repo)
     }
 
     fn upsert_repo_knowledge(&self, entry: &claudear_core::types::RepoKnowledge) -> Result<i64> {
@@ -3411,6 +3884,53 @@ impl EmbeddingStore for SqliteTracker {
             None => conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?,
         };
         Ok(count as usize)
+    }
+
+    fn record_issue_recurrence(
+        &self,
+        source: &str,
+        issue_id: &str,
+        event_count: i64,
+        is_escalating: bool,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO issue_recurrence (source, issue_id, event_count, is_escalating, observed_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))
+             ON CONFLICT(source, issue_id) DO UPDATE SET
+                 event_count = excluded.event_count,
+                 is_escalating = excluded.is_escalating,
+                 observed_at = excluded.observed_at",
+            params![source, issue_id, event_count, is_escalating as i64],
+        )?;
+        Ok(())
+    }
+
+    fn get_issue_with_recurrence(
+        &self,
+        source: &str,
+        issue_id: &str,
+    ) -> Result<Option<(String, String, i64, bool)>> {
+        let conn = self.acquire_lock()?;
+        let row = conn
+            .query_row(
+                "SELECT COALESCE(i.title, ''), COALESCE(i.url, ''),
+                        COALESCE(r.event_count, 0), COALESCE(r.is_escalating, 0)
+                 FROM issues i
+                 LEFT JOIN issue_recurrence r
+                     ON r.source = i.source AND r.issue_id = i.issue_id
+                 WHERE i.source = ?1 AND i.issue_id = ?2",
+                params![source, issue_id],
+                |row| {
+                    let title: String = row.get(0)?;
+                    let url: String = row.get(1)?;
+                    let event_count: i64 = row.get(2)?;
+                    let is_escalating: i64 = row.get(3)?;
+                    Ok((title, url, event_count, is_escalating != 0))
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     fn search_code_chunks(
@@ -4142,8 +4662,154 @@ impl SimilarityStore for SqliteTracker {
     }
 }
 
+impl DiscordStore for SqliteTracker {
+    fn save_discord_chunks(
+        &self,
+        chunks: &[claudear_core::types::DiscordMessageChunk],
+    ) -> Result<Vec<i64>> {
+        SqliteTracker::save_discord_chunks(self, chunks)
+    }
+
+    fn save_discord_chunk_embeddings(
+        &self,
+        pairs: &[(i64, &[f32])],
+        model_name: &str,
+    ) -> Result<()> {
+        SqliteTracker::save_discord_chunk_embeddings(self, pairs, model_name)
+    }
+
+    fn search_discord_message_chunks(
+        &self,
+        query_embedding: &[f32],
+        channel_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
+        SqliteTracker::search_discord_message_chunks(self, query_embedding, channel_id, limit)
+    }
+
+    fn discord_chunk_hash_matches(&self, channel_id: &str, content_hash: &str) -> Result<bool> {
+        SqliteTracker::discord_chunk_hash_matches(self, channel_id, content_hash)
+    }
+
+    fn delete_discord_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
+        SqliteTracker::delete_discord_message_data_for_channel(self, channel_id)
+    }
+
+    fn delete_discord_message_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
+        SqliteTracker::delete_discord_message_chunks_by_ids(self, chunk_ids)
+    }
+
+    fn cleanup_stale_discord_message_data(
+        &self,
+        channel_id: &str,
+        current_hashes: &[String],
+    ) -> Result<()> {
+        SqliteTracker::cleanup_stale_discord_message_data(self, channel_id, current_hashes)
+    }
+
+    fn delete_all_discord_message_data(&self) -> Result<()> {
+        SqliteTracker::delete_all_discord_message_data(self)
+    }
+
+    fn get_discord_message_embedding_model(&self) -> Result<Option<String>> {
+        SqliteTracker::get_discord_message_embedding_model(self)
+    }
+
+    fn get_discord_message_index_meta(&self, key: &str) -> Result<Option<String>> {
+        SqliteTracker::get_discord_message_index_meta(self, key)
+    }
+
+    fn set_discord_message_index_meta(&self, key: &str, value: &str) -> Result<()> {
+        SqliteTracker::set_discord_message_index_meta(self, key, value)
+    }
+
+    fn upsert_discord_channel(
+        &self,
+        channel_id: &str,
+        guild_id: Option<&str>,
+        parent_id: Option<&str>,
+        name: Option<&str>,
+        channel_type: Option<i64>,
+        kind: claudear_core::types::DiscordChannelKind,
+        archived: bool,
+    ) -> Result<()> {
+        SqliteTracker::upsert_discord_channel(
+            self,
+            channel_id,
+            guild_id,
+            parent_id,
+            name,
+            channel_type,
+            kind,
+            archived,
+        )
+    }
+
+    fn get_discord_channel_cursor(&self, channel_id: &str) -> Result<Option<String>> {
+        SqliteTracker::get_discord_channel_cursor(self, channel_id)
+    }
+
+    fn set_discord_channel_cursor(
+        &self,
+        channel_id: &str,
+        last_message_id: &str,
+        indexed_at: &str,
+    ) -> Result<()> {
+        SqliteTracker::set_discord_channel_cursor(self, channel_id, last_message_id, indexed_at)
+    }
+
+    fn get_discord_channel_backfill(&self, channel_id: &str) -> Result<(bool, Option<String>)> {
+        SqliteTracker::get_discord_channel_backfill(self, channel_id)
+    }
+
+    fn set_discord_channel_backfill(
+        &self,
+        channel_id: &str,
+        complete: bool,
+        backfill_cursor: Option<&str>,
+        indexed_at: &str,
+    ) -> Result<()> {
+        SqliteTracker::set_discord_channel_backfill(
+            self,
+            channel_id,
+            complete,
+            backfill_cursor,
+            indexed_at,
+        )
+    }
+
+    fn list_discord_channels(&self) -> Result<Vec<StoredDiscordChannel>> {
+        SqliteTracker::list_discord_channels(self)
+    }
+
+    fn get_discord_knowledgebase_stats(&self) -> Result<DiscordKnowledgebaseStats> {
+        SqliteTracker::get_discord_knowledgebase_stats(self)
+    }
+}
+
 impl SqliteTracker {
     /// Record an activity to the activity log.
+    /// Persist a single action-pipeline run.
+    pub fn record_action_run(
+        &self,
+        source: &str,
+        issue_id: &str,
+        short_id: &str,
+        action_kind: &str,
+        status: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO action_runs (source, issue_id, short_id, action_kind, status, detail)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+            params![source, issue_id, short_id, action_kind, status, detail],
+        )?;
+        Ok(())
+    }
+
     pub fn record_activity(&self, entry: &ActivityLogEntry) -> Result<i64> {
         let conn = self.acquire_lock()?;
         let metadata_json = entry.metadata.as_ref().map(|m| m.to_string());
@@ -4591,7 +5257,8 @@ impl SqliteTracker {
 
     /// Convert a database row to a PrReviewState.
     /// Expects columns: pr_url, repo, pr_number, issue_id, source,
-    /// last_review_id, last_review_time, last_comment_id, last_comment_time, is_active
+    /// last_review_id, last_review_time, last_comment_id, last_comment_time,
+    /// last_issue_comment_id, last_issue_comment_time, is_active
     fn row_to_pr_review_state(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<claudear_core::types::PrReviewState> {
@@ -4605,7 +5272,9 @@ impl SqliteTracker {
             last_review_time: row.get(6)?,
             last_comment_id: row.get(7)?,
             last_comment_time: row.get(8)?,
-            is_active: row.get::<_, i32>(9)? != 0,
+            last_issue_comment_id: row.get(9)?,
+            last_issue_comment_time: row.get(10)?,
+            is_active: row.get::<_, i32>(11)? != 0,
         })
     }
 
@@ -4922,6 +5591,95 @@ impl SqliteTracker {
             params![attempt_id, qa_id, usage_type, similarity_score],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Record the chunks retrieved for an attempt across all RAG sources.
+    /// Upserts on `(attempt_id, source_kind, chunk_ref)`; preserves any
+    /// already-computed `used` / `quality_score` on conflict.
+    pub fn record_retrieval_usage(&self, rows: &[RetrievalUsageRecord]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO retrieval_usage
+                    (attempt_id, source_kind, chunk_ref, file_path, rank,
+                     similarity_score, injected, char_len, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))
+                ON CONFLICT(attempt_id, source_kind, chunk_ref) DO UPDATE SET
+                    file_path = excluded.file_path,
+                    rank = excluded.rank,
+                    similarity_score = excluded.similarity_score,
+                    injected = excluded.injected,
+                    char_len = excluded.char_len
+                "#,
+            )?;
+            for r in rows {
+                stmt.execute(params![
+                    r.attempt_id,
+                    r.source_kind,
+                    r.chunk_ref,
+                    r.file_path,
+                    r.rank,
+                    r.similarity_score,
+                    r.injected as i64,
+                    r.char_len,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Attach a relevance quality score to a specific retrieved chunk.
+    pub fn set_retrieval_quality(
+        &self,
+        attempt_id: i64,
+        source_kind: &str,
+        chunk_ref: &str,
+        quality_score: f64,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE retrieval_usage SET quality_score = ?4 \
+             WHERE attempt_id = ?1 AND source_kind = ?2 AND chunk_ref = ?3",
+            params![attempt_id, source_kind, chunk_ref, quality_score],
+        )?;
+        Ok(())
+    }
+
+    /// Read all retrieval-usage rows for an attempt, ordered by source then rank.
+    pub fn get_retrieval_usage(&self, attempt_id: i64) -> Result<Vec<RetrievalUsageRecord>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, attempt_id, source_kind, chunk_ref, file_path, rank,
+                   similarity_score, injected, char_len, quality_score
+            FROM retrieval_usage
+            WHERE attempt_id = ?1
+            ORDER BY source_kind, rank
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![attempt_id], |row| {
+                Ok(RetrievalUsageRecord {
+                    id: Some(row.get(0)?),
+                    attempt_id: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    chunk_ref: row.get(3)?,
+                    file_path: row.get(4)?,
+                    rank: row.get(5)?,
+                    similarity_score: row.get(6)?,
+                    injected: row.get::<_, i64>(7)? != 0,
+                    char_len: row.get(8)?,
+                    quality_score: row.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Update success/failure counters for a Q&A entry.
@@ -5353,6 +6111,8 @@ impl SqliteTracker {
             cost_estimate: None,
             mttr_trend: Vec::new(),
             repo_leaderboard: Vec::new(),
+            commit_trend: Vec::new(),
+            support_rating: None,
         })
     }
 
@@ -6335,6 +7095,186 @@ impl SqliteTracker {
         Ok(rows.flatten().collect())
     }
 
+    /// Daily commit-production trend over the last `days` days.
+    ///
+    /// Counts `claude_executions` that actually produced a commit (the commit
+    /// hash advanced), bucketed by the day the execution started. This is an
+    /// approximation of "≥1 commit per execution" — multi-commit runs only
+    /// expose before/after endpoints, so they count once.
+    pub fn get_commit_trend(
+        &self,
+        days: usize,
+    ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
+        let conn = self.acquire_lock()?;
+        let modifier = format!("-{} days", days);
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                date(started_at) as day,
+                COUNT(*) as commits
+            FROM claude_executions
+            WHERE started_at IS NOT NULL
+              AND started_at >= datetime('now', ?1)
+              AND git_commit_after IS NOT NULL
+              AND (git_commit_before IS NULL OR git_commit_after != git_commit_before)
+            GROUP BY day
+            ORDER BY day ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![modifier], |row| {
+            Ok(claudear_core::types::CommitTrendPoint {
+                period_start: row.get(0)?,
+                commits: row.get(1)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Map a joined `action_runs` + rating row to a `SupportReply`.
+    ///
+    /// Column order: id, source, short_id, status(kind), detail, created_at,
+    /// response_mins, rating, note, rated_by.
+    fn row_to_support_reply(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<claudear_core::types::SupportReply> {
+        Ok(claudear_core::types::SupportReply {
+            action_run_id: row.get(0)?,
+            source: row.get(1)?,
+            short_id: row.get(2)?,
+            kind: row.get(3)?,
+            detail: row.get(4)?,
+            created_at: Self::parse_datetime(&row.get::<_, String>(5)?)?,
+            response_time_mins: row.get(6)?,
+            rating: row.get(7)?,
+            note: row.get(8)?,
+            rated_by: row.get(9)?,
+        })
+    }
+
+    /// List recent support replies (QA channels + HelpScout) with any rating.
+    ///
+    /// Response time is derived by joining back to the originating `fix_attempts`
+    /// row (received → reply sent); it is `NULL` when the attempt predates the
+    /// reply record or cannot be matched.
+    pub fn list_support_replies(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::SupportReply>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                ar.id,
+                ar.source,
+                ar.short_id,
+                ar.status,
+                ar.detail,
+                ar.created_at,
+                (julianday(ar.created_at) - julianday(fa.attempted_at)) * 24.0 * 60.0 AS response_mins,
+                r.rating,
+                r.note,
+                r.rated_by
+            FROM action_runs ar
+            LEFT JOIN support_reply_ratings r ON r.action_run_id = ar.id
+            LEFT JOIN fix_attempts fa ON fa.source = ar.source AND fa.issue_id = ar.issue_id
+            WHERE ar.action_kind = 'reply'
+              AND ar.source IN ('discord','slack','telegram','whatsapp','helpscout')
+            ORDER BY ar.created_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit as i64], Self::row_to_support_reply)?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Record (or update) an admin's 1..5 rating for a support reply.
+    pub fn record_reply_rating(
+        &self,
+        action_run_id: i64,
+        rating: i32,
+        note: Option<&str>,
+        rated_by: &str,
+    ) -> Result<()> {
+        if !(1..=5).contains(&rating) {
+            return Err(claudear_core::error::Error::Other(format!(
+                "rating must be between 1 and 5, got {rating}"
+            )));
+        }
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO support_reply_ratings (action_run_id, rating, note, rated_by)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(action_run_id) DO UPDATE SET
+                rating = excluded.rating,
+                note = excluded.note,
+                rated_by = excluded.rated_by,
+                updated_at = datetime('now')
+            "#,
+            params![action_run_id, rating, note, rated_by],
+        )?;
+        Ok(())
+    }
+
+    /// Aggregate support-reply rating + response-time summary (QA + HelpScout).
+    pub fn get_support_rating_summary(&self) -> Result<claudear_core::types::SupportRatingSummary> {
+        let conn = self.acquire_lock()?;
+
+        // Headline aggregates over all rateable replies.
+        let (total_replies, rated_count, avg_rating, avg_response_time_mins) = conn.query_row(
+            r#"
+            SELECT
+                COUNT(*) AS total_replies,
+                COUNT(r.rating) AS rated_count,
+                AVG(r.rating) AS avg_rating,
+                AVG((julianday(ar.created_at) - julianday(fa.attempted_at)) * 24.0 * 60.0) AS avg_response_mins
+            FROM action_runs ar
+            LEFT JOIN support_reply_ratings r ON r.action_run_id = ar.id
+            LEFT JOIN fix_attempts fa ON fa.source = ar.source AND fa.issue_id = ar.issue_id
+            WHERE ar.action_kind = 'reply'
+              AND ar.source IN ('discord','slack','telegram','whatsapp','helpscout')
+            "#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ))
+            },
+        )?;
+
+        // Average rating per source.
+        let mut by_source = std::collections::HashMap::new();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT ar.source, AVG(r.rating) AS avg_rating
+            FROM action_runs ar
+            JOIN support_reply_ratings r ON r.action_run_id = ar.id
+            WHERE ar.action_kind = 'reply'
+              AND ar.source IN ('discord','slack','telegram','whatsapp','helpscout')
+            GROUP BY ar.source
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
+        })?;
+        for row in rows.flatten() {
+            if let (source, Some(avg)) = row {
+                by_source.insert(source, avg);
+            }
+        }
+
+        Ok(claudear_core::types::SupportRatingSummary {
+            total_replies,
+            rated_count,
+            avg_rating,
+            avg_response_time_mins,
+            avg_rating_by_source: by_source,
+        })
+    }
+
     /// Complexity-based engineering time savings estimate.
     ///
     /// For each merged fix, computes a complexity score from lines changed, files
@@ -6900,6 +7840,115 @@ impl SqliteTracker {
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// Upsert the single agent-instruction row for a scope. `repo` is None for
+    /// the global row and Some(`org/name`) for a per-repo row.
+    pub fn upsert_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+        text: &str,
+        updated_by: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let now = Utc::now().to_rfc3339();
+        let scope_str = scope.to_string();
+
+        // Match on IFNULL so the NULL-repo global row is addressable.
+        let updated = conn.execute(
+            "UPDATE agent_instructions SET instruction_text = ?1, is_active = 1, updated_by = ?2, updated_at = ?3
+             WHERE scope = ?4 AND IFNULL(repo, '') = IFNULL(?5, '')",
+            params![text, updated_by, now, scope_str, repo],
+        )?;
+
+        if updated > 0 {
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_instructions WHERE scope = ?1 AND IFNULL(repo, '') = IFNULL(?2, '')",
+                    params![scope_str, repo],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            return Ok(id);
+        }
+
+        conn.execute(
+            "INSERT INTO agent_instructions (scope, repo, instruction_text, is_active, updated_by, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5)",
+            params![scope_str, repo, text, updated_by, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get the active agent instruction for a scope, if any.
+    pub fn get_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+    ) -> Result<Option<claudear_core::types::AgentInstruction>> {
+        let conn = self.acquire_lock()?;
+        let scope_str = scope.to_string();
+        let row = conn
+            .query_row(
+                "SELECT id, scope, repo, instruction_text, is_active, updated_at
+                 FROM agent_instructions
+                 WHERE scope = ?1 AND IFNULL(repo, '') = IFNULL(?2, '') AND is_active = 1",
+                params![scope_str, repo],
+                |row| {
+                    let scope_val: String = row.get(1)?;
+                    Ok(claudear_core::types::AgentInstruction {
+                        id: row.get(0)?,
+                        scope: scope_val
+                            .parse()
+                            .unwrap_or(claudear_core::types::InstructionScope::Global),
+                        repo: row.get(2)?,
+                        instruction_text: row.get(3)?,
+                        is_active: row.get::<_, i32>(4)? != 0,
+                        updated_at: Self::parse_datetime(&row.get::<_, String>(5)?)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Resolve the effective instruction block: global first, then the per-repo
+    /// override, concatenated with clear provenance. `repo` is None when the run
+    /// has no resolved repo (e.g. skipped resolution or a QA answer); global
+    /// instructions still apply in that case. Returns None when neither scope has
+    /// active text.
+    pub fn resolve_agent_instructions(&self, repo: Option<&str>) -> Result<Option<String>> {
+        let global = self
+            .get_agent_instruction(claudear_core::types::InstructionScope::Global, None)?
+            .map(|i| i.instruction_text)
+            .filter(|t| !t.trim().is_empty());
+        let per_repo = match repo {
+            Some(r) => self
+                .get_agent_instruction(claudear_core::types::InstructionScope::Repo, Some(r))?
+                .map(|i| i.instruction_text)
+                .filter(|t| !t.trim().is_empty()),
+            None => None,
+        };
+
+        if global.is_none() && per_repo.is_none() {
+            return Ok(None);
+        }
+
+        let mut block = String::from(
+            "# Operator Instructions (claudear)\nThese instructions were configured by your operators. Follow them.\n",
+        );
+        if let Some(g) = global {
+            block.push_str("\n## Global\n");
+            block.push_str(g.trim());
+            block.push('\n');
+        }
+        if let (Some(r), Some(repo)) = (per_repo, repo) {
+            block.push_str(&format!("\n## Repository: {}\n", repo));
+            block.push_str(r.trim());
+            block.push('\n');
+        }
+        Ok(Some(block))
     }
 
     /// System 4: Upsert a repo knowledge entry.
@@ -7941,6 +8990,666 @@ impl SqliteTracker {
         Ok(results)
     }
 
+    /// Save Discord message chunks, returning the inserted row ids (in order).
+    pub fn save_discord_chunks(
+        &self,
+        chunks: &[claudear_core::types::DiscordMessageChunk],
+    ) -> Result<Vec<i64>> {
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let mut ids = Vec::with_capacity(chunks.len());
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO discord_message_chunks (guild_id, channel_id, channel_kind, start_message_id, end_message_id, participant_ids, start_message_time, end_message_time, chunk_text, context_text, content_hash)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+            )?;
+
+            for chunk in chunks {
+                // Persist participant ids as a comma-separated list (snowflake ids never contain commas).
+                let participants = chunk.participant_ids.as_ref().map(|v| v.join(","));
+                stmt.execute(params![
+                    chunk.guild_id.as_deref(),
+                    &chunk.channel_id,
+                    chunk.channel_kind.as_i64(),
+                    &chunk.start_message_id,
+                    &chunk.end_message_id,
+                    participants,
+                    &chunk.start_message_time,
+                    &chunk.end_message_time,
+                    &chunk.chunk_text,
+                    &chunk.context_text,
+                    chunk.content_hash.as_deref(),
+                ])?;
+                ids.push(tx.last_insert_rowid());
+            }
+        }
+
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Save embeddings for Discord message chunks and insert into the HNSW vector index.
+    pub fn save_discord_chunk_embeddings(
+        &self,
+        pairs: &[(i64, &[f32])],
+        model_name: &str,
+    ) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.acquire_lock()?;
+
+        let dimension = pairs[0].1.len();
+        let _ = Self::ensure_discord_chunk_vector_table(&conn, dimension);
+
+        let has_vector_table = Self::table_exists(&conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)?;
+
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO discord_message_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
+            )?;
+
+            for &(chunk_id, embedding) in pairs {
+                let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+                stmt.execute(params![chunk_id, blob, model_name])?;
+
+                if has_vector_table {
+                    let emb_id = tx.last_insert_rowid();
+                    let insert_sql = format!(
+                        "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
+                        DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+                    );
+                    if let Err(e) = tx.execute(&insert_sql, params![emb_id, blob]) {
+                        tracing::warn!(error = %e, chunk_id, "Failed to insert into discord chunk vector table — aborting batch");
+                        // Drop tx without commit to roll back the entire batch,
+                        // so embeddings and vector index stay consistent.
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Lazily create the HNSW vector table for Discord message chunk embeddings.
+    fn ensure_discord_chunk_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
+        if dimension == 0 {
+            return Ok(false);
+        }
+        validate_dimension(dimension)?;
+
+        if !is_vectorlite_available(conn) {
+            match try_load_vectorlite(conn) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Unable to load vectorlite for discord chunk search");
+                    return Ok(false);
+                }
+            }
+        }
+
+        if Self::table_exists(conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)? {
+            // Reuse the existing table only if its declared dimension matches.
+            // After an embedding-model upgrade the vector length can change, so a
+            // stale `float32[N]` table must be dropped and recreated — otherwise
+            // inserts of the new blobs fail and searches see stale vectors.
+            let existing_sql: Option<String> = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![DISCORD_MESSAGE_CHUNK_VECTOR_TABLE],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let matches = existing_sql
+                .as_deref()
+                .map(|sql| sql.contains(&format!("float32[{}]", dimension)))
+                .unwrap_or(false);
+            if matches {
+                return Ok(true);
+            }
+            tracing::info!(
+                dimension,
+                "Discord chunk vector table dimension changed — recreating"
+            );
+            conn.execute_batch(&format!(
+                "DROP TABLE IF EXISTS {}",
+                DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+            ))?;
+        }
+
+        let sql = format!(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
+                embedding float32[{dimension}] cosine,
+                hnsw(max_elements=100000, ef_construction=200, M=16)
+            )
+            "#,
+            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE,
+            dimension = dimension
+        );
+
+        match conn.execute_batch(&sql) {
+            Ok(()) => {
+                // Backfill existing embeddings.
+                let backfill = format!(
+                    r#"
+                    INSERT INTO {table}(rowid, embedding)
+                    SELECT id, embedding
+                    FROM discord_message_chunk_embeddings
+                    WHERE length(embedding) = ?1
+                    "#,
+                    table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+                );
+                if let Err(e) = conn.execute(&backfill, params![(dimension * 4) as i64]) {
+                    tracing::debug!(error = %e, "Failed to backfill discord chunk vector embeddings");
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to create discord chunk vector table");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Search Discord message chunks by vector similarity using the HNSW index.
+    pub fn search_discord_message_chunks(
+        &self,
+        query_embedding: &[f32],
+        channel_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
+        use claudear_core::types::{DiscordChannelKind, DiscordMessageChunk, DiscordSearchResult};
+
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Clamp limit to prevent excessive memory usage from the HNSW candidate multiplier.
+        let limit = limit.min(1000);
+
+        let conn = self.acquire_lock()?;
+
+        if !Self::ensure_discord_chunk_vector_table(&conn, query_embedding.len())? {
+            // Vectorlite unavailable — fall back to empty results.
+            return Ok(Vec::new());
+        }
+
+        let query_blob: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let candidate_limit = limit * DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER;
+
+        let sql = format!(
+            r#"
+            WITH candidates AS (
+                SELECT rowid AS emb_id,
+                       MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
+                FROM {table}
+                WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
+            )
+            SELECT c.similarity,
+                   ch.id, ch.guild_id, ch.channel_id, ch.channel_kind,
+                   ch.start_message_id, ch.end_message_id, ch.participant_ids,
+                   ch.start_message_time, ch.end_message_time,
+                   ch.chunk_text, ch.context_text, ch.content_hash
+            FROM candidates c
+            JOIN discord_message_chunk_embeddings e ON e.id = c.emb_id
+            JOIN discord_message_chunks ch ON ch.id = e.chunk_id
+            WHERE (?4 IS NULL OR ch.channel_id = ?4)
+            ORDER BY c.similarity DESC
+            LIMIT ?5
+            "#,
+            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to prepare discord chunk vector search");
+                return Ok(Vec::new());
+            }
+        };
+
+        let rows = match stmt.query_map(
+            params![
+                query_blob,
+                candidate_limit as i64,
+                DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH as i64,
+                channel_id,
+                limit as i64,
+            ],
+            |row| {
+                let similarity: f64 = row.get(0)?;
+                let kind_int: i64 = row.get(4)?;
+                let participants: Option<String> = row.get(7)?;
+                Ok(DiscordSearchResult {
+                    chunk: DiscordMessageChunk {
+                        id: row.get(1)?,
+                        guild_id: row.get(2)?,
+                        channel_id: row.get(3)?,
+                        channel_kind: DiscordChannelKind::from_i64(kind_int),
+                        start_message_id: row.get(5)?,
+                        end_message_id: row.get(6)?,
+                        participant_ids: participants.map(|s| {
+                            s.split(',')
+                                .filter(|x| !x.is_empty())
+                                .map(String::from)
+                                .collect()
+                        }),
+                        start_message_time: row.get(8)?,
+                        end_message_time: row.get(9)?,
+                        chunk_text: row.get(10)?,
+                        context_text: row.get(11)?,
+                        content_hash: row.get(12)?,
+                    },
+                    score: similarity,
+                })
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "Discord chunk vector search failed");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(r) => results.push(r),
+                Err(e) => tracing::debug!(error = %e, "Failed to read discord chunk vector row"),
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn discord_chunk_hash_matches(&self, channel_id: &str, content_hash: &str) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let (chunk_count, embedded_count): (i64, i64) = conn.query_row(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM discord_message_chunks
+                 WHERE channel_id = ?1 AND content_hash = ?2),
+                (SELECT COUNT(*) FROM discord_message_chunks c
+                 JOIN discord_message_chunk_embeddings e ON e.chunk_id = c.id
+                 WHERE c.channel_id = ?1 AND c.content_hash = ?2)
+            "#,
+            params![channel_id, content_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(chunk_count > 0 && chunk_count == embedded_count)
+    }
+
+    /// Delete all indexed chunks (and CASCADE-deleted embeddings) for a channel/thread.
+    pub fn delete_discord_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+
+        // embeddings will be deleted via the cascade delete
+        conn.execute(
+            "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete Discord message chunks (and their CASCADE-deleted embeddings) by chunk IDs.
+    pub fn delete_discord_message_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
+        if chunk_ids.is_empty() {
+            return Ok(());
+        };
+        let conn = self.acquire_lock()?;
+        let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "DELETE FROM discord_message_chunks WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        // embeddings will be deleted via the cascade delete
+        conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    /// Remove indexed chunks for a channel whose `content_hash` is no longer in current_hashes
+    pub fn cleanup_stale_discord_message_data(
+        &self,
+        channel_id: &str,
+        current_hashes: &[String],
+    ) -> Result<()> {
+        let mut conn = self.acquire_lock()?;
+
+        if current_hashes.is_empty() {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+
+        let indexed: Vec<(i64, Option<String>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
+            )?;
+            let rows: Vec<(i64, Option<String>)> = stmt
+                .query_map(params![channel_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+
+        let current_set: std::collections::HashSet<&str> =
+            current_hashes.iter().map(|s| s.as_str()).collect();
+
+        let stale_ids: Vec<i64> = indexed
+            .into_iter()
+            .filter_map(|(id, hash)| match hash {
+                Some(h) if !current_set.contains(h.as_str()) => Some(id),
+                _ => None,
+            })
+            .collect();
+
+        if !stale_ids.is_empty() {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for id in &stale_ids {
+                tx.execute(
+                    "DELETE FROM discord_message_chunks WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_all_discord_message_data(&self) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        // Embeddings CASCADE via the discord_message_chunks FK.
+        conn.execute("DELETE FROM discord_message_chunks", [])?;
+        // Reset the channel registry/cursors so a forced full re-index re-backfills
+        // history instead of resuming incrementally from a now-stale cursor.
+        conn.execute("DELETE FROM discord_channels", [])?;
+        // Drop the HNSW vector table so it is recreated fresh — clears stale vectors
+        // and lets a new embedding model's dimension take effect. Best-effort: it may
+        // not exist, or vectorlite may be unavailable on this connection.
+        let _ = conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {}",
+            DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+        ));
+        Ok(())
+    }
+
+    /// Embedding model name used for the stored Discord chunks (None if none yet).
+    pub fn get_discord_message_embedding_model(&self) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT embedding_model FROM discord_message_chunk_embeddings LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn get_discord_message_index_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT value FROM discord_message_chunk_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Set (upsert) a global value in the discord_message_chunk_metadata table.
+    pub fn set_discord_message_index_meta(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO discord_message_chunk_metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Register or refresh a discovered channel/thread in the `discord_channels`
+    /// registry. Leaves the incremental cursor (`last_indexed_*`) untouched.
+    #[expect(clippy::too_many_arguments)]
+    pub fn upsert_discord_channel(
+        &self,
+        channel_id: &str,
+        guild_id: Option<&str>,
+        parent_id: Option<&str>,
+        name: Option<&str>,
+        channel_type: Option<i64>,
+        kind: claudear_core::types::DiscordChannelKind,
+        archived: bool,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO discord_channels (channel_id, guild_id, parent_id, name, channel_type, kind, archived)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                guild_id = excluded.guild_id,
+                parent_id = excluded.parent_id,
+                name = excluded.name,
+                channel_type = excluded.channel_type,
+                kind = excluded.kind,
+                archived = excluded.archived
+            "#,
+            params![
+                channel_id,
+                guild_id,
+                parent_id,
+                name,
+                channel_type,
+                kind.as_i64(),
+                archived as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Incremental cursor for a channel/thread: the last message id indexed.
+    /// `None` means the channel has never been indexed (do a backfill).
+    pub fn get_discord_channel_cursor(&self, channel_id: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<Option<String>> = conn
+            .query_row(
+                "SELECT last_indexed_message_id FROM discord_channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(result.flatten())
+    }
+
+    /// Advance the incremental cursor for a channel/thread to `last_message_id`.
+    pub fn set_discord_channel_cursor(
+        &self,
+        channel_id: &str,
+        last_message_id: &str,
+        indexed_at: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO discord_channels (channel_id, last_indexed_message_id, last_indexed_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                last_indexed_message_id = excluded.last_indexed_message_id,
+                last_indexed_at = excluded.last_indexed_at
+            "#,
+            params![channel_id, last_message_id, indexed_at],
+        )?;
+        Ok(())
+    }
+
+    /// Backfill state for a channel/thread: `(backfill_complete, backfill_cursor)`.
+    /// Defaults to `(false, None)` when the channel has no row yet — i.e. backfill
+    /// has not started, so it is not complete and there is no progress cursor.
+    pub fn get_discord_channel_backfill(&self, channel_id: &str) -> Result<(bool, Option<String>)> {
+        let conn = self.acquire_lock()?;
+        let result: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT backfill_complete, backfill_cursor FROM discord_channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(result
+            .map(|(complete, cursor)| (complete != 0, cursor))
+            .unwrap_or((false, None)))
+    }
+
+    /// Record backfill progress for a channel/thread: whether the full history is
+    /// now scraped (`complete`) and the oldest indexed id (`backfill_cursor`,
+    /// the point to page *before* on the next backfill step).
+    pub fn set_discord_channel_backfill(
+        &self,
+        channel_id: &str,
+        complete: bool,
+        backfill_cursor: Option<&str>,
+        indexed_at: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO discord_channels (channel_id, backfill_complete, backfill_cursor, last_indexed_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                backfill_complete = excluded.backfill_complete,
+                backfill_cursor = excluded.backfill_cursor,
+                last_indexed_at = excluded.last_indexed_at
+            "#,
+            params![channel_id, complete as i64, backfill_cursor, indexed_at],
+        )?;
+        Ok(())
+    }
+
+    /// List tracked Discord channels/threads with derived indexing stats. The
+    /// indexed timeline (`indexed_from`/`indexed_to`) and `chunk_count` are
+    /// aggregated from `discord_message_chunks`; categories are excluded since
+    /// they are never indexed themselves.
+    pub fn list_discord_channels(&self) -> Result<Vec<StoredDiscordChannel>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                c.channel_id,
+                c.guild_id,
+                c.parent_id,
+                -- Category of a channel is its direct parent (cat_direct); for a
+                -- thread the parent is a channel, so go one more hop (cat_thread).
+                COALESCE(cat_direct.name, cat_thread.name) AS category_name,
+                c.name,
+                c.kind,
+                c.archived,
+                c.backfill_complete,
+                c.last_indexed_message_id,
+                c.last_indexed_at,
+                COUNT(ch.id) AS chunk_count,
+                MIN(ch.start_message_time) AS indexed_from,
+                MAX(ch.end_message_time) AS indexed_to
+            FROM discord_channels c
+            LEFT JOIN discord_message_chunks ch ON ch.channel_id = c.channel_id
+            LEFT JOIN discord_channels cat_direct
+                   ON cat_direct.channel_id = c.parent_id AND cat_direct.kind = 4
+            LEFT JOIN discord_channels parent_chan
+                   ON parent_chan.channel_id = c.parent_id AND parent_chan.kind = 0
+            LEFT JOIN discord_channels cat_thread
+                   ON cat_thread.channel_id = parent_chan.parent_id AND cat_thread.kind = 4
+            WHERE c.kind != 4
+            GROUP BY c.channel_id
+            ORDER BY c.name
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let kind = claudear_core::types::DiscordChannelKind::from_i64(row.get(5)?);
+            let kind_str = match kind {
+                claudear_core::types::DiscordChannelKind::Channel => "channel",
+                claudear_core::types::DiscordChannelKind::Thread => "thread",
+                claudear_core::types::DiscordChannelKind::Category => "category",
+            };
+            Ok(StoredDiscordChannel {
+                channel_id: row.get(0)?,
+                guild_id: row.get(1)?,
+                parent_id: row.get(2)?,
+                category_name: row.get(3)?,
+                name: row.get(4)?,
+                kind: kind_str.to_string(),
+                archived: row.get::<_, i64>(6)? != 0,
+                backfill_complete: row.get::<_, i64>(7)? != 0,
+                last_indexed_message_id: row.get(8)?,
+                last_indexed_at: row.get(9)?,
+                chunk_count: row.get(10)?,
+                indexed_from: row.get(11)?,
+                indexed_to: row.get(12)?,
+            })
+        })?;
+
+        let mut channels = Vec::new();
+        for row in rows.flatten() {
+            channels.push(row);
+        }
+        Ok(channels)
+    }
+
+    /// Aggregate statistics for the Discord knowledgebase index.
+    pub fn get_discord_knowledgebase_stats(&self) -> Result<DiscordKnowledgebaseStats> {
+        let conn = self.acquire_lock()?;
+
+        let channel_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM discord_channels WHERE kind = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let thread_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM discord_channels WHERE kind = 11",
+            [],
+            |row| row.get(0),
+        )?;
+        let chunk_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM discord_message_chunks", [], |row| {
+                row.get(0)
+            })?;
+        let last_indexed_at: Option<String> = conn
+            .query_row(
+                "SELECT MAX(last_indexed_at) FROM discord_channels",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        Ok(DiscordKnowledgebaseStats {
+            channel_count: channel_count as usize,
+            thread_count: thread_count as usize,
+            chunk_count: chunk_count as usize,
+            last_indexed_at,
+        })
+    }
+
     /// Find code symbols by name (substring match).
     pub fn find_code_symbols(
         &self,
@@ -8242,6 +9951,81 @@ mod tests {
     use chrono::{Datelike, Timelike, Utc};
 
     #[test]
+    fn test_agent_instructions_scope_and_resolve() {
+        use claudear_core::types::InstructionScope;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Nothing set: resolve is None.
+        assert!(tracker
+            .resolve_agent_instructions(Some("org/repo"))
+            .unwrap()
+            .is_none());
+
+        // Global only.
+        tracker
+            .upsert_agent_instruction(InstructionScope::Global, None, "Be terse.", Some("admin"))
+            .unwrap();
+        let g = tracker
+            .get_agent_instruction(InstructionScope::Global, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.instruction_text, "Be terse.");
+        assert_eq!(g.scope, InstructionScope::Global);
+        assert!(g.repo.is_none());
+
+        let resolved = tracker
+            .resolve_agent_instructions(Some("org/repo"))
+            .unwrap()
+            .unwrap();
+        assert!(resolved.contains("## Global"));
+        assert!(resolved.contains("Be terse."));
+        assert!(!resolved.contains("## Repository:"));
+
+        // Global still applies when there is no resolved repo (e.g. QA / Skip).
+        let no_repo = tracker.resolve_agent_instructions(None).unwrap().unwrap();
+        assert!(no_repo.contains("## Global"));
+        assert!(!no_repo.contains("## Repository:"));
+
+        // Per-repo override is namespaced and concatenated after global.
+        tracker
+            .upsert_agent_instruction(
+                InstructionScope::Repo,
+                Some("org/repo"),
+                "Generated output; edit the generator instead.",
+                None,
+            )
+            .unwrap();
+        let resolved = tracker
+            .resolve_agent_instructions(Some("org/repo"))
+            .unwrap()
+            .unwrap();
+        assert!(resolved.contains("## Global"));
+        assert!(resolved.contains("## Repository: org/repo"));
+        assert!(resolved.contains("edit the generator instead"));
+
+        // A different repo does not see the override.
+        let other = tracker
+            .resolve_agent_instructions(Some("org/other"))
+            .unwrap()
+            .unwrap();
+        assert!(!other.contains("## Repository:"));
+
+        // No-repo resolution never leaks a per-repo override.
+        let no_repo = tracker.resolve_agent_instructions(None).unwrap().unwrap();
+        assert!(!no_repo.contains("## Repository:"));
+
+        // Upsert replaces text for the same scope (no duplicate row).
+        tracker
+            .upsert_agent_instruction(InstructionScope::Global, None, "Updated.", None)
+            .unwrap();
+        let g = tracker
+            .get_agent_instruction(InstructionScope::Global, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.instruction_text, "Updated.");
+    }
+
+    #[test]
     fn test_record_and_retrieve_attempt() {
         let tracker = SqliteTracker::in_memory().unwrap();
 
@@ -8256,6 +10040,58 @@ mod tests {
         assert_eq!(attempt.short_id, "PROJ-123");
         assert_eq!(attempt.source, "linear");
         assert_eq!(attempt.status, FixAttemptStatus::Pending);
+    }
+
+    #[test]
+    fn test_answer_message_ids_round_trip() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("discord", "999000111", "DISCORD-99900011")
+            .unwrap();
+
+        let chunk_ids = vec!["555111".to_string(), "555222".to_string()];
+        tracker
+            .record_answer_message_ids("discord", "999000111", &chunk_ids)
+            .unwrap();
+
+        // Any chunk id resolves back to the (source, issue_id).
+        assert_eq!(
+            tracker.lookup_answer_issue("555111").unwrap(),
+            Some(("discord".to_string(), "999000111".to_string()))
+        );
+        assert_eq!(
+            tracker.lookup_answer_issue("555222").unwrap(),
+            Some(("discord".to_string(), "999000111".to_string()))
+        );
+
+        // A partial id must NOT match (delimiter guard).
+        assert_eq!(tracker.lookup_answer_issue("5551").unwrap(), None);
+        // An unknown id resolves to nothing.
+        assert_eq!(tracker.lookup_answer_issue("777").unwrap(), None);
+        // Empty input is safe.
+        assert_eq!(tracker.lookup_answer_issue("").unwrap(), None);
+        tracker
+            .record_answer_message_ids("discord", "999000111", &[])
+            .unwrap();
+
+        // A LIKE wildcard input must not match (wildcards are escaped).
+        assert_eq!(tracker.lookup_answer_issue("%").unwrap(), None);
+
+        // Recording again appends without dropping earlier ids, and re-recording
+        // an existing id does not duplicate it.
+        tracker
+            .record_answer_message_ids("discord", "999000111", &["555333".to_string()])
+            .unwrap();
+        tracker
+            .record_answer_message_ids("discord", "999000111", &["555111".to_string()])
+            .unwrap();
+        for id in ["555111", "555222", "555333"] {
+            assert_eq!(
+                tracker.lookup_answer_issue(id).unwrap(),
+                Some(("discord".to_string(), "999000111".to_string())),
+                "id {id} should still resolve after append"
+            );
+        }
     }
 
     #[test]
@@ -9664,6 +11500,8 @@ mod tests {
         state.last_review_time = Some("2024-01-15T10:00:00Z".to_string());
         state.last_comment_id = Some(888);
         state.last_comment_time = Some("2024-01-15T11:00:00Z".to_string());
+        state.last_issue_comment_id = Some(777);
+        state.last_issue_comment_time = Some("2024-01-15T12:00:00Z".to_string());
         tracker.save_pr_review_state(&state).unwrap();
 
         // Verify the update
@@ -9678,6 +11516,11 @@ mod tests {
         assert_eq!(
             states[0].last_comment_time,
             Some("2024-01-15T11:00:00Z".to_string())
+        );
+        assert_eq!(states[0].last_issue_comment_id, Some(777));
+        assert_eq!(
+            states[0].last_issue_comment_time,
+            Some("2024-01-15T12:00:00Z".to_string())
         );
     }
 
@@ -9751,6 +11594,230 @@ mod tests {
         assert_eq!(comments[0].body, "Consider using a const here");
         assert_eq!(comments[0].author, "reviewer1");
         assert_eq!(comments[0].line, Some(42));
+    }
+
+    #[test]
+    fn test_pr_review_comment_handled_ledger() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/7";
+
+        let mk = |id: i64| claudear_core::types::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear please fix".to_string(),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: format!("https://github.com/owner/repo/pull/7#c{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+
+        // A freshly recorded comment is unhandled.
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap();
+        tracker.record_pr_review_comment(pr_url, &mk(2)).unwrap();
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 2);
+        assert_eq!(unhandled[0].id, 1);
+
+        // Marking handled clears them.
+        tracker.mark_pr_review_comments_handled(pr_url).unwrap();
+        assert!(tracker
+            .get_unhandled_pr_review_comments(pr_url)
+            .unwrap()
+            .is_empty());
+
+        // Re-recording a handled comment does not resurrect it (handled_at kept).
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap();
+        assert!(tracker
+            .get_unhandled_pr_review_comments(pr_url)
+            .unwrap()
+            .is_empty());
+
+        // A new comment fails repeatedly and is given up on at the cap.
+        tracker.record_pr_review_comment(pr_url, &mk(3)).unwrap();
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .len(),
+            1
+        );
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(3, "conversation")], 3)
+            .unwrap(); // attempts=1
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(3, "conversation")], 3)
+            .unwrap(); // attempts=2
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .len(),
+            1,
+            "should still retry below the cap"
+        );
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(3, "conversation")], 3)
+            .unwrap(); // attempts=3 -> give up
+        assert!(
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .is_empty(),
+            "should stop retrying once the attempt cap is reached"
+        );
+    }
+
+    #[test]
+    fn test_mark_handled_by_ids_targets_only_given_comments() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/9";
+
+        let mk = |id: i64| claudear_core::types::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear fix".to_string(),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: format!("h{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap();
+        tracker.record_pr_review_comment(pr_url, &mk(2)).unwrap();
+
+        // Acknowledge only comment 1; comment 2 (recorded concurrently) survives.
+        tracker
+            .mark_pr_review_comments_handled_by_ids(pr_url, &[(1, "conversation")])
+            .unwrap();
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 1);
+        assert_eq!(unhandled[0].id, 2);
+    }
+
+    #[test]
+    fn test_inline_and_conversation_same_id_coexist() {
+        // The same numeric GitHub id can appear as both an inline review comment
+        // and a PR conversation comment (distinct id sequences). The composite
+        // (comment_kind, scm_comment_id) key must let both rows exist rather than
+        // one overwriting the other.
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/1";
+
+        let base = |id: i64, path: &str| claudear_core::types::ReviewComment {
+            id,
+            path: path.to_string(),
+            position: None,
+            original_position: None,
+            body: format!("body for {}", path),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: "h".to_string(),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        // Inline (non-empty path) and conversation (empty path) share id 42.
+        tracker
+            .record_pr_review_comment(pr_url, &base(42, "src/main.rs"))
+            .unwrap();
+        tracker
+            .record_pr_review_comment(pr_url, &base(42, ""))
+            .unwrap();
+
+        let comments = tracker.get_comments_for_pr(pr_url).unwrap();
+        assert_eq!(comments.len(), 2, "colliding id overwrote a row");
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Acknowledging only the inline row must not touch the conversation row
+        // that shares the id.
+        tracker
+            .mark_pr_review_comments_handled_by_ids(pr_url, &[(42, "inline")])
+            .unwrap();
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 1, "colliding id acknowledged wrong row");
+        assert!(
+            unhandled[0].path.is_empty(),
+            "the surviving row should be the conversation comment"
+        );
+    }
+
+    #[test]
+    fn test_note_failure_retires_one_worst_offender() {
+        // A batch failure can't be blamed on a specific comment, so only the single
+        // worst offender (most attempts, at cap) is retired per cycle — a valid
+        // comment that merely co-occurs with a poison one isn't dropped alongside it.
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/3";
+        let mk = |id: i64| claudear_core::types::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear fix".to_string(),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: format!("h{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap(); // poison
+        tracker.record_pr_review_comment(pr_url, &mk(2)).unwrap(); // valid, arrives later
+
+        // Comment 1 fails once alone (attempts=1), then both fail together with
+        // cap=2: comment 1 reaches the cap, comment 2 is only at 1.
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(1, "conversation")], 2)
+            .unwrap();
+        tracker
+            .note_pr_review_comment_failure_by_ids(
+                pr_url,
+                &[(1, "conversation"), (2, "conversation")],
+                2,
+            )
+            .unwrap();
+
+        // Only the worst offender (id 1) is retired; the valid comment survives.
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 1);
+        assert_eq!(unhandled[0].id, 2);
     }
 
     #[test]
@@ -10385,6 +12452,111 @@ mod tests {
     }
 
     #[test]
+    fn test_get_issue_timeline_rolls_up_this_issues_events_only() {
+        use claudear_core::types::TimelineEventStatus;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let events = [
+            TimelineEventStatus::ProcessingStarted,
+            TimelineEventStatus::RepoResolved,
+            TimelineEventStatus::FixStarted,
+            TimelineEventStatus::FixSucceeded,
+        ];
+        for ev in events {
+            tracker
+                .record_activity(
+                    &ActivityLogEntry::new(ev.as_str(), "msg")
+                        .with_source("linear")
+                        .with_issue("issue-1", "LIN-1"),
+                )
+                .unwrap();
+        }
+        // A different issue's event must not leak into this timeline.
+        tracker
+            .record_activity(
+                &ActivityLogEntry::new(TimelineEventStatus::FixFailed.as_str(), "other")
+                    .with_source("linear")
+                    .with_issue("issue-2", "LIN-2"),
+            )
+            .unwrap();
+
+        let timeline = tracker.get_issue_timeline("linear", "issue-1").unwrap();
+        assert_eq!(timeline.issue, "issue-1");
+        let got: std::collections::HashSet<&str> =
+            timeline.events.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(got.len(), events.len());
+        for ev in events {
+            assert!(got.contains(ev.as_str()), "missing event {}", ev.as_str());
+        }
+        assert!(!got.contains("fix_failed"), "leaked another issue's event");
+    }
+
+    #[test]
+    fn test_get_issue_timeline_flattens_metadata_context() {
+        use claudear_core::types::TimelineEventStatus;
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_activity(
+                &ActivityLogEntry::new(TimelineEventStatus::FixSucceeded.as_str(), "ok")
+                    .with_source("linear")
+                    .with_issue("issue-9", "LIN-9")
+                    .with_metadata(serde_json::json!({ "pr": 123 })),
+            )
+            .unwrap();
+
+        let timeline = tracker.get_issue_timeline("linear", "issue-9").unwrap();
+        assert_eq!(timeline.events.len(), 1);
+        assert_eq!(timeline.events[0].event, "fix_succeeded");
+        assert_eq!(
+            timeline.events[0].context.get("pr").unwrap(),
+            &serde_json::json!(123)
+        );
+    }
+
+    #[test]
+    fn test_get_issue_timeline_empty_for_unknown_issue() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let timeline = tracker.get_issue_timeline("linear", "nope").unwrap();
+        assert_eq!(timeline.issue, "nope");
+        assert!(timeline.events.is_empty());
+    }
+
+    #[test]
+    fn test_get_issue_timeline_is_chronological() {
+        use claudear_core::types::TimelineEventStatus;
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Recorded in lifecycle order; timeline must return them oldest-first
+        // (get_activities_for_issue is newest-first, so this guards the sort).
+        let seq = [
+            TimelineEventStatus::ProcessingStarted,
+            TimelineEventStatus::RepoResolved,
+            TimelineEventStatus::FixStarted,
+            TimelineEventStatus::FixSucceeded,
+        ];
+        for ev in seq {
+            tracker
+                .record_activity(
+                    &ActivityLogEntry::new(ev.as_str(), "m")
+                        .with_source("linear")
+                        .with_issue("issue-7", "LIN-7"),
+                )
+                .unwrap();
+        }
+
+        let timeline = tracker.get_issue_timeline("linear", "issue-7").unwrap();
+        let got: Vec<&str> = timeline.events.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(
+            got,
+            vec![
+                "processing_started",
+                "repo_resolved",
+                "fix_started",
+                "fix_succeeded"
+            ]
+        );
+    }
+
+    #[test]
     fn test_get_recent_activities_respects_limit() {
         let tracker = SqliteTracker::in_memory().unwrap();
         for i in 0..5 {
@@ -10948,6 +13120,71 @@ mod tests {
             .unwrap();
         assert_eq!(sc, 2);
         assert_eq!(fc, 1);
+    }
+
+    #[test]
+    fn test_retrieval_usage_lifecycle() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "issue-r", "LIN-R")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-r").unwrap().unwrap();
+
+        let rows = vec![
+            RetrievalUsageRecord::new(
+                attempt.id,
+                "code_chunk",
+                "101",
+                Some("src/foo.rs".to_string()),
+                0,
+                0.91,
+                Some(420),
+            ),
+            RetrievalUsageRecord::new(
+                attempt.id,
+                "code_chunk",
+                "102",
+                Some("src/bar.rs".to_string()),
+                1,
+                0.72,
+                Some(88),
+            ),
+            RetrievalUsageRecord::new(attempt.id, "qa", "7", None, 0, 0.8, None),
+        ];
+        tracker.record_retrieval_usage(&rows).unwrap();
+
+        // Read back: ordered by source_kind then rank.
+        let fetched = tracker.get_retrieval_usage(attempt.id).unwrap();
+        assert_eq!(fetched.len(), 3);
+        assert_eq!(fetched[0].source_kind, "code_chunk");
+        assert_eq!(fetched[0].rank, 0);
+        assert!(fetched[0].injected);
+        assert!(fetched[0].quality_score.is_none());
+
+        // Attach a quality score to a specific chunk.
+        tracker
+            .set_retrieval_quality(attempt.id, "code_chunk", "102", 0.65)
+            .unwrap();
+
+        let fetched = tracker.get_retrieval_usage(attempt.id).unwrap();
+        let bar = fetched.iter().find(|r| r.chunk_ref == "102").unwrap();
+        assert_eq!(bar.quality_score, Some(0.65));
+
+        // Upsert preserves the row identity (no duplicate) and refreshes score.
+        let again = vec![RetrievalUsageRecord::new(
+            attempt.id,
+            "code_chunk",
+            "101",
+            Some("src/foo.rs".to_string()),
+            0,
+            0.99,
+            Some(420),
+        )];
+        tracker.record_retrieval_usage(&again).unwrap();
+        let fetched = tracker.get_retrieval_usage(attempt.id).unwrap();
+        assert_eq!(fetched.len(), 3, "upsert must not duplicate rows");
+        let foo = fetched.iter().find(|r| r.chunk_ref == "101").unwrap();
+        assert!((foo.similarity_score - 0.99).abs() < 1e-9);
     }
 
     #[test]
@@ -14832,6 +17069,103 @@ mod tests {
     }
 
     #[test]
+    fn test_get_commit_trend_counts_commit_producing_executions() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        // Produced a commit (hash advanced) -> counted.
+        let mut e1 = AgentExecution::new().with_attempt_id(attempt.id);
+        e1.git_commit_before = Some("aaa".to_string());
+        e1.git_commit_after = Some("bbb".to_string());
+        tracker.record_execution(&e1).unwrap();
+
+        // No commit (hash unchanged) -> not counted.
+        let mut e2 = AgentExecution::new().with_attempt_id(attempt.id);
+        e2.git_commit_before = Some("ccc".to_string());
+        e2.git_commit_after = Some("ccc".to_string());
+        tracker.record_execution(&e2).unwrap();
+
+        // No commit recorded at all -> not counted.
+        let e3 = AgentExecution::new().with_attempt_id(attempt.id);
+        tracker.record_execution(&e3).unwrap();
+
+        let trend = tracker.get_commit_trend(30).unwrap();
+        assert_eq!(trend.len(), 1, "all executions are today => one bucket");
+        assert_eq!(trend[0].commits, 1, "only the hash-advancing exec counts");
+    }
+
+    #[test]
+    fn test_get_commit_trend_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        assert!(tracker.get_commit_trend(30).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_support_replies_listing_and_rating() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // An attempt provides the "received" timestamp for response-time calc.
+        tracker.record_attempt("helpscout", "42", "HS-7").unwrap();
+        // A reply was sent for it.
+        tracker
+            .record_action_run(
+                "helpscout",
+                "42",
+                "HS-7",
+                "reply",
+                "answer",
+                "Here's the fix",
+            )
+            .unwrap();
+        // A non-reply action and a non-support source should be excluded.
+        tracker
+            .record_action_run("helpscout", "42", "HS-7", "verify", "reproduced", "repro")
+            .unwrap();
+        tracker
+            .record_action_run("github", "9", "GH-9", "reply", "answer", "ignored")
+            .unwrap();
+
+        let replies = tracker.list_support_replies(50).unwrap();
+        assert_eq!(replies.len(), 1, "only helpscout reply is rateable");
+        let reply = &replies[0];
+        assert_eq!(reply.source, "helpscout");
+        assert_eq!(reply.kind, "answer");
+        assert!(reply.rating.is_none(), "not rated yet");
+
+        // Rate it as an admin.
+        tracker
+            .record_reply_rating(reply.action_run_id, 4, Some("solid"), "admin@x.io")
+            .unwrap();
+
+        // Upsert: re-rating replaces the value.
+        tracker
+            .record_reply_rating(reply.action_run_id, 5, None, "admin@x.io")
+            .unwrap();
+
+        let replies = tracker.list_support_replies(50).unwrap();
+        assert_eq!(replies[0].rating, Some(5));
+        assert_eq!(replies[0].rated_by.as_deref(), Some("admin@x.io"));
+
+        let summary = tracker.get_support_rating_summary().unwrap();
+        assert_eq!(summary.total_replies, 1);
+        assert_eq!(summary.rated_count, 1);
+        assert_eq!(summary.avg_rating, Some(5.0));
+        assert_eq!(summary.avg_rating_by_source.get("helpscout"), Some(&5.0));
+    }
+
+    #[test]
+    fn test_record_reply_rating_rejects_out_of_range() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_action_run("slack", "1", "S-1", "reply", "answer", "hi")
+            .unwrap();
+        let id = tracker.list_support_replies(10).unwrap()[0].action_run_id;
+        assert!(tracker.record_reply_rating(id, 0, None, "a@x.io").is_err());
+        assert!(tracker.record_reply_rating(id, 6, None, "a@x.io").is_err());
+        assert!(tracker.record_reply_rating(id, 3, None, "a@x.io").is_ok());
+    }
+
+    #[test]
     fn test_get_complexity_time_savings_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let savings = tracker
@@ -16705,6 +19039,281 @@ mod tests {
         tracker.save_code_chunk_embeddings(&[], "test").unwrap();
     }
 
+    // --- Discord message chunks (vectorlite) ---
+
+    fn sample_discord_chunk(
+        channel_id: &str,
+        start_id: &str,
+    ) -> claudear_core::types::DiscordMessageChunk {
+        claudear_core::types::DiscordMessageChunk {
+            id: None,
+            guild_id: Some("guild1".to_string()),
+            channel_id: channel_id.to_string(),
+            channel_kind: claudear_core::types::DiscordChannelKind::Channel,
+            start_message_id: start_id.to_string(),
+            end_message_id: start_id.to_string(),
+            participant_ids: Some(vec!["u1".to_string(), "u2".to_string()]),
+            start_message_time: "2024-01-01T00:00:00Z".to_string(),
+            end_message_time: "2024-01-01T00:05:00Z".to_string(),
+            chunk_text: "hello world".to_string(),
+            context_text: "channel general\nhello world".to_string(),
+            content_hash: Some(format!("hash-{}", start_id)),
+        }
+    }
+
+    #[test]
+    fn test_save_discord_chunks_returns_ids() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let chunks = vec![
+            sample_discord_chunk("100", "1001"),
+            sample_discord_chunk("100", "1002"),
+        ];
+        let ids = tracker.save_discord_chunks(&chunks).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn test_save_discord_chunks_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ids = tracker.save_discord_chunks(&[]).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_save_discord_chunk_embeddings_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.save_discord_chunk_embeddings(&[], "test").unwrap();
+    }
+
+    #[test]
+    fn test_search_discord_chunks_empty_embedding() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let results = tracker
+            .search_discord_message_chunks(&[], None, 10)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_discord_chunks_zero_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let results = tracker
+            .search_discord_message_chunks(&[0.1, 0.2, 0.3, 0.4], None, 0)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_save_discord_chunk_embeddings_and_search() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let chunks = vec![
+            sample_discord_chunk("100", "1001"),
+            sample_discord_chunk("200", "2001"),
+        ];
+        let ids = tracker.save_discord_chunks(&chunks).unwrap();
+
+        let emb_a = vec![1.0f32, 0.0, 0.0, 0.0];
+        let emb_b = vec![0.0f32, 1.0, 0.0, 0.0];
+        tracker
+            .save_discord_chunk_embeddings(&[(ids[0], &emb_a), (ids[1], &emb_b)], "test-model")
+            .unwrap();
+
+        // Query nearest to the first chunk. When vectorlite is available the
+        // nearest match (channel "100") comes back; when it is not, search
+        // degrades to empty results — both are valid outcomes.
+        let results = tracker
+            .search_discord_message_chunks(&[0.9f32, 0.1, 0.0, 0.0], None, 5)
+            .unwrap();
+        if let Some(top) = results.first() {
+            assert_eq!(top.chunk.channel_id, "100");
+            assert_eq!(top.chunk.start_message_id, "1001");
+            assert_eq!(
+                top.chunk.participant_ids.as_deref(),
+                Some(["u1".to_string(), "u2".to_string()].as_slice())
+            );
+            assert!(top.score >= results.last().unwrap().score);
+        }
+
+        // The optional channel_id filter must restrict results to that channel.
+        let filtered = tracker
+            .search_discord_message_chunks(&[0.0f32, 0.9, 0.0, 0.0], Some("200"), 5)
+            .unwrap();
+        for r in &filtered {
+            assert_eq!(r.chunk.channel_id, "200");
+        }
+    }
+
+    #[test]
+    fn test_discord_channel_backfill_defaults_when_absent() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // No row yet => not complete, no progress cursor.
+        let (complete, cursor) = tracker.get_discord_channel_backfill("chan-x").unwrap();
+        assert!(!complete);
+        assert_eq!(cursor, None);
+        // Forward cursor also absent.
+        assert_eq!(tracker.get_discord_channel_cursor("chan-x").unwrap(), None);
+    }
+
+    #[test]
+    fn test_delete_all_discord_message_data_resets_channels() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // A chunk + a channel with completed backfill and a forward cursor.
+        tracker
+            .save_discord_chunks(&[sample_discord_chunk("100", "1001")])
+            .unwrap();
+        tracker
+            .upsert_discord_channel(
+                "100",
+                Some("g"),
+                None,
+                Some("general"),
+                Some(0),
+                claudear_core::types::DiscordChannelKind::Channel,
+                false,
+            )
+            .unwrap();
+        tracker
+            .set_discord_channel_backfill("100", true, Some("1"), "2024-01-01T00:00:00Z")
+            .unwrap();
+        tracker
+            .set_discord_channel_cursor("100", "1001", "2024-01-01T00:00:00Z")
+            .unwrap();
+
+        tracker.delete_all_discord_message_data().unwrap();
+
+        // Chunks gone, and the channel registry/cursors reset so a re-run backfills.
+        assert!(!tracker
+            .discord_chunk_hash_matches("100", "hash-1001")
+            .unwrap());
+        let (complete, backfill_cursor) = tracker.get_discord_channel_backfill("100").unwrap();
+        assert!(!complete);
+        assert_eq!(backfill_cursor, None);
+        assert_eq!(tracker.get_discord_channel_cursor("100").unwrap(), None);
+    }
+
+    #[test]
+    fn test_discord_channel_backfill_roundtrip() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Mid-backfill: progress recorded, not complete.
+        tracker
+            .set_discord_channel_backfill("c1", false, Some("900"), "2024-01-01T00:00:00Z")
+            .unwrap();
+        let (complete, cursor) = tracker.get_discord_channel_backfill("c1").unwrap();
+        assert!(!complete);
+        assert_eq!(cursor.as_deref(), Some("900"));
+
+        // Forward cursor is independent of backfill progress.
+        tracker
+            .set_discord_channel_cursor("c1", "1000", "2024-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            tracker.get_discord_channel_cursor("c1").unwrap().as_deref(),
+            Some("1000")
+        );
+
+        // Completing backfill flips the flag without disturbing the forward cursor.
+        tracker
+            .set_discord_channel_backfill("c1", true, Some("1"), "2024-01-02T00:00:00Z")
+            .unwrap();
+        let (complete, cursor) = tracker.get_discord_channel_backfill("c1").unwrap();
+        assert!(complete);
+        assert_eq!(cursor.as_deref(), Some("1"));
+        assert_eq!(
+            tracker.get_discord_channel_cursor("c1").unwrap().as_deref(),
+            Some("1000")
+        );
+    }
+
+    #[test]
+    fn test_list_discord_channels_with_stats() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // A regular channel with two chunks spanning a wider time window.
+        let mut early = sample_discord_chunk("100", "1001");
+        early.start_message_time = "2024-01-01T00:00:00Z".to_string();
+        early.end_message_time = "2024-01-01T00:05:00Z".to_string();
+        let mut late = sample_discord_chunk("100", "1002");
+        late.start_message_time = "2024-03-01T00:00:00Z".to_string();
+        late.end_message_time = "2024-03-01T12:00:00Z".to_string();
+        tracker.save_discord_chunks(&[early, late]).unwrap();
+        tracker
+            .upsert_discord_channel(
+                "100",
+                Some("g"),
+                Some("300"), // parent category 300 ("a-category")
+                Some("general"),
+                Some(0),
+                claudear_core::types::DiscordChannelKind::Channel,
+                false,
+            )
+            .unwrap();
+        tracker
+            .set_discord_channel_backfill("100", true, Some("1"), "2024-03-02T00:00:00Z")
+            .unwrap();
+        tracker
+            .set_discord_channel_cursor("100", "1002", "2024-03-02T00:00:00Z")
+            .unwrap();
+
+        // A thread (no chunks yet) and a category (must be excluded).
+        tracker
+            .upsert_discord_channel(
+                "200",
+                Some("g"),
+                Some("100"),
+                Some("a-thread"),
+                Some(11),
+                claudear_core::types::DiscordChannelKind::Thread,
+                false,
+            )
+            .unwrap();
+        tracker
+            .upsert_discord_channel(
+                "300",
+                Some("g"),
+                None,
+                Some("a-category"),
+                Some(4),
+                claudear_core::types::DiscordChannelKind::Category,
+                false,
+            )
+            .unwrap();
+
+        let channels = tracker.list_discord_channels().unwrap();
+        // Category excluded => only the channel + thread.
+        assert_eq!(channels.len(), 2);
+
+        let general = channels.iter().find(|c| c.channel_id == "100").unwrap();
+        assert_eq!(general.kind, "channel");
+        assert_eq!(general.name.as_deref(), Some("general"));
+        // Channel's category is its direct parent.
+        assert_eq!(general.category_name.as_deref(), Some("a-category"));
+        assert!(general.backfill_complete);
+        assert_eq!(general.chunk_count, 2);
+        assert_eq!(
+            general.indexed_from.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+        assert_eq!(general.indexed_to.as_deref(), Some("2024-03-01T12:00:00Z"));
+        assert_eq!(general.last_indexed_message_id.as_deref(), Some("1002"));
+
+        let thread = channels.iter().find(|c| c.channel_id == "200").unwrap();
+        assert_eq!(thread.kind, "thread");
+        assert_eq!(thread.chunk_count, 0);
+        assert_eq!(thread.indexed_from, None);
+        assert_eq!(thread.indexed_to, None);
+        // Thread's category is resolved via its parent channel (200 -> 100 -> 300).
+        assert_eq!(thread.category_name.as_deref(), Some("a-category"));
+
+        // Aggregate stats: 1 channel, 1 thread, 2 chunks.
+        let stats = tracker.get_discord_knowledgebase_stats().unwrap();
+        assert_eq!(stats.channel_count, 1);
+        assert_eq!(stats.thread_count, 1);
+        assert_eq!(stats.chunk_count, 2);
+        assert!(stats.last_indexed_at.is_some());
+    }
+
     #[test]
     fn test_get_cost_estimate_plan_estimate() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -17588,5 +20197,250 @@ mod tests {
         // Should have the default value
         let progress = rx.borrow().clone();
         assert_eq!(progress.status, "idle");
+    }
+
+    #[test]
+    fn test_purge_operational_data_deletes_attempts_and_related() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempts
+        tracker
+            .record_attempt("linear", "issue-1", "LIN-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "issue-2", "SEN-2")
+            .unwrap();
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        // Create activity log entries
+        let entry = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "test".to_string(),
+            source: Some("linear".to_string()),
+            issue_id: Some("issue-1".to_string()),
+            short_id: None,
+            message: "test entry".to_string(),
+            metadata: None,
+        };
+        tracker.record_activity(&entry).unwrap();
+
+        // Create processing metrics
+        let metric = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "test_metric".to_string(),
+            metric_value: 1.0,
+            source: None,
+            tags: None,
+        };
+        tracker.record_metric(&metric).unwrap();
+
+        // Verify data exists
+        let stats = tracker.get_stats().unwrap();
+        assert_eq!(stats.total, 2);
+        let activities = tracker.get_recent_activities(100, None).unwrap();
+        assert!(!activities.is_empty());
+
+        // Purge
+        let result = tracker.purge_operational_data().unwrap();
+
+        assert_eq!(result.fix_attempts, 2);
+        assert_eq!(result.activity_log, 1);
+        assert_eq!(result.processing_metrics, 1);
+        assert!(result.total_deleted() >= 4);
+
+        // Verify operational data is gone
+        let stats = tracker.get_stats().unwrap();
+        assert_eq!(stats.total, 0);
+        let activities = tracker.get_recent_activities(100, None).unwrap();
+        assert!(activities.is_empty());
+    }
+
+    #[test]
+    fn test_purge_preserves_knowledge_and_embeddings() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a fix attempt and feedback outcome
+        tracker
+            .record_attempt("linear", "issue-k", "LIN-K")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-k").unwrap().unwrap();
+        let outcome = FixOutcome {
+            id: 0,
+            attempt_id: attempt.id,
+            source: "linear".to_string(),
+            issue_id: "issue-k".to_string(),
+            issue_text: "Bug in handler".to_string(),
+            prompt_used: "Fix the bug".to_string(),
+            outcome: Outcome::Merged,
+            error_type: Some("null_ref".to_string()),
+            learnings: Some("Always null-check".to_string()),
+            keywords: vec!["null".to_string()],
+            embedding: None,
+            created_at: Utc::now(),
+        };
+        tracker.store_feedback_outcome(&outcome).unwrap();
+
+        // Store an issue embedding
+        let issue_embedding = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "issue-k".to_string(),
+            short_id: Some("LIN-K".to_string()),
+            title: Some("Bug".to_string()),
+            description: Some("A bug".to_string()),
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            embedding: None,
+            embedding_model: None,
+            created_at: Utc::now(),
+            updated_at: None,
+        };
+        tracker.store_issue(&issue_embedding).unwrap();
+
+        // Store an error pattern
+        let pattern = ErrorPattern {
+            id: 0,
+            pattern_hash: "hash1".to_string(),
+            error_type: Some("null_ref".to_string()),
+            error_message: Some("null pointer".to_string()),
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            occurrence_count: 3,
+            sources: Some(vec!["linear".to_string()]),
+            example_issue_ids: Some(vec!["issue-k".to_string()]),
+            resolution_hints: None,
+        };
+        tracker.record_error_pattern(&pattern).unwrap();
+
+        // Purge
+        let result = tracker.purge_operational_data().unwrap();
+
+        // Attempts should be deleted
+        assert_eq!(result.fix_attempts, 1);
+
+        // Feedback outcomes should be detached (attempt_id NULLed), not deleted
+        assert_eq!(result.feedback_outcomes_detached, 1);
+        // Verify the row still exists in the DB (attempt_id is NULL so the trait
+        // method can't deserialize it, but the knowledge is preserved)
+        {
+            let conn = tracker.acquire_lock().unwrap();
+            let (count, learnings): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT COUNT(*), MAX(learnings) FROM feedback_outcomes",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(learnings, Some("Always null-check".to_string()));
+        }
+
+        // Issue embeddings should be preserved
+        let issues = tracker.list_issues(None, 100, 0).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].issue_id, "issue-k");
+
+        // Error patterns should be preserved
+        let patterns = tracker.get_error_patterns(100).unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].error_type, Some("null_ref".to_string()));
+    }
+
+    #[test]
+    fn test_purge_preserves_repositories_and_code_index() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a repository
+        let repo_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+        assert!(repo_id > 0);
+
+        // Store inference attempt
+        tracker
+            .record_inference_attempt(
+                "issue-inf",
+                "linear",
+                &["main.rs".to_string()],
+                &["handle".to_string()],
+                &["null".to_string()],
+                Some(repo_id),
+                "high",
+                "file match",
+                None,
+            )
+            .unwrap();
+
+        // Purge
+        tracker.purge_operational_data().unwrap();
+
+        // Repository should still exist
+        let repo = tracker.get_repository("org/repo").unwrap();
+        assert!(repo.is_some());
+        assert_eq!(repo.unwrap().name, "org/repo");
+
+        // Inference attempts should still exist
+        let history = tracker.get_inference_history(100).unwrap();
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn test_purge_on_empty_db() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker.purge_operational_data().unwrap();
+        assert_eq!(result.total_deleted(), 0);
+        assert_eq!(result.feedback_outcomes_detached, 0);
+    }
+
+    #[test]
+    fn test_purge_deletes_regression_tracking() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker
+            .record_attempt("linear", "issue-r", "LIN-R")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-r").unwrap().unwrap();
+        tracker
+            .mark_success("linear", "issue-r", "https://github.com/org/repo/pull/5")
+            .unwrap();
+
+        let watch = claudear_core::types::RegressionWatch {
+            id: 0,
+            issue_type: claudear_core::types::IssueType::LinearBug,
+            issue_id: "issue-r".to_string(),
+            fix_attempt_id: attempt.id,
+            status: claudear_core::types::RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: Utc::now(),
+        };
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        assert!(watch_id > 0);
+
+        let check = claudear_core::types::RegressionCheck {
+            id: 0,
+            regression_watch_id: watch_id,
+            issue_still_exists: false,
+            checked_at: Some(Utc::now()),
+            check_details: Some("all clear".to_string()),
+            created_at: Utc::now(),
+        };
+        tracker.add_regression_check(&check).unwrap();
+
+        // Purge
+        let result = tracker.purge_operational_data().unwrap();
+        assert_eq!(result.regression_watches, 1);
+        assert_eq!(result.regression_checks, 1);
+        assert_eq!(result.fix_attempts, 1);
+
+        // Verify regression data is gone
+        let watches = tracker.get_all_regression_watches().unwrap();
+        assert!(watches.is_empty());
     }
 }

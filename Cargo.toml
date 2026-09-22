@@ -20,7 +20,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 
 # Database
-rusqlite = { version = "0.38", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
 
 # Embeddings
 fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls"] }
@@ -37,7 +37,7 @@ clap = { version = "4", features = ["derive", "env"] }
 indicatif = "0.18"
 
 # Configuration
-toml = "1.0"
+toml = "1.1"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -48,7 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
 # Error monitoring
-sentry = { version = "0.46", features = ["tower-axum-matched-path", "tracing", "rustls", "backtrace", "contexts", "debug-images", "panic", "anyhow", "reqwest"], default-features = false }
+sentry = { version = "0.47", features = ["tower-axum-matched-path", "tracing", "rustls", "backtrace", "contexts", "debug-images", "panic", "anyhow", "reqwest"], default-features = false }
 
 # Error handling
 thiserror = "2"
@@ -58,6 +58,7 @@ anyhow = "1"
 aes-gcm = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
+sha1 = "0.10"
 hex = "0.4"
 subtle = "2"
 zeroize = "1"

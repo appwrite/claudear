@@ -202,7 +202,7 @@ export interface FixAttemptDetail {
   resolved_at: string | null;
   retry_count: number;
   last_retry_at: string | null;
-  issue_labels: string[];
+  issue_labels?: string[];
   parent_attempt_id: number | null;
   cascade_repo: string | null;
 }
@@ -223,6 +223,24 @@ export interface AttemptExecutionLogResponse {
   truncated: boolean;
 }
 
+export interface RetrievalUsageRecord {
+  id: number | null;
+  attempt_id: number;
+  source_kind: string; // 'code_chunk' | 'similar_issue' | 'discord_chunk' | 'qa'
+  chunk_ref: string;
+  file_path: string | null;
+  rank: number;
+  similarity_score: number;
+  injected: boolean;
+  char_len: number | null;
+  quality_score: number | null;
+}
+
+export interface AttemptRetrievalResponse {
+  attempt_id: number;
+  rows: RetrievalUsageRecord[];
+}
+
 export interface AnalyticsSummary {
   success_rate: number;
   total_processed: number;
@@ -236,6 +254,34 @@ export interface AnalyticsSummary {
   cost_estimate?: CostEstimate | null;
   mttr_trend?: MttrDataPoint[];
   repo_leaderboard?: RepoLeaderboardEntry[];
+  commit_trend?: CommitTrendPoint[];
+  support_rating?: SupportRatingSummary | null;
+}
+
+export interface CommitTrendPoint {
+  period_start: string;
+  commits: number;
+}
+
+export interface SupportReply {
+  action_run_id: number;
+  source: string;
+  short_id: string;
+  kind: string;
+  detail?: string | null;
+  created_at: string;
+  response_time_mins?: number | null;
+  rating?: number | null;
+  note?: string | null;
+  rated_by?: string | null;
+}
+
+export interface SupportRatingSummary {
+  total_replies: number;
+  rated_count: number;
+  avg_rating: number | null;
+  avg_response_time_mins: number | null;
+  avg_rating_by_source: Record<string, number>;
 }
 
 export interface ProcessingMetric {
@@ -428,6 +474,29 @@ export interface IndexingProgress {
   total_files_indexed: number;
   started_at: string | null;
   updated_at: string | null;
+}
+
+export interface StoredDiscordChannel {
+  channel_id: string;
+  guild_id: string | null;
+  parent_id: string | null;
+  category_name: string | null;
+  name: string | null;
+  kind: string;
+  archived: boolean;
+  backfill_complete: boolean;
+  last_indexed_message_id: string | null;
+  last_indexed_at: string | null;
+  chunk_count: number;
+  indexed_from: string | null;
+  indexed_to: string | null;
+}
+
+export interface DiscordKnowledgebaseStats {
+  channel_count: number;
+  thread_count: number;
+  chunk_count: number;
+  last_indexed_at: string | null;
 }
 
 export interface InferenceStats {
@@ -626,6 +695,17 @@ export function setOnUnauthorized(cb: () => void) {
   onUnauthorized = cb
 }
 
+/**
+ * Read the CSRF token from the readable `claudear_csrf` cookie. The backend
+ * sets this cookie on every request and requires mutating requests (POST/PUT/
+ * DELETE) to echo it back in the `x-csrf-token` header (double-submit cookie
+ * pattern). Returns an empty string if the cookie isn't present yet.
+ */
+export function getCsrfToken(): string {
+  const match = document.cookie.match(/(?:^|;\s*)claudear_csrf=([^;]*)/)
+  return match ? decodeURIComponent(match[1]) : ''
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url)
   if (res.status === 401) {
@@ -644,7 +724,10 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
   Sentry.addBreadcrumb({ category: 'api', message: `POST ${url}`, level: 'info' })
   const res = await fetch(url, {
     method: 'POST',
-    headers: body ? { 'Content-Type': 'application/json' } : {},
+    headers: {
+      'x-csrf-token': getCsrfToken(),
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   })
   if (res.status === 401) {
@@ -664,7 +747,10 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
   Sentry.addBreadcrumb({ category: 'api', message: `PUT ${url}`, level: 'info' })
   const res = await fetch(url, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-csrf-token': getCsrfToken(),
+    },
     body: JSON.stringify(body),
   })
   if (res.status === 401) {
@@ -681,7 +767,10 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
 
 async function deleteRequest(url: string): Promise<void> {
   Sentry.addBreadcrumb({ category: 'api', message: `DELETE ${url}`, level: 'info' })
-  const res = await fetch(url, { method: 'DELETE' })
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: { 'x-csrf-token': getCsrfToken() },
+  })
   if (res.status === 401) {
     onUnauthorized?.()
     throw new Error('Unauthorized')
@@ -752,8 +841,36 @@ export async function fetchActivity(params?: {
   return fetchJson(`${API_BASE}/activity?${searchParams}`);
 }
 
+export interface TimelineEvent {
+  time: string;
+  event: string;
+  message?: string;
+  // Flattened metadata context (e.g. `repo`, `pr`).
+  [key: string]: unknown;
+}
+
+export interface IssueTimeline {
+  issue: string;
+  events: TimelineEvent[];
+}
+
+export async function fetchIssueTimeline(
+  source: string,
+  issueId: string,
+): Promise<IssueTimeline> {
+  return fetchJson(
+    `${API_BASE}/issues/${encodeURIComponent(source)}/${encodeURIComponent(issueId)}/timeline`,
+  );
+}
+
 export async function fetchAttemptDetail(attemptId: number): Promise<AttemptDetailResponse> {
   return fetchJson(`${API_BASE}/attempts/${attemptId}/detail`);
+}
+
+export async function fetchAttemptRetrieval(
+  attemptId: number,
+): Promise<AttemptRetrievalResponse> {
+  return fetchJson(`${API_BASE}/attempts/${attemptId}/retrieval`);
 }
 
 export async function fetchAttemptExecutionLog(
@@ -784,6 +901,18 @@ export async function fetchMetrics(params?: {
 
 export async function fetchErrors(limit = 50): Promise<ErrorPattern[]> {
   return fetchJson(`${API_BASE}/errors?limit=${limit}`);
+}
+
+export async function fetchSupportReplies(): Promise<SupportReply[]> {
+  return fetchJson(`${API_BASE}/support/replies`);
+}
+
+export async function rateReply(
+  actionRunId: number,
+  rating: number,
+  note?: string,
+): Promise<void> {
+  await postJson(`${API_BASE}/support/replies/${actionRunId}/rating`, { rating, note });
 }
 
 export async function fetchPrs(params?: {
@@ -847,6 +976,14 @@ export async function fetchRepoStats(): Promise<IndexStats> {
 
 export async function fetchDependencies(): Promise<StoredDependency[]> {
   return fetchJson(`${API_BASE}/repos/dependencies`);
+}
+
+export async function fetchDiscordChannels(): Promise<StoredDiscordChannel[]> {
+  return fetchJson(`${API_BASE}/channels`);
+}
+
+export async function fetchDiscordChannelStats(): Promise<DiscordKnowledgebaseStats> {
+  return fetchJson(`${API_BASE}/channels/stats`);
 }
 
 export const INDEXING_PROGRESS_WS_PATH = '/api/repos/indexing-progress';
@@ -999,6 +1136,30 @@ export async function fetchConfig(): Promise<ConfigResponse> {
 
 export async function saveConfig(content: string): Promise<{ ok: boolean; message: string }> {
   return putJson(`${API_BASE}/config`, { content })
+}
+
+
+export interface InstructionResponse {
+  scope: string
+  repo: string | null
+  text: string
+  updated_at: string | null
+}
+
+export async function fetchGlobalInstruction(): Promise<InstructionResponse> {
+  return fetchJson(`${API_BASE}/instructions/global`)
+}
+
+export async function saveGlobalInstruction(text: string): Promise<{ ok: boolean }> {
+  return putJson(`${API_BASE}/instructions/global`, { text })
+}
+
+export async function fetchRepoInstruction(repo: string): Promise<InstructionResponse> {
+  return fetchJson(`${API_BASE}/repos/${encodeURIComponent(repo)}/instructions`)
+}
+
+export async function saveRepoInstruction(repo: string, text: string): Promise<{ ok: boolean }> {
+  return putJson(`${API_BASE}/repos/${encodeURIComponent(repo)}/instructions`, { text })
 }
 
 

@@ -4,9 +4,11 @@ import {
   fetchAttempts,
   fetchAttemptDetail,
   fetchAttemptExecutionLog,
+  fetchAttemptRetrieval,
   type AttemptsResponse,
   type AttemptDetailResponse,
   type AttemptExecutionLogResponse,
+  type AttemptRetrievalResponse,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
 import { Select } from '../components/ui/select'
@@ -16,7 +18,9 @@ import { BlockSkeleton, TableRowsSkeleton } from '../components/shared/page-skel
 import { DataTable, type Column } from '../components/shared/data-table'
 import { StatusBadge } from '../components/shared/status-badge'
 import { TimeAgo } from '../components/shared/time-ago'
-import { ExternalLink, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Modal } from '../components/shared/modal'
+import { RetrievalModalContent } from '../components/attempts/retrieval-modal'
+import { ExternalLink, ChevronLeft, ChevronRight, Layers } from 'lucide-react'
 
 const statusOptions = [
   { value: 'pending', label: 'Pending' },
@@ -57,6 +61,7 @@ export default function AttemptsPage() {
   const [sourceFilter, setSourceFilter] = useState('')
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [selectedLog, setSelectedLog] = useState<SelectedExecutionLog | null>(null)
+  const [retrievalId, setRetrievalId] = useState<number | null>(null)
 
   const { data, error, isLoading } = useSWR<AttemptsResponse>(
     ['attempts', page, statusFilter, sourceFilter],
@@ -73,6 +78,11 @@ export default function AttemptsPage() {
   const { data: detail, isLoading: detailLoading } = useSWR<AttemptDetailResponse>(
     selectedId ? ['attempt-detail', selectedId] : null,
     () => fetchAttemptDetail(selectedId!),
+  )
+
+  const { data: retrieval, isLoading: retrievalLoading } = useSWR<AttemptRetrievalResponse>(
+    retrievalId ? ['attempt-retrieval', retrievalId] : null,
+    () => fetchAttemptRetrieval(retrievalId!),
   )
 
   const {
@@ -145,6 +155,20 @@ export default function AttemptsPage() {
       key: 'retry_count',
       header: 'Retries',
       render: row => <span>{row.retry_count}</span>,
+    },
+    {
+      key: 'retrieval',
+      header: 'Context',
+      render: row => (
+        <button
+          onClick={() => setRetrievalId(row.id)}
+          title="View retrieved context & quality"
+          className="text-muted-foreground hover:text-primary inline-flex items-center gap-1"
+        >
+          <Layers className="h-3.5 w-3.5" />
+          View
+        </button>
+      ),
     },
   ]
 
@@ -282,7 +306,7 @@ export default function AttemptsPage() {
                         <p className="text-sm text-destructive">{detail.attempt.error_message}</p>
                       </div>
                     )}
-                    {detail.attempt.issue_labels.length > 0 && (
+                    {detail.attempt.issue_labels && detail.attempt.issue_labels.length > 0 && (
                       <div className="sm:col-span-2 lg:col-span-3">
                         <p className="text-sm text-muted-foreground mb-1">Labels</p>
                         <div className="flex flex-wrap gap-1">
@@ -502,6 +526,17 @@ export default function AttemptsPage() {
           )}
         </div>
       )}
+
+      <Modal
+        open={retrievalId !== null}
+        onClose={() => setRetrievalId(null)}
+        title="Retrieved Context & Quality"
+      >
+        <RetrievalModalContent
+          rows={retrieval?.rows ?? []}
+          loading={retrievalLoading}
+        />
+      </Modal>
     </div>
   )
 }

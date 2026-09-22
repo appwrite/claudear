@@ -2,10 +2,11 @@
 
 use super::{AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
+use claudear_config::McpServerConfig;
 use claudear_core::error::{Error, Result};
 use claudear_core::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
 use claudear_core::types::{
-    ActivityLogEntry, AgentExecution, AgentResult, BlockingQuestion, Issue,
+    ActivityLogEntry, AgentExecution, AgentResult, BlockingQuestion, Issue, ReplyKind, VerifyResult,
 };
 use claudear_storage::FixAttemptTracker;
 use serde::Deserialize;
@@ -22,6 +23,14 @@ use tokio::sync::{mpsc, Mutex};
 const DEFAULT_LOG_DIR: &str = "./logs";
 const CLAUDE_LOG_SUBDIR: &str = "claude";
 const EXECUTION_LOG_PREVIEW_LIMIT: usize = 2000;
+
+/// Default read-only tools granted for RAG-grounded Q&A runs when the config
+/// doesn't specify its own set
+const DEFAULT_READONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebFetch", "WebSearch"];
+
+/// Timeout for read-only structured queries (classification-scale, not the long
+/// fix-run timeout).
+const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
 
 /// Resolve the root directory for execution logs.
 /// Used by both the runner and the API to validate log file paths.
@@ -224,12 +233,21 @@ pub struct ClaudeRunnerConfig {
     pub instructions: Option<String>,
     /// Tool permissions granted without prompting (--allowedTools).
     pub permissions: Vec<String>,
+    /// Tools allowed for read-only Q&A (question) runs. Empty means fall back to
+    /// [`DEFAULT_READONLY_TOOLS`].
+    pub readonly_tools: Vec<String>,
     /// Skip all permission prompts (default: false).
     pub skip_permissions: bool,
     /// CLI binary name or absolute path (default: "claude").
     pub binary: String,
     /// Extra environment variables to set when spawning the agent process.
     pub env: HashMap<String, String>,
+    /// MCP servers to attach, keyed by server name. Attachment is gated per-run
+    /// by each server's `sources` list against the issue source.
+    pub mcp: HashMap<String, McpServerConfig>,
+    /// Mirrors the global `debug_logging` flag. When true, the rendered MCP
+    /// config is logged (with secret values redacted) on each attach.
+    pub debug_logging: bool,
 }
 
 impl Default for ClaudeRunnerConfig {
@@ -239,9 +257,12 @@ impl Default for ClaudeRunnerConfig {
             model: None,
             instructions: None,
             permissions: Vec::new(),
+            readonly_tools: Vec::new(),
             skip_permissions: false,
             binary: "claude".to_string(),
             env: HashMap::new(),
+            mcp: HashMap::new(),
+            debug_logging: false,
         }
     }
 }
@@ -275,15 +296,6 @@ impl ClaudeAgentRunner {
         }
     }
 
-    /// Create a new Claude runner without template support (for testing).
-    #[cfg(feature = "sqlite")]
-    pub fn new_simple(config: ClaudeRunnerConfig) -> Self {
-        use claudear_storage::SqliteTracker;
-        // Use a temporary in-memory tracker
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-        Self::new(config, tracker)
-    }
-
     /// Run Claude Code with a prompt to fix an issue in a specific repository.
     pub async fn run_fix(
         &self,
@@ -313,6 +325,7 @@ impl ClaudeAgentRunner {
             issue_identifier,
             env,
             project_dir,
+            Some("linear"),
         )
         .await
     }
@@ -578,7 +591,14 @@ The PR title should include the issue ID: {}
         project_dir: &Path,
     ) -> Result<AgentResult> {
         let (env, label) = self.prepare_env_and_label(issue);
-        self.execute_with_env(prompt, label, env, project_dir).await
+        self.execute_with_env(
+            prompt,
+            label,
+            env,
+            project_dir,
+            issue.map(|i| i.source.as_str()),
+        )
+        .await
     }
 
     async fn execute_with_env(
@@ -587,11 +607,276 @@ The PR title should include the issue ID: {}
         label: &str,
         env: HashMap<String, String>,
         project_dir: &Path,
+        source: Option<&str>,
     ) -> Result<AgentResult> {
-        self.execute_with_env_and_attempt(prompt, label, env, None, project_dir)
+        self.execute_with_env_and_attempt(prompt, label, env, None, project_dir, true, source)
             .await
     }
 
+    /// Run a read-only, schema-constrained query via `--json-schema` and return
+    /// the object from the `result` stream event. Read-only tools, no permission
+    /// skipping, short classification-scale timeout.
+    async fn run_structured_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+    ) -> Result<serde_json::Value> {
+        let mut args = vec![
+            "--verbose".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--json-schema".to_string(),
+            json_schema.to_string(),
+        ];
+        if let Some(ref model) = self.config.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+        if let Some(ref instructions) = self.config.instructions {
+            args.push("--append-system-prompt".to_string());
+            args.push(instructions.clone());
+        }
+        let readonly_tools: Vec<String> = if self.config.readonly_tools.is_empty() {
+            DEFAULT_READONLY_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            self.config.readonly_tools.clone()
+        };
+        for perm in &readonly_tools {
+            args.push("--allowedTools".to_string());
+            args.push(perm.clone());
+        }
+        // Deliver the prompt via stdin, not as a CLI argument. Large prompts
+        // (e.g. the repo classifier's all-candidates prompt) otherwise overflow
+        // the OS argv limit and fail to spawn with E2BIG ("Argument list too
+        // long"). `--print` with no positional prompt reads the prompt from stdin.
+        args.push("--print".to_string());
+
+        let (env, _label) = self.prepare_env_and_label(None);
+
+        let mut child = Command::new(&self.config.binary)
+            .args(&args)
+            .current_dir(project_dir)
+            .envs(env)
+            .env_remove("CLAUDECODE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Discard stderr: this lean path never reads it, and leaving it piped
+            // would let `--verbose` diagnostics fill the OS buffer and block the
+            // child before it writes the `result` event to stdout.
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| Error::runner(format!("Failed to spawn {}: {}", self.config.binary, e)))?;
+
+        // Write the prompt to stdin concurrently with reading stdout to avoid a
+        // pipe-buffer deadlock when the prompt is large.
+        if let Some(mut child_stdin) = child.stdin.take() {
+            let prompt_bytes = prompt.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = child_stdin.write_all(prompt_bytes.as_bytes()).await {
+                    tracing::warn!(error = %e, "Failed to write prompt to agent stdin");
+                }
+                if let Err(e) = child_stdin.shutdown().await {
+                    tracing::debug!(error = %e, "Failed to close agent stdin");
+                }
+            });
+        }
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::runner("Failed to capture stdout"))?;
+
+        let collect = async {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut structured: Option<serde_json::Value> = None;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(StreamEvent::Result {
+                    structured_output: Some(v),
+                    ..
+                }) = serde_json::from_str::<StreamEvent>(trimmed)
+                {
+                    structured = Some(v);
+                }
+            }
+            structured
+        };
+
+        let timeout = std::time::Duration::from_secs(STRUCTURED_QUERY_TIMEOUT_SECS);
+        let structured = match tokio::time::timeout(timeout, collect).await {
+            Ok(s) => {
+                let _ = child.wait().await;
+                s
+            }
+            Err(_) => {
+                let _ = child.start_kill();
+                return Err(Error::runner(format!(
+                    "structured query timed out after {}s",
+                    STRUCTURED_QUERY_TIMEOUT_SECS
+                )));
+            }
+        };
+
+        structured.ok_or_else(|| Error::runner("no structured output in response"))
+    }
+
+    /// Attempt to reproduce a reported issue, read-only. Returns a structured
+    /// verdict parsed from the agent's output. Conservative: on any parse failure
+    /// the issue is treated as NOT reproduced.
+    pub async fn run_verify(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<VerifyResult> {
+        let prompt = build_verify_prompt(issue, context);
+        let (env, _) = self.prepare_env_and_label(Some(issue));
+        let result = self
+            .execute_with_env_and_attempt(
+                &prompt,
+                &issue.short_id,
+                env,
+                None,
+                project_dir,
+                false,
+                Some(issue.source.as_str()),
+            )
+            .await?;
+        Ok(parse_verify_result(&result.output))
+    }
+
+    /// Generate a grounded, human-sounding reply, read-only. `guideline` is an
+    /// optional per-inbox style guideline; `kind` selects the framing.
+    pub async fn run_reply(
+        &self,
+        issue: &Issue,
+        context: &str,
+        guideline: Option<&str>,
+        kind: ReplyKind,
+        project_dir: &Path,
+    ) -> Result<String> {
+        let prompt = build_reply_prompt(issue, context, guideline, kind);
+        let (env, _) = self.prepare_env_and_label(Some(issue));
+        let result = self
+            .execute_with_env_and_attempt(
+                &prompt,
+                &issue.short_id,
+                env,
+                None,
+                project_dir,
+                false,
+                Some(issue.source.as_str()),
+            )
+            .await?;
+        if result.success || !result.output.trim().is_empty() {
+            Ok(result.output)
+        } else {
+            Err(Error::runner(
+                result
+                    .error
+                    .unwrap_or_else(|| "Failed to generate reply".to_string()),
+            ))
+        }
+    }
+
+    /// Render matched MCP servers into a private temp file (claudear-mcp-*.json,
+    /// 0600 on Unix) passed to the CLI via --mcp-config and deleted when the handle
+    /// drops. `${VAR}` in env is expanded by the CLI.
+    fn render_mcp_config(
+        servers: &[(&String, &McpServerConfig)],
+    ) -> std::io::Result<tempfile::NamedTempFile> {
+        let mut mcp_servers = serde_json::Map::new();
+        for (name, cfg) in servers {
+            let mut entry = serde_json::Map::new();
+            if let Some(ref command) = cfg.command {
+                // stdio transport
+                entry.insert("command".to_string(), json!(command));
+                entry.insert("args".to_string(), json!(cfg.args));
+                if !cfg.env.is_empty() {
+                    entry.insert("env".to_string(), json!(cfg.env));
+                }
+                if let Some(ref transport) = cfg.transport {
+                    entry.insert("type".to_string(), json!(transport));
+                }
+            } else if let Some(ref url) = cfg.url {
+                // http/sse transport
+                entry.insert(
+                    "type".to_string(),
+                    json!(cfg.transport.clone().unwrap_or_else(|| "http".to_string())),
+                );
+                entry.insert("url".to_string(), json!(url));
+                if !cfg.headers.is_empty() {
+                    entry.insert("headers".to_string(), json!(cfg.headers));
+                }
+            }
+            mcp_servers.insert((*name).clone(), serde_json::Value::Object(entry));
+        }
+        let doc = json!({ "mcpServers": serde_json::Value::Object(mcp_servers) });
+
+        let mut file = tempfile::Builder::new()
+            .prefix("claudear-mcp-")
+            .suffix(".json")
+            .tempfile()?;
+        let bytes = serde_json::to_vec_pretty(&doc).map_err(std::io::Error::other)?;
+        // Write to the already-open handle; avoids reopening (fails under Windows locks).
+        use std::io::Write;
+        file.as_file_mut().write_all(&bytes)?;
+        file.as_file_mut().flush()?;
+        Ok(file)
+    }
+
+    /// A redacted JSON view of the matched MCP servers for debug logging.
+    /// Mirrors what `render_mcp_config` writes, but masks every `env`/`headers`
+    /// value that could hold a secret. Pure `${VAR}` references are shown as-is
+    /// (they name a variable, not a secret); anything else becomes "***".
+    fn redact_mcp_for_log(servers: &[(&String, &McpServerConfig)]) -> serde_json::Value {
+        let mask = |v: &str| -> String {
+            let t = v.trim();
+            if t.starts_with("${") && t.ends_with('}') && !t[2..].contains("${") {
+                v.to_string()
+            } else {
+                "***".to_string()
+            }
+        };
+        let redact_map = |m: &std::collections::HashMap<String, String>| -> serde_json::Value {
+            json!(m
+                .iter()
+                .map(|(k, v)| (k.clone(), mask(v)))
+                .collect::<std::collections::HashMap<_, _>>())
+        };
+        let mut out = serde_json::Map::new();
+        for (name, cfg) in servers {
+            let mut entry = serde_json::Map::new();
+            if let Some(ref command) = cfg.command {
+                entry.insert("command".to_string(), json!(command));
+                entry.insert("args".to_string(), json!(cfg.args));
+                if !cfg.env.is_empty() {
+                    entry.insert("env".to_string(), redact_map(&cfg.env));
+                }
+            } else if let Some(ref url) = cfg.url {
+                entry.insert("url".to_string(), json!(url));
+                if !cfg.headers.is_empty() {
+                    entry.insert("headers".to_string(), redact_map(&cfg.headers));
+                }
+            }
+            if let Some(ref transport) = cfg.transport {
+                entry.insert("type".to_string(), json!(transport));
+            }
+            entry.insert("sources".to_string(), json!(cfg.sources));
+            entry.insert("tools".to_string(), json!(cfg.tools));
+            out.insert((*name).clone(), serde_json::Value::Object(entry));
+        }
+        json!({ "mcpServers": serde_json::Value::Object(out) })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn execute_with_env_and_attempt(
         &self,
         prompt: &str,
@@ -599,6 +884,8 @@ The PR title should include the issue ID: {}
         env: HashMap<String, String>,
         attempt_id: Option<i64>,
         project_dir: &Path,
+        structured: bool,
+        source: Option<&str>,
     ) -> Result<AgentResult> {
         // Create execution record for analytics
         let mut execution = AgentExecution::new();
@@ -635,14 +922,102 @@ The PR title should include the issue ID: {}
         }));
         self.tracker.record_activity(&activity).ok();
 
+        // Attach MCP servers whose sources match this run; held until return so the
+        // temp file outlives the child, then auto-deleted. Require exactly one of
+        // `command`/`url` so strict MCP loading never rejects an ambiguous server.
+        let matched_mcp: Vec<(&String, &McpServerConfig)> = self
+            .config
+            .mcp
+            .iter()
+            .filter(|(_, cfg)| cfg.matches_source(source))
+            .filter(|(name, cfg)| {
+                let valid = cfg.has_valid_transport();
+                if !valid {
+                    tracing::warn!(
+                        component = "claude",
+                        label = label,
+                        server = name.as_str(),
+                        "Skipping MCP server: set exactly one of `command`/`url` with a matching `type`"
+                    );
+                }
+                valid
+            })
+            .collect();
+        let mut mcp_config_file: Option<tempfile::NamedTempFile> = None;
+        if !matched_mcp.is_empty() {
+            match Self::render_mcp_config(&matched_mcp) {
+                Ok(file) => {
+                    tracing::info!(
+                        component = "claude",
+                        label = label,
+                        source = source.unwrap_or("none"),
+                        servers = matched_mcp.len(),
+                        "Attaching MCP servers to run"
+                    );
+                    if self.config.debug_logging {
+                        let redacted = Self::redact_mcp_for_log(&matched_mcp);
+                        tracing::info!(
+                            component = "claude",
+                            label = label,
+                            path = %file.path().display(),
+                            config = %redacted,
+                            "Rendered MCP config (secret values redacted)"
+                        );
+                    }
+                    mcp_config_file = Some(file);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        component = "claude",
+                        label = label,
+                        error = %e,
+                        "Failed to render MCP config; continuing without MCP servers"
+                    );
+                }
+            }
+        }
+        // Tools to allowlist for the attached servers. An explicit `tools` list is
+        // scoped to `mcp__<server>__<tool>`; empty grants all of the server's tools
+        // via `mcp__<server>`. Applied uniformly to fix and read-only runs.
+        let mcp_tool_globs: Vec<String> = if mcp_config_file.is_some() {
+            matched_mcp
+                .iter()
+                .flat_map(|(name, cfg)| {
+                    if cfg.tools.is_empty() {
+                        vec![format!("mcp__{}", name)]
+                    } else {
+                        cfg.tools
+                            .iter()
+                            .map(|tool| format!("mcp__{}__{}", name, tool))
+                            .collect()
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let mut args = vec![
             "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
-            "--json-schema".to_string(),
-            RESULT_SCHEMA.to_string(),
         ];
-        if self.config.skip_permissions {
+        // When we attach a rendered config, load only it (--strict ignores any repo
+        // .mcp.json). With no servers matched, no MCP flags are added at all.
+        if let Some(ref file) = mcp_config_file {
+            args.push("--mcp-config".to_string());
+            args.push(file.path().display().to_string());
+            args.push("--strict-mcp-config".to_string());
+        }
+        // Structured (fix) runs enforce the result JSON schema. Read-only Q&A
+        // runs return plain assistant text instead.
+        if structured {
+            args.push("--json-schema".to_string());
+            args.push(RESULT_SCHEMA.to_string());
+        }
+        // Read-only Q&A runs must never skip permission prompts, and are
+        // restricted to a read-only tool set so the repo cannot be mutated.
+        if structured && self.config.skip_permissions {
             args.push("--dangerously-skip-permissions".to_string());
         }
         if let Some(ref model) = self.config.model {
@@ -653,12 +1028,33 @@ The PR title should include the issue ID: {}
             args.push("--append-system-prompt".to_string());
             args.push(instructions.clone());
         }
-        for perm in &self.config.permissions {
-            args.push("--allowedTools".to_string());
-            args.push(perm.clone());
+        if structured {
+            for perm in &self.config.permissions {
+                args.push("--allowedTools".to_string());
+                args.push(perm.clone());
+            }
+        } else if self.config.readonly_tools.is_empty() {
+            for perm in DEFAULT_READONLY_TOOLS {
+                args.push("--allowedTools".to_string());
+                args.push((*perm).to_string());
+            }
+        } else {
+            for perm in &self.config.readonly_tools {
+                args.push("--allowedTools".to_string());
+                args.push(perm.clone());
+            }
         }
+        // Allowlist the attached MCP servers' tools for both fix and Q&A runs.
+        for glob in &mcp_tool_globs {
+            if !args.iter().any(|a| a == glob) {
+                args.push("--allowedTools".to_string());
+                args.push(glob.clone());
+            }
+        }
+        // Prompt is delivered via stdin (see spawn below), not as a CLI argument,
+        // to avoid the OS argv size limit (E2BIG) on large prompts. `--print`
+        // with no positional prompt reads it from stdin.
         args.push("--print".to_string());
-        args.push(prompt.to_string());
 
         let log_files = Self::create_execution_log_files(label);
         if let Some(ref files) = log_files {
@@ -698,11 +1094,9 @@ The PR title should include the issue ID: {}
                 None => None,
             };
 
-        let cli_args_without_prompt: Vec<String> = args
-            .iter()
-            .take(args.len().saturating_sub(1))
-            .cloned()
-            .collect();
+        // The prompt is no longer part of argv (it's piped via stdin), so all
+        // remaining args are safe to log.
+        let cli_args_without_prompt: Vec<String> = args.clone();
         Self::append_execution_event(
             &event_writer,
             label,
@@ -725,6 +1119,7 @@ The PR title should include the issue ID: {}
             .current_dir(project_dir)
             .envs(env)
             .env_remove("CLAUDECODE")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -746,6 +1141,20 @@ The PR title should include the issue ID: {}
                 )));
             }
         };
+
+        // Write the prompt to stdin concurrently with reading stdout/stderr so a
+        // large prompt cannot deadlock against the child's output pipes.
+        if let Some(mut child_stdin) = child.stdin.take() {
+            let prompt_bytes = prompt.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = child_stdin.write_all(prompt_bytes.as_bytes()).await {
+                    tracing::warn!(error = %e, "Failed to write prompt to agent stdin");
+                }
+                if let Err(e) = child_stdin.shutdown().await {
+                    tracing::debug!(error = %e, "Failed to close agent stdin");
+                }
+            });
+        }
 
         Self::append_execution_event(
             &event_writer,
@@ -1787,8 +2196,221 @@ impl AgentRunner for ClaudeAgentRunner {
         project_dir: &Path,
     ) -> Result<AgentResult> {
         let (env, label) = self.prepare_env_and_label(issue);
-        self.execute_with_env_and_attempt(prompt, label, env, attempt_id, project_dir)
+        self.execute_with_env_and_attempt(
+            prompt,
+            label,
+            env,
+            attempt_id,
+            project_dir,
+            true,
+            issue.map(|i| i.source.as_str()),
+        )
+        .await
+    }
+
+    async fn answer_question(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<String> {
+        self.generate_reply(issue, context, None, ReplyKind::Answer, project_dir)
             .await
+    }
+
+    async fn verify_issue(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<VerifyResult> {
+        self.run_verify(issue, context, project_dir).await
+    }
+
+    async fn generate_reply(
+        &self,
+        issue: &Issue,
+        context: &str,
+        guideline: Option<&str>,
+        kind: ReplyKind,
+        project_dir: &Path,
+    ) -> Result<String> {
+        self.run_reply(issue, context, guideline, kind, project_dir)
+            .await
+    }
+
+    async fn structured_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+    ) -> Result<serde_json::Value> {
+        self.run_structured_query(prompt, json_schema, project_dir)
+            .await
+    }
+}
+
+/// The reported text of a payload: its description if present, else the title.
+fn issue_body(issue: &Issue) -> &str {
+    issue
+        .description
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or(&issue.title)
+}
+
+/// Build the prompt for a read-only attempt to reproduce a reported issue.
+///
+/// The agent must NOT fix anything; it inspects the code (read-only) to decide
+/// whether the issue reproduces as described and returns a single JSON verdict.
+fn build_verify_prompt(issue: &Issue, context: &str) -> String {
+    format!(
+        r#"You are a senior engineer triaging a reported issue from {source}.
+
+Your ONLY job is to determine whether the issue reproduces AS DESCRIBED, by
+reading and tracing the relevant code in this repository. Do NOT fix anything.
+
+STRICT RULES:
+- This is read-only. Do NOT modify files, run write commands, or create branches/PRs.
+- Decide `reproduced=true` ONLY when you find concrete evidence in the code that
+  the described behavior occurs (a clear code path, missing guard, off-by-one,
+  etc.). If you cannot find such evidence, answer `reproduced=false`.
+- Be conservative: when uncertain, answer `reproduced=false`.
+
+Retrieved code context:
+{context}
+
+Reported issue:
+Title: {title}
+{body}
+
+When `reproduced=true`, also explain WHY it's a problem, the root cause you
+traced, and a proposed fix direction (do NOT apply it). Leave those fields as
+empty strings when `reproduced=false`.
+
+Respond with ONLY a single JSON object on its own, no prose:
+{{"reproduced": true|false, "summary": "<one sentence verdict>", "impact": "<user-facing impact / why it's an issue>", "root_cause": "<the underlying cause in the code>", "suggested_fix": "<proposed fix direction>", "evidence": "<files/line refs and the code path that confirms or refutes the report>"}}"#,
+        source = issue.source,
+        context = context,
+        title = issue.title,
+        body = issue_body(issue),
+    )
+}
+
+/// Build the prompt for a read-only, RAG-grounded, human-sounding reply.
+///
+/// `guideline` is an optional per-inbox template treated as a soft style
+/// guideline; `kind` selects the framing of the reply.
+fn build_reply_prompt(
+    issue: &Issue,
+    context: &str,
+    guideline: Option<&str>,
+    kind: ReplyKind,
+) -> String {
+    let task = match kind {
+        ReplyKind::Answer => {
+            "Write a helpful reply that answers the customer's question or addresses \
+their request, grounded in the actual code."
+        }
+        ReplyKind::NeedRepro => {
+            "We could not reproduce the reported issue from the description. Write a \
+friendly reply that asks the customer for the specific steps to reproduce, \
+their environment/version, and any error output — without sounding dismissive."
+        }
+        ReplyKind::FixShipped => {
+            "A fix for the reported issue has shipped and is live. Write a reply that \
+lets the customer know it's resolved, briefly describes what was fixed, and \
+invites them to reach out if it persists."
+        }
+    };
+
+    let guideline_block = match guideline {
+        Some(g) if !g.trim().is_empty() => format!(
+            "\nStyle guideline for this inbox (treat as a LOOSE guideline — match the \
+tone and spirit, but vary the wording naturally; do NOT copy it verbatim):\n{g}\n",
+        ),
+        _ => String::new(),
+    };
+
+    // HelpScout renders the reply body as HTML, not Markdown, so Markdown syntax
+    // shows up as raw characters. Other sources (Discord, Slack, GitHub, Linear)
+    // render Markdown, so only constrain formatting for HelpScout.
+    let format_rule = if issue.source == "helpscout" {
+        "\n- Write in PLAIN PROSE. This ticket system does NOT render Markdown, so do \
+NOT use Markdown syntax: no `**bold**`, `_italics_`, backticks/code fences, `#` \
+headers, `-`/`*` bullet lists, or `[text](url)` links. Write URLs as bare URLs and \
+use short paragraphs separated by blank lines instead of lists."
+    } else {
+        ""
+    };
+
+    format!(
+        r#"You are a member of the support/engineering team replying to a ticket from {source}.
+
+{task}
+
+STRICT RULES:
+- This is read-only. Do NOT modify files, run write commands, or create branches/PRs.
+- Ground any technical claim in the actual code; do not invent behavior.
+- Sound like a real, helpful human — natural, warm, and concise. Avoid robotic
+  boilerplate and obvious AI phrasing. Write in the first person.
+- Do NOT include internal-only notes, chain-of-thought, or a "Sources" section;
+  output only the message text that will be sent to the ticket.{format_rule}
+{guideline_block}
+Retrieved code context:
+{context}
+
+Ticket:
+Title: {title}
+{body}
+
+Write only the reply message."#,
+        source = issue.source,
+        task = task,
+        format_rule = format_rule,
+        guideline_block = guideline_block,
+        context = context,
+        title = issue.title,
+        body = issue_body(issue),
+    )
+}
+
+/// Parse a `VerifyResult` from the agent's output. Tolerant of surrounding prose
+/// and code fences. Conservative: any failure yields `reproduced=false`.
+fn parse_verify_result(output: &str) -> VerifyResult {
+    fn from_json(s: &str) -> Option<VerifyResult> {
+        serde_json::from_str::<VerifyResult>(s).ok()
+    }
+
+    let trimmed = output.trim();
+    // Direct parse, then the outermost {...} span.
+    if let Some(v) = from_json(trimmed) {
+        return v;
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if end > start {
+            if let Some(v) = from_json(&trimmed[start..=end]) {
+                return v;
+            }
+        }
+    }
+
+    // Fallback heuristic when no JSON could be parsed.
+    let lower = trimmed.to_lowercase();
+    let reproduced = lower.contains("\"reproduced\": true")
+        || lower.contains("\"reproduced\":true")
+        || lower.contains("reproduced: true");
+    VerifyResult {
+        reproduced,
+        summary: if reproduced {
+            "Reproduced (parsed heuristically)".to_string()
+        } else {
+            "Could not parse a verdict; treated as not reproduced".to_string()
+        },
+        impact: String::new(),
+        root_cause: String::new(),
+        suggested_fix: String::new(),
+        evidence: trimmed.chars().take(2000).collect(),
     }
 }
 
@@ -1796,8 +2418,93 @@ impl AgentRunner for ClaudeAgentRunner {
 mod tests {
     use super::*;
 
+    /// Create a runner with a no-op tracker for tests that don't need persistence.
+    fn new_simple(config: ClaudeRunnerConfig) -> ClaudeAgentRunner {
+        let tracker = Arc::new(claudear_storage::NoopTracker);
+        ClaudeAgentRunner::new(config, tracker)
+    }
+
     /// Mutex to serialize tests that manipulate process-global env vars.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn verify_issue() -> Issue {
+        Issue::new("1", "HS-1", "Login crashes on submit", "url", "helpscout")
+    }
+
+    #[test]
+    fn test_parse_verify_result_direct_json() {
+        let v = parse_verify_result(
+            r#"{"reproduced": true, "summary": "found it", "evidence": "src/a.rs:10"}"#,
+        );
+        assert!(v.reproduced);
+        assert_eq!(v.summary, "found it");
+    }
+
+    #[test]
+    fn test_parse_verify_result_json_in_prose() {
+        let v = parse_verify_result(
+            "Here is my verdict:\n{\"reproduced\": false, \"summary\": \"no repro\", \"evidence\": \"\"}\nThanks.",
+        );
+        assert!(!v.reproduced);
+        assert_eq!(v.summary, "no repro");
+    }
+
+    #[test]
+    fn test_parse_verify_result_garbage_is_not_reproduced() {
+        let v = parse_verify_result("I could not determine anything useful");
+        assert!(!v.reproduced);
+    }
+
+    #[test]
+    fn test_build_verify_prompt_is_read_only_and_asks_json() {
+        let prompt = build_verify_prompt(&verify_issue(), "ctx");
+        assert!(prompt.contains("Login crashes on submit"));
+        assert!(prompt.contains("read-only"));
+        assert!(prompt.contains("Do NOT fix"));
+        assert!(prompt.contains("\"reproduced\""));
+    }
+
+    #[test]
+    fn test_build_reply_prompt_guideline_is_soft() {
+        let prompt = build_reply_prompt(
+            &verify_issue(),
+            "ctx",
+            Some("Warm and apologetic; sign off as Support."),
+            ReplyKind::NeedRepro,
+        );
+        // Guideline is injected but explicitly framed as loose.
+        assert!(prompt.contains("Warm and apologetic"));
+        assert!(prompt.contains("LOOSE guideline"));
+        // NeedRepro framing asks for reproduction steps.
+        assert!(prompt.to_lowercase().contains("reproduce"));
+    }
+
+    #[test]
+    fn test_build_reply_prompt_fix_shipped_framing() {
+        let prompt = build_reply_prompt(&verify_issue(), "", None, ReplyKind::FixShipped);
+        assert!(
+            prompt.to_lowercase().contains("shipped") || prompt.to_lowercase().contains("resolved")
+        );
+    }
+
+    #[test]
+    fn test_build_reply_prompt_plain_prose_only_for_helpscout() {
+        // HelpScout renders HTML, not Markdown — the plain-prose rule applies.
+        let hs = Issue::new("1", "HS-1", "title", "url", "helpscout");
+        let prompt = build_reply_prompt(&hs, "ctx", None, ReplyKind::Answer);
+        assert!(prompt.contains("PLAIN PROSE"));
+        assert!(prompt.contains("does NOT render Markdown"));
+
+        // Markdown-rendering sources keep formatting freedom (no rule injected).
+        for source in ["discord", "slack", "github", "linear"] {
+            let issue = Issue::new("1", "X-1", "title", "url", source);
+            let prompt = build_reply_prompt(&issue, "ctx", None, ReplyKind::Answer);
+            assert!(
+                !prompt.contains("PLAIN PROSE"),
+                "plain-prose rule should not apply for source {source}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_cli_assistant_text_event() {
@@ -1999,7 +2706,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_no_question_protocol() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "context", std::path::Path::new("/tmp"));
         assert!(!prompt.contains("CLAUDEAR_QUESTION"));
@@ -2007,7 +2714,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_no_pr_url_instruction() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "context", std::path::Path::new("/tmp"));
         assert!(!prompt.contains("PR_URL:"));
@@ -2048,7 +2755,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
 
         let issue = Issue::new(
             "123",
@@ -2124,7 +2831,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_sentry_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
 
         let issue = Issue::new(
             "456",
@@ -2186,7 +2893,7 @@ mod tests {
     #[test]
     fn test_runner_config() {
         let config = ClaudeRunnerConfig::default();
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "linear");
         let project_dir = std::path::Path::new("/path/to/project");
         let prompt = runner.build_prompt(&issue, "context", project_dir);
@@ -2252,7 +2959,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_github_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "789",
             "#789",
@@ -2267,7 +2974,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_unknown_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "123",
             "JIRA-123",
@@ -2281,13 +2988,13 @@ mod tests {
 
     #[test]
     fn test_has_agent_md() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         assert!(!runner.has_agent_md(std::path::Path::new("/nonexistent/path")));
     }
 
     #[test]
     fn test_get_agent_md_nonexistent() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         assert!(runner
             .get_agent_md(std::path::Path::new("/nonexistent/path"))
             .is_none());
@@ -2360,7 +3067,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_empty_context() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Test", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "", std::path::Path::new("/tmp"));
         assert!(!prompt.is_empty());
@@ -2369,7 +3076,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_special_characters() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "1",
             "TEST-1",
@@ -2409,7 +3116,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_multiline_context() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -2473,7 +3180,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_unicode_context() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "1",
             "TEST-1",
@@ -2491,8 +3198,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_new_with_tracker() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         assert!(!runner.has_agent_md(std::path::Path::new("/tmp")));
     }
@@ -3133,6 +3839,158 @@ mod tests {
         assert!(debug.contains("events"));
     }
 
+    // Read a rendered temp file via the already-open handle (avoids reopening by
+    // path, which can lock on Windows), mirroring render_mcp_config's own approach.
+    fn read_temp(file: &tempfile::NamedTempFile) -> String {
+        use std::io::Read;
+        let mut s = String::new();
+        file.reopen().unwrap().read_to_string(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn test_render_mcp_config_stdio() {
+        let name = "appwrite".to_string();
+        let mut env = HashMap::new();
+        env.insert(
+            "APPWRITE_API_KEY".to_string(),
+            "${APPWRITE_API_KEY}".to_string(),
+        );
+        let cfg = McpServerConfig {
+            command: Some("uvx".to_string()),
+            args: vec!["mcp-server-appwrite".to_string()],
+            env,
+            sources: vec!["helpscout".to_string()],
+            ..Default::default()
+        };
+        let servers = vec![(&name, &cfg)];
+        let file = ClaudeAgentRunner::render_mcp_config(&servers).expect("render");
+        let doc: serde_json::Value = serde_json::from_str(&read_temp(&file)).unwrap();
+        let server = &doc["mcpServers"]["appwrite"];
+        assert_eq!(server["command"], "uvx");
+        assert_eq!(server["args"][0], "mcp-server-appwrite");
+        assert_eq!(server["env"]["APPWRITE_API_KEY"], "${APPWRITE_API_KEY}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(file.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn test_redact_mcp_for_log_masks_secrets() {
+        let name = "grafana".to_string();
+        let mut env = HashMap::new();
+        // Pure ${VAR} ref -> shown; literal secret and JSON blob -> masked.
+        env.insert(
+            "GRAFANA_URL".to_string(),
+            "https://tel.example.com/".to_string(),
+        );
+        env.insert(
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN".to_string(),
+            "${GRAFANA_SERVICE_ACCOUNT_TOKEN}".to_string(),
+        );
+        env.insert(
+            "GRAFANA_TOKEN_LITERAL".to_string(),
+            "glsa_realsecret".to_string(),
+        );
+        env.insert(
+            "GRAFANA_EXTRA_HEADERS".to_string(),
+            "{\"CF-Access-Client-Id\": \"${CF_ID}\"}".to_string(),
+        );
+        let cfg = McpServerConfig {
+            command: Some("uvx".to_string()),
+            args: vec!["mcp-grafana".to_string()],
+            env,
+            sources: vec!["sentry".to_string()],
+            tools: vec!["list_datasources".to_string()],
+            ..Default::default()
+        };
+        let servers = vec![(&name, &cfg)];
+        let doc = ClaudeAgentRunner::redact_mcp_for_log(&servers);
+        let env_out = &doc["mcpServers"]["grafana"]["env"];
+        // Non-secret-looking URL is still masked (we mask all non-${VAR} values).
+        assert_eq!(env_out["GRAFANA_URL"], "***");
+        // Pure var reference passes through unmasked.
+        assert_eq!(
+            env_out["GRAFANA_SERVICE_ACCOUNT_TOKEN"],
+            "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"
+        );
+        // Literal secret is masked.
+        assert_eq!(env_out["GRAFANA_TOKEN_LITERAL"], "***");
+        // JSON blob with an embedded ${VAR} is not a pure ref -> masked.
+        assert_eq!(env_out["GRAFANA_EXTRA_HEADERS"], "***");
+        // Non-secret structure is preserved.
+        assert_eq!(doc["mcpServers"]["grafana"]["command"], "uvx");
+        assert_eq!(doc["mcpServers"]["grafana"]["args"][0], "mcp-grafana");
+        assert_eq!(doc["mcpServers"]["grafana"]["sources"][0], "sentry");
+        assert_eq!(doc["mcpServers"]["grafana"]["tools"][0], "list_datasources");
+    }
+
+    #[test]
+    fn test_render_mcp_config_stdio_json_headers_env() {
+        // A stdio server whose env carries a JSON blob with ${VAR} references
+        // (e.g. Grafana behind Cloudflare Access). The value is written verbatim;
+        // Claude Code expands the ${VAR}s at runtime, including inside the string.
+        let name = "grafana".to_string();
+        let mut env = HashMap::new();
+        env.insert(
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN".to_string(),
+            "${GRAFANA_SERVICE_ACCOUNT_TOKEN}".to_string(),
+        );
+        let headers_json =
+            "{\"CF-Access-Client-Id\": \"${CF_ACCESS_CLIENT_ID}\", \"CF-Access-Client-Secret\": \"${CF_ACCESS_CLIENT_SECRET}\"}";
+        env.insert(
+            "GRAFANA_EXTRA_HEADERS".to_string(),
+            headers_json.to_string(),
+        );
+        let cfg = McpServerConfig {
+            command: Some("uvx".to_string()),
+            args: vec!["mcp-grafana".to_string()],
+            env,
+            sources: vec!["sentry".to_string()],
+            ..Default::default()
+        };
+        let servers = vec![(&name, &cfg)];
+        let file = ClaudeAgentRunner::render_mcp_config(&servers).expect("render");
+        let doc: serde_json::Value = serde_json::from_str(&read_temp(&file)).unwrap();
+        let server = &doc["mcpServers"]["grafana"];
+        assert_eq!(server["command"], "uvx");
+        assert_eq!(server["args"][0], "mcp-grafana");
+        assert_eq!(
+            server["env"]["GRAFANA_SERVICE_ACCOUNT_TOKEN"],
+            "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"
+        );
+        // The JSON blob survives round-trip unescaped and unexpanded.
+        assert_eq!(server["env"]["GRAFANA_EXTRA_HEADERS"], headers_json);
+    }
+
+    #[test]
+    fn test_render_mcp_config_http() {
+        let name = "remote".to_string();
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer ${TOKEN}".to_string());
+        let cfg = McpServerConfig {
+            url: Some("https://example.com/mcp".to_string()),
+            transport: Some("http".to_string()),
+            headers,
+            ..Default::default()
+        };
+        let servers = vec![(&name, &cfg)];
+        let file = ClaudeAgentRunner::render_mcp_config(&servers).expect("render");
+        let doc: serde_json::Value = serde_json::from_str(&read_temp(&file)).unwrap();
+        let server = &doc["mcpServers"]["remote"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "https://example.com/mcp");
+        assert_eq!(server["headers"]["Authorization"], "Bearer ${TOKEN}");
+        // stdio-only fields must be absent for an http transport.
+        assert!(server.get("command").is_none());
+        assert!(server.get("args").is_none());
+        assert!(server.get("env").is_none());
+    }
+
     #[test]
     fn test_create_execution_log_files_produces_valid_paths() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -3197,7 +4055,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_with_issue() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("id-42", "PROJ-42", "A bug", "https://ex.com", "linear");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -3215,7 +4073,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_without_issue() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let (env, label) = runner.prepare_env_and_label(None);
 
         assert_eq!(label, "custom");
@@ -3225,7 +4083,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_sentry_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("s-1", "SENTRY-1", "Error", "https://sentry.io/1", "sentry");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -3243,7 +4101,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_github_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "789",
             "#789",
@@ -3260,7 +4118,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_for_issue_matches_build_prompt() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let project_dir = Path::new("/tmp");
 
@@ -3275,7 +4133,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp_dir);
         std::fs::write(tmp_dir.join("AGENT.md"), "# Agent instructions\nDo things.").unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         assert!(runner.has_agent_md(&tmp_dir));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -3288,7 +4146,7 @@ mod tests {
         let content = "# Agent\nCustom instructions here.";
         std::fs::write(tmp_dir.join("AGENT.md"), content).unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let loaded = runner.get_agent_md(&tmp_dir);
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap(), content);
@@ -3298,7 +4156,7 @@ mod tests {
 
     #[test]
     fn test_get_agent_md_returns_none_for_missing() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         assert!(runner
             .get_agent_md(Path::new("/nonexistent/path/xyz"))
             .is_none());
@@ -3804,7 +4662,7 @@ mod tests {
             skip_permissions: true,
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         // Verify the runner works by calling methods that depend on proper initialization
         assert!(!runner.has_agent_md(Path::new("/nonexistent")));
         let issue = Issue::new("1", "T-1", "Bug", "https://example.com", "linear");
@@ -4010,7 +4868,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_contains_issue_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "LIN-1", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -4026,7 +4884,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_contains_context() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "LIN-1", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -4041,7 +4899,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_contains_short_id() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "PROJ-999", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -4056,7 +4914,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_instructs_pr_creation() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "linear");
         let prompt =
             runner.build_prompt(&issue, "ctx", Path::new("/tmp/nonexistent_project_dir_xyz"));
@@ -4408,7 +5266,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_gitlab_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("gl-1", "MR-1", "Fix", "https://gitlab.com/1", "gitlab");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -4423,7 +5281,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_jira_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("j-99", "JIRA-99", "Task", "https://jira.ex.com/99", "jira");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -4434,7 +5292,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_custom_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "c-1",
             "CUSTOM-1",
@@ -4454,7 +5312,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_env_contains_inherited_vars() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let (_env, _label) = runner.prepare_env_and_label(None);
         // The environment should contain inherited env vars from the process
         // PATH should always be present
@@ -4480,7 +5338,7 @@ mod tests {
         )
         .unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(&issue, "error context here", &tmp_dir);
 
@@ -4504,7 +5362,7 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         std::fs::write(tmp_dir.join("AGENT.md"), "# Agent v2").unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "sentry");
         let from_public = runner.build_prompt_for_issue(&issue, "ctx", &tmp_dir);
         let from_private = runner.build_prompt(&issue, "ctx", &tmp_dir);
@@ -4842,7 +5700,7 @@ mod tests {
             model: Some("haiku".to_string()),
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         assert_eq!(runner.config.model.as_deref(), Some("haiku"));
     }
 
@@ -4852,7 +5710,7 @@ mod tests {
             timeout_secs: 42,
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         assert_eq!(runner.config.timeout_secs, 42);
     }
 
@@ -4862,7 +5720,7 @@ mod tests {
             skip_permissions: true,
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         assert!(runner.config.skip_permissions);
     }
 
@@ -4872,7 +5730,7 @@ mod tests {
             instructions: Some("Be thorough".to_string()),
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         assert_eq!(runner.config.instructions.as_deref(), Some("Be thorough"));
     }
 
@@ -4882,13 +5740,13 @@ mod tests {
             permissions: vec!["Bash".to_string(), "Read".to_string()],
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         assert_eq!(runner.config.permissions, vec!["Bash", "Read"]);
     }
 
     #[test]
     fn test_runner_base_env_captures_process_env() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         // The base_env should be a snapshot of the process environment
         assert!(!runner.base_env.is_empty());
         // PATH is virtually always present
@@ -5014,7 +5872,7 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         std::fs::write(tmp_dir.join("AGENT.md"), "# GitHub Agent").unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "42",
             "#42",
@@ -5041,7 +5899,7 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         std::fs::write(tmp_dir.join("AGENT.md"), "# Sentry Handler").unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "99",
             "SENTRY-99",
@@ -5493,16 +6351,14 @@ more output"#;
 
     #[test]
     fn test_claude_agent_runner_name() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         assert_eq!(runner.name(), "claude");
     }
 
     #[test]
     fn test_claude_agent_runner_capabilities() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         let caps = runner.capabilities();
         assert!(
@@ -5526,8 +6382,7 @@ more output"#;
 
     #[test]
     fn test_claude_agent_runner_build_prompt_delegates() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         let issue = Issue::new("1", "LIN-1", "Bug title", "https://example.com", "linear");
         // The trait method should produce the same result as the internal method
@@ -5538,9 +6393,8 @@ more output"#;
 
     #[tokio::test]
     async fn test_claude_execute_nonexistent_binary_returns_error() {
-        use claudear_storage::SqliteTracker;
         // Use a project_dir that does not exist to force a spawn error
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let config = ClaudeRunnerConfig::default();
         let runner = ClaudeAgentRunner::new(config, tracker);
         let result = runner
@@ -5562,6 +6416,7 @@ more output"#;
         );
     }
 
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn test_claude_execute_records_activity_on_failure() {
         use claudear_storage::SqliteTracker;
@@ -5603,8 +6458,7 @@ more output"#;
 
     #[test]
     fn test_claude_agent_runner_as_dyn_trait() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         // Verify it can be used as Arc<dyn AgentRunner>
         let agent: Arc<dyn AgentRunner> = Arc::new(runner);
@@ -5612,8 +6466,6 @@ more output"#;
         let caps = agent.capabilities();
         assert!(caps.structured_output);
     }
-
-    // --- Additional coverage tests ---
 
     #[test]
     fn test_structured_result_with_changelog() {
@@ -5988,7 +6840,7 @@ more output"#;
 
     #[test]
     fn test_prepare_env_and_label_does_not_include_claudecode() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let (env, _) = runner.prepare_env_and_label(None);
         // The base_env should have filtered out CLAUDECODE
         assert!(!env.contains_key("CLAUDECODE"));
@@ -5996,7 +6848,7 @@ more output"#;
 
     #[test]
     fn test_prepare_env_and_label_discord_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("d-1", "DISC-1", "Bug", "https://discord.com/1", "discord");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
         assert_eq!(label, "DISC-1");
@@ -6009,7 +6861,7 @@ more output"#;
 
     #[test]
     fn test_prepare_env_and_label_slack_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("s-1", "SLACK-1", "Task", "https://slack.com/1", "slack");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
         assert_eq!(label, "SLACK-1");
@@ -6328,8 +7180,6 @@ more output"#;
             "Schema description should describe confidence scoring"
         );
     }
-
-    // --- StructuredResult → extraction logic tests ---
 
     /// Simulate the extraction logic from execute(): parse a serde_json::Value as
     /// StructuredResult and extract the confidence fields, matching lines 1418-1447.

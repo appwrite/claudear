@@ -1,3 +1,5 @@
+import { getCsrfToken } from './api'
+
 const API_BASE = '/api'
 
 export interface ModelDetails {
@@ -50,7 +52,10 @@ export async function getModelInfo(modelId: string): Promise<ModelInfoResponse> 
 export async function downloadModel(url?: string): Promise<void> {
   const res = await fetch(`${API_BASE}/chat/models/download`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-csrf-token': getCsrfToken(),
+    },
     body: JSON.stringify({ url }),
   })
   if (!res.ok) {

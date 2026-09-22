@@ -3,7 +3,7 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use claudear_config::config::RetryConfig;
 use claudear_core::error::Result;
-use claudear_core::types::{ActivityLogEntry, FixAttempt, FixAttemptStatus};
+use claudear_core::types::{ActivityLogEntry, FixAttempt, FixAttemptStatus, TimelineEventStatus};
 use claudear_storage::FixAttemptTracker;
 use serde_json::json;
 use std::sync::Arc;
@@ -106,6 +106,18 @@ impl RetryManager {
                             self.config.max_retries, error
                         ),
                     )?;
+                    // Timeline: max retries reached, cannot auto-fix.
+                    self.tracker
+                        .record_activity(
+                            &ActivityLogEntry::new(
+                                TimelineEventStatus::FixAbandoned.as_str(),
+                                format!("Fix abandoned for {} (max retries)", attempt.short_id),
+                            )
+                            .with_source(source.to_string())
+                            .with_issue(issue_id.to_string(), attempt.short_id.clone())
+                            .with_metadata(json!({ "max_retries": self.config.max_retries })),
+                        )
+                        .ok();
                     let _ = self
                         .tracker
                         .update_qa_outcome_stats_for_attempt(attempt.id, false);

@@ -5,6 +5,8 @@ import {
   fetchAttempts,
   fetchConfig,
   fetchDependencies,
+  fetchDiscordChannels,
+  fetchDiscordChannelStats,
   fetchErrors,
   fetchExperiments,
   fetchFeedback,
@@ -83,6 +85,10 @@ const routePrefetchers: Record<string, () => void> = {
     queuePreload('repos', fetchRepos)
     queuePreload('repo-stats', fetchRepoStats)
     queuePreload('dependencies', fetchDependencies)
+  },
+  '/channels': () => {
+    queuePreload('discord-channels', fetchDiscordChannels)
+    queuePreload('discord-channel-stats', fetchDiscordChannelStats)
   },
   '/learning': () => {
     queuePreload('repos', fetchRepos)

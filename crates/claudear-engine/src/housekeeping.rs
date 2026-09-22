@@ -7,6 +7,7 @@
 //! regardless of how issues are ingested.
 
 use crate::watcher::Watcher;
+use chrono::Utc;
 use std::sync::Arc;
 use tokio::time::{interval, Duration, Instant};
 
@@ -30,8 +31,8 @@ impl HousekeepingWorker {
     ///
     /// 1. Warm-start (clone repos, sync DB, load feedback).
     /// 2. Mark the watcher as running.
-    /// 3. On every tick: retries, cascades, auto-close, reviews, metrics, and
-    ///    periodic learning.
+    /// 3. On every tick: retries, cascades, auto-close, reviews, metrics,
+    ///    periodic learning and report-gen
     pub async fn start(&self) -> anyhow::Result<()> {
         // Warm-start: clone repos, sync to DB, index code, load feedback
         self.watcher.warm_start().await?;
@@ -54,6 +55,16 @@ impl HousekeepingWorker {
 
         let reindex_interval = self.watcher.reindex_interval();
         let mut last_reindex = Instant::now();
+
+        let discord_reindex_interval = self.watcher.discord_reindex_interval();
+        let mut last_discord_reindex = Instant::now();
+
+        // Weekly digest of repetitive, non-actionable Sentry issues. State is
+        // held locally in this owned loop (no interior mutability needed). On a
+        // process restart `last_sent_at` resets; `is_due` gates on weekday +
+        // exact hour + a 6-day window, so a duplicate is only possible if the
+        // daemon restarts during the target hour on the target weekday.
+        let mut digest_schedule = self.watcher.repetitive_digest_schedule();
 
         while self.watcher.is_running() {
             timer.tick().await;
@@ -90,6 +101,14 @@ impl HousekeepingWorker {
                 }
             }
 
+            // Periodically re-index the Discord knowledge source
+            if let Some(discord_dur) = discord_reindex_interval {
+                if last_discord_reindex.elapsed() >= discord_dur {
+                    self.watcher.reindex_discord_knowledgebase().await;
+                    last_discord_reindex = Instant::now();
+                }
+            }
+
             // Run independent housekeeping jobs concurrently
             let auto_close_fut = async {
                 if !self.watcher.is_dry_run() {
@@ -121,8 +140,28 @@ impl HousekeepingWorker {
                 }
             };
 
-            let (_, _, housekeeping_ok, _) =
-                tokio::join!(auto_close_fut, reviews_fut, housekeeping_fut, learning_fut);
+            // Weekly repetitive-issues digest (report-only).
+            let digest_fut = async {
+                if !self.watcher.is_dry_run() {
+                    if let Some(schedule) = digest_schedule.as_mut() {
+                        let now = Utc::now();
+                        if schedule.is_due(now) {
+                            if let Err(e) = self.watcher.send_repetitive_digest().await {
+                                tracing::error!(component = "digest", error = %e, "Error sending repetitive-issues digest");
+                            }
+                            schedule.last_sent_at = Some(now);
+                        }
+                    }
+                }
+            };
+
+            let (_, _, housekeeping_ok, _, _) = tokio::join!(
+                auto_close_fut,
+                reviews_fut,
+                housekeeping_fut,
+                learning_fut,
+                digest_fut
+            );
 
             let duration_secs = cron_start.elapsed().as_secs_f64();
             let cron_status = if housekeeping_ok { "ok" } else { "error" };

@@ -6,7 +6,7 @@
 use super::{AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
 use claudear_core::error::{Error, Result};
-use claudear_core::types::{AgentResult, Issue};
+use claudear_core::types::{AgentResult, Issue, ReplyKind, VerifyResult};
 use rand::RngExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -188,6 +188,72 @@ impl AgentRunner for AgentOrchestrator {
                 Err(last_error.unwrap_or_else(|| Error::runner("All providers failed")))
             }
         }
+    }
+
+    async fn answer_question(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<String> {
+        // Read-only Q&A always uses the primary provider.
+        let provider = self
+            .providers
+            .first()
+            .map(|p| &p.provider)
+            .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
+        provider.answer_question(issue, context, project_dir).await
+    }
+
+    async fn verify_issue(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<VerifyResult> {
+        // Read-only verification always uses the primary provider.
+        let provider = self
+            .providers
+            .first()
+            .map(|p| &p.provider)
+            .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
+        provider.verify_issue(issue, context, project_dir).await
+    }
+
+    async fn generate_reply(
+        &self,
+        issue: &Issue,
+        context: &str,
+        guideline: Option<&str>,
+        kind: ReplyKind,
+        project_dir: &Path,
+    ) -> Result<String> {
+        // Read-only reply generation always uses the primary provider.
+        let provider = self
+            .providers
+            .first()
+            .map(|p| &p.provider)
+            .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
+        provider
+            .generate_reply(issue, context, guideline, kind, project_dir)
+            .await
+    }
+
+    async fn structured_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+    ) -> Result<serde_json::Value> {
+        // Read-only structured queries always use the primary provider.
+        let provider = self
+            .providers
+            .first()
+            .map(|p| &p.provider)
+            .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
+        provider
+            .structured_query(prompt, json_schema, project_dir)
+            .await
     }
 }
 

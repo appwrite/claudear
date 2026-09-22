@@ -414,18 +414,17 @@ pub async fn login_handler(
         .create_session(user.id, &expires_str)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Set cookie
-    // Only set Secure flag when not on localhost — browsers (notably Firefox)
-    // may refuse to send Secure cookies over ws:// WebSocket connections even
-    // to localhost, breaking the indexing-progress WebSocket endpoint.
-    let is_localhost = matches!(
-        state.config.bind_address.as_str(),
-        "127.0.0.1" | "localhost" | "::1"
-    );
+    // Set cookie.
+    // Mark the cookie Secure only when the server is actually serving HTTPS
+    // (TLS enabled). Keying this off bind_address would force Secure=true for
+    // any non-localhost bind (e.g. "0.0.0.0"), so a plain-HTTP deployment would
+    // have browsers silently drop the cookie — login succeeds but every
+    // subsequent request is unauthenticated. This mirrors the CSRF cookie,
+    // which already keys off tls.enabled.
     let mut cookie = Cookie::new(SESSION_COOKIE, token);
     cookie.set_path("/");
     cookie.set_http_only(true);
-    cookie.set_secure(!is_localhost);
+    cookie.set_secure(state.config.tls.enabled);
     cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
     cookie.set_max_age(tower_cookies::cookie::time::Duration::days(
         SESSION_MAX_AGE_DAYS,
@@ -926,6 +925,7 @@ mod tests {
             processing_delay_ms: 5000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
+            debug_logging: false,
             agent: AgentConfig::default(),
             scm: ScmConfig::default(),
             issues: IssuesConfig::default(),
@@ -938,6 +938,7 @@ mod tests {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            retrieval_eval: Default::default(),
             evaluation: claudear_config::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: claudear_config::config::DashboardConfig::default(),
@@ -945,6 +946,9 @@ mod tests {
             chat: claudear_config::config::ChatConfig::default(),
             tls: claudear_config::config::TlsConfig::default(),
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
+            qa: claudear_config::config::QaConfig::default(),
+            knowledgebase: claudear_config::config::KnowledgebasesConfig::default(),
+            reports: claudear_config::config::ReportsConfig::default(),
         }
     }
 

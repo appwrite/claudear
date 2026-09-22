@@ -164,11 +164,11 @@ impl EmbeddingClient {
 
         // --- Pool size: min(desired, RAM budget) ----------------------------
         let nproc = default_pool_size();
-        let pool_size = if per_instance_bytes > 0 {
-            // Budget: 60% of the memory that was available *before* we loaded
-            // the first instance (so the first instance counts against it).
-            let budget = mem_before * 6 / 10;
-            let max_from_memory = (budget / per_instance_bytes).max(1) as usize;
+        // Budget: 60% of the memory that was available *before* we loaded
+        // the first instance (so the first instance counts against it).
+        let budget = mem_before * 6 / 10;
+        let pool_size = if let Some(quotient) = budget.checked_div(per_instance_bytes) {
+            let max_from_memory = quotient.max(1) as usize;
             // Cap at the requested pool size (or nproc if not explicitly set).
             let capped = max_from_memory.min(desired_pool_size);
             tracing::info!(

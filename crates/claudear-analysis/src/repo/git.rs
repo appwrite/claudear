@@ -62,11 +62,52 @@ impl GitOps {
     ///
     /// If the repository doesn't exist locally, it will be cloned.
     /// If it exists, only `git fetch origin` is run — the working tree is untouched.
-    pub async fn ensure_repo_fetched(repo_path: &Path, scm_url: &str) -> Result<()> {
+    ///
+    /// After fetching/cloning, updates `refs/remotes/origin/HEAD` so the remote's
+    /// default branch can be detected, and returns the detected default branch name.
+    pub async fn ensure_repo_fetched(repo_path: &Path, scm_url: &str) -> Result<String> {
         if repo_path.exists() {
-            Self::fetch_all(repo_path).await
+            Self::fetch_all(repo_path).await?;
         } else {
-            Self::clone(scm_url, repo_path).await
+            Self::clone(scm_url, repo_path).await?;
+        }
+
+        // Update origin/HEAD so we know the remote's default branch.
+        Self::update_remote_head(repo_path).await;
+
+        Ok(Self::detect_default_branch(repo_path).await)
+    }
+
+    /// Ensure a repository is current *and* its working tree is advanced to the
+    /// remote's default branch.
+    pub async fn ensure_repo_synced(repo_path: &Path, scm_url: &str) -> Result<String> {
+        // Repair single-branch/stale-refspec clones so the fetch sees the current default.
+        if Self::is_git_repo(repo_path) {
+            Self::ensure_all_branches_tracked(repo_path).await;
+        }
+        let default_branch = Self::ensure_repo_fetched(repo_path, scm_url).await?;
+        Self::checkout_reset(repo_path, &default_branch).await?;
+        Ok(default_branch)
+    }
+
+    /// Set the fetch refspec to track all branches (`git remote set-branches origin '*'`).
+    async fn ensure_all_branches_tracked(repo_path: &Path) {
+        let output = Command::new("git")
+            .args(["remote", "set-branches", "origin", "*"])
+            .current_dir(repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        match output {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::debug!(repo = ?repo_path, error = %stderr, "Failed to widen fetch refspec");
+            }
+            Err(e) => {
+                tracing::debug!(repo = ?repo_path, error = %e, "Failed to run git remote set-branches");
+            }
         }
     }
 
@@ -75,7 +116,7 @@ impl GitOps {
         tracing::debug!(repo = ?repo_path, "Fetching all remote refs");
 
         let output = Command::new("git")
-            .args(["fetch", "origin"])
+            .args(["fetch", "origin", "--prune"])
             .current_dir(repo_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -374,9 +415,29 @@ impl GitOps {
             return Err(Error::git(format!("git fetch failed: {}", stderr)));
         }
 
-        // Checkout the branch (branch name is validated above)
+        Self::checkout_reset(repo_path, branch).await?;
+
+        tracing::debug!(repo = ?repo_path, "Repository updated successfully");
+        Ok(())
+    }
+
+    /// Check out `branch` and hard-reset the working tree to `origin/<branch>`.
+    ///
+    /// Assumes the relevant refs are already fetched. Discards any local changes
+    /// in the working tree — callers must only use this on managed clones.
+    async fn checkout_reset(repo_path: &Path, branch: &str) -> Result<()> {
+        // Validate branch name to prevent injection via crafted branch names
+        validate_ref(branch, "branch name")?;
+
+        // Force create-or-reset the local branch to the remote tip, discarding any dirty state.
         let output = Command::new("git")
-            .args(["checkout", branch])
+            .args([
+                "checkout",
+                "-f",
+                "-B",
+                branch,
+                &format!("origin/{}", branch),
+            ])
             .current_dir(repo_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -404,7 +465,6 @@ impl GitOps {
             return Err(Error::git(format!("git reset failed: {}", stderr)));
         }
 
-        tracing::debug!(repo = ?repo_path, "Repository updated successfully");
         Ok(())
     }
 
@@ -412,6 +472,81 @@ impl GitOps {
     pub fn is_git_repo(path: &Path) -> bool {
         let git_path = path.join(".git");
         git_path.is_dir() || git_path.is_file()
+    }
+
+    /// Detect the remote's default branch by reading `refs/remotes/origin/HEAD`.
+    ///
+    /// Returns the branch name (e.g. `"main"`) or falls back to `"main"` if the
+    /// ref cannot be read.
+    pub async fn detect_default_branch(repo_path: &Path) -> String {
+        let output = Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let refname = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                // e.g. "refs/remotes/origin/main" → "main"
+                refname
+                    .strip_prefix("refs/remotes/origin/")
+                    .unwrap_or("main")
+                    .to_string()
+            }
+            _ => "main".to_string(),
+        }
+    }
+
+    /// Synchronous version of [`detect_default_branch`](Self::detect_default_branch)
+    /// for use in non-async contexts (e.g. filesystem index building).
+    pub fn detect_default_branch_sync(repo_path: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(repo_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let refname = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                refname
+                    .strip_prefix("refs/remotes/origin/")
+                    .unwrap_or("main")
+                    .to_string()
+            }
+            _ => "main".to_string(),
+        }
+    }
+
+    /// Update `refs/remotes/origin/HEAD` to match the remote's default branch.
+    ///
+    /// This queries the remote to determine its HEAD, so it requires network
+    /// access. Failures are logged but not propagated since this is best-effort.
+    async fn update_remote_head(repo_path: &Path) {
+        let output = Command::new("git")
+            .args(["remote", "set-head", "origin", "--auto"])
+            .current_dir(repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                tracing::debug!(repo = ?repo_path, "Updated origin/HEAD");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::debug!(repo = ?repo_path, error = %stderr, "Failed to update origin/HEAD");
+            }
+            Err(e) => {
+                tracing::debug!(repo = ?repo_path, error = %e, "Failed to run git remote set-head");
+            }
+        }
     }
 
     /// Get the current branch of a repository.
@@ -1080,9 +1215,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Now ensure_repo_fetched should just fetch
+        // Now ensure_repo_fetched should just fetch and return the default branch
         let result = GitOps::ensure_repo_fetched(&target, &url).await;
-        assert!(result.is_ok(), "fetch failed: {:?}", result.unwrap_err());
+        let default_branch = result.expect("fetch failed");
+        assert_eq!(default_branch, "main");
     }
 
     // ════════════════════════════════════════════════════════════

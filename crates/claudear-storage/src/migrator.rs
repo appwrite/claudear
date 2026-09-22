@@ -26,6 +26,51 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_session_last_active",
         sql: include_str!("../../../migrations/V2__add_session_last_active.sql"),
     },
+    Migration {
+        version: 3,
+        name: "action_runs",
+        sql: include_str!("../../../migrations/V3__action_runs.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "support_reply_ratings",
+        sql: include_str!("../../../migrations/V4__support_reply_ratings.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "issue_recurrence",
+        sql: include_str!("../../../migrations/V5__issue_recurrence.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "support_discord_knowledgebase",
+        sql: include_str!("../../../migrations/V6__support_discord_knowledgebase.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "retrieval_usage",
+        sql: include_str!("../../../migrations/V7__retrieval_usage.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "answer_message_ids",
+        sql: include_str!("../../../migrations/V8__answer_message_ids.sql"),
+    },
+    Migration {
+        version: 9,
+        name: "pr_review_states_issue_comments",
+        sql: include_str!("../../../migrations/V9__pr_review_states_issue_comments.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "agent_instructions",
+        sql: include_str!("../../../migrations/V10__agent_instructions.sql"),
+    },
+    Migration {
+        version: 11,
+        name: "fix_attempt_routing_intent",
+        sql: include_str!("../../../migrations/V11__fix_attempt_routing_intent.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -86,7 +131,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 11);
 
         // Verify a table from V1 exists
         let count: u32 = conn
@@ -97,6 +142,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+
+        // Verify the V8 column exists on fix_attempts.
+        let has_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('fix_attempts') WHERE name = 'answer_message_ids'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_col, 1);
+
+        // Verify the V9 columns exist: the issue-comment cursor on pr_review_states
+        // and the handled ledger on pr_review_comments.
+        let has_issue_comment_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pr_review_states') WHERE name = 'last_issue_comment_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_issue_comment_col, 1);
+
+        let has_handled_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pr_review_comments') WHERE name = 'handled_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_handled_col, 1);
+
+        let has_kind_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pr_review_comments') WHERE name = 'comment_kind'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_kind_col, 1);
+
+        // Verify the V10 table exists.
+        let has_instructions: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agent_instructions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_instructions, 1);
+
+        // Verify the V11 column exists on fix_attempts.
+        let has_routing_intent: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('fix_attempts') WHERE name = 'routing_intent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_routing_intent, 1);
     }
 
     #[test]
@@ -111,7 +215,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -167,6 +271,10 @@ mod tests {
             "eval_deltas",
             "chat_sessions",
             "chat_messages",
+            "action_runs",
+            "support_reply_ratings",
+            "issue_recurrence",
+            "retrieval_usage",
         ];
 
         for table in expected_tables {

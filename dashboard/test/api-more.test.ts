@@ -190,7 +190,7 @@ describe("additional api coverage", () => {
 
     expect(postCall).toBeTruthy();
     expect(postCall?.init?.method).toBe("POST");
-    expect(postCall?.init?.headers).toEqual({ "Content-Type": "application/json" });
+    expect(postCall?.init?.headers).toEqual({ "Content-Type": "application/json", "x-csrf-token": "" });
     expect(postCall?.init?.body).toBe(
       JSON.stringify({ experiment_name: "exp", variant: "control", prompt_template: "prompt" })
     );

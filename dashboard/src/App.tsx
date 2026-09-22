@@ -13,6 +13,7 @@ import FeedbackPage from './pages/feedback'
 import RegressionsPage from './pages/regressions'
 import ExperimentsPage from './pages/experiments'
 import ReposPage from './pages/repos'
+import ChannelsPage from './pages/channels'
 import InferencePage from './pages/inference'
 import ActivityPage from './pages/activity'
 import UsersPage from './pages/users'
@@ -54,6 +55,7 @@ const routes: Record<string, () => JSX.Element | null> = {
   '/regressions': RegressionsPage,
   '/experiments': ExperimentsPage,
   '/repos': ReposPage,
+  '/channels': ChannelsPage,
   '/learning': LearningPage,
   '/chat': ChatPage,
   '/models': ModelsPage,

@@ -1,7 +1,9 @@
 //! Discord webhook notifier.
 
 use super::Notifier;
-use crate::discord::{CreateMessageParams, DiscordClient, MessageEmbed};
+use crate::ask_reply_inbox;
+use crate::discord::{CreateMessageParams, DiscordClient, DiscordMessageReference, MessageEmbed};
+use crate::reports::RepetitiveDigest;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_config::config::DiscordConfig;
@@ -50,6 +52,12 @@ impl DiscordWebhookClient for ReqwestDiscordWebhookClient {
 
         Ok(HttpResponse { status, body })
     }
+}
+
+/// Metadata returned after successfully sending a Discord message.
+struct SentMessageInfo {
+    message_id: String,
+    channel_id: String,
 }
 
 /// Discord webhook notifier.
@@ -171,10 +179,15 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         }
     }
 
-    async fn send(&self, message: DiscordMessage) -> Result<()> {
+    async fn send(&self, message: DiscordMessage) -> Result<Option<SentMessageInfo>> {
         if let Some(ref webhook_url) = self.config.webhook_url {
             let body = serde_json::to_value(&message)?;
-            let response = self.http.post_json(webhook_url.expose(), &body).await?;
+            let url_with_wait = if webhook_url.expose().contains('?') {
+                format!("{}&wait=true", webhook_url.expose())
+            } else {
+                format!("{}?wait=true", webhook_url.expose())
+            };
+            let response = self.http.post_json(&url_with_wait, &body).await?;
 
             if response.status < 200 || response.status >= 300 {
                 return Err(Error::notifier(
@@ -183,19 +196,66 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
                 ));
             }
 
-            return Ok(());
+            let info = serde_json::from_str::<serde_json::Value>(&response.body)
+                .ok()
+                .and_then(|v| {
+                    let id = v.get("id")?.as_str()?.to_string();
+                    let channel_id = v.get("channel_id")?.as_str()?.to_string();
+                    Some(SentMessageInfo {
+                        message_id: id,
+                        channel_id,
+                    })
+                });
+            return Ok(info);
         }
 
         if let Some(ref client) = self.bot_client {
             if let Some(ref channel_id) = self.config.channel_id {
                 if !channel_id.is_empty() {
                     let params = Self::to_create_message_params(&message);
-                    client.send_message(channel_id, params).await?;
+                    let sent = client.send_message(channel_id, params).await?;
+                    return Ok(Some(SentMessageInfo {
+                        message_id: sent.id,
+                        channel_id: sent.channel_id,
+                    }));
                 }
             }
         }
 
-        Ok(())
+        Ok(None)
+    }
+
+    /// Send a message, preferring the channel the issue originated from.
+    ///
+    /// When a bot client is available and the issue carries an originating
+    /// `channel_id` (e.g. a Discord question), the message is posted there.
+    /// When `reply_to_origin` is true, it is sent as a native Discord reply to
+    /// the originating message (`issue.id`), so the answer is threaded under the
+    /// question. Replies require the bot path; the webhook fallback ignores the
+    /// reply and posts a standalone message.
+    async fn send_to_issue_channel(
+        &self,
+        issue: &Issue,
+        message: DiscordMessage,
+        reply_to_origin: bool,
+    ) -> Result<Option<SentMessageInfo>> {
+        let origin_channel = issue
+            .get_metadata::<String>("channel_id")
+            .filter(|c| !c.is_empty());
+        if let (Some(client), Some(channel_id)) = (self.bot_client.as_ref(), origin_channel) {
+            let mut params = Self::to_create_message_params(&message);
+            if reply_to_origin {
+                // Reply to the original Discord message so the answer is
+                // visibly threaded to the question it addresses.
+                params.message_reference = origin_reply_reference(issue, &channel_id);
+            }
+            let sent = client.send_message(&channel_id, params).await?;
+            return Ok(Some(SentMessageInfo {
+                message_id: sent.id,
+                channel_id: sent.channel_id,
+            }));
+        }
+        self.send(message).await
     }
 
     fn has_bot_channel(&self) -> bool {
@@ -210,6 +270,28 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
                 .as_ref()
                 .map(|v| !v.is_empty())
                 .unwrap_or(false)
+    }
+
+    /// Returns true when at least one concrete delivery path exists:
+    /// a non-empty webhook URL, or a successfully constructed bot client
+    /// paired with a non-empty channel ID.
+    fn has_delivery_path(&self) -> bool {
+        let has_webhook = self
+            .config
+            .webhook_url
+            .as_ref()
+            .map(|v| !v.expose().is_empty())
+            .unwrap_or(false);
+
+        let has_bot = self.bot_client.is_some()
+            && self
+                .config
+                .channel_id
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+
+        has_webhook || has_bot
     }
 
     fn to_create_message_params(msg: &DiscordMessage) -> CreateMessageParams {
@@ -352,6 +434,136 @@ pub(crate) fn build_start_message(issue: &Issue, mention: Option<String>) -> Dis
             timestamp: Some(timestamp()),
         }]),
     }
+}
+
+/// Maximum number of message chunks to send for a single answer.
+const MAX_ANSWER_CHUNKS: usize = 5;
+
+/// Split `text` into UTF-8-safe chunks of at most `max_len` bytes, preferring to
+/// break on newline boundaries. At most `max_chunks` are produced; if content
+/// remains beyond the cap, a truncation marker is appended to the last chunk.
+pub(crate) fn chunk_text(text: &str, max_len: usize, max_chunks: usize) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() || max_len == 0 || max_chunks == 0 {
+        return Vec::new();
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() && chunks.len() < max_chunks {
+        if remaining.len() <= max_len {
+            chunks.push(remaining.to_string());
+            remaining = "";
+            break;
+        }
+
+        // Largest char boundary <= max_len.
+        let mut split = max_len;
+        while split > 0 && !remaining.is_char_boundary(split) {
+            split -= 1;
+        }
+        // Prefer breaking on the last newline in the first half..split for cleaner output.
+        if let Some(nl) = remaining[..split].rfind('\n') {
+            if nl > max_len / 2 {
+                split = nl + 1;
+            }
+        }
+        if split == 0 {
+            // Pathological: a single char wider than max_len shouldn't happen, but
+            // guard against an infinite loop.
+            split = remaining.len().min(max_len.max(1));
+            while split < remaining.len() && !remaining.is_char_boundary(split) {
+                split += 1;
+            }
+        }
+
+        chunks.push(remaining[..split].to_string());
+        remaining = remaining[split..].trim_start_matches('\n');
+    }
+
+    if !remaining.is_empty() {
+        let marker = "\n…(answer truncated)";
+        if let Some(last) = chunks.last_mut() {
+            let budget = max_len.saturating_sub(marker.len());
+            if last.len() > budget {
+                let mut cut = budget;
+                while cut > 0 && !last.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                last.truncate(cut);
+            }
+            last.push_str(marker);
+        }
+    }
+
+    chunks
+}
+
+/// Build the Discord message(s) carrying a RAG-grounded answer. Long answers are
+/// split across multiple embeds/messages.
+/// Build a native-reply reference targeting the message that originated `issue`,
+/// so a reply is threaded under the original question.
+///
+/// Returns `None` when the issue carries no usable message id (nothing to reply
+/// to), in which case the caller posts a standalone message instead.
+pub(crate) fn origin_reply_reference(
+    issue: &Issue,
+    channel_id: &str,
+) -> Option<DiscordMessageReference> {
+    if issue.id.is_empty() {
+        return None;
+    }
+    Some(DiscordMessageReference {
+        message_id: Some(issue.id.clone()),
+        channel_id: Some(channel_id.to_string()),
+        guild_id: None,
+        // Deliver even if the original question was deleted in the meantime.
+        fail_if_not_exists: Some(false),
+    })
+}
+
+pub(crate) fn build_answer_messages(
+    issue: &Issue,
+    answer: &str,
+    mention: Option<String>,
+) -> Vec<DiscordMessage> {
+    let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
+    let chunks = chunk_text(answer, MAX_DESCRIPTION_LENGTH, MAX_ANSWER_CHUNKS);
+    let total = chunks.len();
+
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let title = if i == 0 {
+                Some(format!("\u{1F4AC} Answer: {}", short_id))
+            } else {
+                None
+            };
+            let footer_text = if total > 1 {
+                format!("Claudear \u{00B7} {}/{}", i + 1, total)
+            } else {
+                "Claudear".to_string()
+            };
+            DiscordMessage {
+                content: if i == 0 { mention.clone() } else { None },
+                embeds: Some(vec![DiscordEmbed {
+                    title,
+                    description: Some(chunk),
+                    url: if i == 0 {
+                        Some(truncate_string(&issue.url, MAX_URL_LENGTH))
+                    } else {
+                        None
+                    },
+                    color: Some(0x9b59b6), // Purple
+                    fields: None,
+                    footer: Some(DiscordFooter { text: footer_text }),
+                    timestamp: Some(timestamp()),
+                }]),
+            }
+        })
+        .collect()
 }
 
 /// Build the Discord message for a "PR created" notification.
@@ -925,6 +1137,74 @@ pub(crate) fn build_urgent_issues_message(
     })
 }
 
+/// Build the Discord message for the weekly repetitive-issues digest.
+///
+/// Returns `None` when the digest is empty (nothing to send). The mention is
+/// placed in `content` (outside the embed) so it actually pings the user.
+pub(crate) fn build_repetitive_digest_message(
+    digest: &RepetitiveDigest,
+    mention: Option<String>,
+) -> Option<DiscordMessage> {
+    if digest.is_empty() {
+        return None;
+    }
+
+    let fields: Vec<DiscordField> = digest
+        .entries
+        .iter()
+        .take(10)
+        .map(|entry| {
+            let title = truncate_string(&entry.title, 80);
+            let url = truncate_string(&entry.url, MAX_URL_LENGTH);
+            let escalating = if entry.is_escalating {
+                " \u{1F4C8}"
+            } else {
+                ""
+            };
+            let mut value = format!(
+                "[{}]({})\n{} events{}",
+                title, url, entry.event_count, escalating
+            );
+            if let Some(err) = &entry.last_error {
+                value.push_str(&format!("\n_{}_", truncate_string(err, 200)));
+            }
+            DiscordField {
+                name: truncate_string(&entry.short_id, MAX_SHORT_ID_LENGTH).to_string(),
+                value,
+                inline: Some(false),
+            }
+        })
+        .collect();
+
+    let extra = digest.entries.len().saturating_sub(10);
+    let mut description =
+        "These Sentry issues keep recurring but the agent can't fix them \u{2014} they need a human."
+            .to_string();
+    if extra > 0 {
+        description.push_str(&format!(" (+{} more)", extra));
+    }
+
+    Some(DiscordMessage {
+        content: mention,
+        embeds: Some(vec![DiscordEmbed {
+            title: Some(format!(
+                "\u{1F501} {} repetitive issue{} ({})",
+                digest.entries.len(),
+                if digest.entries.len() > 1 { "s" } else { "" },
+                digest.period
+            )),
+            description: Some(description),
+            url: None,
+            color: Some(0x9b59b6), // Purple
+            fields: Some(fields),
+            footer: Some(DiscordFooter {
+                text: "Claudear \u{2014} Weekly Repetitive Issues".to_string(),
+            }),
+            timestamp: Some(timestamp()),
+        }]),
+    })
+}
+
 /// Build the Discord message for a human-in-the-loop question.
 pub(crate) fn build_ask_question_message(
     issue: &Issue,
@@ -1001,7 +1281,8 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_start_message(issue, mention)).await
+        let _ = self.send(build_start_message(issue, mention)).await?;
+        Ok(())
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
@@ -1010,12 +1291,15 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             .get_metadata::<String>("cascade_downstream_repo")
             .is_some()
         {
-            self.send(build_cascade_success_message(issue, pr_url, mention))
-                .await
+            let _ = self
+                .send(build_cascade_success_message(issue, pr_url, mention))
+                .await?;
         } else {
-            self.send(build_success_message(issue, pr_url, mention))
-                .await
+            let _ = self
+                .send(build_success_message(issue, pr_url, mention))
+                .await?;
         }
+        Ok(())
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
@@ -1024,11 +1308,13 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             .get_metadata::<bool>("regression_resolved")
             .unwrap_or(false)
         {
-            self.send(build_regression_resolved_message(issue, mention))
-                .await
+            let _ = self
+                .send(build_regression_resolved_message(issue, mention))
+                .await?;
         } else {
-            self.send(build_completed_message(issue, mention)).await
+            let _ = self.send(build_completed_message(issue, mention)).await?;
         }
+        Ok(())
     }
 
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
@@ -1037,41 +1323,83 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             .get_metadata::<bool>("regression_detected")
             .unwrap_or(false)
         {
-            self.send(build_regression_detected_message(issue, error, mention))
-                .await
+            let _ = self
+                .send(build_regression_detected_message(issue, error, mention))
+                .await?;
         } else if issue
             .get_metadata::<String>("cascade_downstream_repo")
             .is_some()
         {
-            self.send(build_cascade_failed_message(issue, error, mention))
-                .await
+            let _ = self
+                .send(build_cascade_failed_message(issue, error, mention))
+                .await?;
         } else {
-            self.send(build_failed_message(issue, error, mention)).await
+            let _ = self
+                .send(build_failed_message(issue, error, mention))
+                .await?;
         }
+        Ok(())
     }
 
     async fn notify_merged(&self, issue: &Issue, pr_url: &str) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_merged_message(issue, pr_url, mention))
-            .await
+        let _ = self
+            .send(build_merged_message(issue, pr_url, mention))
+            .await?;
+        Ok(())
     }
 
     async fn notify_closed(&self, issue: &Issue, pr_url: &str) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_closed_message(issue, pr_url, mention))
-            .await
+        let _ = self
+            .send(build_closed_message(issue, pr_url, mention))
+            .await?;
+        Ok(())
     }
 
     async fn notify_status(&self, message: &str) -> Result<()> {
-        self.send(build_status_message(message)).await
+        let _ = self.send(build_status_message(message)).await?;
+        Ok(())
+    }
+
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<Vec<String>> {
+        if !self.has_delivery_path() {
+            return Err(Error::notifier(
+                "discord",
+                "No delivery path configured: need either a webhook URL or a bot token with channel ID",
+            ));
+        }
+        let mention = self.get_user_mention_for_issue(issue);
+        // Reply to the original question with the first message so the answer is
+        // threaded to it; any continuation chunks follow as normal messages. We
+        // return the ids of the sent messages so a later reply to any chunk maps
+        // back to the issue for reply-chain context.
+        let mut ids = Vec::new();
+        for (i, message) in build_answer_messages(issue, answer, mention)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(info) = self.send_to_issue_channel(issue, message, i == 0).await? {
+                ids.push(info.message_id);
+            }
+        }
+        Ok(ids)
     }
 
     async fn notify_urgent_issues(&self, issues: &[Issue]) -> Result<()> {
         let mention = self.get_user_mention();
-        match build_urgent_issues_message(issues, mention) {
-            Some(message) => self.send(message).await,
-            None => Ok(()),
+        if let Some(message) = build_urgent_issues_message(issues, mention) {
+            let _ = self.send(message).await?;
         }
+        Ok(())
+    }
+
+    async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
+        let mention = self.get_user_mention();
+        if let Some(message) = build_repetitive_digest_message(digest, mention) {
+            let _ = self.send(message).await?;
+        }
+        Ok(())
     }
 
     async fn ask_question(
@@ -1079,14 +1407,36 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         issue: &Issue,
         request: &AskRequest,
     ) -> Result<Option<AskDelivery>> {
+        if !self.has_delivery_path() {
+            return Err(Error::notifier(
+                "discord",
+                "No delivery path configured: need either a webhook URL or a bot token with channel ID",
+            ));
+        }
+
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_ask_question_message(issue, request, mention))
+        let sent_info = self
+            .send(build_ask_question_message(issue, request, mention))
             .await?;
+
+        let message_id = sent_info.as_ref().map(|info| info.message_id.clone());
+        if let Some(ref info) = sent_info {
+            ask_reply_inbox::remember_ask_delivery_id(
+                "discord",
+                &request.correlation_id,
+                info.message_id.clone(),
+            );
+            ask_reply_inbox::remember_ask_poll_channel(
+                "discord",
+                &request.correlation_id,
+                info.channel_id.clone(),
+            );
+        }
 
         Ok(Some(AskDelivery {
             channel: "discord".to_string(),
             target: self.get_target_discord_id_for_issue(issue),
-            message_id: None,
+            message_id,
         }))
     }
 
@@ -1099,29 +1449,55 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             Some(c) => c,
             None => return Ok(Vec::new()),
         };
-        let channel_id = match self.config.channel_id.as_ref() {
+
+        // Prefer the channel the webhook actually posted to (fixes M2: webhook
+        // may target a different channel than self.config.channel_id). Fall back
+        // to the configured channel_id when no remembered channel exists.
+        let poll_channel = ask_reply_inbox::ask_poll_channel("discord", &request.correlation_id);
+        let channel_id = match poll_channel
+            .as_deref()
+            .or(self.config.channel_id.as_deref())
+        {
             Some(v) if !v.is_empty() => v,
             _ => return Ok(Vec::new()),
         };
 
-        let messages = client.list_channel_messages(channel_id, 50).await?;
+        // Use remembered delivery IDs from the inbox (set during ask_question).
+        let remembered_ids: std::collections::HashSet<String> =
+            ask_reply_inbox::ask_delivery_ids("discord", &request.correlation_id)
+                .into_iter()
+                .collect();
 
-        // Identify ask messages by their embed title ("❓ Input needed: ...").
-        let ask_prefix = format!("\u{2753} Input needed: {}", request.short_id);
-        let ask_message_ids: std::collections::HashSet<String> = messages
-            .iter()
-            .filter(|m| {
-                m.embeds
+        // When we have a known ask message ID, fetch only messages posted after
+        // it (fixes the 50-message window limit). Otherwise fall back to recent
+        // history and scan by embed title.
+        let messages = if let Some(after_id) = remembered_ids.iter().min() {
+            client
+                .list_channel_messages_after(channel_id, after_id, 100)
+                .await?
+        } else {
+            client.list_channel_messages(channel_id, 100).await?
+        };
+
+        // Build the full set of ask message IDs: start with remembered IDs,
+        // then also scan fetched messages for the embed title pattern as a
+        // fallback (covers the case where remembered IDs are empty).
+        let mut ask_message_ids = remembered_ids;
+        if ask_message_ids.is_empty() {
+            let ask_prefix = format!("\u{2753} Input needed: {}", request.short_id);
+            for m in &messages {
+                if m.embeds
                     .iter()
                     .any(|e| e.title.as_ref().is_some_and(|t| t.starts_with(&ask_prefix)))
-            })
-            .map(|m| m.id.clone())
-            .collect();
+                {
+                    ask_message_ids.insert(m.id.clone());
+                }
+            }
+        }
 
         let reply_pairs: Vec<(String, AskReply)> = messages
             .into_iter()
             .filter_map(|message| {
-                // Skip the ask messages themselves.
                 if ask_message_ids.contains(&message.id) {
                     return None;
                 }
@@ -1133,14 +1509,11 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
                     .map(|dt| dt.with_timezone(&Utc))?;
 
                 // Only accept Discord replies (message_reference) to an ask message.
-                // No timestamp filter: replies matched by message_reference are
-                // authoritative regardless of timing (the reply can arrive before
-                // the daemon finishes internal bookkeeping).
                 let is_reply_to_ask = message
                     .message_reference
                     .as_ref()
                     .and_then(|r| r.message_id.as_ref())
-                    .map(|message_id| ask_message_ids.contains(message_id))
+                    .map(|mid| ask_message_ids.contains(mid))
                     .unwrap_or(false);
 
                 if !is_reply_to_ask {
@@ -1161,9 +1534,19 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             })
             .collect();
 
-        // React to reply messages with an emoji
         for (msg_id, _) in &reply_pairs {
-            let emojis = ["🎉", "💜", "✨", "🌟", "🙌", "💪", "🔥", "🚀", "🤩", "💖"];
+            let emojis = [
+                "\u{1F389}",
+                "\u{1F49C}",
+                "\u{2728}",
+                "\u{1F31F}",
+                "\u{1F64C}",
+                "\u{1F4AA}",
+                "\u{1F525}",
+                "\u{1F680}",
+                "\u{1F929}",
+                "\u{1F496}",
+            ];
             let hash: usize = msg_id
                 .bytes()
                 .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
@@ -1197,6 +1580,100 @@ mod tests {
         assert_eq!(get_source_emoji("sentry"), "\u{1F534}");
         assert_eq!(get_source_emoji("github"), "\u{1F419}");
         assert_eq!(get_source_emoji("unknown"), "\u{1F4CC}");
+    }
+
+    #[test]
+    fn test_chunk_text_short_single_chunk() {
+        let chunks = chunk_text("hello world", 2048, 5);
+        assert_eq!(chunks, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn test_chunk_text_empty() {
+        assert!(chunk_text("", 2048, 5).is_empty());
+        assert!(chunk_text("   ", 2048, 5).is_empty());
+    }
+
+    #[test]
+    fn test_chunk_text_splits_on_length() {
+        let text = "a".repeat(50);
+        let chunks = chunk_text(&text, 20, 5);
+        assert!(chunks.len() >= 3);
+        for c in &chunks {
+            assert!(c.len() <= 20);
+        }
+        // Concatenation preserves all content (no truncation within cap).
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn test_chunk_text_respects_max_chunks_and_marks_truncation() {
+        let text = "a".repeat(1000);
+        let chunks = chunk_text(&text, 20, 2);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.last().unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn test_build_answer_messages_first_has_title_and_mention() {
+        let issue = Issue::new("123", "DISCORD-123", "Q", "https://x/y", "discord");
+        let msgs = build_answer_messages(&issue, "a short answer", Some("<@1>".to_string()));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content.as_deref(), Some("<@1>"));
+        let embed = &msgs[0].embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("DISCORD-123"));
+        assert_eq!(embed.description.as_deref(), Some("a short answer"));
+    }
+
+    #[test]
+    fn test_build_answer_messages_multichunk_only_first_has_mention() {
+        let issue = Issue::new("123", "DISCORD-123", "Q", "https://x/y", "discord");
+        let long = "b".repeat(MAX_DESCRIPTION_LENGTH * 2 + 100);
+        let msgs = build_answer_messages(&issue, &long, Some("<@1>".to_string()));
+        assert!(msgs.len() >= 2);
+        assert_eq!(msgs[0].content.as_deref(), Some("<@1>"));
+        assert!(msgs[1].content.is_none());
+        // Continuation embeds carry no title.
+        assert!(msgs[1].embeds.as_ref().unwrap()[0].title.is_none());
+    }
+
+    // --- Native reply reference (threading answers to the question) ---
+
+    #[test]
+    fn test_origin_reply_reference_targets_original_message() {
+        let issue = Issue::new(
+            "1511974915572502629",
+            "DISCORD-15119749",
+            "what is query not equal syntax?",
+            "https://discord/x",
+            "discord",
+        );
+        let r = origin_reply_reference(&issue, "1471462861338312775")
+            .expect("reference should be built for a non-empty message id");
+
+        // Replies to the originating Discord message, in its channel.
+        assert_eq!(r.message_id.as_deref(), Some("1511974915572502629"));
+        assert_eq!(r.channel_id.as_deref(), Some("1471462861338312775"));
+        // Must not fail delivery if the question was deleted meanwhile.
+        assert_eq!(r.fail_if_not_exists, Some(false));
+    }
+
+    #[test]
+    fn test_origin_reply_reference_none_without_message_id() {
+        let mut issue = Issue::new("", "DISCORD-1", "q", "u", "discord");
+        issue.id.clear();
+        assert!(origin_reply_reference(&issue, "chan").is_none());
+    }
+
+    #[test]
+    fn test_reply_reference_serializes_required_fields() {
+        let issue = Issue::new("99", "DISCORD-9", "q", "u", "discord");
+        let r = origin_reply_reference(&issue, "chan").unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        // The reply target and graceful-degrade flag must reach Discord.
+        assert!(json.contains("\"message_id\":\"99\""));
+        assert!(json.contains("\"channel_id\":\"chan\""));
+        assert!(json.contains("\"fail_if_not_exists\":false"));
     }
 
     #[test]
@@ -1599,7 +2076,7 @@ mod tests {
         notifier.notify_start(&issue).await.unwrap();
 
         let (url, _) = notifier.http.get_last_call().unwrap();
-        assert_eq!(url, "https://discord.com/api/webhooks/123/abc");
+        assert_eq!(url, "https://discord.com/api/webhooks/123/abc?wait=true");
     }
 
     #[tokio::test]
@@ -2952,7 +3429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ask_question_disabled_webhook_returns_ok_delivery() {
+    async fn test_ask_question_disabled_webhook_returns_error() {
         let config = DiscordConfig {
             webhook_url: None,
             user_id: None,
@@ -2963,9 +3440,10 @@ mod tests {
         let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
         let request = make_ask_request("tok-9", "Confirm?", None, vec![], None, None);
 
-        let result = notifier.ask_question(&issue, &request).await.unwrap();
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().channel, "discord");
+        let result = notifier.ask_question(&issue, &request).await;
+        assert!(result.is_err());
+        let err_str = result.unwrap_err().to_string();
+        assert!(err_str.contains("No delivery path configured"));
     }
 
     #[tokio::test]
@@ -3568,6 +4046,62 @@ mod tests {
         assert!(msg.embeds.is_some());
     }
 
+    fn test_digest(entries: Vec<crate::reports::RepetitiveEntry>) -> RepetitiveDigest {
+        RepetitiveDigest {
+            period: "Last 7 Days".to_string(),
+            from: Utc::now(),
+            to: Utc::now(),
+            entries,
+        }
+    }
+
+    #[test]
+    fn test_build_repetitive_digest_message_empty_is_none() {
+        let digest = test_digest(vec![]);
+        assert!(build_repetitive_digest_message(&digest, Some("<@1>".to_string())).is_none());
+    }
+
+    #[test]
+    fn test_build_repetitive_digest_message_has_mention_and_fields() {
+        let digest = test_digest(vec![
+            crate::reports::RepetitiveEntry {
+                issue_id: "A".to_string(),
+                short_id: "SENTRY-A".to_string(),
+                title: "Pool exhausted".to_string(),
+                url: "https://sentry.io/A".to_string(),
+                event_count: 1200,
+                is_escalating: true,
+                last_error: Some("max retries reached".to_string()),
+                repo: Some("o/r".to_string()),
+            },
+            crate::reports::RepetitiveEntry {
+                issue_id: "B".to_string(),
+                short_id: "SENTRY-B".to_string(),
+                title: "Timeout".to_string(),
+                url: "https://sentry.io/B".to_string(),
+                event_count: 80,
+                is_escalating: false,
+                last_error: None,
+                repo: None,
+            },
+        ]);
+
+        let msg = build_repetitive_digest_message(&digest, Some("<@123>".to_string())).unwrap();
+        // Mention must be in content (outside embed) so it pings.
+        assert_eq!(msg.content.as_deref(), Some("<@123>"));
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed
+            .title
+            .as_ref()
+            .unwrap()
+            .contains("2 repetitive issues"));
+        let fields = embed.fields.as_ref().unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "SENTRY-A");
+        assert!(fields[0].value.contains("1200 events"));
+        assert!(fields[0].value.contains("max retries reached"));
+    }
+
     #[test]
     fn test_build_success_message_fields() {
         let issue = test_issue();
@@ -3896,7 +4430,7 @@ mod tests {
         // Should have used the webhook (mock was called), not the bot API
         assert_eq!(notifier.http.get_call_count(), 1);
         let (url, _) = notifier.http.get_last_call().unwrap();
-        assert_eq!(url, "https://discord.com/api/webhooks/123/abc");
+        assert_eq!(url, "https://discord.com/api/webhooks/123/abc?wait=true");
     }
 
     #[test]

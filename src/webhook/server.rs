@@ -1,6 +1,6 @@
 //! HTTP server for webhooks.
 
-use super::{GitHubWebhookHandler, WebhookHandler, WebhookHandlerRegistry};
+use super::{GitHubWebhookHandler, WebhookAction, WebhookHandler, WebhookHandlerRegistry};
 use crate::config::Config;
 use crate::error::Error;
 use crate::error::Result;
@@ -49,11 +49,15 @@ struct AppState {
     embedding_client: Option<Arc<crate::feedback::EmbeddingClient>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
+    discord_search_service: Option<Arc<crate::knowledgebase::DiscordSearchService>>,
     #[allow(dead_code)]
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     user_registry: UserRegistry,
     agent: Arc<dyn AgentRunner>,
+    /// Optional runner for answering questions (uses `qa_model`).
+    /// Falls back to `agent` when not set.
+    qa_agent: Option<Arc<dyn AgentRunner>>,
     github_handler: Option<GitHubWebhookHandler>,
     suppression_regex_cache: Option<crate::prioritisation::suppression::RegexCache>,
     /// Tracks currently processing webhooks with timestamps for TTL-based cleanup.
@@ -82,9 +86,12 @@ pub struct WebhookServer {
     embedding_client: Option<Arc<crate::feedback::EmbeddingClient>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
+    discord_search_service: Option<Arc<crate::knowledgebase::DiscordSearchService>>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     github_handler: Option<GitHubWebhookHandler>,
     agent: Arc<dyn AgentRunner>,
+    /// Optional runner for answering questions (uses `qa_model`); falls back to `agent`.
+    qa_agent: Option<Arc<dyn AgentRunner>>,
     port: u16,
     /// When set, the dashboard API routes are merged into the webhook server.
     dashboard_config_path: Option<std::path::PathBuf>,
@@ -136,12 +143,20 @@ impl WebhookServer {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             review_watcher: None,
             github_handler,
             agent,
+            qa_agent: None,
             port,
             dashboard_config_path: None,
         }
+    }
+
+    /// Set a dedicated runner for answering questions (uses `qa_model`).
+    /// When unset, question answering falls back to the main agent.
+    pub fn set_qa_agent(&mut self, qa_agent: Option<Arc<dyn AgentRunner>>) {
+        self.qa_agent = qa_agent;
     }
 
     /// Set the issue embedding service for semantic dedup and context enrichment.
@@ -155,6 +170,13 @@ impl WebhookServer {
         service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
     ) {
         self.code_search_service = service;
+    }
+
+    pub fn set_discord_search_service(
+        &mut self,
+        service: Option<Arc<crate::knowledgebase::DiscordSearchService>>,
+    ) {
+        self.discord_search_service = service;
     }
 
     /// Set the review watcher for PR review tracking.
@@ -226,11 +248,13 @@ impl WebhookServer {
             embedding_client,
             issue_embedding_service: self.issue_embedding_service,
             code_search_service: self.code_search_service,
+            discord_search_service: self.discord_search_service,
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
             review_watcher: self.review_watcher,
             user_registry,
             github_handler: self.github_handler,
             suppression_regex_cache,
+            qa_agent: self.qa_agent,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -261,6 +285,15 @@ impl WebhookServer {
                 config_path,
                 indexing_rx,
                 None,
+            );
+            // Apply the dashboard middleware (cookies, CSRF, CORS, security
+            // headers) to the dashboard routes only — not the webhook routes,
+            // whose inbound POSTs carry no CSRF token. Without this the
+            // CookieManagerLayer is absent and dashboard login 500s with
+            // "Can't extract cookies. Is `CookieManagerLayer` enabled?".
+            let dashboard_routes = claudear_engine::api::apply_dashboard_middleware(
+                dashboard_routes,
+                state.config.tls.enabled,
             );
             webhook_routes.merge(dashboard_routes)
         } else {
@@ -816,11 +849,22 @@ async fn handle_github_webhook(
         .process_webhook(body.as_ref(), &payload, header_map)
         .await
     {
-        Ok(true) => (StatusCode::OK, Json(json!({ "status": "processed" }))),
-        Ok(false) => (
+        Ok(WebhookAction::Processed) => (StatusCode::OK, Json(json!({ "status": "processed" }))),
+        Ok(WebhookAction::Ignored) => (
             StatusCode::OK,
             Json(json!({ "status": "ignored", "reason": "Event not applicable" })),
         ),
+        Ok(WebhookAction::PrClosed { pr_url, merged }) => {
+            handle_pr_closed_webhook(&state, &pr_url, merged);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "processed",
+                    "action": "pr_closed",
+                    "merged": merged
+                })),
+            )
+        }
         Err(Error::Webhook(_)) | Err(Error::InvalidSignature) => {
             let rejected_activity = ActivityLogEntry::new(
                 "webhook_rejected",
@@ -840,6 +884,96 @@ async fn handle_github_webhook(
                 Json(json!({ "error": "Failed to process GitHub webhook" })),
             )
         }
+    }
+}
+
+/// Handle a PR closed/merged event received via webhook.
+///
+/// Looks up the fix attempt by PR URL and updates its status immediately so the
+/// dashboard reflects reality without waiting for the next polling cycle. Cascade
+/// triggering is intentionally left to the housekeeping loop.
+fn handle_pr_closed_webhook(state: &Arc<AppState>, pr_url: &str, merged: bool) {
+    let attempt = match state.tracker.get_attempt_by_pr_url(pr_url) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            tracing::debug!(
+                source = "github",
+                pr_url = %pr_url,
+                "No fix attempt found for PR URL, ignoring close event"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(
+                source = "github",
+                pr_url = %pr_url,
+                error = %e,
+                "Failed to look up fix attempt by PR URL"
+            );
+            return;
+        }
+    };
+
+    if merged {
+        if let Err(e) = state
+            .tracker
+            .mark_merged(&attempt.source, &attempt.issue_id)
+        {
+            tracing::error!(
+                source = "github",
+                issue_id = %attempt.issue_id,
+                error = %e,
+                "Failed to mark attempt as merged via webhook"
+            );
+            return;
+        }
+
+        let activity =
+            ActivityLogEntry::new("pr_merged", format!("PR merged (webhook): {}", pr_url))
+                .with_source(attempt.source.clone())
+                .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                .with_metadata(json!({ "pr_url": pr_url, "via": "webhook" }));
+        state.tracker.record_activity(&activity).ok();
+
+        if attempt.scm_repo.is_some() {
+            state.tracker.update_pr_status(pr_url, "merged").ok();
+        }
+    } else {
+        if let Err(e) = state
+            .tracker
+            .mark_closed(&attempt.source, &attempt.issue_id)
+        {
+            tracing::error!(
+                source = "github",
+                issue_id = %attempt.issue_id,
+                error = %e,
+                "Failed to mark attempt as closed via webhook"
+            );
+            return;
+        }
+
+        let activity = ActivityLogEntry::new(
+            "pr_closed",
+            format!("PR closed without merge (webhook): {}", pr_url),
+        )
+        .with_source(attempt.source.clone())
+        .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+        .with_metadata(json!({ "pr_url": pr_url, "via": "webhook" }));
+        state.tracker.record_activity(&activity).ok();
+
+        if attempt.scm_repo.is_some() {
+            state.tracker.update_pr_status(pr_url, "closed").ok();
+        }
+    }
+
+    // Unwatch the PR from the review watcher since it's no longer open
+    if let Some(ref review_watcher) = state.review_watcher {
+        review_watcher.unwatch_pr(pr_url);
+        tracing::debug!(
+            source = "github",
+            pr_url = %pr_url,
+            "Unwatched PR after close/merge webhook"
+        );
     }
 }
 
@@ -874,10 +1008,12 @@ async fn process_issue(
         tracker: state.tracker.clone(),
         notifier: state.notifier.clone(),
         agent: state.agent.clone(),
+        qa_agent: state.qa_agent.clone(),
         inferrer: state.inferrer.clone(),
         embedding_client: state.embedding_client.clone(),
         issue_embedding_service: state.issue_embedding_service.clone(),
         code_search_service: state.code_search_service.clone(),
+        discord_search_service: state.discord_search_service.clone(),
         feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
             crate::feedback::FeedbackAnalyzer::new().with_tracker(state.tracker.clone()),
         )),
@@ -885,6 +1021,7 @@ async fn process_issue(
         user_registry: state.user_registry.clone(),
         github_client: None,
         llm_analyzer: None,
+        intent_classifier: None,
     };
 
     let input = ProcessingInput {
@@ -895,6 +1032,11 @@ async fn process_issue(
         attempt_id,
         review_feedback: None,
         existing_pr_branch: None,
+        // Webhook path builds its IssueProcessor with `intent_classifier: None`, so intent
+        // classification falls back to the heuristic; `None` keeps it on the fix pipeline
+        // (behaviour-preserving).
+        intent: None,
+        diagnosis: None,
     };
 
     let context_provider = WebhookContext(handler.as_ref());
@@ -1072,6 +1214,7 @@ mod tests {
             processing_delay_ms: 1000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
+            debug_logging: false,
             agent: AgentConfig::default(),
             scm: ScmConfig::default(),
             issues: IssuesConfig::default(),
@@ -1084,6 +1227,7 @@ mod tests {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            retrieval_eval: Default::default(),
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
@@ -1091,6 +1235,9 @@ mod tests {
             chat: crate::config::ChatConfig::default(),
             tls: crate::config::TlsConfig::default(),
             embedding: crate::config::EmbeddingModelConfig::default(),
+            qa: crate::config::QaConfig::default(),
+            knowledgebase: crate::config::KnowledgebasesConfig::default(),
+            reports: crate::config::ReportsConfig::default(),
         }
     }
 
@@ -1366,10 +1513,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1407,10 +1556,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(processing_set),
             suppression_regex_cache: None,
         });
@@ -1446,10 +1597,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1519,10 +1672,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1567,10 +1722,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1637,10 +1794,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1717,10 +1876,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1769,10 +1930,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1822,10 +1985,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(processing),
             suppression_regex_cache: None,
         });
@@ -1871,10 +2036,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1942,10 +2109,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -2068,10 +2237,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -2180,10 +2351,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         }
@@ -2264,10 +2437,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -2298,10 +2473,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -2330,10 +2507,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         })
@@ -2359,10 +2538,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(processing),
             suppression_regex_cache: None,
         })
@@ -2387,10 +2568,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         })
@@ -2656,10 +2839,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: Some(cache),
         });
@@ -3412,10 +3597,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -3451,10 +3638,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -3491,10 +3680,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -3643,10 +3834,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: Some(github_handler),
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -3938,10 +4131,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -4068,10 +4263,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -4120,10 +4317,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -4259,10 +4458,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: Some(github_handler),
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -4351,10 +4552,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -4386,10 +4589,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -4833,10 +5038,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -5012,10 +5219,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5052,10 +5261,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5091,10 +5302,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5130,10 +5343,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5169,10 +5384,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5208,10 +5425,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5247,10 +5466,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5290,10 +5511,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5332,10 +5555,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5381,10 +5606,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5469,10 +5696,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5499,10 +5728,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5634,10 +5865,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: Some(cache),
         });
@@ -5691,10 +5924,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: Some(cache),
         });
@@ -6064,10 +6299,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: Some(cache),
         });
@@ -6238,10 +6475,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(processing),
             suppression_regex_cache: None,
         });
@@ -6267,10 +6506,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -6464,10 +6705,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -6734,10 +6977,12 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         })

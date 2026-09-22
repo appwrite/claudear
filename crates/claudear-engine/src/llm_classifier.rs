@@ -1,9 +1,18 @@
-//! LLM-based repository classifier.
+//! Local-LLM-based classifiers.
 //!
-//! Uses a local LLM (via llama-cpp-2) to classify issues into repositories
-//! based on rich context: issue details, extracted signals, and repo profiles.
+//! Uses a local LLM (via llama-cpp-2) for classification. Provides
+//! [`LlmRepoClassifier`] (which repo an issue belongs to) and
+//! [`LocalLlmIntentClassifier`] (bug/security vs question/fix routing). Both run
+//! freeform completions against the model and parse the reply — no structured
+//! output.
 
+use crate::intent::CATEGORY_RULES;
+use crate::intent::{
+    intent_body, intent_conversation_section, intent_title, parse_intent, Intent, IntentClassifier,
+};
+use async_trait::async_trait;
 use claudear_analysis::inference::{ClassificationRequest, RepoClassifier};
+use claudear_core::types::Issue;
 use claudear_integrations::chat::llm::{GenerationParams, LlmEngine};
 use std::sync::Arc;
 use std::time::Instant;
@@ -225,10 +234,145 @@ fn truncate_prompt(prompt: &str, max_chars: usize) -> String {
     prompt[..max_chars].to_string()
 }
 
+/// Local-LLM-backed intent classifier (offline GGUF model).
+///
+/// Runs a freeform one-word completion and parses it — no structured output.
+/// The inference is synchronous and CPU-bound, so it is offloaded to a blocking
+/// thread to avoid stalling the async runtime.
+pub struct LocalLlmIntentClassifier {
+    engine: Arc<LlmEngine>,
+}
+
+impl LocalLlmIntentClassifier {
+    pub fn new(engine: Arc<LlmEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait]
+impl IntentClassifier for LocalLlmIntentClassifier {
+    async fn classify_intent(&self, issue: &Issue, conversation: Option<&str>) -> Option<Intent> {
+        let engine = self.engine.clone();
+        let issue = issue.clone();
+        let conversation = conversation.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            classify_intent_blocking(&engine, &issue, conversation.as_deref())
+        })
+        .await
+        .unwrap_or(None)
+    }
+}
+
+/// Synchronous local-LLM intent classification.
+fn classify_intent_blocking(
+    engine: &LlmEngine,
+    issue: &Issue,
+    conversation: Option<&str>,
+) -> Option<Intent> {
+    let prompt = build_intent_prompt(issue, conversation);
+    let params = GenerationParams {
+        temperature: 0.1,
+        max_tokens: 8,
+        top_p: 0.9,
+        stop_sequences: vec![
+            "\n\n".to_string(),
+            "<|end|>".to_string(),
+            "<|user|>".to_string(),
+        ],
+    };
+
+    let start = Instant::now();
+    let tokens = match engine.complete_streaming(&prompt, &params) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "Local LLM intent inference failed");
+            return None;
+        }
+    };
+    let response = tokens.join("");
+    tracing::debug!(
+        response = %response.trim(),
+        elapsed_ms = start.elapsed().as_millis(),
+        "Local LLM intent completion"
+    );
+    parse_intent(&response)
+}
+
+/// Build the intent-classification prompt using the model's chat control tokens.
+fn build_intent_prompt(issue: &Issue, conversation: Option<&str>) -> String {
+    format!(
+        "<|system|>\n\
+         You classify an incoming developer-support message into exactly one of:\n\
+         {rules}\n\
+         Respond with ONLY one word: bug, security, question, or fix.\n\
+         <|end|>\n\
+         <|user|>\n\
+         {conversation}\
+         Title: {title}\n\
+         {body}\n\
+         <|end|>\n\
+         <|assistant|>",
+        rules = CATEGORY_RULES,
+        conversation = intent_conversation_section(conversation),
+        title = intent_title(issue),
+        body = intent_body(issue),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn sample_issue(title: &str, description: Option<&str>) -> Issue {
+        use claudear_core::types::{IssuePriority, IssueStatus};
+        Issue {
+            id: "ID-1".to_string(),
+            short_id: "ID-1".to_string(),
+            title: title.to_string(),
+            description: description.map(|s| s.to_string()),
+            url: String::new(),
+            source: "discord".to_string(),
+            priority: IssuePriority::Medium,
+            status: IssueStatus::Open,
+            metadata: HashMap::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn test_build_intent_prompt_uses_control_tokens_and_contract() {
+        let issue = sample_issue("what is query not equal syntax?", None);
+        let prompt = build_intent_prompt(&issue, None);
+
+        assert!(prompt.contains("what is query not equal syntax?"));
+        assert!(prompt.contains("\"bug\""));
+        assert!(prompt.contains("\"security\""));
+        assert!(prompt.contains("\"question\""));
+        assert!(prompt.contains("\"fix\""));
+        assert!(prompt.contains("ONLY one word"));
+        // Local prompt uses the model's chat control tokens.
+        assert!(prompt.contains("<|system|>"));
+        assert!(prompt.contains("<|assistant|>"));
+    }
+
+    #[test]
+    fn test_build_intent_prompt_omits_duplicate_description() {
+        let issue = sample_issue("how do I paginate?", Some("how do I paginate?"));
+        let prompt = build_intent_prompt(&issue, None);
+        assert_eq!(prompt.matches("how do I paginate?").count(), 1);
+    }
+
+    #[test]
+    fn test_build_intent_prompt_includes_conversation() {
+        let issue = sample_issue("yes create a pr now", None);
+        let convo = "[User]: can you add dedicated scopes?\n[Claudear]: here is the plan";
+        let prompt = build_intent_prompt(&issue, Some(convo));
+        assert!(prompt.contains("can you add dedicated scopes?"));
+        assert!(prompt.contains("Classify the LATEST message"));
+        assert!(prompt.contains("yes create a pr now"));
+    }
 
     fn sample_request() -> ClassificationRequest {
         ClassificationRequest {

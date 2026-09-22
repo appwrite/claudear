@@ -1,5 +1,6 @@
 //! Main watcher that coordinates sources, Claude, and notifications.
 
+use crate::intent::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
@@ -14,11 +15,13 @@ use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActivityLogEntry, AskRequest, BlockingQuestion, FixAttemptStats, FixAttemptStatus, Issue,
-    IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric, RegressionWatch,
+    ActivityLogEntry, AskRequest, BlockingQuestion, FixAttempt, FixAttemptStats, FixAttemptStatus,
+    Issue, IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric,
+    RegressionWatch, ReplyKind, TimelineEventStatus,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
+use claudear_integrations::reports::{ReportFrequency, ReportGenerator, ReportSchedule};
 use claudear_integrations::runner::{self, AgentRunner};
 use claudear_integrations::scm::{
     PrReviewState, PrStatus, ReviewEvent, ReviewWatcher, ScmProvider,
@@ -32,6 +35,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{interval, Duration};
+
+/// A candidate issue ready for dispatch: the issue, its match result, and the
+/// decided routing `Intent` (`None` for non-QA-eligible / QA-disabled sources).
+type QueuedIssue = (Issue, MatchResult, Option<Intent>);
+
+/// How many times a PR review comment may fail processing before it is given up
+/// on (marked handled) instead of re-triggering the fix agent every cycle.
+const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
 
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
@@ -84,6 +95,8 @@ fn parse_approval_reply(answer: &str) -> ApprovalDecision {
 struct ProcessingState {
     keys: HashSet<String>,
     source_counts: HashMap<String, usize>,
+    qa_source_counts: HashMap<String, usize>,
+    qa_keys: HashSet<String>,
 }
 
 impl ProcessingState {
@@ -91,6 +104,8 @@ impl ProcessingState {
         Self {
             keys: HashSet::new(),
             source_counts: HashMap::new(),
+            qa_source_counts: HashMap::new(),
+            qa_keys: HashSet::new(),
         }
     }
 
@@ -109,7 +124,14 @@ impl ProcessingState {
     fn remove(&mut self, key: &str) -> bool {
         if self.keys.remove(key) {
             let source = source_from_processing_key(key).to_string();
-            if let Some(count) = self.source_counts.get_mut(&source) {
+            if self.qa_keys.remove(key) {
+                if let Some(count) = self.qa_source_counts.get_mut(&source) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.qa_source_counts.remove(&source);
+                    }
+                }
+            } else if let Some(count) = self.source_counts.get_mut(&source) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     self.source_counts.remove(&source);
@@ -128,6 +150,21 @@ impl ProcessingState {
     /// O(1) count of active processing items for a given source.
     fn source_count(&self, source: &str) -> usize {
         self.source_counts.get(source).copied().unwrap_or(0)
+    }
+
+    fn insert_qa(&mut self, key: String) -> bool {
+        if self.keys.insert(key.clone()) {
+            let source = source_from_processing_key(&key).to_string();
+            *self.qa_source_counts.entry(source).or_insert(0) += 1;
+            self.qa_keys.insert(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn qa_source_count(&self, source: &str) -> usize {
+        self.qa_source_counts.get(source).copied().unwrap_or(0)
     }
 
     #[allow(dead_code)]
@@ -152,6 +189,8 @@ pub struct WatcherOptions {
     pub review_watcher: Option<Arc<ReviewWatcher>>,
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub code_search_service: Option<Arc<claudear_analysis::repo::code_index::CodeSearchService>>,
+    pub discord_search_service: Option<Arc<claudear_analysis::knowledgebase::DiscordSearchService>>,
+    pub discord_index_orchestrator: Option<Arc<crate::discord_index::DiscordIndexOrchestrator>>,
     pub relationships: Option<RepoRelationships>,
     pub github_client: Option<Arc<GitHubClient>>,
     /// Generic SCM provider for PR status checking (GitLab, etc.).
@@ -159,9 +198,15 @@ pub struct WatcherOptions {
     pub scm_provider: Option<Arc<dyn ScmProvider>>,
     pub user_registry: UserRegistry,
     pub agent: Arc<dyn AgentRunner>,
-    /// Optional separate agent runner for repo classification (uses a cheaper/faster model).
+    /// Optional separate agent runner for classification (intent + repo default).
     /// Falls back to `agent` if not set.
     pub classification_agent: Option<Arc<dyn AgentRunner>>,
+    /// Optional runner for repository classification specifically (uses `repo_model`).
+    /// Falls back to `classification_agent`, then `agent`, when not set.
+    pub repo_classification_agent: Option<Arc<dyn AgentRunner>>,
+    /// Optional runner for answering questions (uses `qa_model`).
+    /// Falls back to `agent` when not set.
+    pub qa_agent: Option<Arc<dyn AgentRunner>>,
     pub dry_run: bool,
     /// Optional pre-loaded LLM engine for repo classification.
     pub llm_engine: Option<Arc<claudear_integrations::chat::llm::LlmEngine>>,
@@ -178,11 +223,16 @@ pub struct Watcher {
     review_watcher: Option<Arc<ReviewWatcher>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<claudear_analysis::repo::code_index::CodeSearchService>>,
+    discord_search_service: Option<Arc<claudear_analysis::knowledgebase::DiscordSearchService>>,
+    discord_index_orchestrator: Option<Arc<crate::discord_index::DiscordIndexOrchestrator>>,
     relationships: Option<RepoRelationships>,
     github_client: Option<Arc<GitHubClient>>,
     scm_provider: Option<Arc<dyn ScmProvider>>,
     user_registry: UserRegistry,
     agent: Arc<dyn AgentRunner>,
+    /// Optional runner for answering questions (uses `qa_model`).
+    /// Falls back to `agent` when not set.
+    qa_agent: Option<Arc<dyn AgentRunner>>,
     dry_run: bool,
     is_running: AtomicBool,
     processing: RwLock<ProcessingState>,
@@ -197,9 +247,20 @@ pub struct Watcher {
     slot_available: Notify,
     /// Optional LLM analyzer for enhanced analysis across the pipeline.
     llm_analyzer: Option<Arc<crate::llm_analyzer::LlmAnalyzerImpl>>,
+    /// Intent classifier for QA-vs-fix routing. Backend selected by `qa.use_llm`:
+    /// agent-based (Claude Code) by default, local-LLM-based when `qa.use_llm` is
+    /// set.
+    intent_classifier: Option<Arc<dyn crate::intent::IntentClassifier>>,
     /// Join handles for spawned issue-processing tasks (used by tests to drain).
     spawn_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
+
+/// A ledger comment carried by a review batch: `(scm_comment_id, comment_kind)`.
+type CommentRef = (i64, &'static str);
+
+/// Actionable review feedback grouped for one PR:
+/// `(pr_url, feedback_summary, feedback_count, comment_refs)`.
+type PrReviewFeedback = (String, String, usize, Vec<CommentRef>);
 
 impl Watcher {
     /// Create a new watcher.
@@ -210,9 +271,12 @@ impl Watcher {
         let mut inferrer = options.inferrer;
         if options.config.llm.use_agent {
             if let Some(ref mut inf) = inferrer {
+                // Repo classification prefers its own model (`repo_model`), then
+                // the shared classification runner, then the main agent.
                 let classifier_runner = options
-                    .classification_agent
+                    .repo_classification_agent
                     .clone()
+                    .or_else(|| options.classification_agent.clone())
                     .unwrap_or_else(|| options.agent.clone());
                 let agent_classifier =
                     crate::agent_classifier::AgentRepoClassifier::new(classifier_runner);
@@ -231,8 +295,29 @@ impl Watcher {
             Arc::new(crate::llm_analyzer::LlmAnalyzerImpl::new(engine.clone()))
         });
 
+        // Intent-classification backend, selected by `qa.use_llm`: local LLM when
+        // set, else the coding agent (preferring the cheaper classification agent).
+        let intent_classifier: Option<Arc<dyn crate::intent::IntentClassifier>> =
+            if options.config.qa.use_llm {
+                options.llm_engine.clone().map(|engine| {
+                    tracing::info!("Local-LLM intent classifier enabled (qa.use_llm = true)");
+                    Arc::new(crate::llm_classifier::LocalLlmIntentClassifier::new(engine))
+                        as Arc<dyn crate::intent::IntentClassifier>
+                })
+            } else {
+                let classifier_runner = options
+                    .classification_agent
+                    .clone()
+                    .unwrap_or_else(|| options.agent.clone());
+                tracing::info!("Agent-based intent classifier enabled (using configured agent)");
+                Some(Arc::new(
+                    crate::agent_classifier::AgentIntentClassifier::new(classifier_runner),
+                ))
+            };
+
         Self {
             agent: options.agent,
+            qa_agent: options.qa_agent,
             config: options.config,
             sources: options.sources,
             notifier: options.notifier,
@@ -242,6 +327,8 @@ impl Watcher {
             review_watcher: options.review_watcher,
             issue_embedding_service: options.issue_embedding_service,
             code_search_service: options.code_search_service,
+            discord_search_service: options.discord_search_service,
+            discord_index_orchestrator: options.discord_index_orchestrator,
             relationships: options.relationships,
             github_client: options.github_client,
             scm_provider: options.scm_provider,
@@ -255,6 +342,7 @@ impl Watcher {
             rate_limit_pause_until: RwLock::new(HashMap::new()),
             slot_available: Notify::new(),
             llm_analyzer,
+            intent_classifier,
             spawn_handles: tokio::sync::Mutex::new(Vec::new()),
         }
     }
@@ -729,9 +817,14 @@ impl Watcher {
         );
 
         for (name, path, scm_url) in &repos {
-            if let Err(e) = GitOps::ensure_repo_fetched(path, scm_url).await {
-                tracing::warn!(repo = %name, error = %e, "Failed to fetch repo during periodic reindex");
-                continue;
+            match GitOps::ensure_repo_synced(path, scm_url).await {
+                Ok(default_branch) => {
+                    tracing::debug!(repo = %name, default_branch = %default_branch, "Fetched repo");
+                }
+                Err(e) => {
+                    tracing::warn!(repo = %name, error = %e, "Failed to fetch repo during periodic reindex");
+                    continue;
+                }
             }
             self.reindex_repo(name, path).await;
         }
@@ -851,6 +944,9 @@ impl Watcher {
                 }
             }
         }
+
+        // Discord knowledge-source indexing (channels/threads -> embeddings)
+        self.reindex_discord_knowledgebase().await;
 
         // Load feedback outcomes from DB for learning
         match self.tracker.get_feedback_outcomes(None, 1000) {
@@ -1105,6 +1201,38 @@ impl Watcher {
         Some(std::time::Duration::from_secs_f64(hours * 3600.0))
     }
 
+    /// Periodic reindex interval for the Discord knowledge source, or `None`
+    /// when the source is absent/disabled or the interval is 0.
+    pub fn discord_reindex_interval(&self) -> Option<std::time::Duration> {
+        self.discord_index_orchestrator.as_ref()?;
+        let cfg = self.config.knowledgebase.discord.as_ref()?;
+        if !cfg.enabled || cfg.reindex_interval_hours <= 0.0 {
+            return None;
+        }
+        Some(std::time::Duration::from_secs_f64(
+            cfg.reindex_interval_hours * 3600.0,
+        ))
+    }
+
+    /// Run the Discord knowledge-source indexer once, if configured. No-op when
+    /// the orchestrator is absent (source disabled or missing token/guild).
+    pub async fn reindex_discord_knowledgebase(&self) {
+        let Some(orchestrator) = self.discord_index_orchestrator.as_ref() else {
+            return;
+        };
+        let Some(cfg) = self.config.knowledgebase.discord.as_ref() else {
+            return;
+        };
+        match orchestrator.run(cfg).await {
+            Ok(stats) => {
+                tracing::info!(%stats, "Discord knowledgebase indexing complete")
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Discord knowledgebase indexing failed")
+            }
+        }
+    }
+
     /// Check for new PR reviews that require action.
     ///
     /// This polls the ReviewWatcher for any new CHANGES_REQUESTED or COMMENTED reviews
@@ -1117,7 +1245,8 @@ impl Watcher {
 
         // Check for new reviews
         let events = review_watcher.check_for_reviews().await?;
-        for (pr_url, feedback_summary, feedback_count) in Self::group_review_feedback_by_pr(events)
+        for (pr_url, feedback_summary, feedback_count, comment_refs) in
+            Self::group_review_feedback_by_pr(events)
         {
             tracing::info!(
                 pr_url = %pr_url,
@@ -1135,24 +1264,60 @@ impl Watcher {
                         status = %attempt.status,
                         "Skipping review feedback for terminal attempt status"
                     );
+                    // The PR is merged/closed/cannot-fix: close out the ledger so
+                    // its comments stop being re-surfaced, then stop watching.
+                    if let Err(e) = self.tracker.mark_pr_review_comments_handled(&pr_url) {
+                        tracing::warn!(pr_url = %pr_url, error = %e, "Failed to close review-comment ledger for terminal PR");
+                    }
                     review_watcher.unwatch_pr(&pr_url);
                     continue;
                 }
-                if let Err(e) = self
+                match self
                     .process_review_action(&attempt, &feedback_summary)
                     .await
                 {
-                    tracing::error!(
-                        pr_url = %pr_url,
-                        error = %e,
-                        "Failed to process review feedback"
-                    );
+                    Ok(()) => {
+                        // Durably handled: acknowledge exactly the comments in this
+                        // batch so they aren't re-surfaced, without touching any
+                        // comment recorded concurrently while we were processing.
+                        if let Err(e) = self
+                            .tracker
+                            .mark_pr_review_comments_handled_by_ids(&pr_url, &comment_refs)
+                        {
+                            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to mark review comments handled");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            pr_url = %pr_url,
+                            error = %e,
+                            "Failed to process review feedback; will retry next cycle"
+                        );
+                        // Leave the batch's comments unhandled so they retry, but
+                        // count the failure so a poison comment eventually gives up.
+                        if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
+                            &pr_url,
+                            &comment_refs,
+                            MAX_REVIEW_COMMENT_ATTEMPTS,
+                        ) {
+                            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                        }
+                    }
                 }
             } else {
                 tracing::warn!(
                     pr_url = %pr_url,
                     "Received review for unknown PR, skipping"
                 );
+                // No attempt to act on; count it as a failure so this batch's
+                // uncorrelated comments don't re-surface forever.
+                if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
+                    &pr_url,
+                    &comment_refs,
+                    MAX_REVIEW_COMMENT_ATTEMPTS,
+                ) {
+                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                }
             }
         }
 
@@ -1166,8 +1331,16 @@ impl Watcher {
         )
     }
 
-    fn group_review_feedback_by_pr(events: Vec<ReviewEvent>) -> Vec<(String, String, usize)> {
+    /// Group actionable review events per PR into (pr_url, feedback_summary,
+    /// feedback_count, comment_refs). `comment_refs` are exactly the ledger comments
+    /// carried by the batch as `(scm_comment_id, comment_kind)`, so acknowledgement
+    /// targets those specific rows rather than the whole PR (which would wrongly
+    /// mark a concurrently-recorded comment handled) or a colliding id in the other
+    /// namespace.
+    fn group_review_feedback_by_pr(events: Vec<ReviewEvent>) -> Vec<PrReviewFeedback> {
         let mut feedback_by_pr: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut refs_by_pr: std::collections::HashMap<String, Vec<CommentRef>> =
             std::collections::HashMap::new();
         let mut pr_order: Vec<String> = Vec::new();
 
@@ -1180,6 +1353,10 @@ impl Watcher {
             if !feedback_by_pr.contains_key(&pr_url) {
                 pr_order.push(pr_url.clone());
             }
+            refs_by_pr
+                .entry(pr_url.clone())
+                .or_default()
+                .extend(event.comment_refs());
             feedback_by_pr
                 .entry(pr_url)
                 .or_default()
@@ -1189,9 +1366,10 @@ impl Watcher {
         pr_order
             .into_iter()
             .filter_map(|pr_url| {
+                let refs = refs_by_pr.remove(&pr_url).unwrap_or_default();
                 feedback_by_pr.remove(&pr_url).map(|feedbacks| {
                     let count = feedbacks.len();
-                    (pr_url, feedbacks.join("\n\n---\n\n"), count)
+                    (pr_url, feedbacks.join("\n\n---\n\n"), count, refs)
                 })
             })
             .collect()
@@ -1311,92 +1489,109 @@ impl Watcher {
         }
 
         // Process the issue with the review feedback appended to context.
-        if let Some(pr_url) = &attempt.pr_url {
-            // Look up the existing PR branch so the worktree can check it out
-            let existing_pr_branch = self
-                .tracker
-                .get_pr(pr_url)
-                .ok()
-                .flatten()
-                .and_then(|pr| pr.head_branch);
+        let pr_url = match &attempt.pr_url {
+            Some(url) => url,
+            None => {
+                tracing::warn!(
+                    source = %attempt.source,
+                    issue_id = %attempt.issue_id,
+                    short_id = %attempt.short_id,
+                    "Cannot process review feedback: attempt has no PR URL"
+                );
+                return Err(claudear_core::error::Error::source(
+                    &attempt.source,
+                    format!(
+                        "Attempt {} has no PR URL, cannot address review feedback",
+                        attempt.short_id
+                    ),
+                ));
+            }
+        };
 
-            tracing::info!(
-                pr_url = %pr_url,
-                branch = ?existing_pr_branch,
-                "Re-processing issue to address review feedback"
-            );
+        // Look up the existing PR branch so the worktree can check it out
+        let existing_pr_branch = self
+            .tracker
+            .get_pr(pr_url)
+            .ok()
+            .flatten()
+            .and_then(|pr| pr.head_branch);
 
-            // If the same issue is currently being processed, wait for that run
-            // to finish so review feedback isn't silently dropped.
-            let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
-            let wait_started = std::time::Instant::now();
-            let max_wait = std::time::Duration::from_secs(300);
-            loop {
-                while {
-                    let processing = self.processing.read().await;
-                    processing.contains(&processing_key)
-                } {
-                    if !self.is_running.load(Ordering::SeqCst) {
-                        return Err(claudear_core::error::Error::source(
-                            &attempt.source,
-                            format!(
-                                "Watcher stopping while waiting for in-flight processing of {}",
-                                attempt.short_id
-                            ),
-                        ));
-                    }
-                    if wait_started.elapsed() >= max_wait {
-                        return Err(claudear_core::error::Error::source(
-                            &attempt.source,
-                            format!(
-                                "Timed out waiting for in-flight processing of {}",
-                                attempt.short_id
-                            ),
-                        ));
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
+        tracing::info!(
+            pr_url = %pr_url,
+            branch = ?existing_pr_branch,
+            "Re-processing issue to address review feedback"
+        );
 
-                match self
-                    .trigger_issue_with_feedback(
+        // If the same issue is currently being processed, wait for that run
+        // to finish so review feedback isn't silently dropped.
+        let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
+        let wait_started = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(300);
+        loop {
+            while {
+                let processing = self.processing.read().await;
+                processing.contains(&processing_key)
+            } {
+                if !self.is_running.load(Ordering::SeqCst) {
+                    return Err(claudear_core::error::Error::source(
                         &attempt.source,
-                        &attempt.issue_id,
-                        Some(feedback.to_string()),
-                        existing_pr_branch.clone(),
-                        Some("Review feedback received".into()),
-                    )
-                    .await
-                {
-                    Ok(()) => break,
-                    Err(e) => {
-                        let still_processing = {
-                            let processing = self.processing.read().await;
-                            processing.contains(&processing_key)
-                        };
-                        if still_processing {
-                            if !self.is_running.load(Ordering::SeqCst) {
-                                return Err(claudear_core::error::Error::source(
-                                    &attempt.source,
-                                    format!(
-                                        "Watcher stopping while waiting for in-flight processing of {}",
-                                        attempt.short_id
-                                    ),
-                                ));
-                            }
-                            if wait_started.elapsed() >= max_wait {
-                                return Err(claudear_core::error::Error::source(
-                                    &attempt.source,
-                                    format!(
-                                        "Timed out waiting for in-flight processing of {}",
-                                        attempt.short_id
-                                    ),
-                                ));
-                            }
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            continue;
+                        format!(
+                            "Watcher stopping while waiting for in-flight processing of {}",
+                            attempt.short_id
+                        ),
+                    ));
+                }
+                if wait_started.elapsed() >= max_wait {
+                    return Err(claudear_core::error::Error::source(
+                        &attempt.source,
+                        format!(
+                            "Timed out waiting for in-flight processing of {}",
+                            attempt.short_id
+                        ),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            match self
+                .trigger_issue_with_feedback(
+                    &attempt.source,
+                    &attempt.issue_id,
+                    Some(feedback.to_string()),
+                    existing_pr_branch.clone(),
+                    Some("Review feedback received".into()),
+                )
+                .await
+            {
+                Ok(()) => break,
+                Err(e) => {
+                    let still_processing = {
+                        let processing = self.processing.read().await;
+                        processing.contains(&processing_key)
+                    };
+                    if still_processing {
+                        if !self.is_running.load(Ordering::SeqCst) {
+                            return Err(claudear_core::error::Error::source(
+                                &attempt.source,
+                                format!(
+                                    "Watcher stopping while waiting for in-flight processing of {}",
+                                    attempt.short_id
+                                ),
+                            ));
                         }
-                        return Err(e);
+                        if wait_started.elapsed() >= max_wait {
+                            return Err(claudear_core::error::Error::source(
+                                &attempt.source,
+                                format!(
+                                    "Timed out waiting for in-flight processing of {}",
+                                    attempt.short_id
+                                ),
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
                     }
+                    return Err(e);
                 }
             }
         }
@@ -1784,13 +1979,18 @@ impl Watcher {
         )?;
 
         // Fetch the downstream repo (no checkout/reset — just update object store)
-        if let Err(e) = GitOps::ensure_repo_fetched(&project_dir, &scm_url).await {
-            tracing::warn!(
-                downstream = %downstream_repo_name,
-                error = %e,
-                "Failed to fetch downstream repo, continuing anyway"
-            );
-        }
+        let detected_default_branch = match GitOps::ensure_repo_synced(&project_dir, &scm_url).await
+        {
+            Ok(branch) => branch,
+            Err(e) => {
+                tracing::warn!(
+                    downstream = %downstream_repo_name,
+                    error = %e,
+                    "Failed to fetch downstream repo, continuing with index default branch"
+                );
+                default_branch.clone()
+            }
+        };
 
         // Incrementally re-index code after fetch so code search is up-to-date
         self.reindex_repo(downstream_repo_name, &project_dir).await;
@@ -1800,7 +2000,7 @@ impl Watcher {
         let wt_path = worktree_path(&self.config.workspace, downstream_repo_name, &cascade_id);
         let effective_branch = rule
             .and_then(|r| r.target_branch.as_deref())
-            .unwrap_or(&default_branch);
+            .unwrap_or(&detected_default_branch);
         GitOps::create_worktree(
             &project_dir,
             &wt_path,
@@ -2167,6 +2367,50 @@ Create a PR with your changes.{custom_instructions}"#,
         Ok(())
     }
 
+    /// The weekly schedule for the repetitive-issues digest, or `None` when the
+    /// feature is disabled. The caller (housekeeping loop) owns the returned
+    /// schedule and its `last_sent_at` cadence state.
+    pub fn repetitive_digest_schedule(&self) -> Option<ReportSchedule> {
+        let cfg = &self.config.reports.repetitive_digest;
+        if !cfg.enabled {
+            return None;
+        }
+        let day = match ReportFrequency::parse(&format!("weekly-{}", cfg.day.to_lowercase())) {
+            Some(ReportFrequency::Weekly(d)) => d,
+            _ => chrono::Weekday::Mon,
+        };
+        Some(ReportSchedule::weekly("repetitive-digest", day, cfg.hour))
+    }
+
+    /// Build and send the weekly digest of repetitive, non-actionable Sentry
+    /// issues — issues the agent gave up on (`cannot_fix`) that keep recurring.
+    /// Report-only; the Discord notifier mentions the configured on-call user.
+    ///
+    /// Built entirely from stored data: the `cannot_fix` set joined with the
+    /// recurrence observed at processing time (see `record_issue_recurrence`).
+    /// No live API calls, so it never surfaces issues the agent hasn't seen and
+    /// tried. No-ops when nothing qualifies.
+    pub async fn send_repetitive_digest(&self) -> Result<()> {
+        let min_event_count = self.config.reports.repetitive_digest.min_event_count;
+        let digest = ReportGenerator::new(self.tracker.clone())
+            .generate_repetitive_digest(min_event_count)?;
+
+        if digest.is_empty() {
+            tracing::info!(
+                component = "digest",
+                "No repetitive non-actionable Sentry issues this week; nothing to send"
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            component = "digest",
+            count = digest.entries.len(),
+            "Sending weekly repetitive-issues digest"
+        );
+        self.notifier.notify_repetitive_digest(&digest).await
+    }
+
     /// Run housekeeping tasks: retries, cascades, and metrics.
     /// Called on the global timer, separate from per-source polling.
     pub async fn run_housekeeping_cycle(&self) -> Result<()> {
@@ -2459,6 +2703,81 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Check for merged PRs and trigger cascade processing.
+    /// After a fix merges, post a human-sounding "fix shipped" reply back to the
+    /// originating ticket. Opt-in via `[reply]`; only tracker-style sources receive
+    /// a ticket comment (conversational sources are notified via their channel).
+    async fn maybe_send_fix_shipped_reply(&self, attempt: &FixAttempt) {
+        if !self.config.reply().enabled {
+            return;
+        }
+        if matches!(
+            attempt.source.as_str(),
+            "discord" | "slack" | "telegram" | "whatsapp"
+        ) {
+            return;
+        }
+        let Some(source) = self.sources.iter().find(|s| s.name() == attempt.source) else {
+            return;
+        };
+
+        // Fetch the real issue for grounding; fall back to a synthetic one.
+        let issue = match source.get_issue(&attempt.issue_id).await {
+            Ok(i) => i,
+            Err(_) => Issue::new(
+                &attempt.issue_id,
+                &attempt.short_id,
+                "Issue resolved",
+                attempt.pr_url.as_deref().unwrap_or(""),
+                &attempt.source,
+            ),
+        };
+
+        let inbox_key = issue
+            .get_metadata::<String>("mailbox_id")
+            .unwrap_or_else(|| attempt.source.clone());
+        let guideline = self.config.reply().template_for(Some(&inbox_key));
+        let context = match attempt.pr_url.as_deref() {
+            Some(pr) => format!("The fix shipped in PR: {pr}"),
+            None => String::new(),
+        };
+
+        let scratch = std::env::temp_dir().join("claudear-qa");
+        let _ = std::fs::create_dir_all(&scratch);
+
+        let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
+        let reply = match tokio::time::timeout(
+            timeout,
+            self.agent
+                .generate_reply(&issue, &context, guideline, ReplyKind::FixShipped, &scratch),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(short_id = %attempt.short_id, error = %e, "Failed to generate fix-shipped reply");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(short_id = %attempt.short_id, "Fix-shipped reply generation timed out");
+                return;
+            }
+        };
+
+        if let Err(e) = source.add_comment(&attempt.issue_id, &reply).await {
+            tracing::warn!(short_id = %attempt.short_id, error = %e, "Failed to post fix-shipped reply");
+            return;
+        }
+        let summary: String = reply.chars().take(500).collect();
+        let _ = self.tracker.record_action_run(
+            &attempt.source,
+            &attempt.issue_id,
+            &attempt.short_id,
+            "reply",
+            "fix_shipped",
+            &summary,
+        );
+    }
+
     async fn check_pr_merges_and_cascade(&self) -> Result<()> {
         let github_client = self.github_client.as_ref();
         let scm_provider = self.scm_provider.as_ref();
@@ -2506,6 +2825,18 @@ Create a PR with your changes.{custom_instructions}"#,
                     pr_status_merged += 1;
                     self.tracker
                         .mark_merged(&attempt.source, &attempt.issue_id)?;
+                    // Timeline: PR merged.
+                    self.tracker
+                        .record_activity(
+                            &ActivityLogEntry::new(
+                                TimelineEventStatus::PrMerged.as_str(),
+                                format!("PR merged for {}", attempt.short_id),
+                            )
+                            .with_source(attempt.source.clone())
+                            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                            .with_metadata(json!({ "pr_url": attempt.pr_url })),
+                        )
+                        .ok();
                     let _ = self
                         .tracker
                         .update_qa_outcome_stats_for_attempt(attempt.id, true);
@@ -2597,6 +2928,10 @@ Create a PR with your changes.{custom_instructions}"#,
                         }
                     }
 
+                    // Action pipeline: once the fix is live, post a human-sounding
+                    // "fix shipped" reply back to the originating ticket.
+                    self.maybe_send_fix_shipped_reply(attempt).await;
+
                     // Record feedback outcome
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
                         .await;
@@ -2639,6 +2974,18 @@ Create a PR with your changes.{custom_instructions}"#,
                     pr_status_closed += 1;
                     self.tracker
                         .mark_closed(&attempt.source, &attempt.issue_id)?;
+                    // Timeline: PR closed without merging.
+                    self.tracker
+                        .record_activity(
+                            &ActivityLogEntry::new(
+                                TimelineEventStatus::PrClosed.as_str(),
+                                format!("PR closed for {}", attempt.short_id),
+                            )
+                            .with_source(attempt.source.clone())
+                            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                            .with_metadata(json!({ "pr_url": attempt.pr_url })),
+                        )
+                        .ok();
                     let _ = self
                         .tracker
                         .update_qa_outcome_stats_for_attempt(attempt.id, false);
@@ -2828,9 +3175,13 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // Apply per-source max issues per cycle limit (falls back to global)
         let source_max_issues = self.config.max_issues_per_cycle_for(source.name());
+        // QA gets its own per-cycle budget so questions (answered read-only, fast) are not
+        // starved by a burst of fix requests.
+        let source_max_qa = self.config.qa.max_qa_per_cycle;
 
-        // Sort and select: use prioritisation engine when enabled, else legacy sort.
-        let to_process: Vec<(Issue, MatchResult)> = if self.config.prioritisation.enabled {
+        // Order candidates first (prioritisation engine or legacy sort), WITHOUT capping yet —
+        // the cap(s) are applied after the QA/fix partition below.
+        let ordered: Vec<(Issue, MatchResult)> = if self.config.prioritisation.enabled {
             let (prioritised, suppressed) = claudear_analysis::prioritisation::prioritise(
                 &self.config.prioritisation,
                 candidates,
@@ -2869,21 +3220,93 @@ Create a PR with your changes.{custom_instructions}"#,
                 }
             }
 
-            // Convert back and take top N
             prioritised
                 .into_iter()
-                .take(source_max_issues)
                 .map(|pi| (pi.issue, pi.match_result))
                 .collect()
         } else {
             self.sort_by_priority(&mut candidates);
-            candidates.into_iter().take(source_max_issues).collect()
+            candidates
+        };
+
+        // Decide each issue's type (QA vs fix) at poll time for QA-eligible chat sources, then
+        // apply two independent caps: questions up to `source_max_qa`, fixes up to
+        // `source_max_issues`. The decided `Intent` rides along so `IssueProcessor` dispatches
+        // directly without re-running the classifier. Non-chat / QA-disabled sources keep the
+        // single-cap behaviour with no carried type.
+        let qa_split_enabled = self.config.qa.enabled
+            && crate::processing::qa_eligible_source(source.name())
+            && self.intent_classifier.is_some();
+
+        let to_process: Vec<(Issue, MatchResult, Option<Intent>)> = if qa_split_enabled {
+            // Classify each ordered issue via the configured backend. The local LLM
+            // backend offloads its synchronous inference to a blocking thread; the
+            // agent backend awaits an agent run. Fix-bias on ambiguity / errors,
+            // matching `classify_intent`'s contract. Sequential to avoid fanning out
+            // many concurrent agent runs.
+            let classifier = self
+                .intent_classifier
+                .clone()
+                .expect("intent_classifier present (checked by qa_split_enabled)");
+            let mut intents: Vec<Intent> = Vec::with_capacity(ordered.len());
+            for (issue, _) in &ordered {
+                // Ground the classification in the Discord reply thread (if any) so a
+                // follow-up in an ongoing QA conversation ("yes create a pr now") is
+                // classified in context and can escalate out of the read-only lane,
+                // instead of being judged as an isolated, ambiguous message. Only
+                // Claudear's own answers feed routing, so untrusted user text in the
+                // thread cannot inject a fix/PR escalation.
+                let conversation = crate::processing::assemble_reply_chain(
+                    &self.config,
+                    self.tracker.as_ref(),
+                    issue,
+                    crate::processing::TranscriptTrust::ClaudearOnly,
+                )
+                .await;
+                intents.push(
+                    classifier
+                        .classify_intent(issue, conversation.as_deref())
+                        .await
+                        .unwrap_or(Intent::Fix),
+                );
+            }
+
+            // Partition preserving prioritisation order within each bucket. Only
+            // pure questions take the QA bucket; bug/security/fix are processed.
+            let mut questions: Vec<(Issue, MatchResult, Option<Intent>)> = Vec::new();
+            let mut fixes: Vec<(Issue, MatchResult, Option<Intent>)> = Vec::new();
+            for ((issue, match_result), intent) in ordered.into_iter().zip(intents) {
+                match intent {
+                    Intent::Question => {
+                        questions.push((issue, match_result, Some(Intent::Question)))
+                    }
+                    other => fixes.push((issue, match_result, Some(other))),
+                }
+            }
+            questions.truncate(source_max_qa);
+            fixes.truncate(source_max_issues);
+            tracing::info!(
+                source = source.name(),
+                questions = questions.len(),
+                fixes = fixes.len(),
+                max_qa = source_max_qa,
+                max_issues = source_max_issues,
+                "QA/fix split applied"
+            );
+            // Questions first so they grab concurrency slots ahead of slow fix runs.
+            questions.into_iter().chain(fixes).collect()
+        } else {
+            ordered
+                .into_iter()
+                .take(source_max_issues)
+                .map(|(issue, match_result)| (issue, match_result, None))
+                .collect()
         };
 
         let to_process_count = to_process.len();
         let queued_short_ids: Vec<String> = to_process
             .iter()
-            .map(|(issue, _)| issue.short_id.clone())
+            .map(|(issue, _, _)| issue.short_id.clone())
             .collect();
         let queued_metric = ProcessingMetric::new("issues_queued", to_process_count as f64)
             .with_source(source.name().to_string());
@@ -2898,7 +3321,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 "fetched": candidates_count + duplicate_skipped + attempted_skipped + inflight_skipped + unmatched_skipped + semantic_duplicate_skipped,
                 "matched": candidates_count,
                 "queued": to_process_count,
-                "deferred": candidates_count.saturating_sub(source_max_issues),
+                "deferred": candidates_count.saturating_sub(to_process_count),
                 "skipped": {
                     "duplicate": duplicate_skipped,
                     "already_attempted": attempted_skipped,
@@ -2908,6 +3331,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 },
                 "queued_short_ids": queued_short_ids,
                 "source_max_issues": source_max_issues,
+                "source_max_qa": source_max_qa,
             }),
         );
         if to_process.is_empty() {
@@ -2915,7 +3339,7 @@ Create a PR with your changes.{custom_instructions}"#,
             return Ok(());
         }
 
-        let skipped = candidates_count.saturating_sub(source_max_issues);
+        let skipped = candidates_count.saturating_sub(to_process_count);
         if skipped > 0 {
             tracing::info!(
                 source = source.name(),
@@ -2937,7 +3361,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
             tracing::info!("");
             tracing::info!("[DRY RUN] Would process the following issues:");
-            for (issue, match_result) in &to_process {
+            for (issue, match_result, _intent) in &to_process {
                 tracing::info!("  - [{}] {}", issue.short_id, issue.title);
                 tracing::info!(
                     "    Priority: {:?}, Reason: {}",
@@ -2986,8 +3410,8 @@ Create a PR with your changes.{custom_instructions}"#,
         // Notify about urgent issues
         let urgent_issues: Vec<Issue> = to_process
             .iter()
-            .filter(|(_, m)| m.priority == MatchPriority::Urgent)
-            .map(|(i, _)| i.clone())
+            .filter(|(_, m, _)| m.priority == MatchPriority::Urgent)
+            .map(|(i, _, _)| i.clone())
             .collect();
 
         if !urgent_issues.is_empty() {
@@ -3008,58 +3432,36 @@ Create a PR with your changes.{custom_instructions}"#,
             return Ok(());
         }
 
-        // Process issues with rate limiting (per-source limit, clamped to 1 to avoid deadlock).
-        let configured_source_max_concurrent = self.config.max_concurrent_for(source.name());
-        let source_max_concurrent = configured_source_max_concurrent.max(1);
-        if configured_source_max_concurrent == 0 {
+        // Process issues with rate limiting. Questions and fixes run in independent
+        // concurrency lanes so a burst of slow fixes can never starve fast, read-only
+        // QA answers. Each lane gates on its own per-source in-flight counter
+        // (clamped to 1 to avoid deadlock).
+        let fix_max = self.config.max_concurrent_for(source.name()).max(1);
+        if self.config.max_concurrent_for(source.name()) == 0 {
             tracing::warn!(
                 source = source.name(),
                 "max_concurrent_for source evaluated to 0, clamping to 1"
             );
         }
-        for (i, (issue, match_result)) in to_process.into_iter().enumerate() {
-            if !self.is_running.load(Ordering::SeqCst) {
-                break;
-            }
-            if self.is_rate_limit_paused().await {
-                tracing::info!(
-                    source = source.name(),
-                    "Stopping source batch early due to Claude rate-limit pause"
-                );
-                break;
-            }
+        let qa_max = self.config.qa.max_concurrent.max(1);
+        if self.config.qa.max_concurrent == 0 {
+            tracing::warn!(
+                source = source.name(),
+                "qa.max_concurrent evaluated to 0, clamping to 1"
+            );
+        }
 
-            // Wait for concurrency slot (per-source limit)
-            while self.active_processing_for_source(source.name()).await >= source_max_concurrent {
-                if !self.is_running.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                if self.is_provider_rate_limited().await {
-                    tracing::info!(
-                        source = source.name(),
-                        "Stopping source batch while waiting for slot due to provider rate-limit pause"
-                    );
-                    return Ok(());
-                }
-                self.slot_available.notified().await;
-            }
+        let (questions, fixes): (Vec<QueuedIssue>, Vec<QueuedIssue>) = to_process
+            .into_iter()
+            .partition(|(_, _, intent)| matches!(intent, Some(Intent::Question)));
 
-            // Spawn processing as a background task so poll_source returns
-            // promptly and the housekeeping loop (review checks, auto-close,
-            // retries) is not starved.
-            let watcher = Arc::clone(self);
-            let source_clone = Arc::clone(source);
-            let handle = tokio::spawn(async move {
-                watcher
-                    .process_issue(source_clone, issue, match_result, None, None)
-                    .await;
-            });
-            self.spawn_handles.lock().await.push(handle);
-
-            // Add delay between starting new issues (skip trailing delay after the last item)
-            if i + 1 < to_process_count && self.config.processing_delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
-            }
+        if questions.is_empty() {
+            self.dispatch_lane(source, fixes, fix_max, false).await;
+        } else {
+            tokio::join!(
+                self.dispatch_lane(source, questions, qa_max, true),
+                self.dispatch_lane(source, fixes, fix_max, false),
+            );
         }
 
         // Record how many issues were spawned (don't fail main operation if this fails)
@@ -3072,9 +3474,90 @@ Create a PR with your changes.{custom_instructions}"#,
         Ok(())
     }
 
-    /// Number of active processing items for a specific source.
+    /// Number of active *fix-lane* processing items for a specific source.
+    /// QA items are tracked separately; see [`Self::active_qa_for_source`].
     async fn active_processing_for_source(&self, source_name: &str) -> usize {
         self.processing.read().await.source_count(source_name)
+    }
+
+    async fn active_qa_for_source(&self, source_name: &str) -> usize {
+        self.processing.read().await.qa_source_count(source_name)
+    }
+
+    /// Dispatch one concurrency lane: spawn a processing task per item, gating on the
+    /// lane's own per-source in-flight counter so it never blocks (nor is blocked by) the
+    /// other lane. `is_qa` selects the QA counter/budget vs the fix counter/budget.
+    async fn dispatch_lane(
+        self: &Arc<Self>,
+        source: &Arc<dyn IssueSource>,
+        items: Vec<QueuedIssue>,
+        max_concurrent: usize,
+        is_qa: bool,
+    ) {
+        let lane = if is_qa { "qa" } else { "fix" };
+        let total = items.len();
+        for (i, (issue, match_result, intent)) in items.into_iter().enumerate() {
+            if !self.is_running.load(Ordering::SeqCst) {
+                break;
+            }
+            if self.is_rate_limit_paused().await {
+                tracing::info!(
+                    source = source.name(),
+                    lane,
+                    "Stopping lane early due to Claude rate-limit pause"
+                );
+                break;
+            }
+
+            // Wait for a concurrency slot in THIS lane.
+            loop {
+                let in_flight = if is_qa {
+                    self.active_qa_for_source(source.name()).await
+                } else {
+                    self.active_processing_for_source(source.name()).await
+                };
+                if in_flight < max_concurrent {
+                    break;
+                }
+                if !self.is_running.load(Ordering::SeqCst) {
+                    return;
+                }
+                if self.is_provider_rate_limited().await {
+                    tracing::info!(
+                        source = source.name(),
+                        lane,
+                        "Stopping lane while waiting for slot due to provider rate-limit pause"
+                    );
+                    return;
+                }
+                self.slot_available.notified().await;
+            }
+
+            // Carry the trusted routing intent (classified upstream on trusted
+            // content) so the answered attempt is stamped with it, letting the
+            // reply-chain transcript emit a structural marker instead of
+            // re-injecting the generated answer body into the classifier.
+            let mut issue = issue;
+            if let Some(intent) = intent {
+                issue.set_metadata("routing_intent", intent.routing_label());
+            }
+
+            // Spawn processing as a background task so poll_source returns promptly and
+            // the housekeeping loop (review checks, auto-close, retries) is not starved.
+            let watcher = Arc::clone(self);
+            let source_clone = Arc::clone(source);
+            let handle = tokio::spawn(async move {
+                watcher
+                    .process_issue(source_clone, issue, match_result, None, None, intent)
+                    .await;
+            });
+            self.spawn_handles.lock().await.push(handle);
+
+            // Add delay between starting new issues (skip trailing delay after the last item).
+            if i + 1 < total && self.config.processing_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
+            }
+        }
     }
 
     /// Check whether an approval request should be sent for the given resolution.
@@ -3247,6 +3730,7 @@ Create a PR with your changes.{custom_instructions}"#,
         match_result: MatchResult,
         review_feedback: Option<String>,
         existing_pr_branch: Option<String>,
+        intent: Option<Intent>,
     ) -> bool {
         use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
 
@@ -3259,6 +3743,9 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         let processing_key = format!("{}:{}", source.name(), issue.id);
+        // Questions are counted in a dedicated QA lane so they never compete with
+        // slow fixes for the same per-source concurrency budget.
+        let is_qa = matches!(intent, Some(Intent::Question));
 
         // Atomic check-and-insert to prevent race conditions.
         {
@@ -3270,12 +3757,28 @@ Create a PR with your changes.{custom_instructions}"#,
                 );
                 return false;
             }
-            processing.insert(processing_key.clone());
+            if is_qa {
+                processing.insert_qa(processing_key.clone());
+            } else {
+                processing.insert(processing_key.clone());
+            }
         }
         self.active_processing.fetch_add(1, Ordering::SeqCst);
 
+        let intent_label = match intent {
+            Some(Intent::Question) => "question",
+            Some(Intent::Bug) => "bug",
+            Some(Intent::Security) => "security",
+            Some(Intent::Fix) => "fix",
+            None => "unclassified",
+        };
         tracing::info!("");
-        tracing::info!(short_id = %issue.short_id, title = %issue.title, "Processing issue");
+        tracing::info!(
+            short_id = %issue.short_id,
+            title = %issue.title,
+            intent = intent_label,
+            "Processing issue"
+        );
         tracing::info!(short_id = %issue.short_id, reason = %match_result.reason, "Match reason");
         tracing::info!(short_id = %issue.short_id, priority = ?match_result.priority, "Match priority");
         self.record_issue_decision(
@@ -3300,11 +3803,38 @@ Create a PR with your changes.{custom_instructions}"#,
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
 
+        // Timeline: attempt created (pending).
+        self.tracker
+            .record_activity(
+                &ActivityLogEntry::new(
+                    TimelineEventStatus::ProcessingStarted.as_str(),
+                    format!("Started processing {}", issue.short_id),
+                )
+                .with_source(issue.source.clone())
+                .with_issue(issue.id.clone(), issue.short_id.clone()),
+            )
+            .ok();
+
         // Persist full issue content to the issues table (independent of embeddings)
         {
             let stored = IssueEmbedding::from_issue(&issue);
             if let Err(e) = self.tracker.store_issue(&stored) {
                 tracing::debug!(error = %e, "Failed to store issue content");
+            }
+        }
+
+        // Persist the observed recurrence signal (Sentry event_count / escalating)
+        // so the weekly repetitive-issues digest can be built from stored
+        // observations rather than a live API call.
+        if let Some(event_count) = issue.get_metadata::<i64>("event_count") {
+            let is_escalating = issue.get_metadata::<bool>("is_escalating").unwrap_or(false);
+            if let Err(e) = self.tracker.record_issue_recurrence(
+                source.name(),
+                &issue.id,
+                event_count,
+                is_escalating,
+            ) {
+                tracing::debug!(error = %e, "Failed to record issue recurrence");
             }
         }
 
@@ -3334,6 +3864,18 @@ Create a PR with your changes.{custom_instructions}"#,
                         "project_dir": project_dir.display().to_string(),
                     }),
                 );
+                // Timeline: repository resolved.
+                self.tracker
+                    .record_activity(
+                        &ActivityLogEntry::new(
+                            TimelineEventStatus::RepoResolved.as_str(),
+                            format!("Resolved repository for {}", issue.short_id),
+                        )
+                        .with_source(issue.source.clone())
+                        .with_issue(issue.id.clone(), issue.short_id.clone())
+                        .with_metadata(json!({ "repo": resolution.repo_name() })),
+                    )
+                    .ok();
             }
             RepoResolution::Skip { .. } => {}
         }
@@ -3378,16 +3920,20 @@ Create a PR with your changes.{custom_instructions}"#,
         // Save issue info before move for post-processing
         let issue_short_id = issue.short_id.clone();
 
-        // Build IssueProcessor and delegate to shared pipeline
+        // Build IssueProcessor and delegate to shared pipeline. The processor
+        // internally routes pure questions to a read-only Q&A answer path and
+        // everything else to the fix pipeline.
         let processor = IssueProcessor {
             config: self.config.clone(),
             tracker: Arc::clone(&self.tracker),
             notifier: Arc::clone(&self.notifier),
             agent: Arc::clone(&self.agent),
+            qa_agent: self.qa_agent.clone(),
             inferrer: self.inferrer.clone(),
             embedding_client: self.embedding_client.clone(),
             issue_embedding_service: self.issue_embedding_service.clone(),
             code_search_service: self.code_search_service.clone(),
+            discord_search_service: self.discord_search_service.clone(),
             feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
                 FeedbackAnalyzer::new().with_tracker(self.tracker.clone()),
             )),
@@ -3395,6 +3941,7 @@ Create a PR with your changes.{custom_instructions}"#,
             user_registry: self.user_registry.clone(),
             github_client: self.github_client.clone(),
             llm_analyzer: self.llm_analyzer.clone(),
+            intent_classifier: self.intent_classifier.clone(),
         };
 
         let input = ProcessingInput {
@@ -3405,6 +3952,8 @@ Create a PR with your changes.{custom_instructions}"#,
             attempt_id,
             review_feedback,
             existing_pr_branch,
+            intent,
+            diagnosis: None,
         };
 
         let context_provider = crate::processing::SourceContext(source.as_ref());
@@ -3625,11 +4174,10 @@ Create a PR with your changes.{custom_instructions}"#,
         let meridiem = if let Some(rest) = tail.strip_prefix("am") {
             tail = rest;
             "am"
-        } else if let Some(rest) = tail.strip_prefix("pm") {
+        } else {
+            let rest = tail.strip_prefix("pm")?;
             tail = rest;
             "pm"
-        } else {
-            return None;
         };
 
         tail = tail.trim_start();
@@ -4031,6 +4579,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 match_result,
                 review_feedback,
                 existing_pr_branch,
+                None,
             )
             .await;
         if !started {
@@ -4044,6 +4593,72 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         Ok(())
+    }
+
+    /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
+    /// issue, bypassing classification. Backs the `claudear action ...` CLI.
+    pub async fn run_action(
+        &self,
+        action: claudear_core::types::ActionKind,
+        source_name: &str,
+        issue_id: &str,
+    ) -> Result<crate::processing::ProcessingOutcome> {
+        use crate::processing::{IssueProcessor, ProcessingInput};
+
+        let source = self
+            .sources
+            .iter()
+            .find(|s| s.name() == source_name)
+            .ok_or_else(|| claudear_core::error::Error::source(source_name, "Unknown source"))?;
+
+        let issue = source.get_issue(issue_id).await?;
+        let match_result = MatchResult::matched("Manual action", MatchPriority::Urgent);
+        let resolution =
+            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
+        let attempt_id = self
+            .tracker
+            .get_attempt(source.name(), &issue.id)
+            .ok()
+            .flatten()
+            .map(|a| a.id);
+
+        let processor = IssueProcessor {
+            config: self.config.clone(),
+            tracker: Arc::clone(&self.tracker),
+            notifier: Arc::clone(&self.notifier),
+            agent: Arc::clone(&self.agent),
+            qa_agent: self.qa_agent.clone(),
+            inferrer: self.inferrer.clone(),
+            embedding_client: self.embedding_client.clone(),
+            issue_embedding_service: self.issue_embedding_service.clone(),
+            code_search_service: self.code_search_service.clone(),
+            discord_search_service: self.discord_search_service.clone(),
+            feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
+                FeedbackAnalyzer::new().with_tracker(self.tracker.clone()),
+            )),
+            review_watcher: self.review_watcher.clone(),
+            user_registry: self.user_registry.clone(),
+            github_client: self.github_client.clone(),
+            llm_analyzer: self.llm_analyzer.clone(),
+            intent_classifier: self.intent_classifier.clone(),
+        };
+
+        let input = ProcessingInput {
+            issue,
+            source_name: source.name().to_string(),
+            match_result,
+            resolution,
+            attempt_id,
+            review_feedback: None,
+            existing_pr_branch: None,
+            intent: None,
+            diagnosis: None,
+        };
+
+        let context_provider = crate::processing::SourceContext(source.as_ref());
+        Ok(processor
+            .run_single_action(action, input, &context_provider)
+            .await)
     }
 
     /// Reset a failed attempt to allow retry.
@@ -4432,6 +5047,7 @@ mod tests {
             processing_delay_ms: 1000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
+            debug_logging: false,
             agent: claudear_config::config::AgentConfig::default(),
             scm: claudear_config::config::ScmConfig::default(),
             issues: claudear_config::config::IssuesConfig::default(),
@@ -4444,6 +5060,7 @@ mod tests {
             learning: claudear_config::config::LearningConfig::default(),
             prioritisation: claudear_config::config::PrioritisationConfig::default(),
             code_index: claudear_config::config::CodeIndexConfig::default(),
+            retrieval_eval: Default::default(),
             evaluation: claudear_config::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: claudear_config::config::DashboardConfig::default(),
@@ -4451,6 +5068,9 @@ mod tests {
             chat: claudear_config::config::ChatConfig::default(),
             tls: claudear_config::config::TlsConfig::default(),
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
+            qa: claudear_config::config::QaConfig::default(),
+            knowledgebase: claudear_config::config::KnowledgebasesConfig::default(),
+            reports: claudear_config::config::ReportsConfig::default(),
         }
     }
 
@@ -4475,12 +5095,16 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
             agent,
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run,
             llm_engine: None,
         }))
@@ -4777,6 +5401,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -4786,6 +5412,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         };
@@ -5361,6 +5989,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -5370,6 +6000,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -5416,6 +6048,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -5425,6 +6059,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -5490,6 +6126,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -5499,6 +6137,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -5556,6 +6196,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -5565,6 +6207,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -5717,6 +6361,61 @@ mod tests {
         assert!(grouped[0].1.contains("first"));
         assert!(grouped[0].1.contains("second"));
         assert!(grouped[0].1.contains("---"));
+        // Reviews carry no ledger comment ids.
+        assert!(grouped[0].3.is_empty());
+    }
+
+    #[test]
+    fn test_group_review_feedback_collects_comment_ids() {
+        // CommentsAdded events contribute their comment ids so acknowledgement can
+        // target exactly the batch, not the whole PR.
+        let mk = |id: i64| claudear_integrations::scm::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear fix".to_string(),
+            user: claudear_integrations::scm::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            html_url: format!("h{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        let events = vec![
+            claudear_integrations::scm::ReviewEvent::CommentsAdded {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                comments: vec![mk(101), mk(102)],
+            },
+            claudear_integrations::scm::ReviewEvent::CommentsAdded {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                comments: vec![mk(103)],
+            },
+        ];
+
+        let grouped = Watcher::group_review_feedback_by_pr(events);
+        assert_eq!(grouped.len(), 1);
+        let mut refs = grouped[0].3.clone();
+        refs.sort();
+        // Empty-path comments are conversation-kind; each ref namespaces its id.
+        assert_eq!(
+            refs,
+            vec![
+                (101, "conversation"),
+                (102, "conversation"),
+                (103, "conversation")
+            ]
+        );
     }
 
     #[tokio::test]
@@ -5974,6 +6673,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -5983,6 +6684,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -6061,6 +6764,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -6070,6 +6775,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -6108,6 +6815,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -6117,6 +6826,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -6729,6 +7440,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -6738,6 +7451,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7094,6 +7809,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -7103,6 +7820,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7205,6 +7924,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: Some(relationships),
             github_client: None,
             scm_provider: None,
@@ -7214,6 +7935,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7270,6 +7993,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: Some(RepoRelationships::new()),
             github_client: None,
             scm_provider: None,
@@ -7279,6 +8004,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7330,6 +8057,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: Some(RepoRelationships::new()),
             github_client: None,
             scm_provider: None,
@@ -7339,6 +8068,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7395,6 +8126,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: Some(RepoRelationships::new()),
             github_client: None,
             scm_provider: None,
@@ -7404,6 +8137,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7574,6 +8309,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -7583,6 +8320,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -7707,6 +8446,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -7716,6 +8457,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7800,6 +8543,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -7809,6 +8554,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -7845,7 +8592,7 @@ mod tests {
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
 
         let result = watcher
-            .process_issue(source, issue, match_result, None, None)
+            .process_issue(source, issue, match_result, None, None, None)
             .await;
         assert!(
             !result,
@@ -7884,6 +8631,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: Some(relationships),
             github_client: None,
             scm_provider: None,
@@ -7893,6 +8642,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7999,6 +8750,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8008,6 +8761,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -8043,6 +8798,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8052,6 +8809,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8254,6 +9013,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8263,6 +9024,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8293,6 +9056,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8302,6 +9067,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8346,6 +9113,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8355,6 +9124,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8386,6 +9157,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8395,6 +9168,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8425,6 +9200,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8434,6 +9211,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8463,6 +9242,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8472,6 +9253,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8500,6 +9283,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8509,6 +9294,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8558,6 +9345,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8567,6 +9356,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8617,6 +9408,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None, // No GitHub client
             scm_provider: None,
@@ -8626,6 +9419,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8676,6 +9471,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8685,6 +9482,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8735,6 +9534,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8744,6 +9545,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8788,6 +9591,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8797,6 +9602,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8842,6 +9649,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: Some(RepoRelationships::new()),
             github_client: None,
             scm_provider: None,
@@ -8851,6 +9660,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8971,6 +9782,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -8980,6 +9793,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -9013,7 +9828,7 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         let started = watcher
-            .process_issue(source, issue, match_result, None, None)
+            .process_issue(source, issue, match_result, None, None, None)
             .await;
         assert!(started); // true because it processed (even though it failed)
 
@@ -9200,6 +10015,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: Some(relationships),
             github_client: None,
             scm_provider: None,
@@ -9209,6 +10026,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -9250,6 +10069,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -9259,6 +10080,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9319,6 +10142,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -9328,6 +10153,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9435,6 +10262,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: Some(relationships),
             github_client: None,
             scm_provider: None,
@@ -9444,6 +10273,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9501,7 +10332,7 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         watcher
-            .process_issue(source, issue, match_result, None, None)
+            .process_issue(source, issue, match_result, None, None, None)
             .await;
 
         // Verify the attempt was recorded
@@ -9613,6 +10444,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -9622,6 +10455,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -9690,6 +10525,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: Some(relationships),
             github_client: None,
             scm_provider: None,
@@ -9699,6 +10536,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9753,6 +10592,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -9762,6 +10603,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9863,6 +10706,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -9872,6 +10717,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9896,6 +10743,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -9905,6 +10754,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10071,6 +10922,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -10080,6 +10933,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10117,6 +10972,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -10126,6 +10983,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10179,6 +11038,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -10188,6 +11049,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }))
@@ -10540,6 +11403,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -10549,6 +11414,8 @@ mod tests {
                 sqlite.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10669,11 +11536,15 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
             agent: mock_agent,
@@ -10749,11 +11620,15 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
             agent,
@@ -10862,6 +11737,55 @@ mod tests {
         state.insert("linear:1".to_string());
         assert_eq!(state.source_count("sentry"), 2);
         assert_eq!(state.source_count("linear"), 1);
+    }
+
+    #[test]
+    fn test_processing_state_insert_qa_counts_only_qa_lane() {
+        // A QA insert increments the QA lane only, leaving the fix lane at zero.
+        let mut state = ProcessingState::new();
+        assert!(state.insert_qa("discord:1".to_string()));
+        assert_eq!(state.qa_source_count("discord"), 1);
+        assert_eq!(state.source_count("discord"), 0);
+        assert!(state.contains("discord:1"));
+    }
+
+    #[test]
+    fn test_processing_state_lanes_are_independent() {
+        // Fixes and questions for the same source count in separate lanes.
+        let mut state = ProcessingState::new();
+        state.insert("discord:fix1".to_string());
+        state.insert("discord:fix2".to_string());
+        state.insert_qa("discord:q1".to_string());
+
+        assert_eq!(state.source_count("discord"), 2);
+        assert_eq!(state.qa_source_count("discord"), 1);
+    }
+
+    #[test]
+    fn test_processing_state_remove_routes_to_correct_lane() {
+        let mut state = ProcessingState::new();
+        state.insert("discord:fix1".to_string());
+        state.insert_qa("discord:q1".to_string());
+        assert_eq!(state.source_count("discord"), 1);
+        assert_eq!(state.qa_source_count("discord"), 1);
+
+        // Removing the QA key decrements only the QA lane.
+        assert!(state.remove("discord:q1"));
+        assert_eq!(state.qa_source_count("discord"), 0);
+        assert_eq!(state.source_count("discord"), 1);
+
+        // Removing the fix key decrements only the fix lane.
+        assert!(state.remove("discord:fix1"));
+        assert_eq!(state.source_count("discord"), 0);
+        assert_eq!(state.qa_source_count("discord"), 0);
+    }
+
+    #[test]
+    fn test_processing_state_insert_qa_duplicate_returns_false() {
+        let mut state = ProcessingState::new();
+        assert!(state.insert_qa("discord:1".to_string()));
+        assert!(!state.insert_qa("discord:1".to_string()));
+        assert_eq!(state.qa_source_count("discord"), 1);
     }
 
     #[test]
@@ -10983,6 +11907,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -10992,6 +11918,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11017,6 +11945,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -11026,6 +11956,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11051,6 +11983,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -11060,6 +11994,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11085,6 +12021,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -11094,6 +12032,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11120,6 +12060,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -11129,6 +12071,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11511,6 +12455,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -11520,6 +12466,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11553,6 +12501,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None, // No GitHub client
             scm_provider: None,  // No SCM provider
@@ -11562,6 +12512,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11613,6 +12565,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -11622,6 +12576,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11649,6 +12605,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -11658,6 +12616,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11804,7 +12764,7 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         let result = watcher
-            .process_issue(source, issue, match_result, None, None)
+            .process_issue(source, issue, match_result, None, None, None)
             .await;
         assert!(
             !result,
@@ -11845,6 +12805,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -11854,6 +12816,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -12412,6 +13376,8 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -12421,6 +13387,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         })

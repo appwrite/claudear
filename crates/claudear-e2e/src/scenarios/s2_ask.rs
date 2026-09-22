@@ -14,7 +14,11 @@ use std::time::Duration;
 const PORT: u16 = 3151;
 
 /// Ask-flow instructions that force Claude to use the blocking_question field.
-const ASK_INSTRUCTIONS: &str = "IMPORTANT: Before making any code changes, you MUST set success=false and populate the blocking_question field in your structured output to ask: Which testing framework should I use for this change? Set options to [pytest, unittest, none]. Do NOT use the AskUserQuestion tool - use the blocking_question field in the structured output schema instead. Do not proceed with the fix until you receive an answer.";
+///
+/// The instruction deliberately forbids making changes and requires the question
+/// as a hard gate. Without the answer, Claude cannot know which framework to use
+/// and therefore cannot produce a correct fix.
+const ASK_INSTRUCTIONS: &str = "CRITICAL CONSTRAINT: You are FORBIDDEN from creating any commits, branches, or pull requests until you have received a human answer to your blocking question. Your FIRST structured output MUST have success=false and blocking_question populated with this exact question: 'Which testing framework should I use for this change?' with options=['pytest', 'unittest', 'none']. If you return success=true or blocking_question=null on your first attempt, the system will reject your output as invalid. You MUST ask the question first and wait for the answer before proceeding.";
 
 pub async fn run(ctx: &ScenarioContext<'_>) -> Result<()> {
     let mut cleanup = CleanupTracker::new(ctx.scm.clone(), ctx.source.clone());
@@ -326,14 +330,10 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             "INSERT INTO regression_checks (regression_watch_id, issue_still_exists, check_details, checked_at) VALUES ({watch_id}, 1, 'Simulated regression detected by e2e test', datetime('now'))"
         ))?;
 
-        // 4. Set watch to regressed
+        // 4. Set watch to regressed (mirrors what the daemon does when it detects
+        // the issue still exists during monitoring)
         db.exec(&format!(
             "UPDATE regression_watches SET status='regressed', regressed_at=datetime('now') WHERE id={watch_id}"
-        ))?;
-
-        // 5. Delete old regression watch (UNIQUE constraint prevents new one)
-        db.exec(&format!(
-            "DELETE FROM regression_watches WHERE id={watch_id}"
         ))?;
     }
 

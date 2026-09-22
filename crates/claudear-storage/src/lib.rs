@@ -16,8 +16,9 @@ pub use analytics::{
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteTracker;
 pub use types::{
-    ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
-    InferenceStats, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
+    ConfidenceBreakdown, DiagnosticCounts, DiscordKnowledgebaseStats, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, PurgeResult, StoredDependency, StoredDiscordChannel,
+    StoredIndexedRepo, StoredRepository, UserRow,
 };
 #[cfg(feature = "sqlite")]
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
@@ -26,9 +27,9 @@ use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, ErrorPattern, FixAttempt, FixAttemptStats,
-    FixAttemptStatus, IssueEmbedding, PrAnalytics, PrRecord, PrReviewRecord, ProcessingMetric,
-    PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck, RegressionWatch,
-    RegressionWatchStatus, SimilarIssue,
+    FixAttemptStatus, IssueEmbedding, IssueTimeline, PrAnalytics, PrRecord, PrReviewRecord,
+    ProcessingMetric, PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck,
+    RegressionWatch, RegressionWatchStatus, SimilarIssue,
 };
 use claudear_core::types::{CrossRepoCorrelation, FixOutcome};
 use std::collections::{HashMap, HashSet};
@@ -64,6 +65,67 @@ pub fn parse_pr_url(url: &str) -> Option<(String, i64)> {
         let mr_iid: i64 = caps.get(2)?.as_str().parse().ok()?;
         return Some((project, mr_iid));
     }
+    None
+}
+
+/// A GitHub "create a PR" link the agent sometimes returns *instead of* a real
+/// PR: either the compare page (`/compare/<base>...<head>`) or the pull/new page
+/// (`/pull/new/<branch>`). These mean a branch was pushed but no PR was opened.
+/// Carries enough to open the actual PR via the API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrIntentUrl {
+    /// `owner/repo`.
+    pub repo: String,
+    /// Head branch (the pushed branch the PR should be opened from).
+    pub head: String,
+    /// Base branch. `Some` for a compare link (it names the base); `None` for a
+    /// pull/new link (caller should fall back to the repo's default branch).
+    pub base: Option<String>,
+}
+
+/// Parse a GitHub "create a PR" intent link (compare or pull/new) into its
+/// parts. Returns `None` for real PR URLs (use [`parse_pr_url`]) and for any
+/// link that isn't a recognizable compare/pull-new page.
+pub fn parse_pr_intent_url(url: &str) -> Option<PrIntentUrl> {
+    if url.len() > MAX_PR_URL_LENGTH {
+        return None;
+    }
+    // Take everything after the host, then drop any query/fragment.
+    let after_host = url.split("github.com/").nth(1)?;
+    let after_host = after_host.split(['?', '#']).next().unwrap_or(after_host);
+
+    // .../pull/new/<branch>  (branch may contain slashes)
+    if let Some(idx) = after_host.find("/pull/new/") {
+        let repo = &after_host[..idx];
+        let head = after_host[idx + "/pull/new/".len()..].trim_end_matches('/');
+        if repo.matches('/').count() == 1 && !repo.is_empty() && !head.is_empty() {
+            return Some(PrIntentUrl {
+                repo: repo.to_string(),
+                head: head.to_string(),
+                base: None,
+            });
+        }
+        return None;
+    }
+
+    // .../compare/<base>...<head>  (git refs cannot contain "..", so the split is safe)
+    if let Some(idx) = after_host.find("/compare/") {
+        let repo = &after_host[..idx];
+        if repo.matches('/').count() != 1 || repo.is_empty() {
+            return None;
+        }
+        let spec = after_host[idx + "/compare/".len()..].trim_end_matches('/');
+        let (base, head) = spec.split_once("...").or_else(|| spec.split_once(".."))?;
+        if base.is_empty() || head.is_empty() {
+            return None;
+        }
+        return Some(PrIntentUrl {
+            repo: repo.to_string(),
+            head: head.to_string(),
+            base: Some(base.to_string()),
+        });
+    }
+
     None
 }
 
@@ -126,6 +188,51 @@ pub trait AttemptTracker: Send + Sync {
     /// Mark an issue as cannot be fixed (max retries reached).
     fn mark_cannot_fix(&self, source: &str, issue_id: &str, reason: &str) -> Result<()>;
 
+    /// Mark an issue as answered (it was a question, not a fix request).
+    ///
+    /// Default no-op; persistent trackers should set the attempt status to
+    /// `answered` so it is not retried or re-polled.
+    fn mark_answered(
+        &self,
+        source: &str,
+        issue_id: &str,
+        summary: &str,
+        intent: Option<&str>,
+    ) -> Result<()> {
+        let _ = (source, issue_id, summary, intent);
+        Ok(())
+    }
+
+    /// Read the routing intent classified for an attempt, if one was stored.
+    fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
+        let _ = (source, issue_id);
+        Ok(None)
+    }
+
+    /// Record the Discord message ids of the answer chunks Claudear sent for an
+    /// issue, so a user's reply to any chunk can be mapped back to the issue.
+    ///
+    /// Default no-op; persistent trackers should store the ids for later lookup
+    /// via [`FixAttemptTracker::lookup_answer_issue`].
+    fn record_answer_message_ids(
+        &self,
+        source: &str,
+        issue_id: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        let _ = (source, issue_id, message_ids);
+        Ok(())
+    }
+
+    /// Reverse lookup: given a Discord message id the bot sent as (part of) an
+    /// answer, return the `(source, issue_id)` it belongs to, if known.
+    ///
+    /// Default returns `None`.
+    fn lookup_answer_issue(&self, message_id: &str) -> Result<Option<(String, String)>> {
+        let _ = message_id;
+        Ok(None)
+    }
+
     /// Get issues that are eligible for retry (failed/closed with retry_count < max_retries).
     fn get_retryable_issues(&self, max_retries: u32) -> Result<Vec<FixAttempt>>;
 
@@ -141,6 +248,20 @@ pub trait ActivityStore: Send + Sync {
         Ok(0)
     }
 
+    /// Record an action-pipeline run (verify verdict, reply post, etc.) for
+    /// queryability/analytics. Default no-op; the SQLite tracker persists it.
+    fn record_action_run(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+        _short_id: &str,
+        _action_kind: &str,
+        _status: &str,
+        _detail: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Get recent activity entries.
     fn get_recent_activities(&self, _limit: usize) -> Result<Vec<ActivityLogEntry>> {
         Ok(Vec::new())
@@ -151,6 +272,15 @@ pub trait ActivityStore: Send + Sync {
         &self,
         _limit: usize,
         _source_filter: Option<&str>,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        Ok(Vec::new())
+    }
+
+    /// Get all activity entries for a single issue, most recent first.
+    fn get_activities_for_issue(
+        &self,
+        _source: &str,
+        _issue_id: &str,
     ) -> Result<Vec<ActivityLogEntry>> {
         Ok(Vec::new())
     }
@@ -258,6 +388,38 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Daily commit-production trend over the last `_days` days.
+    fn get_commit_trend(
+        &self,
+        _days: usize,
+    ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
+        Ok(Vec::new())
+    }
+
+    /// List recent support replies (QA channels + HelpScout) with any existing rating.
+    fn list_support_replies(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<claudear_core::types::SupportReply>> {
+        Ok(Vec::new())
+    }
+
+    /// Record (or update) an admin's 1..5 rating for a support reply.
+    fn record_reply_rating(
+        &self,
+        _action_run_id: i64,
+        _rating: i32,
+        _note: Option<&str>,
+        _rated_by: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Aggregate support-reply rating + response-time summary.
+    fn get_support_rating_summary(&self) -> Result<claudear_core::types::SupportRatingSummary> {
+        Ok(claudear_core::types::SupportRatingSummary::default())
+    }
+
     /// Complexity-based engineering time savings estimate.
     fn get_complexity_time_savings(
         &self,
@@ -343,6 +505,40 @@ pub trait ActivityStore: Send + Sync {
     /// Prune old activity log entries. Returns count pruned.
     fn prune_old_activities(&self, _days_to_keep: i64) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Purge all operational data (attempts, PRs, executions, reviews, activity logs,
+    /// regressions, clusters, metrics) while preserving knowledge, inference, embeddings,
+    /// code index, and learned patterns.
+    ///
+    /// Feedback outcomes are detached from attempts (attempt_id set to NULL) rather than
+    /// deleted, so learnings and embeddings are retained.
+    fn purge_operational_data(&self) -> Result<types::PurgeResult> {
+        Ok(types::PurgeResult {
+            fix_attempts: 0,
+            prs: 0,
+            pr_reviews: 0,
+            pr_review_comments: 0,
+            pr_review_states: 0,
+            claude_executions: 0,
+            strategy_fingerprints: 0,
+            diff_analyses: 0,
+            regression_watches: 0,
+            release_tracking: 0,
+            regression_checks: 0,
+            qa_usage: 0,
+            activity_log: 0,
+            processing_metrics: 0,
+            webhook_deliveries: 0,
+            issue_clusters: 0,
+            issue_cluster_members: 0,
+            content_clusters: 0,
+            severity_scores: 0,
+            suppression_log: 0,
+            eval_snapshots: 0,
+            eval_deltas: 0,
+            feedback_outcomes_detached: 0,
+        })
     }
 
     /// Prune old processing metrics. Returns count pruned.
@@ -469,6 +665,51 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Get review comments recorded for a PR that have not yet been durably
+    /// handled (their feedback has not been acted upon). Re-surfaced each poll so
+    /// review-comment processing is at-least-once: a crash or downstream failure
+    /// between detecting a comment and acting on it does not drop it.
+    fn get_unhandled_pr_review_comments(
+        &self,
+        _pr_url: &str,
+    ) -> Result<Vec<claudear_core::types::ReviewComment>> {
+        Ok(Vec::new())
+    }
+
+    /// Mark every not-yet-handled review comment on a PR as durably handled.
+    /// Use only when the whole PR is done (merged/closed); to acknowledge a
+    /// processed batch, prefer [`mark_pr_review_comments_handled_by_ids`] so a
+    /// concurrently-recorded comment isn't marked without being processed.
+    fn mark_pr_review_comments_handled(&self, _pr_url: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Mark only the given comments on a PR as durably handled. Called once the
+    /// batch that carried exactly these comments has been successfully acted upon.
+    /// Each comment is `(scm_comment_id, comment_kind)` so a colliding id in the
+    /// other namespace is not acknowledged by mistake.
+    fn mark_pr_review_comments_handled_by_ids(
+        &self,
+        _pr_url: &str,
+        _comments: &[(i64, &str)],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Record a failed attempt to act on the given comments: bumps each one's
+    /// attempt count and gives up (marks the single worst offender handled) once
+    /// it reaches `max_attempts`, so a poison comment does not re-run the fix agent
+    /// forever. Each comment is `(scm_comment_id, comment_kind)` so a colliding id
+    /// in the other namespace is not charged by mistake.
+    fn note_pr_review_comment_failure_by_ids(
+        &self,
+        _pr_url: &str,
+        _comments: &[(i64, &str)],
+        _max_attempts: i64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Get fix attempts for a batch of (source, issue_id) keys.
     fn get_attempts_batch(&self, _keys: &[(&str, &str)]) -> Result<Vec<Option<FixAttempt>>> {
         Ok(Vec::new())
@@ -485,6 +726,13 @@ pub trait ActivityStore: Send + Sync {
     /// System 7: Update a PR's fix quality score.
     fn update_pr_fix_quality_score(&self, _pr_url: &str, _score: f64) -> Result<()> {
         Ok(())
+    }
+
+    fn get_issue_timeline(&self, _source: &str, _issue_id: &str) -> Result<IssueTimeline> {
+        Ok(IssueTimeline {
+            events: Vec::new(),
+            issue: String::new(),
+        })
     }
 }
 
@@ -554,6 +802,33 @@ pub trait KnowledgeStore: Send + Sync {
         Ok(0)
     }
 
+    /// Record the chunks retrieved for an attempt (retrieval-quality assessment).
+    fn record_retrieval_usage(
+        &self,
+        _rows: &[claudear_core::types::RetrievalUsageRecord],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Attach a relevance quality score to a retrieved chunk.
+    fn set_retrieval_quality(
+        &self,
+        _attempt_id: i64,
+        _source_kind: &str,
+        _chunk_ref: &str,
+        _quality_score: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read all retrieval-usage rows for an attempt (for surfacing/inspection).
+    fn get_retrieval_usage(
+        &self,
+        _attempt_id: i64,
+    ) -> Result<Vec<claudear_core::types::RetrievalUsageRecord>> {
+        Ok(Vec::new())
+    }
+
     /// Update success/failure counters for a Q&A entry.
     fn update_qa_outcome_stats(&self, _qa_id: i64, _success: bool) -> Result<()> {
         Ok(())
@@ -592,6 +867,32 @@ pub trait KnowledgeStore: Send + Sync {
         _repo: &str,
     ) -> Result<Vec<claudear_core::types::PromotedInstruction>> {
         Ok(Vec::new())
+    }
+
+    /// Upsert the single agent-instruction row for a scope (None repo = global).
+    fn upsert_agent_instruction(
+        &self,
+        _scope: claudear_core::types::InstructionScope,
+        _repo: Option<&str>,
+        _text: &str,
+        _updated_by: Option<&str>,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Get the active agent instruction for a scope, if any.
+    fn get_agent_instruction(
+        &self,
+        _scope: claudear_core::types::InstructionScope,
+        _repo: Option<&str>,
+    ) -> Result<Option<claudear_core::types::AgentInstruction>> {
+        Ok(None)
+    }
+
+    /// Resolve the effective instruction block (global + per-repo). `repo` is
+    /// None when there is no resolved repo; global instructions still apply.
+    fn resolve_agent_instructions(&self, _repo: Option<&str>) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// System 4: Upsert a repo knowledge entry.
@@ -845,6 +1146,35 @@ pub trait EmbeddingStore: Send + Sync {
     /// Count issues with optional source filter.
     fn count_issues(&self, _source: Option<&str>) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Record (upsert) the observed recurrence signal for an issue.
+    ///
+    /// Captured at processing time from the transient issue metadata so the
+    /// repetitive-issues digest can be built from stored observations rather
+    /// than a live API call. Keyed by `(source, issue_id)`; later observations
+    /// overwrite earlier ones.
+    fn record_issue_recurrence(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+        _event_count: i64,
+        _is_escalating: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fetch an issue's display fields plus its last-observed recurrence signal.
+    ///
+    /// Returns `(title, url, event_count, is_escalating)` when the issue is
+    /// stored, with recurrence defaulting to `(0, false)` if never observed.
+    /// `None` when the issue is not in storage.
+    fn get_issue_with_recurrence(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+    ) -> Result<Option<(String, String, i64, bool)>> {
+        Ok(None)
     }
 
     /// Record an inference attempt. Returns the row ID.
@@ -1165,6 +1495,143 @@ pub trait RepoStore: Send + Sync {
     }
 }
 
+pub trait DiscordStore: Send + Sync {
+    /// Batch-save range-based message chunks. Returns the assigned row ids.
+    fn save_discord_chunks(
+        &self,
+        _chunks: &[claudear_core::types::DiscordMessageChunk],
+    ) -> Result<Vec<i64>> {
+        Ok(Vec::new())
+    }
+
+    /// Save embeddings for message chunks and insert them into the HNSW index.
+    fn save_discord_chunk_embeddings(
+        &self,
+        _pairs: &[(i64, &[f32])],
+        _model_name: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Search message chunks by vector similarity, optionally scoped to one channel.
+    fn search_discord_message_chunks(
+        &self,
+        _query_embedding: &[f32],
+        _channel_id: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
+        Ok(Vec::new())
+    }
+
+    fn discord_chunk_hash_matches(&self, _channel_id: &str, _content_hash: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Delete all chunks (and CASCADE-deleted embeddings) for a channel/thread.
+    fn delete_discord_message_data_for_channel(&self, _channel_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete message chunks (and CASCADE-deleted embeddings) by chunk id.
+    fn delete_discord_message_chunks_by_ids(&self, _chunk_ids: &[i64]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Drop chunks for a channel whose `content_hash` is no longer in
+    /// `current_hashes` (messages edited/deleted since last index).
+    fn cleanup_stale_discord_message_data(
+        &self,
+        _channel_id: &str,
+        _current_hashes: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete all Discord chunks/embeddings across every channel (full reset).
+    fn delete_all_discord_message_data(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Embedding model name used for the stored Discord chunks (None if none yet).
+    fn get_discord_message_embedding_model(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Get a global value from the discord_message_chunk_metadata table.
+    fn get_discord_message_index_meta(&self, _key: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Set (upsert) a global value in the discord_message_chunk_metadata table.
+    fn set_discord_message_index_meta(&self, _key: &str, _value: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Register or refresh a discovered channel/thread (cursor left untouched).
+    #[expect(clippy::too_many_arguments)]
+    fn upsert_discord_channel(
+        &self,
+        _channel_id: &str,
+        _guild_id: Option<&str>,
+        _parent_id: Option<&str>,
+        _name: Option<&str>,
+        _channel_type: Option<i64>,
+        _kind: claudear_core::types::DiscordChannelKind,
+        _archived: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Incremental cursor for a channel/thread (None => never indexed, backfill).
+    fn get_discord_channel_cursor(&self, _channel_id: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Advance the incremental cursor for a channel/thread.
+    fn set_discord_channel_cursor(
+        &self,
+        _channel_id: &str,
+        _last_message_id: &str,
+        _indexed_at: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Backfill state `(backfill_complete, backfill_cursor)` for a channel/thread.
+    /// Defaults to `(false, None)` when backfill has not started.
+    fn get_discord_channel_backfill(&self, _channel_id: &str) -> Result<(bool, Option<String>)> {
+        Ok((false, None))
+    }
+
+    /// Record backfill progress: whether full history is scraped (`complete`)
+    /// and the oldest indexed id (`backfill_cursor`).
+    fn set_discord_channel_backfill(
+        &self,
+        _channel_id: &str,
+        _complete: bool,
+        _backfill_cursor: Option<&str>,
+        _indexed_at: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// List tracked Discord channels/threads with derived indexing stats
+    /// (chunk count + indexed timeline). Excludes categories.
+    fn list_discord_channels(&self) -> Result<Vec<StoredDiscordChannel>> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate statistics for the Discord knowledgebase index.
+    fn get_discord_knowledgebase_stats(&self) -> Result<DiscordKnowledgebaseStats> {
+        Ok(DiscordKnowledgebaseStats {
+            channel_count: 0,
+            thread_count: 0,
+            chunk_count: 0,
+            last_indexed_at: None,
+        })
+    }
+}
+
 /// User management, sessions, channels, regression, experiments, diagnostics,
 /// User CRUD, sessions, and channel cursors (all defaulted).
 pub trait UserStore: Send + Sync {
@@ -1371,6 +1838,7 @@ pub trait FixAttemptTracker:
     + UserStore
     + RegressionStore
     + ChatStore
+    + DiscordStore
 {
 }
 
@@ -1387,8 +1855,97 @@ impl<T> FixAttemptTracker for T where
         + UserStore
         + RegressionStore
         + ChatStore
+        + DiscordStore
 {
 }
+
+/// A no-op tracker for use in tests that don't need persistence.
+///
+/// Implements all tracker traits with no-op defaults. Unlike `SqliteTracker`,
+/// this is available without the `sqlite` feature flag.
+pub struct NoopTracker;
+
+impl AttemptTracker for NoopTracker {
+    fn has_attempted(&self, _: &str, _: &str) -> Result<bool> {
+        Ok(false)
+    }
+    fn get_attempted_issue_ids(&self, _: &str) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
+    }
+    fn record_attempt(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn record_attempt_with_labels(&self, _: &str, _: &str, _: &str, _: &[String]) -> Result<()> {
+        Ok(())
+    }
+    fn mark_success(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn mark_failed(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn mark_merged(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn mark_closed(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn mark_resolved(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn get_attempt(&self, _: &str, _: &str) -> Result<Option<FixAttempt>> {
+        Ok(None)
+    }
+    fn get_attempts_by_status(&self, _: FixAttemptStatus) -> Result<Vec<FixAttempt>> {
+        Ok(vec![])
+    }
+    fn get_pending_prs(&self) -> Result<Vec<FixAttempt>> {
+        Ok(vec![])
+    }
+    fn get_attempt_by_pr_url(&self, _: &str) -> Result<Option<FixAttempt>> {
+        Ok(None)
+    }
+    fn reset_attempt(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn get_stats(&self) -> Result<FixAttemptStats> {
+        Ok(FixAttemptStats {
+            total: 0,
+            pending: 0,
+            success: 0,
+            failed: 0,
+            merged: 0,
+            closed: 0,
+            cannot_fix: 0,
+            by_source: Default::default(),
+        })
+    }
+    fn increment_retry(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn mark_cannot_fix(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn get_retryable_issues(&self, _: u32) -> Result<Vec<FixAttempt>> {
+        Ok(vec![])
+    }
+    fn prepare_for_retry(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl ActivityStore for NoopTracker {}
+impl KnowledgeStore for NoopTracker {}
+impl EmbeddingStore for NoopTracker {}
+impl ExperimentStore for NoopTracker {}
+impl EvaluationStore for NoopTracker {}
+impl WebhookStore for NoopTracker {}
+impl SimilarityStore for NoopTracker {}
+impl RepoStore for NoopTracker {}
+impl UserStore for NoopTracker {}
+impl RegressionStore for NoopTracker {}
+impl ChatStore for NoopTracker {}
+impl DiscordStore for NoopTracker {}
 
 #[cfg(test)]
 mod tests {
@@ -1572,6 +2129,7 @@ mod tests {
         impl UserStore for FullTracker {}
         impl RegressionStore for FullTracker {}
         impl ChatStore for FullTracker {}
+        impl DiscordStore for FullTracker {}
 
         #[test]
         fn test_blanket_impl_auto_satisfies_fix_attempt_tracker() {
@@ -2909,6 +3467,8 @@ mod tests {
                 last_review_time: None,
                 last_comment_id: None,
                 last_comment_time: None,
+                last_issue_comment_id: None,
+                last_issue_comment_time: None,
                 is_active: true,
             };
             assert!(t.save_pr_review_state(&state).is_ok());
@@ -3120,6 +3680,45 @@ mod tests {
     fn test_parse_pr_url_github() {
         let result = parse_pr_url("https://github.com/owner/repo/pull/42");
         assert_eq!(result, Some(("owner/repo".to_string(), 42)));
+    }
+
+    #[test]
+    fn test_parse_pr_intent_compare_link() {
+        let got = parse_pr_intent_url(
+            "https://github.com/appwrite/appwrite/compare/main...fix/pool-not-found-error",
+        );
+        assert_eq!(
+            got,
+            Some(PrIntentUrl {
+                repo: "appwrite/appwrite".to_string(),
+                head: "fix/pool-not-found-error".to_string(),
+                base: Some("main".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_intent_pull_new_link() {
+        let got = parse_pr_intent_url(
+            "https://github.com/appwrite-labs/cloud/pull/new/fix/orphaned-invoices-mysql-timeout",
+        );
+        assert_eq!(
+            got,
+            Some(PrIntentUrl {
+                repo: "appwrite-labs/cloud".to_string(),
+                head: "fix/orphaned-invoices-mysql-timeout".to_string(),
+                base: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_intent_rejects_real_pr_and_unrelated() {
+        // A real PR URL is not an "intent" link.
+        assert!(parse_pr_intent_url("https://github.com/owner/repo/pull/42").is_none());
+        // Unrelated links.
+        assert!(parse_pr_intent_url("https://github.com/owner/repo").is_none());
+        assert!(parse_pr_intent_url("https://example.com/compare/a...b").is_none());
     }
 
     #[test]

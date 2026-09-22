@@ -65,7 +65,7 @@ pub use sms::SmsNotifier;
 pub use telegram::TelegramNotifier;
 pub use whatsapp::WhatsAppNotifier;
 
-use crate::reports::Report;
+use crate::reports::{RepetitiveDigest, Report};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
@@ -138,6 +138,15 @@ pub trait Notifier: Send + Sync {
         self.notify_status(&report.format_text()).await
     }
 
+    /// Send the weekly digest of repetitive, non-actionable Sentry issues.
+    ///
+    /// Default implementation formats as text and uses `notify_status`; channels
+    /// that can mention a user (e.g. Discord) should override this to tag the
+    /// configured on-call user.
+    async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
+        self.notify_status(&digest.format_text()).await
+    }
+
     /// Send a blocking question through this channel.
     async fn ask_question(
         &self,
@@ -159,6 +168,18 @@ pub trait Notifier: Send + Sync {
     /// Whether this notifier can receive replies.
     fn supports_replies(&self) -> bool {
         false
+    }
+
+    /// Send a RAG-grounded answer to a question back to the originating channel.
+    ///
+    /// Returns the ids of any messages the channel sent for this answer (used to
+    /// map a later reply back to the issue). The default falls back to a plain
+    /// status message and returns no ids; channels that can reply to a specific
+    /// conversation (e.g. Discord) should override this and return their ids.
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<Vec<String>> {
+        self.notify_status(&format!("Answer for {}:\n{}", issue.short_id, answer))
+            .await?;
+        Ok(Vec::new())
     }
 
     /// Notify that a repo swap is happening for an issue.
@@ -296,6 +317,28 @@ impl Notifier for CompositeNotifier {
         Ok(())
     }
 
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<Vec<String>> {
+        // Deliver to every notifier concurrently (like `broadcast`), tolerating
+        // per-notifier failures, and collect the sent message ids so callers can
+        // map a later reply back to the issue (only reply-capable channels like
+        // Discord contribute ids). `broadcast` can't be reused here: it requires
+        // `Result<()>` futures and discards their return values.
+        let futures = self.notifiers.iter().map(|n| {
+            let n = Arc::clone(n);
+            let issue = issue.clone();
+            let answer = answer.to_string();
+            async move { n.notify_answer(&issue, &answer).await }
+        });
+        let mut ids = Vec::new();
+        for result in futures::future::join_all(futures).await {
+            match result {
+                Ok(mut sent) => ids.append(&mut sent),
+                Err(e) => tracing::warn!(error = %e, "notify_answer failed"),
+            }
+        }
+        Ok(ids)
+    }
+
     async fn notify_merged(&self, issue: &Issue, pr_url: &str) -> Result<()> {
         let issue = issue.clone();
         let pr_url = pr_url.to_string();
@@ -325,6 +368,16 @@ impl Notifier for CompositeNotifier {
         self.broadcast(|n| {
             let report = report.clone();
             async move { n.notify_report(&report).await }
+        })
+        .await;
+        Ok(())
+    }
+
+    async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
+        let digest = digest.clone();
+        self.broadcast(|n| {
+            let digest = digest.clone();
+            async move { n.notify_repetitive_digest(&digest).await }
         })
         .await;
         Ok(())

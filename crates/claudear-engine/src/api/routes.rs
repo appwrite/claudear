@@ -112,6 +112,10 @@ pub fn create_api_router_full(
             "/api/attempts/{id}/logs/{execution_id}/{stream}",
             get(attempt_execution_log_handler),
         )
+        .route(
+            "/api/attempts/{id}/retrieval",
+            get(attempt_retrieval_handler),
+        )
         .route("/api/sources", get(sources_handler))
         .route("/api/retries", get(retries_handler))
         .route("/api/activity", get(activity_handler))
@@ -119,8 +123,17 @@ pub fn create_api_router_full(
         .route("/api/metrics", get(metrics_handler))
         .route("/api/errors", get(errors_handler))
         .route("/api/issues", get(issues_handler))
+        .route(
+            "/api/issues/{source}/{issue_id}/timeline",
+            get(issue_timeline_handler),
+        )
         .route("/api/prs", get(prs_handler))
         .route("/api/prs/analytics", get(pr_analytics_handler))
+        .route("/api/support/replies", get(support_replies_handler))
+        .route(
+            "/api/support/replies/{action_run_id}/rating",
+            axum::routing::post(rate_reply_handler),
+        )
         .route("/api/feedback", get(feedback_handler))
         .route("/api/regressions", get(regressions_handler))
         .route(
@@ -143,6 +156,12 @@ pub fn create_api_router_full(
         )
         .route("/api/repos/dependencies", get(dependencies_handler))
         .route("/api/repos/{repo}/learning", get(repo_learning_handler))
+        .route(
+            "/api/repos/{repo}/instructions",
+            get(get_repo_instruction_handler).put(put_repo_instruction_handler),
+        )
+        .route("/api/channels", get(discord_channels_handler))
+        .route("/api/channels/stats", get(discord_channel_stats_handler))
         .route("/api/inference/stats", get(inference_stats_handler))
         .route("/api/inference/history", get(inference_history_handler))
         .route("/api/telemetry/overview", get(telemetry_overview_handler))
@@ -169,6 +188,10 @@ pub fn create_api_router_full(
         .route(
             "/api/config",
             axum::routing::get(get_config_handler).put(put_config_handler),
+        )
+        .route(
+            "/api/instructions/global",
+            axum::routing::get(get_global_instruction_handler).put(put_global_instruction_handler),
         )
         // User CRUD routes
         .route(
@@ -935,6 +958,12 @@ struct AttemptExecutionLogResponse {
     truncated: bool,
 }
 
+#[derive(Serialize)]
+struct AttemptRetrievalResponse {
+    attempt_id: i64,
+    rows: Vec<claudear_core::types::RetrievalUsageRecord>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct TelemetryWindowMetric {
     window: String,
@@ -1152,6 +1181,24 @@ async fn attempt_full_detail_handler(
     }))
 }
 
+/// Retrieval-quality assessment for an attempt: every chunk pulled from each RAG
+/// source, with score/rank/injected/used/quality_score.
+async fn attempt_retrieval_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<AttemptRetrievalResponse>, StatusCode> {
+    let rows = state.tracker.get_retrieval_usage(id).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(AttemptRetrievalResponse {
+        attempt_id: id,
+        rows,
+    }))
+}
+
 async fn attempt_execution_log_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
@@ -1290,6 +1337,23 @@ async fn activity_handler(
         })
 }
 
+/// Return the timeline for a single issue.
+async fn issue_timeline_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+    Path((source, issue_id)): Path<(String, String)>,
+) -> Result<Json<claudear_core::types::IssueTimeline>, StatusCode> {
+    state
+        .tracker
+        .get_issue_timeline(&source, &issue_id)
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
 async fn analytics_summary_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
@@ -1315,8 +1379,55 @@ async fn analytics_summary_handler(
         .ok();
     summary.mttr_trend = state.tracker.get_mttr_trend(8).unwrap_or_default();
     summary.repo_leaderboard = state.tracker.get_repo_leaderboard().unwrap_or_default();
+    summary.commit_trend = state.tracker.get_commit_trend(30).unwrap_or_default();
+    summary.support_rating = state.tracker.get_support_rating_summary().ok();
 
     Ok(Json(summary))
+}
+
+/// List recent support replies (QA channels + HelpScout) with any existing rating.
+async fn support_replies_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<claudear_core::types::SupportReply>>, StatusCode> {
+    state
+        .tracker
+        .list_support_replies(100)
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct RateReplyRequest {
+    rating: i32,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Record (or update) an admin's 1..5 rating for a support reply.
+async fn rate_reply_handler(
+    admin: AdminUser,
+    State(state): State<ApiState>,
+    Path(action_run_id): Path<i64>,
+    Json(body): Json<RateReplyRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if !(1..=5).contains(&body.rating) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let note = body.note.as_deref().filter(|s| !s.trim().is_empty());
+    state
+        .tracker
+        .record_reply_rating(action_run_id, body.rating, note, &admin.0.email)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn metrics_handler(
@@ -1662,6 +1773,36 @@ async fn dependencies_handler(
     state
         .tracker
         .list_all_dependencies()
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn discord_channels_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<claudear_storage::StoredDiscordChannel>>, StatusCode> {
+    state
+        .tracker
+        .list_discord_channels()
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn discord_channel_stats_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+) -> Result<Json<claudear_storage::DiscordKnowledgebaseStats>, StatusCode> {
+    state
+        .tracker
+        .get_discord_knowledgebase_stats()
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -2161,6 +2302,7 @@ async fn telemetry_timeseries_handler(
                 FixAttemptStatus::Merged => point.merged += 1,
                 FixAttemptStatus::Closed => point.closed += 1,
                 FixAttemptStatus::CannotFix => point.cannot_fix += 1,
+                FixAttemptStatus::Answered => {}
             }
         }
     }
@@ -2434,6 +2576,53 @@ fn redact_secrets(content: &str) -> String {
     re.replace_all(content, r#"${1}"[REDACTED]""#).into_owned()
 }
 
+/// Restore [REDACTED] to actual values before saving to disk
+const REDACTED: &str = "[REDACTED]";
+fn restore_redacted(incoming: &mut toml::Value, current: &toml::Value) {
+    match (incoming, current) {
+        (toml::Value::Table(inc), toml::Value::Table(cur)) => {
+            for (k, v) in inc.iter_mut() {
+                if let Some(cur_val) = cur.get(k) {
+                    restore_redacted(v, cur_val);
+                }
+            }
+        }
+        // Skipping arrays intentionally as secrets will not be stored in the arrays due to ordering issue
+        // (toml::Value::Array(inc), toml::Value::Array(cur)) => {
+        //     for (inc_val, cur_val) in inc.iter_mut().zip(cur.iter()) {
+        //         restore_redacted(inc_val, cur_val);
+        //     }
+        // }
+        (inc @ toml::Value::String(_), cur) if inc.as_str() == Some(REDACTED) => {
+            *inc = cur.clone();
+        }
+
+        _ => {}
+    }
+}
+
+fn find_redacted(value: &toml::Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (k, v) in table {
+                let child = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                find_redacted(v, &child, out);
+            }
+        }
+        toml::Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                find_redacted(v, &format!("{path}[{i}]"), out);
+            }
+        }
+        toml::Value::String(s) if s == REDACTED => out.push(path.to_string()),
+        _ => {}
+    }
+}
+
 /// GET /api/config — return the raw TOML config file content with secrets redacted.
 async fn get_config_handler(
     _user: AdminUser,
@@ -2466,7 +2655,55 @@ async fn put_config_handler(
         ));
     }
 
-    let parsed = toml::from_str::<Config>(&body.content).map_err(|e| {
+    let mut incoming: toml::Value = toml::from_str(&body.content).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Invalid TOML config: {}", e) })),
+        )
+    })?;
+
+    let current: toml::Value = match tokio::fs::read_to_string(&state.config_path).await {
+        Ok(s) => toml::from_str(&s).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Invalid on-disk config: {}", e) })),
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::Table::new())
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "error": format!("Failed to read on-disk config: {}", e) }),
+                ),
+            ));
+        }
+    };
+
+    // Replace any [REDACTED] sentinels in the submitted config with the real
+    // values from the on-disk config before validating and saving.
+    restore_redacted(&mut incoming, &current);
+
+    // Reject any sentinel that could not be restored — writing the literal
+    // "[REDACTED]" would silently corrupt the secret on the next restart.
+    let mut unrestored = Vec::new();
+    find_redacted(&incoming, "", &mut unrestored);
+    if !unrestored.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Config still contains redacted placeholders for: {}. \
+                     Provide the actual value(s) for these fields.",
+                    unrestored.join(", ")
+                )
+            })),
+        ));
+    }
+
+    let parsed: Config = incoming.try_into().map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": format!("Invalid TOML config: {}", e) })),
@@ -2501,6 +2738,132 @@ async fn put_config_handler(
     Ok(Json(
         serde_json::json!({ "ok": true, "message": "Config saved. Restart to apply changes." }),
     ))
+}
+
+#[derive(Serialize)]
+struct InstructionResponse {
+    scope: String,
+    repo: Option<String>,
+    text: String,
+    updated_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InstructionUpdateRequest {
+    text: String,
+}
+
+fn instruction_response(
+    scope: claudear_core::types::InstructionScope,
+    repo: Option<String>,
+    instruction: Option<claudear_core::types::AgentInstruction>,
+) -> InstructionResponse {
+    match instruction {
+        Some(i) => InstructionResponse {
+            scope: i.scope.to_string(),
+            repo: i.repo,
+            text: i.instruction_text,
+            updated_at: Some(i.updated_at.to_rfc3339()),
+        },
+        None => InstructionResponse {
+            scope: scope.to_string(),
+            repo,
+            text: String::new(),
+            updated_at: None,
+        },
+    }
+}
+
+/// GET /api/instructions/global — read the global agent instruction.
+async fn get_global_instruction_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+) -> Result<Json<InstructionResponse>, StatusCode> {
+    let instruction = state
+        .tracker
+        .get_agent_instruction(claudear_core::types::InstructionScope::Global, None)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to read global instruction");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(instruction_response(
+        claudear_core::types::InstructionScope::Global,
+        None,
+        instruction,
+    )))
+}
+
+/// PUT /api/instructions/global — write the global agent instruction.
+async fn put_global_instruction_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Json(body): Json<InstructionUpdateRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !check_api_rate_limit(_user.0.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state
+        .tracker
+        .upsert_agent_instruction(
+            claudear_core::types::InstructionScope::Global,
+            None,
+            &body.text,
+            Some(&_user.0.name),
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to save global instruction");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// GET /api/repos/{repo}/instructions — read a repo's agent instruction.
+async fn get_repo_instruction_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Path(repo): Path<String>,
+) -> Result<Json<InstructionResponse>, StatusCode> {
+    let instruction = state
+        .tracker
+        .get_agent_instruction(claudear_core::types::InstructionScope::Repo, Some(&repo))
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to read repo instruction");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(instruction_response(
+        claudear_core::types::InstructionScope::Repo,
+        Some(repo),
+        instruction,
+    )))
+}
+
+/// PUT /api/repos/{repo}/instructions — write a repo's agent instruction.
+async fn put_repo_instruction_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Path(repo): Path<String>,
+    Json(body): Json<InstructionUpdateRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !check_api_rate_limit(_user.0.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state
+        .tracker
+        .upsert_agent_instruction(
+            claudear_core::types::InstructionScope::Repo,
+            Some(&repo),
+            &body.text,
+            Some(&_user.0.name),
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to save repo instruction");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// Browse GGUF models from HuggingFace.
@@ -2672,6 +3035,7 @@ mod tests {
             processing_delay_ms: 5000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
+            debug_logging: false,
             agent: AgentConfig::default(),
             scm: ScmConfig::default(),
             issues: IssuesConfig::default(),
@@ -2684,6 +3048,7 @@ mod tests {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            retrieval_eval: Default::default(),
             evaluation: claudear_config::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: claudear_config::config::DashboardConfig::default(),
@@ -2691,6 +3056,9 @@ mod tests {
             chat: claudear_config::config::ChatConfig::default(),
             tls: claudear_config::config::TlsConfig::default(),
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
+            qa: claudear_config::config::QaConfig::default(),
+            knowledgebase: claudear_config::config::KnowledgebasesConfig::default(),
+            reports: claudear_config::config::ReportsConfig::default(),
         }
     }
 
@@ -3703,6 +4071,35 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let deps: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(deps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_channels_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/channels", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channels: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_channel_stats_endpoint() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/channels/stats", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -4955,6 +5352,118 @@ mod tests {
         let redacted = redact_secrets(content);
         assert!(redacted.contains("[REDACTED]"));
         assert!(!redacted.contains("key-abc123"));
+    }
+
+    /// Parse TOML, run restore_redacted against the on-disk version, return merged value.
+    fn merge_redacted(incoming: &str, current: &str) -> toml::Value {
+        let mut incoming: toml::Value = toml::from_str(incoming).expect("valid incoming toml");
+        let current: toml::Value = toml::from_str(current).expect("valid current toml");
+        restore_redacted(&mut incoming, &current);
+        incoming
+    }
+
+    #[test]
+    fn test_restore_redacted_replaces_sentinel() {
+        let merged = merge_redacted("api_token = \"[REDACTED]\"", "api_token = \"sk-real\"");
+        assert_eq!(merged["api_token"].as_str(), Some("sk-real"));
+    }
+
+    #[test]
+    fn test_restore_redacted_keeps_edited_value() {
+        // User typed a new secret — it must not be overwritten by the on-disk value.
+        let merged = merge_redacted("api_token = \"sk-new\"", "api_token = \"sk-old\"");
+        assert_eq!(merged["api_token"].as_str(), Some("sk-new"));
+    }
+
+    #[test]
+    fn test_restore_redacted_leaves_non_secret_values_untouched() {
+        let merged = merge_redacted(
+            "workspace = \"/tmp/repos\"\npoll_interval_ms = 300000",
+            "workspace = \"/other\"\npoll_interval_ms = 1",
+        );
+        assert_eq!(merged["workspace"].as_str(), Some("/tmp/repos"));
+        assert_eq!(merged["poll_interval_ms"].as_integer(), Some(300000));
+    }
+
+    #[test]
+    fn test_restore_redacted_nested_table() {
+        let merged = merge_redacted(
+            "[notifiers.helpscout]\napi_key = \"[REDACTED]\"\nmailbox = \"support\"",
+            "[notifiers.helpscout]\napi_key = \"hs-real\"\nmailbox = \"old\"",
+        );
+        assert_eq!(
+            merged["notifiers"]["helpscout"]["api_key"].as_str(),
+            Some("hs-real")
+        );
+        // Non-secret edit in the same table is preserved.
+        assert_eq!(
+            merged["notifiers"]["helpscout"]["mailbox"].as_str(),
+            Some("support")
+        );
+    }
+
+    #[test]
+    fn test_restore_redacted_leaves_arrays_untouched() {
+        // Arrays are intentionally not traversed during restore (the system never
+        // stores secrets in arrays). A sentinel inside an array is therefore left
+        // as-is by restore_redacted; find_redacted catches it and the handler
+        // rejects the save with a 400.
+        let merged = merge_redacted(
+            "tokens = [\"[REDACTED]\", \"keep\"]",
+            "tokens = [\"real-0\", \"stale-1\"]",
+        );
+        let arr = merged["tokens"].as_array().expect("array");
+        assert_eq!(arr[0].as_str(), Some("[REDACTED]"));
+        assert_eq!(arr[1].as_str(), Some("keep"));
+
+        // The unrestored sentinel is surfaced for rejection.
+        let mut out = Vec::new();
+        find_redacted(&merged, "", &mut out);
+        assert_eq!(out, vec!["tokens[0]"]);
+    }
+
+    #[test]
+    fn test_restore_redacted_missing_on_disk_key_keeps_sentinel() {
+        // A secret that was never set on disk cannot be restored, so the literal
+        // sentinel survives the merge. find_redacted is what catches this and the
+        // handler rejects it before writing (see tests below).
+        let merged = merge_redacted("api_token = \"[REDACTED]\"", "other = \"x\"");
+        assert_eq!(merged["api_token"].as_str(), Some("[REDACTED]"));
+    }
+
+    fn redacted_paths(content: &str) -> Vec<String> {
+        let value: toml::Value = toml::from_str(content).expect("valid toml");
+        let mut out = Vec::new();
+        find_redacted(&value, "", &mut out);
+        out
+    }
+
+    #[test]
+    fn test_find_redacted_none_when_fully_restored() {
+        let merged = merge_redacted("api_token = \"[REDACTED]\"", "api_token = \"sk-real\"");
+        let mut out = Vec::new();
+        find_redacted(&merged, "", &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_find_redacted_reports_top_level_key() {
+        assert_eq!(
+            redacted_paths("api_token = \"[REDACTED]\""),
+            vec!["api_token"]
+        );
+    }
+
+    #[test]
+    fn test_find_redacted_reports_nested_path() {
+        let paths = redacted_paths("[notifiers.helpscout]\napi_key = \"[REDACTED]\"");
+        assert_eq!(paths, vec!["notifiers.helpscout.api_key"]);
+    }
+
+    #[test]
+    fn test_find_redacted_reports_array_index() {
+        let paths = redacted_paths("tokens = [\"ok\", \"[REDACTED]\"]");
+        assert_eq!(paths, vec!["tokens[1]"]);
     }
 
     #[test]

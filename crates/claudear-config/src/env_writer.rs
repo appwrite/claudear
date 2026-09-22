@@ -69,7 +69,7 @@ fn update_env_content(content: &str, updates: &HashMap<String, String>) -> Strin
         .iter()
         .filter(|(k, _)| !updated_keys.contains(*k))
         .collect();
-    new_keys.sort_by(|(a, _), (b, _)| a.cmp(b)); // Sort for deterministic output
+    new_keys.sort_by_key(|(a, _)| *a); // Sort for deterministic output
 
     if !new_keys.is_empty() {
         // Add a blank line before new keys if the file isn't empty and doesn't end with blank line

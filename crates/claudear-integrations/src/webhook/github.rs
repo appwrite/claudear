@@ -1,8 +1,9 @@
-//! GitHub webhook handler for PR review events.
+//! GitHub webhook handler for PR review and pull request events.
 //!
-//! This handler processes `pull_request_review` and `pull_request_review_comment`
-//! events from GitHub webhooks to trigger review processing in real-time instead
-//! of relying solely on polling.
+//! This handler processes `pull_request_review`, `pull_request_review_comment`,
+//! `issue_comment` (PR conversation comments), and `pull_request` events from
+//! GitHub webhooks to trigger review processing and detect PR merges/closes in
+//! real-time instead of relying solely on polling.
 
 use crate::scm::{is_skippable_bot, CodeReview, ReviewComment, ReviewUser, ReviewWatcher};
 use claudear_config::config::GitHubConfig;
@@ -13,7 +14,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
-/// GitHub webhook handler for PR review events.
+/// Result of processing a GitHub webhook event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebhookAction {
+    /// The event was processed successfully (e.g. review forwarded to ReviewWatcher).
+    Processed,
+    /// The event was ignored (unrecognized event type, unwatched PR, etc.).
+    Ignored,
+    /// A pull request was closed (merged or closed without merge).
+    PrClosed { pr_url: String, merged: bool },
+}
+
+impl WebhookAction {
+    /// Returns `true` when the event was actively processed (not ignored).
+    pub fn is_processed(&self) -> bool {
+        !matches!(self, WebhookAction::Ignored)
+    }
+}
+
+/// GitHub webhook handler for PR review and pull request events.
 ///
 /// Unlike other webhook handlers, this one doesn't implement the `WebhookHandler` trait
 /// because it doesn't create issues - it processes PR review events and integrates
@@ -122,14 +141,14 @@ impl GitHubWebhookHandler {
     /// The raw_payload must be the exact bytes received from GitHub (before JSON parsing)
     /// to ensure signature verification is accurate.
     ///
-    /// Returns Ok(true) if the event was processed, Ok(false) if it was ignored,
-    /// or an error if processing failed.
+    /// Returns a `WebhookAction` describing what happened, or an error if
+    /// signature verification or processing failed.
     pub async fn process_webhook(
         &self,
         raw_payload: &[u8],
         payload: &serde_json::Value,
         headers: &HashMap<String, String>,
-    ) -> Result<bool> {
+    ) -> Result<WebhookAction> {
         // CRITICAL: Verify signature before processing any webhook data
         if !self.verify_signature(raw_payload, headers) {
             tracing::warn!(
@@ -145,26 +164,28 @@ impl GitHubWebhookHandler {
             Some(t) => t,
             None => {
                 tracing::warn!(source = "github", "Missing x-github-event header");
-                return Ok(false);
+                return Ok(WebhookAction::Ignored);
             }
         };
 
         match event_type {
             "pull_request_review" => self.handle_review_submitted(payload).await,
             "pull_request_review_comment" => self.handle_review_comment(payload).await,
+            "issue_comment" => self.handle_issue_comment(payload).await,
+            "pull_request" => self.handle_pull_request(payload).await,
             _ => {
                 tracing::debug!(
                     source = "github",
                     event_type = %event_type,
-                    "Ignoring non-review event"
+                    "Ignoring unhandled event"
                 );
-                Ok(false)
+                Ok(WebhookAction::Ignored)
             }
         }
     }
 
     /// Handle a pull_request_review.submitted event.
-    async fn handle_review_submitted(&self, payload: &serde_json::Value) -> Result<bool> {
+    async fn handle_review_submitted(&self, payload: &serde_json::Value) -> Result<WebhookAction> {
         let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
         if action != "submitted" {
@@ -173,14 +194,14 @@ impl GitHubWebhookHandler {
                 action = %action,
                 "Ignoring non-submitted review action"
             );
-            return Ok(false);
+            return Ok(WebhookAction::Ignored);
         }
 
         let review = match payload.get("review") {
             Some(r) => r,
             None => {
                 tracing::warn!(source = "github", "Missing review in payload");
-                return Ok(false);
+                return Ok(WebhookAction::Ignored);
             }
         };
 
@@ -188,7 +209,7 @@ impl GitHubWebhookHandler {
             Some(p) => p,
             None => {
                 tracing::warn!(source = "github", "Missing pull_request in payload");
-                return Ok(false);
+                return Ok(WebhookAction::Ignored);
             }
         };
 
@@ -205,7 +226,7 @@ impl GitHubWebhookHandler {
                     pr_url = %pr_url,
                     "ReviewWatcher not available, ignoring event"
                 );
-                return Ok(false);
+                return Ok(WebhookAction::Ignored);
             }
         };
 
@@ -218,7 +239,7 @@ impl GitHubWebhookHandler {
                     pr_url = %pr_url,
                     "PR not being watched, ignoring review"
                 );
-                return Ok(false);
+                return Ok(WebhookAction::Ignored);
             }
         };
 
@@ -233,7 +254,7 @@ impl GitHubWebhookHandler {
                 reviewer = %pr_review.user.login,
                 "Skipping bot review"
             );
-            return Ok(false);
+            return Ok(WebhookAction::Ignored);
         }
 
         // Skip pending reviews
@@ -243,7 +264,7 @@ impl GitHubWebhookHandler {
                 pr_url = %pr_url,
                 "Skipping pending review"
             );
-            return Ok(false);
+            return Ok(WebhookAction::Ignored);
         }
 
         tracing::info!(
@@ -263,11 +284,11 @@ impl GitHubWebhookHandler {
             "Processed review webhook through ReviewWatcher"
         );
 
-        Ok(true)
+        Ok(WebhookAction::Processed)
     }
 
     /// Handle a pull_request_review_comment.created event.
-    async fn handle_review_comment(&self, payload: &serde_json::Value) -> Result<bool> {
+    async fn handle_review_comment(&self, payload: &serde_json::Value) -> Result<WebhookAction> {
         let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
         if action != "created" {
@@ -276,14 +297,14 @@ impl GitHubWebhookHandler {
                 action = %action,
                 "Ignoring non-created comment action"
             );
-            return Ok(false);
+            return Ok(WebhookAction::Ignored);
         }
 
         let comment = match payload.get("comment") {
             Some(c) => c,
             None => {
                 tracing::warn!(source = "github", "Missing comment in payload");
-                return Ok(false);
+                return Ok(WebhookAction::Ignored);
             }
         };
 
@@ -291,7 +312,7 @@ impl GitHubWebhookHandler {
             Some(p) => p,
             None => {
                 tracing::warn!(source = "github", "Missing pull_request in payload");
-                return Ok(false);
+                return Ok(WebhookAction::Ignored);
             }
         };
 
@@ -308,7 +329,7 @@ impl GitHubWebhookHandler {
                     pr_url = %pr_url,
                     "ReviewWatcher not available, ignoring event"
                 );
-                return Ok(false);
+                return Ok(WebhookAction::Ignored);
             }
         };
 
@@ -321,7 +342,7 @@ impl GitHubWebhookHandler {
                     pr_url = %pr_url,
                     "PR not being watched, ignoring comment"
                 );
-                return Ok(false);
+                return Ok(WebhookAction::Ignored);
             }
         };
 
@@ -336,7 +357,7 @@ impl GitHubWebhookHandler {
                 author = %pr_comment.user.login,
                 "Skipping bot comment"
             );
-            return Ok(false);
+            return Ok(WebhookAction::Ignored);
         }
 
         tracing::info!(
@@ -356,7 +377,199 @@ impl GitHubWebhookHandler {
             "Processed review comment webhook through ReviewWatcher"
         );
 
-        Ok(true)
+        Ok(WebhookAction::Processed)
+    }
+
+    /// Handle an `issue_comment.created` event.
+    ///
+    /// GitHub fires this for comments on the PR *conversation* timeline (a plain
+    /// "@claudear fix this" left outside a formal review or inline thread). Only
+    /// comments on pull requests are relevant, so non-PR issue comments are
+    /// ignored. When the comment mentions the review trigger on a watched PR, we
+    /// re-poll via `check_for_pr`, which now picks up conversation comments.
+    async fn handle_issue_comment(&self, payload: &serde_json::Value) -> Result<WebhookAction> {
+        let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+        if action != "created" {
+            tracing::debug!(
+                source = "github",
+                action = %action,
+                "Ignoring non-created issue comment action"
+            );
+            return Ok(WebhookAction::Ignored);
+        }
+
+        let issue = match payload.get("issue") {
+            Some(i) => i,
+            None => {
+                tracing::warn!(source = "github", "Missing issue in payload");
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        // Only PR conversation comments matter; a plain issue has no `pull_request`.
+        let pr = match issue.get("pull_request") {
+            Some(p) => p,
+            None => {
+                tracing::debug!(
+                    source = "github",
+                    "Issue comment is not on a pull request, ignoring"
+                );
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        let pr_url = pr
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .or_else(|| issue.get("html_url").and_then(|v| v.as_str()))
+            .unwrap_or_default();
+
+        let comment = match payload.get("comment") {
+            Some(c) => c,
+            None => {
+                tracing::warn!(source = "github", "Missing comment in payload");
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        let review_watcher = match &self.review_watcher {
+            Some(rw) => rw,
+            None => {
+                tracing::debug!(
+                    source = "github",
+                    pr_url = %pr_url,
+                    "ReviewWatcher not available, ignoring event"
+                );
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        // Only act on PRs we're actively watching.
+        let state = match review_watcher.get_state(pr_url) {
+            Some(s) if s.is_active => s,
+            _ => {
+                tracing::debug!(
+                    source = "github",
+                    pr_url = %pr_url,
+                    "PR not being watched, ignoring issue comment"
+                );
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        // Skip bot comments (unless the bot is in the allowed list).
+        let user = ReviewUser {
+            id: comment
+                .get("user")
+                .and_then(|u| u.get("id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default(),
+            login: comment
+                .get("user")
+                .and_then(|u| u.get("login"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            user_type: comment
+                .get("user")
+                .and_then(|u| u.get("type"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+        if is_skippable_bot(&user, &self.config.allowed_bots) {
+            tracing::debug!(
+                source = "github",
+                pr_url = %pr_url,
+                author = %user.login,
+                "Skipping bot issue comment"
+            );
+            return Ok(WebhookAction::Ignored);
+        }
+
+        // Require the review trigger so unrelated PR chatter doesn't spin up a
+        // re-poll. The polling path applies the same filter, so this only avoids
+        // needless work; correctness does not depend on it.
+        let trigger = self.config.review_trigger.to_lowercase();
+        let body = comment
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !trigger.is_empty() && !body.to_lowercase().contains(&trigger) {
+            tracing::debug!(
+                source = "github",
+                pr_url = %pr_url,
+                "Issue comment does not mention review trigger, ignoring"
+            );
+            return Ok(WebhookAction::Ignored);
+        }
+
+        tracing::info!(
+            source = "github",
+            pr_url = %pr_url,
+            author = %user.login,
+            issue_id = %state.issue_id,
+            "Received PR conversation comment via webhook"
+        );
+
+        let processed_events = review_watcher.check_for_pr(pr_url).await?;
+        tracing::info!(
+            source = "github",
+            pr_url = %pr_url,
+            events = processed_events.len(),
+            "Processed issue comment webhook through ReviewWatcher"
+        );
+
+        Ok(WebhookAction::Processed)
+    }
+
+    /// Handle a pull_request.closed event (merged or closed without merge).
+    async fn handle_pull_request(&self, payload: &serde_json::Value) -> Result<WebhookAction> {
+        let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+        if action != "closed" {
+            tracing::debug!(
+                source = "github",
+                action = %action,
+                "Ignoring non-closed pull_request action"
+            );
+            return Ok(WebhookAction::Ignored);
+        }
+
+        let pr = match payload.get("pull_request") {
+            Some(p) => p,
+            None => {
+                tracing::warn!(source = "github", "Missing pull_request in payload");
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        let pr_url = pr
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        if pr_url.is_empty() {
+            tracing::warn!(
+                source = "github",
+                "Missing html_url in pull_request payload"
+            );
+            return Ok(WebhookAction::Ignored);
+        }
+
+        let merged = pr.get("merged").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        tracing::info!(
+            source = "github",
+            pr_url = %pr_url,
+            merged = merged,
+            "Received pull_request closed event via webhook"
+        );
+
+        Ok(WebhookAction::PrClosed {
+            pr_url: pr_url.to_string(),
+            merged,
+        })
     }
 
     /// Parse a review from the webhook payload.
@@ -864,7 +1077,7 @@ mod tests {
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Missing event header should return Ok(false)"
         );
     }
@@ -880,7 +1093,7 @@ mod tests {
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Unknown event type should return Ok(false)"
         );
     }
@@ -913,7 +1126,7 @@ mod tests {
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
         assert!(
-            result.unwrap(),
+            result.unwrap().is_processed(),
             "Valid review submitted for watched PR should return Ok(true)"
         );
     }
@@ -931,7 +1144,10 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert!(!result.unwrap(), "No watcher should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "No watcher should return Ok(false)"
+        );
     }
 
     #[tokio::test]
@@ -960,7 +1176,10 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert!(!result.unwrap(), "Unwatched PR should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Unwatched PR should return Ok(false)"
+        );
     }
 
     #[tokio::test]
@@ -996,7 +1215,7 @@ mod tests {
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
         assert!(
-            result.unwrap(),
+            result.unwrap().is_processed(),
             "Valid comment created for watched PR should return Ok(true)"
         );
     }
@@ -1027,8 +1246,90 @@ mod tests {
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Comment on unwatched PR should return Ok(false)"
+        );
+    }
+
+    /// Helper: an `issue_comment.created` payload on a pull request.
+    fn issue_comment_payload(pr_url: &str, body: &str, is_pr: bool) -> serde_json::Value {
+        let mut issue = serde_json::json!({
+            "number": 1,
+            "html_url": pr_url
+        });
+        if is_pr {
+            issue["pull_request"] = serde_json::json!({ "html_url": pr_url });
+        }
+        serde_json::json!({
+            "action": "created",
+            "comment": {
+                "id": 300,
+                "user": { "id": 3, "login": "reviewer", "type": "User" },
+                "body": body,
+                "created_at": "2024-01-15T12:00:00Z",
+                "updated_at": "2024-01-15T12:00:00Z",
+                "html_url": "https://github.com/owner/repo/pull/1#issuecomment-300"
+            },
+            "issue": issue
+        })
+    }
+
+    #[tokio::test]
+    async fn test_issue_comment_on_watched_pr_with_trigger_is_processed() {
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let handler = make_handler_watching_pr(pr_url, Arc::new(MockScmProvider::new()));
+
+        let payload_value =
+            issue_comment_payload(pr_url, "@claudear please fix the shutdown race", true);
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let headers = make_headers("issue_comment", &sig);
+
+        let result = handler
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await;
+        assert!(
+            result.unwrap().is_processed(),
+            "Triggered PR conversation comment should be processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue_comment_without_trigger_is_ignored() {
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let handler = make_handler_watching_pr(pr_url, Arc::new(MockScmProvider::new()));
+
+        let payload_value = issue_comment_payload(pr_url, "LGTM, nice", true);
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let headers = make_headers("issue_comment", &sig);
+
+        let result = handler
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await;
+        assert!(
+            !result.unwrap().is_processed(),
+            "Untriggered PR conversation comment should be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue_comment_on_plain_issue_is_ignored() {
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let handler = make_handler_watching_pr(pr_url, Arc::new(MockScmProvider::new()));
+
+        // No `pull_request` field => a regular issue, not a PR.
+        let payload_value = issue_comment_payload(pr_url, "@claudear fix this", false);
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let headers = make_headers("issue_comment", &sig);
+
+        let result = handler
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await;
+        assert!(
+            !result.unwrap().is_processed(),
+            "Comment on a non-PR issue should be ignored"
         );
     }
 
@@ -1041,7 +1342,7 @@ mod tests {
 
         let result = handler.handle_review_submitted(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Non-submitted action should return Ok(false)"
         );
     }
@@ -1056,7 +1357,7 @@ mod tests {
 
         let result = handler.handle_review_submitted(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Missing review field should return Ok(false)"
         );
     }
@@ -1075,7 +1376,7 @@ mod tests {
 
         let result = handler.handle_review_submitted(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Missing pull_request field should return Ok(false)"
         );
     }
@@ -1102,7 +1403,10 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert!(!result.unwrap(), "Bot review should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Bot review should return Ok(false)"
+        );
     }
 
     #[tokio::test]
@@ -1127,7 +1431,10 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert!(!result.unwrap(), "Pending review should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Pending review should return Ok(false)"
+        );
     }
 
     // handle_review_comment tests (3 tests)
@@ -1139,7 +1446,7 @@ mod tests {
 
         let result = handler.handle_review_comment(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Non-created action should return Ok(false)"
         );
     }
@@ -1154,7 +1461,7 @@ mod tests {
 
         let result = handler.handle_review_comment(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Missing comment field should return Ok(false)"
         );
     }
@@ -1186,7 +1493,10 @@ mod tests {
         });
 
         let result = handler.handle_review_comment(&payload).await;
-        assert!(!result.unwrap(), "Bot comment should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Bot comment should return Ok(false)"
+        );
     }
 
     // parse edge case tests (2 tests)
@@ -2037,7 +2347,10 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert!(!result.unwrap(), "Ping event should be ignored");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Ping event should be ignored"
+        );
     }
 
     #[tokio::test]
@@ -2050,7 +2363,10 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert!(!result.unwrap(), "Issues event should be ignored");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Issues event should be ignored"
+        );
     }
 
     #[tokio::test]
@@ -2063,24 +2379,122 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert!(!result.unwrap(), "Check suite event should be ignored");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Check suite event should be ignored"
+        );
     }
 
     #[tokio::test]
-    async fn test_process_webhook_pull_request_event_ignored() {
+    async fn test_process_webhook_pull_request_closed_merged() {
         let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
-        let payload = b"{}";
-        let sig = make_valid_signature("test_secret", payload);
-        // Note: "pull_request" is different from "pull_request_review"
+        let payload_value = serde_json::json!({
+            "action": "closed",
+            "pull_request": {
+                "html_url": "https://github.com/owner/repo/pull/42",
+                "merged": true
+            }
+        });
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
         let headers = make_headers("pull_request", &sig);
 
         let result = handler
-            .process_webhook(payload, &serde_json::json!({}), &headers)
-            .await;
-        assert!(
-            !result.unwrap(),
-            "pull_request event (not review) should be ignored"
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            WebhookAction::PrClosed {
+                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                merged: true
+            }
         );
+    }
+
+    #[tokio::test]
+    async fn test_process_webhook_pull_request_closed_not_merged() {
+        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let payload_value = serde_json::json!({
+            "action": "closed",
+            "pull_request": {
+                "html_url": "https://github.com/owner/repo/pull/42",
+                "merged": false
+            }
+        });
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let headers = make_headers("pull_request", &sig);
+
+        let result = handler
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            WebhookAction::PrClosed {
+                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                merged: false
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_webhook_pull_request_opened_ignored() {
+        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let payload_value = serde_json::json!({
+            "action": "opened",
+            "pull_request": {
+                "html_url": "https://github.com/owner/repo/pull/42",
+                "merged": false
+            }
+        });
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let headers = make_headers("pull_request", &sig);
+
+        let result = handler
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await
+            .unwrap();
+        assert_eq!(result, WebhookAction::Ignored);
+    }
+
+    #[tokio::test]
+    async fn test_process_webhook_pull_request_missing_pr_url_ignored() {
+        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let payload_value = serde_json::json!({
+            "action": "closed",
+            "pull_request": {
+                "merged": true
+            }
+        });
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let headers = make_headers("pull_request", &sig);
+
+        let result = handler
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await
+            .unwrap();
+        assert_eq!(result, WebhookAction::Ignored);
+    }
+
+    #[tokio::test]
+    async fn test_process_webhook_pull_request_missing_payload_ignored() {
+        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let payload_value = serde_json::json!({
+            "action": "closed"
+        });
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let headers = make_headers("pull_request", &sig);
+
+        let result = handler
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await
+            .unwrap();
+        assert_eq!(result, WebhookAction::Ignored);
     }
 
     #[tokio::test]
@@ -2093,7 +2507,10 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert!(!result.unwrap(), "Empty event type should be ignored");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Empty event type should be ignored"
+        );
     }
 
     #[tokio::test]
@@ -2134,7 +2551,7 @@ mod tests {
 
         let result = handler.handle_review_submitted(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Missing action should be treated as non-submitted"
         );
     }
@@ -2145,7 +2562,10 @@ mod tests {
         let payload = serde_json::json!({ "action": "dismissed" });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert!(!result.unwrap(), "Dismissed action should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Dismissed action should return Ok(false)"
+        );
     }
 
     #[tokio::test]
@@ -2182,7 +2602,7 @@ mod tests {
 
         let result = handler.handle_review_submitted(&payload).await;
         assert!(
-            result.unwrap(),
+            result.unwrap().is_processed(),
             "CHANGES_REQUESTED review on watched PR should return Ok(true)"
         );
     }
@@ -2221,7 +2641,7 @@ mod tests {
 
         let result = handler.handle_review_submitted(&payload).await;
         assert!(
-            result.unwrap(),
+            result.unwrap().is_processed(),
             "COMMENTED review on watched PR should return Ok(true)"
         );
     }
@@ -2249,7 +2669,7 @@ mod tests {
 
         let result = handler.handle_review_submitted(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Lowercase 'pending' should also be skipped"
         );
     }
@@ -2273,7 +2693,7 @@ mod tests {
 
         // No watcher, so returns Ok(false) — but should not panic
         let result = handler.handle_review_submitted(&payload).await;
-        assert!(!result.unwrap());
+        assert!(!result.unwrap().is_processed());
     }
 
     // handle_review_comment — additional cases
@@ -2285,7 +2705,7 @@ mod tests {
 
         let result = handler.handle_review_comment(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Edited comment action should return Ok(false)"
         );
     }
@@ -2297,7 +2717,7 @@ mod tests {
 
         let result = handler.handle_review_comment(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Deleted comment action should return Ok(false)"
         );
     }
@@ -2320,7 +2740,7 @@ mod tests {
 
         let result = handler.handle_review_comment(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Missing action should be treated as non-created"
         );
     }
@@ -2343,7 +2763,7 @@ mod tests {
 
         let result = handler.handle_review_comment(&payload).await;
         assert!(
-            !result.unwrap(),
+            !result.unwrap().is_processed(),
             "Missing pull_request field should return Ok(false)"
         );
     }
@@ -2355,7 +2775,10 @@ mod tests {
         let payload = comment_created_payload(pr_url);
 
         let result = handler.handle_review_comment(&payload).await;
-        assert!(!result.unwrap(), "No watcher should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "No watcher should return Ok(false)"
+        );
     }
 
     // constructor and handler struct tests
@@ -2433,7 +2856,7 @@ mod tests {
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert!(result.unwrap().is_processed());
     }
 
     #[tokio::test]
@@ -2490,7 +2913,7 @@ mod tests {
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert!(result.unwrap().is_processed());
     }
 
     #[tokio::test]
@@ -2533,7 +2956,7 @@ mod tests {
             .process_webhook(payload, &serde_json::json!([]), &headers)
             .await;
         // action will be None -> unwrap_or("") -> not "submitted" -> Ok(false)
-        assert!(!result.unwrap());
+        assert!(!result.unwrap().is_processed());
     }
 
     #[tokio::test]
@@ -2567,7 +2990,7 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert!(!result.unwrap());
+        assert!(!result.unwrap().is_processed());
     }
 
     // Header validation edge cases

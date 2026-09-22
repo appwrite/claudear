@@ -271,7 +271,7 @@ impl SemanticReviewClassifier {
 
         let reference_embeddings = descriptions
             .iter()
-            .zip(embeddings.into_iter())
+            .zip(embeddings)
             .map(|((cat, _), emb)| (*cat, emb))
             .collect();
 

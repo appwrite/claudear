@@ -7,6 +7,7 @@
 pub mod evaluation;
 pub mod feedback;
 pub mod inference;
+pub mod knowledgebase;
 pub mod learning;
 pub mod llm;
 pub mod prioritisation;

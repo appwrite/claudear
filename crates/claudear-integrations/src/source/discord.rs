@@ -75,6 +75,43 @@ impl DiscordSource {
         false
     }
 
+    fn normalize_id(id: &str) -> &str {
+        id.trim_start_matches(['&', '!', '@'])
+    }
+
+    fn mentions_user(msg: &DiscordMessage, user_id: &str) -> bool {
+        let user_id = Self::normalize_id(user_id);
+        if user_id.is_empty() {
+            return false;
+        }
+        if msg.mentions.iter().any(|u| u.id == user_id) {
+            return true;
+        }
+        msg.content.contains(&format!("<@{}>", user_id))
+            || msg.content.contains(&format!("<@!{}>", user_id))
+    }
+
+    fn mentions_role(msg: &DiscordMessage, role_id: &str) -> bool {
+        let role_id = Self::normalize_id(role_id);
+        if role_id.is_empty() {
+            return false;
+        }
+        msg.content.contains(&format!("<@&{}>", role_id))
+    }
+
+    fn passes_mention_gate(&self, msg: &DiscordMessage) -> bool {
+        let user_gate = self.config.bot_id.as_deref().filter(|s| !s.is_empty());
+        let role_gate = self.config.bot_role_id.as_deref().filter(|s| !s.is_empty());
+        match (user_gate, role_gate) {
+            // No gate configured: ingest everything.
+            (None, None) => true,
+            (user_id, role_id) => {
+                user_id.is_some_and(|id| Self::mentions_user(msg, id))
+                    || role_id.is_some_and(|id| Self::mentions_role(msg, id))
+            }
+        }
+    }
+
     /// Strip Discord user mentions (<@123>, <@!123>) from text.
     fn strip_mentions(content: &str) -> String {
         let mut result = content.to_string();
@@ -126,6 +163,22 @@ impl DiscordSource {
             issue.set_metadata("author_id", &author.id);
         }
         issue.set_metadata("channel_id", &msg.channel_id);
+
+        // When this message is a reply, record the parent it points at so the
+        // engine can reconstruct the reply-chain conversation as grounding
+        // context. Only the parent id is available on the payload; the parent's
+        // content is resolved later (from our DB for Claudear's own answers, or
+        // by fetching from Discord for other users' messages).
+        if let Some(ref reference) = msg.message_reference {
+            if let Some(ref parent_id) = reference.message_id {
+                issue.set_metadata("reply_to_message_id", parent_id);
+                let parent_channel = reference
+                    .channel_id
+                    .clone()
+                    .unwrap_or_else(|| msg.channel_id.clone());
+                issue.set_metadata("reply_to_channel_id", &parent_channel);
+            }
+        }
 
         issue
     }
@@ -182,20 +235,67 @@ impl IssueSource for DiscordSource {
                     return Ok(vec![]);
                 }
 
-                // Update cursor to the latest message
+                // Update cursor to the latest message (before filtering, so the
+                // cursor always advances even when every message is filtered out).
                 if let Some(latest) = messages.last() {
                     let mut lock = self.last_seen_id.write().unwrap_or_else(|e| e.into_inner());
                     *lock = Some(latest.id.clone());
                 }
 
-                // Filter out bot messages, our own notifications, and empty content
-                let issues: Vec<Issue> = messages
-                    .iter()
-                    .filter(|msg| !Self::is_bot_message(msg))
-                    .filter(|msg| !Self::is_own_notification(msg))
-                    .filter(|msg| !msg.content.trim().is_empty())
-                    .map(|msg| self.message_to_issue(msg))
-                    .collect();
+                let debug = self.config.debug_logging;
+
+                if !debug {
+                    let issues: Vec<Issue> = messages
+                        .iter()
+                        .filter(|msg| !Self::is_bot_message(msg))
+                        .filter(|msg| !Self::is_own_notification(msg))
+                        .filter(|msg| !msg.content.trim().is_empty())
+                        .filter(|msg| self.passes_mention_gate(msg))
+                        .map(|msg| self.message_to_issue(msg))
+                        .collect();
+                    return Ok(issues);
+                }
+
+                // log during debug mode
+                let mut issues = Vec::new();
+                for msg in &messages {
+                    let author = msg
+                        .author
+                        .as_ref()
+                        .map(|a| a.username.as_str())
+                        .unwrap_or("<unknown>");
+
+                    if Self::is_bot_message(msg) {
+                        tracing::info!(id = %msg.id, author, "Discord message ignored: authored by a bot");
+                        continue;
+                    }
+                    if Self::is_own_notification(msg) {
+                        tracing::info!(id = %msg.id, author, "Discord message ignored: our own notification");
+                        continue;
+                    }
+                    if msg.content.trim().is_empty() {
+                        tracing::info!(id = %msg.id, author, "Discord message ignored: empty content");
+                        continue;
+                    }
+                    if !self.passes_mention_gate(msg) {
+                        tracing::info!(
+                            id = %msg.id,
+                            author,
+                            mentioned_users = ?msg.mentions.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+                            bot_id = ?self.config.bot_id,
+                            bot_role_id = ?self.config.bot_role_id,
+                            "Discord message ignored: bot not mentioned (user or role)"
+                        );
+                        continue;
+                    }
+                    tracing::info!(
+                        id = %msg.id,
+                        author,
+                        mentioned_users = ?msg.mentions.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+                        "Discord message accepted: bot mentioned"
+                    );
+                    issues.push(self.message_to_issue(msg));
+                }
 
                 Ok(issues)
             }
@@ -336,6 +436,7 @@ mod tests {
             thread: None,
             webhook_id: None,
             embeds: vec![],
+            mentions: vec![],
         }
     }
 
@@ -374,6 +475,7 @@ mod tests {
             thread: None,
             webhook_id: None,
             embeds: vec![],
+            mentions: vec![],
         };
         // Webhook messages have author.bot=true but should NOT be filtered
         let mut webhook_msg = make_message("4", "hello", true);
@@ -433,6 +535,55 @@ mod tests {
     }
 
     #[test]
+    fn test_message_to_issue_captures_reply_pointer() {
+        let source = DiscordSource::new(make_config());
+        let mut msg = make_message("999", "what about Y?", false);
+        msg.message_reference = Some(crate::discord::DiscordMessageReference {
+            message_id: Some("parent-42".to_string()),
+            channel_id: Some("thread-7".to_string()),
+            guild_id: None,
+            fail_if_not_exists: None,
+        });
+        let issue = source.message_to_issue(&msg);
+        assert_eq!(
+            issue.get_metadata::<String>("reply_to_message_id"),
+            Some("parent-42".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("reply_to_channel_id"),
+            Some("thread-7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_message_to_issue_reply_channel_falls_back_to_message_channel() {
+        let source = DiscordSource::new(make_config());
+        let mut msg = make_message("999", "follow up", false);
+        msg.message_reference = Some(crate::discord::DiscordMessageReference {
+            message_id: Some("parent-42".to_string()),
+            channel_id: None,
+            guild_id: None,
+            fail_if_not_exists: None,
+        });
+        let issue = source.message_to_issue(&msg);
+        // No reference channel: falls back to the message's own channel.
+        assert_eq!(
+            issue.get_metadata::<String>("reply_to_channel_id"),
+            Some("chan-123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_message_to_issue_no_reply_pointer_when_not_reply() {
+        let source = DiscordSource::new(make_config());
+        let msg = make_message("999", "not a reply", false);
+        let issue = source.message_to_issue(&msg);
+        assert!(issue
+            .get_metadata::<String>("reply_to_message_id")
+            .is_none());
+    }
+
+    #[test]
     fn test_listen_channel_id_fallback() {
         let source = DiscordSource::new(make_config());
         assert_eq!(source.listen_channel_id(), Some("chan-123"));
@@ -459,6 +610,117 @@ mod tests {
         let issue = Issue::new("1", "D-1", "Test", "http://test.com", "discord");
         let result = source.matches_criteria(&issue);
         assert!(result.matches);
+    }
+
+    // --- Bot-mention gate ---
+
+    #[test]
+    fn test_mentions_user_via_structured_mentions() {
+        // The authoritative path: Discord's parsed `mentions` array contains
+        // the bot, even if the raw content has no `<@id>` token.
+        let mut msg = make_message("1", "how do I paginate?", false);
+        msg.mentions = vec![DiscordUser {
+            id: "999".to_string(),
+            username: "claudear".to_string(),
+            discriminator: "0".to_string(),
+            avatar: None,
+            bot: true,
+        }];
+        assert!(DiscordSource::mentions_user(&msg, "999"));
+        // A different user mentioned is not the bot.
+        assert!(!DiscordSource::mentions_user(&msg, "111"));
+    }
+
+    #[test]
+    fn test_mentions_user_content_fallback() {
+        // Fallback when `mentions` wasn't populated: scan raw content for the
+        // mention token in both forms.
+        let plain = make_message("1", "hey <@999> how do I paginate?", false);
+        let nick = make_message("2", "<@!999> help", false);
+        let other = make_message("3", "hey <@111> look", false);
+        let none = make_message("4", "how do I paginate?", false);
+
+        assert!(DiscordSource::mentions_user(&plain, "999"));
+        assert!(DiscordSource::mentions_user(&nick, "999"));
+        assert!(!DiscordSource::mentions_user(&other, "999"));
+        assert!(!DiscordSource::mentions_user(&none, "999"));
+        // Empty user id never matches.
+        assert!(!DiscordSource::mentions_user(&plain, ""));
+        // A role mention (<@&999>) must NOT count as a user mention.
+        let role = make_message("5", "<@&999> hello", false);
+        assert!(!DiscordSource::mentions_user(&role, "999"));
+    }
+
+    #[test]
+    fn test_mentions_role() {
+        // Role mentions live only in the raw content as `<@&ID>`.
+        let role = make_message("1", "<@&777> what adapters does vcs support?", false);
+        let user = make_message("2", "<@777> hi", false);
+        let none = make_message("3", "no mention", false);
+
+        assert!(DiscordSource::mentions_role(&role, "777"));
+        // A leading `&` sigil pasted from `<@&ID>` is tolerated.
+        assert!(DiscordSource::mentions_role(&role, "&777"));
+        // A user mention must NOT count as a role mention.
+        assert!(!DiscordSource::mentions_role(&user, "777"));
+        assert!(!DiscordSource::mentions_role(&none, "777"));
+        assert!(!DiscordSource::mentions_role(&role, ""));
+    }
+
+    #[test]
+    fn test_passes_mention_gate_accepts_user_or_role() {
+        // Both a user id and a role id are configured: either mention passes.
+        let mut config = make_config();
+        config.bot_id = Some("999".to_string());
+        config.bot_role_id = Some("777".to_string());
+        let source = DiscordSource::new(config);
+
+        let user_tag = make_message("1", "<@999> what is query not equal syntax?", false);
+        let role_tag = make_message("2", "<@&777> what is query not equal syntax?", false);
+        let untagged = make_message("3", "what is query not equal syntax?", false);
+        // Mentioning the role's number as a *user* must not pass.
+        let wrong_form = make_message("4", "<@777> hi", false);
+
+        assert!(source.passes_mention_gate(&user_tag));
+        assert!(source.passes_mention_gate(&role_tag));
+        assert!(!source.passes_mention_gate(&untagged));
+        assert!(!source.passes_mention_gate(&wrong_form));
+    }
+
+    #[test]
+    fn test_passes_mention_gate_role_only() {
+        // Only a role id configured (no bot_id): role mention passes, user
+        // mention of that number does not.
+        let mut config = make_config();
+        config.bot_id = None;
+        config.bot_role_id = Some("777".to_string());
+        let source = DiscordSource::new(config);
+
+        assert!(source.passes_mention_gate(&make_message("1", "<@&777> help", false)));
+        assert!(!source.passes_mention_gate(&make_message("2", "<@777> help", false)));
+        assert!(!source.passes_mention_gate(&make_message("3", "no tag", false)));
+    }
+
+    #[test]
+    fn test_passes_mention_gate_requires_tag_when_bot_id_set() {
+        let mut config = make_config();
+        config.bot_id = Some("999".to_string());
+        let source = DiscordSource::new(config);
+
+        let tagged = make_message("1", "<@999> what is query not equal syntax?", false);
+        let untagged = make_message("2", "what is query not equal syntax?", false);
+
+        assert!(source.passes_mention_gate(&tagged));
+        assert!(!source.passes_mention_gate(&untagged));
+    }
+
+    #[test]
+    fn test_passes_mention_gate_allows_all_when_unset() {
+        // Default config has neither bot_id nor bot_role_id → legacy
+        // "reply to all" behaviour.
+        let source = DiscordSource::new(make_config());
+        let untagged = make_message("1", "no mention here", false);
+        assert!(source.passes_mention_gate(&untagged));
     }
 
     #[tokio::test]

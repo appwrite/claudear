@@ -682,6 +682,7 @@ mod tests {
         assert!(schedule.is_due(now));
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_scheduler_add_and_get_schedules() {
         use claudear_storage::SqliteTracker;
@@ -749,6 +750,7 @@ mod tests {
         assert_eq!(scheduler.schedules()[1].name, "weekly-report");
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_scheduler_preview() {
         use claudear_storage::SqliteTracker;
@@ -822,6 +824,7 @@ mod tests {
         assert!(report.period.contains("30 Days"));
     }
 
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn test_scheduler_send_now() {
         use claudear_storage::SqliteTracker;
@@ -894,6 +897,7 @@ mod tests {
         assert_eq!(notifier_clone.call_count.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn test_scheduler_check_and_send_due_schedule() {
         use claudear_storage::SqliteTracker;

@@ -24,20 +24,21 @@ use claudear::{
     runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
     source::{
-        DiscordSource, IssueSource, JiraSource, LinearSource, SentrySource, SlackSource,
-        TelegramSource, WhatsAppSource,
+        DiscordSource, HelpScoutSource, IssueSource, JiraSource, LinearSource, SentrySource,
+        SlackSource, TelegramSource, WhatsAppSource,
     },
     storage::{
         ActivityStore, EmbeddingStore, FixAttemptTracker, RepoStore, SqliteTracker, UserStore,
     },
     telemetry::{InstrumentedNotifier, InstrumentedRunner, InstrumentedScm, InstrumentedSource},
-    types::{ActivityLogEntry, FixAttemptStatus, Issue},
+    types::{ActionKind, ActivityLogEntry, FixAttemptStatus, Issue},
     users::UserRegistry,
     watcher::{Watcher, WatcherOptions},
     webhook::{
-        print_setup_result, GitHubWebhookHandler, GitLabIssueWebhookHandler, JiraWebhookHandler,
-        LinearWebhookHandler, SentryWebhookHandler, SlackWebhookHandler, TelegramWebhookHandler,
-        WebhookConfigurator, WebhookHandlerRegistry, WebhookServer, WhatsAppWebhookHandler,
+        print_setup_result, GitHubWebhookHandler, GitLabIssueWebhookHandler,
+        HelpScoutWebhookHandler, JiraWebhookHandler, LinearWebhookHandler, SentryWebhookHandler,
+        SlackWebhookHandler, TelegramWebhookHandler, WebhookConfigurator, WebhookHandlerRegistry,
+        WebhookServer, WhatsAppWebhookHandler,
     },
 };
 use serde_json::json;
@@ -154,11 +155,25 @@ enum Commands {
         /// Path to .env file for saving webhook secrets
         #[arg(long, default_value = ".env")]
         env_file: String,
+
+        /// Run self-test: start server, send test payloads, verify processing
+        #[arg(long)]
+        self_test: bool,
     },
 
     /// Manually trigger a fix for an issue
     Trigger {
         /// Source name (linear, sentry)
+        source: String,
+        /// Issue ID
+        issue_id: String,
+    },
+
+    /// Run a single action (reply, verify, or resolve) against an issue
+    Action {
+        /// Action to run: reply | verify | resolve
+        action: String,
+        /// Source name (helpscout, linear, sentry, ...)
         source: String,
         /// Issue ID
         issue_id: String,
@@ -170,6 +185,13 @@ enum Commands {
         source: String,
         /// Issue ID
         issue_id: String,
+    },
+
+    /// Purge operational data (attempts, PRs, executions) while preserving knowledge, inference, and embeddings
+    Purge {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        confirm: bool,
     },
 
     /// Show statistics about fix attempts
@@ -681,8 +703,12 @@ struct WatcherDeps {
     review_watcher: Option<Arc<ReviewWatcher>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<claudear::repo::code_index::CodeSearchService>>,
+    discord_search_service: Option<Arc<claudear::knowledgebase::DiscordSearchService>>,
+    discord_index_orchestrator: Option<Arc<claudear::discord_index::DiscordIndexOrchestrator>>,
     agent: Arc<dyn AgentRunner>,
     classification_agent: Option<Arc<dyn AgentRunner>>,
+    repo_classification_agent: Option<Arc<dyn AgentRunner>>,
+    qa_agent: Option<Arc<dyn AgentRunner>>,
     llm_engine: Option<Arc<claudear::chat::llm::LlmEngine>>,
 }
 
@@ -761,6 +787,65 @@ async fn build_watcher_deps(
         None
     };
 
+    // Discord knowledge source: search service (read side) + index orchestrator
+    // (write side). Bot token falls back to the merged notifier/issue Discord
+    // config; the guild id comes from there (the knowledgebase config has none).
+    let (discord_search_service, discord_index_orchestrator) = {
+        let kb = config.knowledgebase.discord.as_ref();
+        if kb.map(|d| d.enabled).unwrap_or(false) {
+            let merged = config.discord_merged();
+            // Treat blank strings (from copied example config) as unset so the
+            // notifier/issue Discord fallback actually applies.
+            let nonempty = |s: String| if s.trim().is_empty() { None } else { Some(s) };
+            let bot_token = kb
+                .and_then(|d| d.bot_token.as_ref())
+                .map(|s| s.expose().to_string())
+                .and_then(nonempty)
+                .or_else(|| {
+                    merged
+                        .bot_token
+                        .as_ref()
+                        .map(|s| s.expose().to_string())
+                        .and_then(nonempty)
+                });
+            let guild_id = kb
+                .and_then(|d| d.guild_id.clone())
+                .and_then(nonempty)
+                .or_else(|| merged.guild_id.clone().and_then(nonempty));
+
+            match (embedding_client.as_ref(), bot_token, guild_id) {
+                (Some(emb), Some(token), Some(guild)) => {
+                    let search = Arc::new(claudear::knowledgebase::DiscordSearchService::new(
+                        tracker.clone(),
+                        emb.clone(),
+                    ));
+                    let indexer = Arc::new(claudear::knowledgebase::DiscordIndexer::new(
+                        tracker.clone(),
+                        emb.clone(),
+                    ));
+                    let orchestrator = claudear::discord_index::DiscordIndexOrchestrator::new(
+                        &token,
+                        guild,
+                        indexer,
+                        tracker.clone(),
+                    )
+                    .map(Arc::new)
+                    .ok();
+                    (Some(search), orchestrator)
+                }
+                _ => {
+                    tracing::warn!(
+                        "Discord knowledgebase enabled but missing embedding client, \
+                         bot_token, or guild_id; skipping"
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        }
+    };
+
     // Generic SCM provider for PR merge detection (GitLab, etc.)
     let scm_provider: Option<Arc<dyn ScmProvider>> = if let Some(gitlab_config) = config.gitlab() {
         if gitlab_config.enabled && gitlab_config.token.is_some() {
@@ -775,40 +860,8 @@ async fn build_watcher_deps(
     };
 
     // Agent runner
-    let agent: Arc<dyn AgentRunner> = InstrumentedRunner::wrap(Arc::new(ClaudeAgentRunner::new(
-        ClaudeRunnerConfig {
-            timeout_secs: config.agent.timeout_secs,
-            model: config
-                .agent
-                .default_provider_config()
-                .and_then(|p| p.model.clone()),
-            instructions: config
-                .agent
-                .default_provider_config()
-                .and_then(|p| p.instructions.clone()),
-            permissions: config
-                .agent
-                .default_provider_config()
-                .map(|p| p.permissions.clone())
-                .unwrap_or_default(),
-            skip_permissions: config
-                .agent
-                .default_provider_config()
-                .map(|p| p.skip_permissions)
-                .unwrap_or(false),
-            binary: config
-                .agent
-                .default_provider_config()
-                .and_then(|p| p.binary.clone())
-                .unwrap_or_else(|| "claude".to_string()),
-            env: config
-                .agent
-                .default_provider_config()
-                .map(|p| p.env.clone())
-                .unwrap_or_default(),
-        },
-        tracker.clone(),
-    )));
+    let agent: Arc<dyn AgentRunner> =
+        claudear::build_provider_runner(config, tracker.clone(), None);
 
     // Eagerly load LLM engine — download model if not present on disk
     let llm_engine = if config.llm.enabled {
@@ -897,46 +950,28 @@ async fn build_watcher_deps(
         agent
     };
 
-    // Build a separate agent runner for classification if a classification_model is configured
-    let classification_agent: Option<Arc<dyn AgentRunner>> = config
-        .agent
-        .default_provider_config()
-        .and_then(|p| p.classification_model.clone())
-        .map(|model| {
-            tracing::info!(model = %model, "Building separate agent runner for classification");
-            let runner = ClaudeAgentRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.agent.timeout_secs,
-                    model: Some(model),
-                    instructions: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.instructions.clone()),
-                    permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.permissions.clone())
-                        .unwrap_or_default(),
-                    skip_permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.skip_permissions)
-                        .unwrap_or(false),
-                    binary: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.binary.clone())
-                        .unwrap_or_else(|| "claude".to_string()),
-                    env: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.env.clone())
-                        .unwrap_or_default(),
-                },
-                tracker.clone(),
-            );
-            InstrumentedRunner::wrap(Arc::new(runner)) as Arc<dyn AgentRunner>
-        });
+    // Purpose-specific agent runners. Each falls back to a broader runner at the
+    // point of use (see WatcherOptions field docs) when its model is unset.
+    let provider = config.agent.default_provider_config();
+    let classification_model = provider.and_then(|p| p.classification_model.clone());
+    let repo_model = provider.and_then(|p| p.repo_model.clone());
+    let qa_model = provider.and_then(|p| p.qa_model.clone());
+
+    if let Some(ref m) = classification_model {
+        tracing::info!(model = %m, "Building agent runner for classification (intent + repo default)");
+    }
+    if let Some(ref m) = repo_model {
+        tracing::info!(model = %m, "Building agent runner for repo classification");
+    }
+    if let Some(ref m) = qa_model {
+        tracing::info!(model = %m, "Building agent runner for QA");
+    }
+
+    let classification_agent =
+        claudear::build_purpose_runner(config, tracker.clone(), classification_model);
+    let repo_classification_agent =
+        claudear::build_purpose_runner(config, tracker.clone(), repo_model);
+    let qa_agent = claudear::build_purpose_runner(config, tracker.clone(), qa_model);
 
     Ok(WatcherDeps {
         sources,
@@ -948,8 +983,12 @@ async fn build_watcher_deps(
         review_watcher,
         issue_embedding_service,
         code_search_service,
+        discord_search_service,
+        discord_index_orchestrator,
         agent,
         classification_agent,
+        repo_classification_agent,
+        qa_agent,
         llm_engine,
     })
 }
@@ -1027,6 +1066,22 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
         }
     }
 
+    if let Some(helpscout_config) = config.helpscout() {
+        if helpscout_config.enabled {
+            if !helpscout_config.app_id.expose().is_empty()
+                && !helpscout_config.app_secret.expose().is_empty()
+                && !helpscout_config.mailbox_ids.is_empty()
+            {
+                sources.push(Arc::new(HelpScoutSource::new(helpscout_config.clone())));
+                tracing::info!("HelpScout source initialized");
+            } else {
+                tracing::warn!(
+                    "HelpScout enabled but missing app_id/app_secret/mailbox_ids; skipping"
+                );
+            }
+        }
+    }
+
     let discord = config.discord_merged();
     if discord.source_enabled {
         if discord.bot_token.is_some()
@@ -1094,6 +1149,15 @@ fn create_webhook_handlers(config: &Config) -> WebhookHandlerRegistry {
         if sentry_config.enabled {
             registry.register(Arc::new(SentryWebhookHandler::new(sentry_config.clone())));
             tracing::info!("Sentry webhook handler registered");
+        }
+    }
+
+    if let Some(helpscout_config) = config.helpscout() {
+        if helpscout_config.enabled && helpscout_config.webhook_secret.is_some() {
+            registry.register(Arc::new(HelpScoutWebhookHandler::new(
+                helpscout_config.clone(),
+            )));
+            tracing::info!("HelpScout webhook handler registered");
         }
     }
 
@@ -2530,6 +2594,81 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Commands::Purge { confirm } = cli.command {
+        if is_daemon_running() {
+            anyhow::bail!("Daemon is running. Stop it first with 'claudear stop' before purging.");
+        }
+
+        let db_tracker = SqliteTracker::new(&config.db_path)?;
+
+        if !confirm {
+            let counts = db_tracker.get_diagnostic_counts()?;
+
+            println!("\nThis will DELETE all operational data:");
+            println!("  fix_attempts:     {}", counts.fix_attempts);
+            println!("  prs:              {}", counts.prs);
+            println!("  pr_reviews:       {}", counts.pr_reviews);
+            println!("  pr_review_states: {}", counts.pr_review_states);
+            println!("  claude_executions:{}", counts.claude_executions);
+            println!("  activity_log:     {}", counts.activity_log);
+            println!("  processing_metrics:{}", counts.processing_metrics);
+            println!(
+                "  feedback_outcomes: {} (detached, not deleted)",
+                counts.feedback_outcomes
+            );
+
+            println!("\nThis will PRESERVE:");
+            println!("  issues (with embeddings): {}", counts.issues);
+            println!("  similar_issues:           {}", counts.similar_issues);
+            println!("  repositories:             {}", counts.repositories);
+            println!("  repo_files:               {}", counts.repo_files);
+            println!("  inference_attempts:        {}", counts.inference_attempts);
+            println!("  error_patterns:           {}", counts.error_patterns);
+            println!("  qa_knowledge, promoted_instructions, repo_knowledge, review_patterns");
+            println!("  code_symbols, code_chunks, code_chunk_embeddings");
+
+            println!("\nRe-run with --confirm to proceed.");
+            return Ok(());
+        }
+
+        let result = db_tracker.purge_operational_data()?;
+
+        println!("\nPurged operational data:");
+        println!("  fix_attempts:         {}", result.fix_attempts);
+        println!("  prs:                  {}", result.prs);
+        println!("  pr_reviews:           {}", result.pr_reviews);
+        println!("  pr_review_comments:   {}", result.pr_review_comments);
+        println!("  pr_review_states:     {}", result.pr_review_states);
+        println!("  claude_executions:    {}", result.claude_executions);
+        println!("  strategy_fingerprints:{}", result.strategy_fingerprints);
+        println!("  diff_analyses:        {}", result.diff_analyses);
+        println!("  regression_watches:   {}", result.regression_watches);
+        println!("  release_tracking:     {}", result.release_tracking);
+        println!("  regression_checks:    {}", result.regression_checks);
+        println!("  qa_usage:             {}", result.qa_usage);
+        println!("  activity_log:         {}", result.activity_log);
+        println!("  processing_metrics:   {}", result.processing_metrics);
+        println!("  webhook_deliveries:   {}", result.webhook_deliveries);
+        println!("  issue_clusters:       {}", result.issue_clusters);
+        println!("  issue_cluster_members:{}", result.issue_cluster_members);
+        println!("  content_clusters:     {}", result.content_clusters);
+        println!("  severity_scores:      {}", result.severity_scores);
+        println!("  suppression_log:      {}", result.suppression_log);
+        println!("  eval_snapshots:       {}", result.eval_snapshots);
+        println!("  eval_deltas:          {}", result.eval_deltas);
+
+        println!("\nPreserved:");
+        println!(
+            "  feedback_outcomes detached: {}",
+            result.feedback_outcomes_detached
+        );
+        println!("  Knowledge, inference, embeddings, and code index retained.");
+
+        println!("\nTotal rows deleted: {}", result.total_deleted());
+
+        return Ok(());
+    }
+
     // Handle Diag commands early (don't need sources or full validation)
     if let Commands::Diag(ref diag_cmd) = cli.command {
         let db_tracker = SqliteTracker::new(&config.db_path)?;
@@ -3117,12 +3256,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             review_watcher: deps.review_watcher.clone(),
             issue_embedding_service: deps.issue_embedding_service.clone(),
             code_search_service: deps.code_search_service.clone(),
+            discord_search_service: deps.discord_search_service.clone(),
+            discord_index_orchestrator: deps.discord_index_orchestrator.clone(),
             relationships: deps.relationships,
             github_client: deps.github_client,
             scm_provider: deps.scm_provider,
             user_registry: user_registry.clone(),
             agent: deps.agent.clone(),
             classification_agent: deps.classification_agent.clone(),
+            repo_classification_agent: deps.repo_classification_agent.clone(),
+            qa_agent: deps.qa_agent.clone(),
             dry_run: false,
             llm_engine: deps.llm_engine.clone(),
         }));
@@ -3245,7 +3388,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let review_watcher_clone = deps.review_watcher.clone();
         let issue_embedding_service_clone = deps.issue_embedding_service.clone();
         let code_search_service_clone = deps.code_search_service.clone();
+        let discord_search_service_clone = deps.discord_search_service.clone();
         let agent_clone = deps.agent.clone();
+        let qa_agent_clone = deps.qa_agent.clone();
         let http_future = async move {
             if enable_webhooks {
                 let handlers = create_webhook_handlers(&config);
@@ -3266,9 +3411,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     github_webhook_handler_for_http,
                     agent_clone,
                 );
+                server.set_qa_agent(qa_agent_clone);
                 server.set_embedding_client(embedding_client_clone);
                 server.set_issue_embedding_service(issue_embedding_service_clone);
                 server.set_code_search_service(code_search_service_clone);
+                server.set_discord_search_service(discord_search_service_clone);
                 server.set_review_watcher(review_watcher_clone);
                 if enable_dashboard {
                     server.set_dashboard(std::path::PathBuf::from(config_path.clone()));
@@ -3636,6 +3783,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         .default_provider_config()
                         .map(|p| p.permissions.clone())
                         .unwrap_or_default(),
+                    readonly_tools: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.readonly_tools.clone())
+                        .unwrap_or_default(),
                     skip_permissions: config
                         .agent
                         .default_provider_config()
@@ -3651,6 +3803,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         .default_provider_config()
                         .map(|p| p.env.clone())
                         .unwrap_or_default(),
+                    mcp: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.mcp.clone())
+                        .unwrap_or_default(),
+                    debug_logging: config.debug_logging,
                 },
                 tracker.clone(),
             )));
@@ -3665,12 +3823,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             review_watcher,
             issue_embedding_service,
             code_search_service,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
             user_registry: user_registry.clone(),
             agent,
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -3795,6 +3957,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             setup,
             base_url,
             env_file,
+            self_test,
         } => {
             let mut config = config;
             config.webhook_port = port;
@@ -3825,6 +3988,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         anyhow::bail!("Webhook auto-configuration failed: {}", e);
                     }
                 }
+            }
+
+            // When self-testing, inject temporary webhook secrets into configured
+            // sources that don't already have one. This lets the self-test exercise
+            // the full webhook pipeline without requiring prior --setup registration.
+            if self_test {
+                claudear::webhook::self_test::inject_test_secrets(&mut config);
             }
 
             let handlers = create_webhook_handlers(&config);
@@ -3862,12 +4032,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 review_watcher: deps.review_watcher.clone(),
                 issue_embedding_service: deps.issue_embedding_service.clone(),
                 code_search_service: deps.code_search_service.clone(),
+                discord_search_service: deps.discord_search_service.clone(),
+                discord_index_orchestrator: deps.discord_index_orchestrator.clone(),
                 relationships: deps.relationships,
                 github_client: deps.github_client,
                 scm_provider: deps.scm_provider,
                 user_registry: user_registry.clone(),
                 agent: deps.agent.clone(),
                 classification_agent: deps.classification_agent.clone(),
+                repo_classification_agent: deps.repo_classification_agent.clone(),
+                qa_agent: deps.qa_agent.clone(),
                 dry_run: false,
                 llm_engine: deps.llm_engine.clone(),
             }));
@@ -3884,9 +4058,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 github_webhook_handler,
                 deps.agent,
             );
+            server.set_qa_agent(deps.qa_agent.clone());
             server.set_embedding_client(deps.embedding_client.clone());
             server.set_issue_embedding_service(deps.issue_embedding_service);
             server.set_code_search_service(deps.code_search_service);
+            server.set_discord_search_service(deps.discord_search_service);
             server.set_review_watcher(deps.review_watcher);
 
             // Start regression monitoring background task
@@ -3918,6 +4094,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     h.abort();
                 }
             };
+
+            if self_test {
+                let port_for_test = port;
+                let config_for_test = config.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    match claudear::webhook::self_test::run(port_for_test, &config_for_test).await {
+                        Ok(()) => {
+                            tracing::info!("Self-test passed!");
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            tracing::error!("Self-test failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                });
+            }
 
             tokio::select! {
                 result = server.start() => result?,
@@ -3972,40 +4166,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             };
 
             let agent: Arc<dyn AgentRunner> =
-                InstrumentedRunner::wrap(Arc::new(ClaudeAgentRunner::new(
-                    ClaudeRunnerConfig {
-                        timeout_secs: config.agent.timeout_secs,
-                        model: config
-                            .agent
-                            .default_provider_config()
-                            .and_then(|p| p.model.clone()),
-                        instructions: config
-                            .agent
-                            .default_provider_config()
-                            .and_then(|p| p.instructions.clone()),
-                        permissions: config
-                            .agent
-                            .default_provider_config()
-                            .map(|p| p.permissions.clone())
-                            .unwrap_or_default(),
-                        skip_permissions: config
-                            .agent
-                            .default_provider_config()
-                            .map(|p| p.skip_permissions)
-                            .unwrap_or(false),
-                        binary: config
-                            .agent
-                            .default_provider_config()
-                            .and_then(|p| p.binary.clone())
-                            .unwrap_or_else(|| "claude".to_string()),
-                        env: config
-                            .agent
-                            .default_provider_config()
-                            .map(|p| p.env.clone())
-                            .unwrap_or_default(),
-                    },
-                    tracker.clone(),
-                )));
+                claudear::build_provider_runner(&config, tracker.clone(), None);
 
             // Eagerly load LLM engine — download model if not present on disk
             let llm_engine = if config.llm.enabled {
@@ -4079,45 +4240,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             };
 
             // Build a separate agent runner for classification if configured
-            let classification_agent: Option<Arc<dyn AgentRunner>> = config
-                .agent
-                .default_provider_config()
-                .and_then(|p| p.classification_model.clone())
-                .map(|model| {
-                    tracing::info!(model = %model, "Building separate agent runner for classification");
-                    let runner = ClaudeAgentRunner::new(
-                        ClaudeRunnerConfig {
-                            timeout_secs: config.agent.timeout_secs,
-                            model: Some(model),
-                            instructions: config
-                                .agent
-                                .default_provider_config()
-                                .and_then(|p| p.instructions.clone()),
-                            permissions: config
-                                .agent
-                                .default_provider_config()
-                                .map(|p| p.permissions.clone())
-                                .unwrap_or_default(),
-                            skip_permissions: config
-                                .agent
-                                .default_provider_config()
-                                .map(|p| p.skip_permissions)
-                                .unwrap_or(false),
-                            binary: config
-                                .agent
-                                .default_provider_config()
-                                .and_then(|p| p.binary.clone())
-                                .unwrap_or_else(|| "claude".to_string()),
-                            env: config
-                                .agent
-                                .default_provider_config()
-                                .map(|p| p.env.clone())
-                                .unwrap_or_default(),
-                        },
-                        tracker.clone(),
-                    );
-                    InstrumentedRunner::wrap(Arc::new(runner)) as Arc<dyn AgentRunner>
-                });
+            let provider = config.agent.default_provider_config();
+            let classification_agent = claudear::build_purpose_runner(
+                &config,
+                tracker.clone(),
+                provider.and_then(|p| p.classification_model.clone()),
+            );
+            let repo_classification_agent = claudear::build_purpose_runner(
+                &config,
+                tracker.clone(),
+                provider.and_then(|p| p.repo_model.clone()),
+            );
+            let qa_agent = claudear::build_purpose_runner(
+                &config,
+                tracker.clone(),
+                provider.and_then(|p| p.qa_model.clone()),
+            );
 
             let tracker_for_api = tracker.clone();
             let vector_store_embeddings = inferrer.as_ref().map(|i| i.embedding_count());
@@ -4131,6 +4269,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 review_watcher,
                 issue_embedding_service,
                 code_search_service,
+                discord_search_service: None,
+                discord_index_orchestrator: None,
                 relationships: None,
                 github_client: if config.is_github_enabled() {
                     Some(Arc::new(GitHubClient::new(config.github().clone())))
@@ -4141,6 +4281,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 user_registry: user_registry.clone(),
                 agent,
                 classification_agent,
+                repo_classification_agent,
+                qa_agent,
                 dry_run,
                 llm_engine,
             }));
@@ -4226,6 +4368,31 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     watcher.trigger_issue(&source, &issue_id).await?;
                 }
 
+                Commands::Action {
+                    action,
+                    source,
+                    issue_id,
+                } => {
+                    let kind: ActionKind =
+                        action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+                    let outcome = watcher.run_action(kind, &source, &issue_id).await?;
+                    use claudear::processing::ProcessingOutcome;
+                    match outcome {
+                        ProcessingOutcome::Success { pr_url } => {
+                            println!("✓ {action}: PR {pr_url}");
+                        }
+                        ProcessingOutcome::CompletedNoPr { reason } => {
+                            println!("✓ {action}: {reason}");
+                        }
+                        ProcessingOutcome::Failed { error } => {
+                            println!("✗ {action} failed: {error}");
+                        }
+                        ProcessingOutcome::WrongRepo { suggested_repo, .. } => {
+                            println!("✗ {action}: wrong repo (suggested: {suggested_repo:?})");
+                        }
+                    }
+                }
+
                 Commands::Reset { source, issue_id } => {
                     watcher.reset_attempt(&source, &issue_id)?;
                 }
@@ -4280,7 +4447,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 | Commands::Inference(_)
                 | Commands::Diag(_)
                 | Commands::Users(_)
-                | Commands::Chat { .. } => unreachable!(),
+                | Commands::Chat { .. }
+                | Commands::Purge { .. } => unreachable!(),
             }
         }
     }

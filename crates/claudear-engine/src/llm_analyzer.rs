@@ -69,6 +69,28 @@ impl LlmAnalyzerImpl {
             Some(response)
         }
     }
+
+    /// Score, from 0.0 (irrelevant) to 1.0 (directly relevant), how useful a
+    /// retrieved snippet is for resolving an issue, using the **local LLM**. Used
+    /// by the opt-in retrieval-quality judge when `agent.use_llm` is set. Returns
+    /// `None` if inference fails or the response can't be parsed as a number.
+    ///
+    /// The agent-backed counterpart is
+    /// [`crate::agent_classifier::score_chunk_relevance_via_agent`].
+    pub fn score_chunk_relevance(&self, issue_summary: &str, chunk_text: &str) -> Option<f64> {
+        let prompt = format!(
+            "{}\n\nRespond with only a decimal number between 0 and 1.\nScore:",
+            crate::agent_classifier::build_relevance_context(issue_summary, chunk_text)
+        );
+        let response = self.complete(&prompt, 8)?;
+        let cleaned: String = response
+            .trim()
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit() && *c != '.')
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        cleaned.parse::<f64>().ok().map(|v| v.clamp(0.0, 1.0))
+    }
 }
 
 /// Try to parse a JSON value from a potentially noisy LLM response.
@@ -131,7 +153,7 @@ fn parse_json_response<T: DeserializeOwned>(response: &str) -> Option<T> {
 
 /// Truncate a string to approximately `max_chars` bytes, safely respecting
 /// UTF-8 char boundaries. Appends "..." when truncated.
-fn truncate(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
     if s.len() <= max_chars {
         return s.to_string();
     }

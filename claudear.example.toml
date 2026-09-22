@@ -35,6 +35,12 @@ max_activity_entries = 10000
 # IPC request timeout in seconds (default: 30)
 ipc_timeout_secs = 30
 
+# Verbose per-source polling diagnostics. When true, sources emit extra
+# per-item logs (e.g. the Discord source logs each fetched message and why it
+# was ingested or ignored, and who was mentioned). Noisy — enable only when
+# debugging why an item wasn't picked up. Default: false.
+debug_logging = false
+
 # Bind address for HTTP server (default: "127.0.0.1", use "0.0.0.0" in Docker)
 bind_address = "127.0.0.1"
 
@@ -86,9 +92,23 @@ use_llm = false
 # Options: sonnet, opus, haiku, or full model ID (e.g., claude-sonnet-4-5-20250929)
 model = "sonnet"
 
-# Model to use for repo classification (optional, falls back to model above)
-# Use a cheaper/faster model for classification to reduce costs
-# classification_model = "haiku"
+# Per-purpose model overrides. Each is optional; when unset it falls back to a
+# broader model, so you only set what you want to differ from `model` above.
+# Use a cheaper/faster model (e.g. "haiku") for classification/QA to cut cost
+# and latency — repo classification in particular runs per issue during
+# inference, so a slow model there stalls the pipeline.
+
+# Classification tasks: repo classification AND intent (QA-vs-fix) routing.
+# Falls back to `model`.
+classification_model = "haiku"
+
+# Repository classification during issue inference, specifically.
+# Falls back to `classification_model`, then `model`. Set this to split repo
+# classification off from intent routing.
+repo_model = "haiku"
+
+# Answering questions (QA). Falls back to `model`.
+qa_model = "sonnet"
 
 # Custom instructions appended to Claude's system prompt
 instructions = "Always write tests. Follow existing code style."
@@ -100,6 +120,8 @@ instructions_file = "./claude-instructions.md"
 # Tool permissions granted without prompting (--allowedTools)
 # See: https://docs.anthropic.com/en/docs/claude-code/settings
 permissions = ["Bash(git *)", "Read", "Edit"]
+
+readonly_tools = ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]
 
 # Skip all permission prompts (default: true)
 skip_permissions = true
@@ -120,6 +142,38 @@ api_url = ""
 
 # Sandbox mode (e.g., "network-off" for Codex)
 sandbox = ""
+
+# MCP servers attached to agent runs, keyed by server name.
+# Gated per-run by `sources` against the issue source. Default here: HelpScout only.
+# Add "discord" to enable there; set sources = [] to enable for all sources.
+# Keep secrets out of this file: reference them via ${VAR} from the daemon/provider env.
+# [agent.providers.claude.mcp.appwrite]
+# command = "uvx"
+# args    = ["mcp-server-appwrite", "--databases", "--users", "--functions"]
+# sources = ["helpscout"]
+# tools: tool names to allow (empty/omitted grants all of the server's tools).
+# tools   = ["databases_list_documents", "databases_get_document"]
+# [agent.providers.claude.mcp.appwrite.env]
+# APPWRITE_ENDPOINT   = "https://fra.cloud.appwrite.io/v1"
+# APPWRITE_PROJECT_ID = "monitoring-fra"
+# APPWRITE_API_KEY    = "${APPWRITE_API_KEY}"   # read-only key, set in daemon env
+
+# Grafana (mcp-grafana) — query dashboards, datasources, and metrics so the
+# agent can pull live telemetry when triaging an issue.
+# [agent.providers.claude.mcp.grafana]
+# command = "uvx"
+# args    = ["mcp-grafana"]
+# sources = ["sentry"]
+# tools: tool names to allow (empty/omitted grants all of the server's tools).
+# tools   = ["search_dashboards", "query_prometheus", "list_datasources"]
+# [agent.providers.claude.mcp.grafana.env]
+# GRAFANA_URL                   = "https://telemetry.example.com/"
+# Env values are written to .mcp.json verbatim, so you can inline literals here
+# or reference ${VAR} from the daemon env (Claude Code expands ${VAR}).
+# GRAFANA_SERVICE_ACCOUNT_TOKEN = "glsa_xxxxxxxxxxxx"   # or "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"
+# When Grafana sits behind Cloudflare Access, pass the service-token headers as a
+# JSON string (inline literals or ${VAR} both work).
+# GRAFANA_EXTRA_HEADERS         = "{\"CF-Access-Client-Id\": \"your-cf-access-client-id\", \"CF-Access-Client-Secret\": \"your-cf-access-client-secret\"}"
 
 # A/B Experiments (optional)
 # Test different providers or configurations against each other.
@@ -462,8 +516,31 @@ listen_channel_id = ""
 # Guild (server) ID for constructing message URLs
 guild_id = ""
 
+# Bot user ID. When set, the source only ingests messages that @-mention this
+# bot, so Claudear engages (answers questions / opens fixes) only when tagged.
+# When unset, every message in the listen channel is ingested (reply to all).
+# Detection uses Discord's parsed `mentions` array, falling back to scanning
+# message content for <@ID> / <@!ID>.
+bot_id = ""
+
+# Bot *role* id, matching role mentions (<@&ID>). If a role in your server
+# shares the bot's name, typing "@Claudear" may insert a role mention instead
+# of a user mention. Set this so the message is ingested either way. Matched in
+# addition to bot_id; when both are empty the gate is disabled (reply to all).
+bot_role_id = ""
+
 # Polling interval in milliseconds (overrides global)
 poll_interval_ms = 300000
+
+# Reply-chain conversation context. When a user replies to a message, resolve
+# the reply thread and feed it to the agent as grounding, so follow-ups continue
+# the conversation without re-quoting. Claudear's own prior answers are read from
+# the DB; other users' messages are fetched from Discord. Defaults to true.
+reply_chain_enabled = true
+
+# Maximum number of ancestor messages to walk when building reply-chain context.
+# Bounds Discord fetches and guards against very long threads. Defaults to 15.
+reply_chain_max_depth = 15
 
 # Slack as an issue source (messages become issues)
 # Shared credentials (bot_token, channel_id) are inherited from notifiers.slack if not set here.
@@ -491,6 +568,36 @@ app_id = ""
 # Slack app configuration token used for manifest API calls
 # Set via SLACK_APP_CONFIG_TOKEN env var for security
 app_config_token = ""
+
+# Polling interval in milliseconds (overrides global)
+poll_interval_ms = 300000
+
+[issues.helpscout]
+# HelpScout customer-support help desk as an issue source. Each conversation
+# becomes a "payload" that runs through the action pipeline
+# (classify -> verify -> resolve -> reply). Each mailbox is treated as an "inbox".
+enabled = false
+
+# OAuth2 client credentials (HelpScout Mailbox API v2 "App ID" / "App Secret").
+# Set via env vars for security.
+app_id = ""
+app_secret = ""
+
+# Mailbox ids to poll (each is a distinct inbox for reply templating).
+mailbox_ids = ["123456"]
+
+# Conversation tags that trigger automation (case-insensitive).
+trigger_tags = ["auto-implement", "claude"]
+
+# Conversation status to poll.
+trigger_status = "active"
+
+# How generated replies are posted back: "note" (internal, safe default) or
+# "reply" (customer-facing).
+reply_as = "note"
+
+# Webhook signature secret (HMAC-SHA1, X-HelpScout-Signature header).
+webhook_secret = ""
 
 # Polling interval in milliseconds (overrides global)
 poll_interval_ms = 300000
@@ -831,6 +938,66 @@ pool_size = 0
 sub_batch_size = 0
 
 # ============================================
+# Question / Answer
+# ============================================
+# When enabled, incoming messages from chat sources (e.g. Discord) are first
+# classified as a question vs a bug/security/fix request. Pure questions are
+# answered with RAG-grounded code context by the agent in a read-only mode — no
+# branch or PR. Anything ambiguous falls back to the normal issue-resolution
+# path. Requires the code index ([code_index]) for grounding.
+
+[qa]
+# Enable question/answer handling (default: false)
+enabled = false
+
+# Number of code chunks retrieved to ground the answer (default: 8)
+max_context_chunks = 8
+
+# Timeout for generating an answer, in seconds (default: 600)
+answer_timeout_secs = 600
+
+# Max questions answered per poll cycle. Separate from the global max_issues_per_cycle so a
+# burst of fix requests can't starve fast read-only answers; typically set higher than the
+# issue cap. (default: 20)
+max_qa_per_cycle = 20
+
+# Backend for intent classification (question vs bug/security/fix). false (default) uses the
+# coding agent (Claude Code) with schema-constrained output; true uses the offline local LLM
+# ([llm]). Independent of the global agent.use_llm, which only swaps the agent runner. (default: false)
+use_llm = false
+
+# Max questions answered concurrently per source, independent of the fix-lane
+# concurrency budget (max_concurrent / [sources.<name>].max_concurrent). Increase
+# this to answer more questions in parallel without affecting fix throughput.
+# Clamped to 1 if set to 0 to avoid deadlock. (default: 1)
+max_concurrent = 1
+
+# ============================================
+# Reply Action
+# ============================================
+# The reply action generates a grounded, human-sounding response to a ticket.
+# Templates are keyed by "inbox" (a HelpScout mailbox id, or a source name) and
+# are treated as SOFT GUIDELINES — the agent follows the tone/structure loosely
+# and varies naturally, it does not reproduce them verbatim.
+
+[notifiers.helpscout]
+# Enable the reply action (default: false)
+enabled = false
+
+# Instruct the agent to sound as human as possible (default: true)
+sound_human = true
+
+# Fallback guideline used when no per-inbox template matches.
+default_template = "Friendly, concise, first-person. Acknowledge the report, give a clear answer, and offer a next step."
+
+# Timeout for verifying (reproducing) a reported bug, in seconds (default: 1800)
+verify_timeout_secs = 1800
+
+# Per-inbox guidelines, keyed by HelpScout mailbox id (or source name).
+[notifiers.helpscout.templates]
+# "123456" = "Warm and apologetic for the inconvenience; sign off as the Support team."
+
+# ============================================
 # Code Indexing
 # ============================================
 # Tree-sitter based code indexing for semantic search across repositories.
@@ -847,6 +1014,23 @@ batch_size = 32
 
 # How often (in hours) to pull and re-index all repositories (default: 6.0, 0 = disable)
 reindex_interval_hours = 6.0
+
+# ============================================
+# Retrieval-Quality Assessment
+# ============================================
+# Every fix attempt pulls context from four retrieval sources (code chunks,
+# similar past issues, indexed Discord discussions, reusable Q&A). Claudear always
+# records which chunks were retrieved per attempt — their source, similarity score,
+# rank, whether they were injected into the prompt, and (for code chunks) whether
+# the fix touched that file — viewable in the Attempts page modal. This section
+# gates only the optional LLM relevance judge that attaches a quality_score to
+# each chunk (extra local-LLM inference cost; requires [llm] enabled).
+
+[retrieval_eval]
+# Enable the LLM relevance judge over retrieved chunks (default: false).
+# When false, quality_score stays empty and no extra inference runs; retrieval
+# recording and file-based "used" attribution still happen.
+enabled = false
 
 # ============================================
 # Self-Evaluation
@@ -1003,3 +1187,50 @@ https_port = 443
 
 # HTTP port for HTTP→HTTPS redirect (default: 80, set to 0 to disable)
 http_redirect_port = 80
+
+[knowledgebase.discord]
+enabled = false
+# Falls back to the notifier/issue Discord bot_token when empty.
+bot_token = ""
+# Guild to index. Falls back to the notifier/issue Discord guild_id when empty.
+guild_id = ""
+# Discord categories to index, by name (case-insensitive) or raw category id.
+# Names are resolved to ids at runtime and the mapping is stored in the db.
+# An empty list indexes nothing. e.g. categories = ["Engineering", "Support"]
+# final channels = channels from categories - ignore_channels from the categories
+categories = []
+# Channel/thread ids to exclude from the resolved set.
+ignore_channels = []
+# 0 means full history
+# in days
+backfill_days = 0
+# How often (in hours) to pull and re-index all repositories (default: 6.0, 0 = disable)
+reindex_interval_hours = 6.0
+
+# ============================================
+# Scheduled Reports / Digests
+# ============================================
+
+[reports.repetitive_digest]
+# Weekly digest of repetitive, non-actionable Sentry issues.
+#
+# Many Sentry issues recur every week but are operational/infra noise the agent
+# cannot produce a code fix for (e.g. connection-pool sizing) — it retries and
+# ends in `cannot_fix`. This digest collects such issues that are STILL firing
+# frequently and posts them once a week to your notifier(s), mentioning
+# notifiers.discord.user_id on Discord so a human can act. Report-only: it does
+# not change the fix pipeline. Requires a configured Sentry source + Discord
+# webhook.
+
+# Enable the weekly digest (default: false)
+enabled = false
+
+# Day of week to send (default: "monday")
+day = "monday"
+
+# Hour to send, 0-23 UTC (default: 9)
+hour = 9
+
+# High-recurrence threshold: minimum Sentry event_count for an issue to qualify.
+# Issues currently flagged escalating qualify regardless of this. (default: 50)
+min_event_count = 50

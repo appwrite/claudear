@@ -128,8 +128,15 @@ impl AgentConfig {
 pub struct ProviderConfig {
     /// Model to use (e.g., sonnet, opus, haiku, or full model ID).
     pub model: Option<String>,
-    /// Model to use for repo classification (optional, falls back to `model`).
+    /// Model to use for classification tasks — repo classification and intent
+    /// (QA-vs-fix) routing. Optional; falls back to `model` when unset.
     pub classification_model: Option<String>,
+    /// Model to use specifically for repository classification during issue
+    /// inference. Optional; falls back to `classification_model`, then `model`.
+    /// Set this to a cheap/fast model (e.g. "haiku") so inference doesn't stall.
+    pub repo_model: Option<String>,
+    /// Model to use for answering questions (QA). Optional; falls back to `model`.
+    pub qa_model: Option<String>,
     /// Custom instructions appended to the agent's system prompt.
     pub instructions: Option<String>,
     /// Path to a file containing custom instructions.
@@ -138,6 +145,12 @@ pub struct ProviderConfig {
     /// Tool permissions granted without prompting (--allowedTools).
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// Tools allowed for read-only Q&A (question) runs, which never skip
+    /// permission prompts. Empty means use the built-in default read-only set
+    /// (Read, Grep, Glob, WebFetch, WebSearch). Set this to add/remove tools
+    /// the agent may use when answering questions without mutating the repo.
+    #[serde(default)]
+    pub readonly_tools: Vec<String>,
     /// Skip all permission prompts (default: false).
     pub skip_permissions: bool,
     /// CLI binary name/path (e.g., "claude", "codex").
@@ -155,6 +168,60 @@ pub struct ProviderConfig {
     /// Provider-specific extra configuration.
     #[serde(default)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
+    /// MCP servers to attach to agent runs, keyed by server name. Gated per-run by sources.
+    #[serde(default)]
+    pub mcp: std::collections::HashMap<String, McpServerConfig>,
+}
+
+/// A single MCP server serialized into the agent's `.mcp.json` at run time.
+/// Reference secrets via `${VAR}` in `env` so they stay out of the config file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Command for a stdio server, e.g. "uvx" or "npx".
+    pub command: Option<String>,
+    /// Arguments passed to `command`.
+    pub args: Vec<String>,
+    /// Environment for the server process. Values may contain `${VAR}` references.
+    pub env: std::collections::HashMap<String, String>,
+    /// URL for an HTTP/SSE transport server (alternative to `command`).
+    pub url: Option<String>,
+    /// Transport type: "stdio" (default when `command` is set), "http", or "sse".
+    #[serde(rename = "type")]
+    pub transport: Option<String>,
+    /// Headers for an HTTP/SSE transport server.
+    pub headers: std::collections::HashMap<String, String>,
+    /// Issue sources this server attaches for. Empty means all sources.
+    pub sources: Vec<String>,
+    /// Tool names to allow, as `mcp__<server>__<tool>`. Empty grants all of the
+    /// server's tools (`mcp__<server>`). Applies to every run that attaches this
+    /// server.
+    pub tools: Vec<String>,
+}
+
+impl McpServerConfig {
+    /// Whether this server attaches for a run from `source`. Empty sources means all.
+    pub fn matches_source(&self, source: Option<&str>) -> bool {
+        match source {
+            Some(s) => self.sources.is_empty() || self.sources.iter().any(|allowed| allowed == s),
+            // Runs without an issue never attach MCP.
+            None => false,
+        }
+    }
+
+    /// Whether exactly one transport is configured and any explicit `type` agrees
+    /// with it. `command` implies stdio; `url` implies http/sse. Rejects neither,
+    /// both, and contradictions (e.g. `command` with `type = "http"`).
+    pub fn has_valid_transport(&self) -> bool {
+        match (self.command.is_some(), self.url.is_some()) {
+            (true, false) => self.transport.as_deref().is_none_or(|t| t == "stdio"),
+            (false, true) => self
+                .transport
+                .as_deref()
+                .is_none_or(|t| t == "http" || t == "sse"),
+            _ => false,
+        }
+    }
 }
 
 /// Experiment configuration for A/B testing providers.
@@ -216,6 +283,8 @@ pub struct IssuesConfig {
     pub discord: Option<DiscordSourceConfig>,
     /// Slack as an issue source (bot_token + channel for inbound messages).
     pub slack: Option<SlackSourceConfig>,
+    /// HelpScout as an issue source (support conversations from one or more mailboxes).
+    pub helpscout: Option<HelpScoutConfig>,
 }
 
 /// Notifier configuration group.
@@ -236,6 +305,10 @@ pub struct NotifiersConfig {
     pub whatsapp: WhatsAppConfig,
     /// Telegram Bot notification channel.
     pub telegram: TelegramConfig,
+    /// HelpScout reply channel — drives the reply action pipeline
+    /// (classify → verify → resolve → reply) and per-inbox reply templates.
+    /// Replaces the former top-level `[reply]` block; read via `Config::reply()`.
+    pub helpscout: ReplyConfig,
 }
 
 /// Discord source-only configuration (for issue ingestion).
@@ -252,6 +325,24 @@ pub struct DiscordSourceConfig {
     pub guild_id: Option<String>,
     /// Polling interval in milliseconds (overrides global).
     pub poll_interval_ms: Option<u64>,
+    /// Bot user ID. When set, only messages that @-mention this bot are
+    /// ingested (engage only when tagged). When unset, every message in the
+    /// listen channel is ingested (legacy behaviour).
+    pub bot_id: Option<String>,
+    /// Bot role ID. When the bot is mentioned via a server *role* (`<@&ID>`)
+    /// rather than as a user (`<@ID>`), Discord emits the role id. Set this
+    /// alongside `bot_id` so the source ingests the message regardless of which
+    /// form the sender picked from autocomplete.
+    pub bot_role_id: Option<String>,
+    /// When a message is a reply, resolve its reply thread into conversation
+    /// context and feed it to the agent (Claudear's own answers come from the
+    /// DB; other users' messages are fetched from Discord). `None` (omitted)
+    /// uses the default: enabled.
+    pub reply_chain_enabled: Option<bool>,
+    /// Maximum number of ancestor messages to walk when building reply-chain
+    /// context. Bounds fetches and guards against long threads. `None` (omitted)
+    /// uses the default: 15.
+    pub reply_chain_max_depth: Option<usize>,
 }
 
 /// Discord notifier-only configuration (for outbound notifications).
@@ -344,6 +435,13 @@ pub struct Config {
     pub max_activity_entries: usize,
     /// IPC request timeout in seconds (default: 30).
     pub ipc_timeout_secs: u64,
+    /// Verbose per-source diagnostics. When true, sources emit extra
+    /// per-item polling logs (e.g. the Discord source logs each fetched
+    /// message and why it was ingested or ignored). Off by default — these
+    /// logs are noisy and only useful when debugging why an item wasn't
+    /// picked up.
+    #[serde(default)]
+    pub debug_logging: bool,
     /// Agent runner configuration (providers, experiments, orchestration).
     #[serde(default)]
     pub agent: AgentConfig,
@@ -378,6 +476,9 @@ pub struct Config {
     /// Code indexing configuration.
     #[serde(default)]
     pub code_index: CodeIndexConfig,
+    /// Retrieval-quality assessment configuration.
+    #[serde(default)]
+    pub retrieval_eval: RetrievalEvalConfig,
     /// Self-evaluation configuration.
     #[serde(default)]
     pub evaluation: EvaluationConfig,
@@ -399,6 +500,15 @@ pub struct Config {
     /// Embedding model configuration (GPU acceleration, pool size).
     #[serde(default)]
     pub embedding: EmbeddingModelConfig,
+    /// RAG-grounded question answering configuration.
+    #[serde(default)]
+    pub qa: QaConfig,
+    /// knowledgebase configuration
+    #[serde(default)]
+    pub knowledgebase: KnowledgebasesConfig,
+    /// Scheduled reports / digests configuration group.
+    #[serde(default)]
+    pub reports: ReportsConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
@@ -569,6 +679,7 @@ impl Default for Config {
             processing_delay_ms: 5000,
             max_activity_entries: 10_000,
             ipc_timeout_secs: 30,
+            debug_logging: false,
             agent: AgentConfig::default(),
             scm: ScmConfig::default(),
             issues: IssuesConfig::default(),
@@ -581,6 +692,7 @@ impl Default for Config {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            retrieval_eval: RetrievalEvalConfig::default(),
             evaluation: EvaluationConfig::default(),
             storage_dir: default_storage_dir(),
             dashboard: DashboardConfig::default(),
@@ -588,7 +700,141 @@ impl Default for Config {
             chat: ChatConfig::default(),
             tls: TlsConfig::default(),
             embedding: EmbeddingModelConfig::default(),
+            qa: QaConfig::default(),
+            knowledgebase: KnowledgebasesConfig::default(),
+            reports: ReportsConfig::default(),
         }
+    }
+}
+
+/// Scheduled reports / digests configuration group.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReportsConfig {
+    /// Weekly digest of repetitive, non-actionable Sentry issues.
+    pub repetitive_digest: RepetitiveDigestConfig,
+}
+
+/// Weekly digest of repetitive, non-actionable Sentry issues.
+///
+/// Surfaces Sentry issues the agent gave up on (`cannot_fix`) that keep
+/// recurring, posting them once a week to the configured notifier(s) and
+/// mentioning `notifiers.discord.user_id` on Discord. Report-only — it does not
+/// change the fix pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepetitiveDigestConfig {
+    /// Whether the weekly digest is enabled (default: false).
+    pub enabled: bool,
+    /// Day of week to send, e.g. "monday" (default: "monday").
+    pub day: String,
+    /// Hour to send, 0-23 UTC (default: 9).
+    pub hour: u32,
+    /// High-recurrence threshold: minimum Sentry `event_count` to qualify.
+    /// Issues currently flagged escalating qualify regardless. (default: 50)
+    pub min_event_count: i64,
+}
+
+impl Default for RepetitiveDigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            day: "monday".to_string(),
+            hour: 9,
+            min_event_count: 50,
+        }
+    }
+}
+
+/// RAG-grounded question answering configuration.
+///
+/// When enabled, incoming messages from chat sources (e.g. Discord) are first
+/// classified as a question vs a fix/feature request. Pure questions are
+/// answered with code-grounded context (via the RAG code search) by the agent
+/// in a read-only mode — no branch or PR is created. Anything ambiguous falls
+/// back to the normal issue-resolution path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QaConfig {
+    /// Enable question/answer handling (default: false).
+    pub enabled: bool,
+    /// Number of code chunks to retrieve for grounding the answer (default: 8).
+    pub max_context_chunks: usize,
+    /// Timeout for generating an answer, in seconds (default: 600).
+    pub answer_timeout_secs: u64,
+    /// Maximum qa to process per poll cycle (independent from issue limits).
+    pub max_qa_per_cycle: usize,
+    /// Backend for intent classification (bug/security/question/fix routing).
+    /// `false` (default) classifies via the coding agent (Claude Code) with
+    /// schema-constrained output; `true` uses the offline local LLM. Independent
+    /// of the global `agent.use_llm`, which only swaps the agent *runner*.
+    pub use_llm: bool,
+    /// Max questions answered concurrently, independent of the fix budget.
+    pub max_concurrent: usize,
+}
+
+impl Default for QaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_context_chunks: 8,
+            answer_timeout_secs: 600,
+            max_qa_per_cycle: 20,
+            use_llm: false,
+            max_concurrent: 1,
+        }
+    }
+}
+
+/// Reply-action configuration.
+///
+/// The Reply action generates a grounded, human-sounding response to a ticket.
+/// Templates are keyed by "inbox" (a HelpScout mailbox id, or a source name in
+/// general) and are treated as *soft guidelines* — the agent is told to follow
+/// the tone/structure loosely and vary naturally, not reproduce them verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplyConfig {
+    /// Enable the reply action (default: false).
+    pub enabled: bool,
+    /// Instruct the agent to sound as human as possible (default: true).
+    pub sound_human: bool,
+    /// Fallback template guideline used when no per-inbox template matches.
+    pub default_template: Option<String>,
+    /// Per-inbox template guidelines, keyed by mailbox id / source name.
+    pub templates: std::collections::HashMap<String, String>,
+    /// Timeout for verifying (reproducing) a reported bug, in seconds (default: 1800).
+    pub verify_timeout_secs: u64,
+    /// When verify can't run (timeout/error/unsupported), assume reproduced and fix
+    /// anyway (default: true). Set false to ask the reporter for repro steps instead.
+    pub verify_fail_open: bool,
+}
+
+impl Default for ReplyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sound_human: true,
+            default_template: None,
+            templates: std::collections::HashMap::new(),
+            verify_timeout_secs: 1800,
+            verify_fail_open: true,
+        }
+    }
+}
+
+impl ReplyConfig {
+    /// Select the template guideline for an inbox, falling back to the default.
+    ///
+    /// Tries the exact `inbox_key` first (e.g. a HelpScout mailbox id), then the
+    /// configured `default_template`. Returns `None` when neither is set.
+    pub fn template_for(&self, inbox_key: Option<&str>) -> Option<&str> {
+        if let Some(key) = inbox_key {
+            if let Some(t) = self.templates.get(key) {
+                return Some(t.as_str());
+            }
+        }
+        self.default_template.as_deref()
     }
 }
 
@@ -812,6 +1058,16 @@ impl Default for CodeIndexConfig {
     }
 }
 
+/// Retrieval-quality assessment configuration. Retrieved chunks are always
+/// recorded per attempt; this gates the optional LLM relevance judge that
+/// attaches a `quality_score` (extra LLM cost).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetrievalEvalConfig {
+    /// Enable the LLM relevance judge over retrieved chunks (opt-in).
+    pub enabled: bool,
+}
+
 /// Self-evaluation configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -834,6 +1090,9 @@ pub struct EvaluationConfig {
     pub post_pr_comment: bool,
     /// Fail the fix attempt on regression.
     pub fail_on_regression: bool,
+    /// Enforce red->green: author a failing test first (must fail on the unfixed
+    /// code), then fix, then require it to pass. Needs test_delta enabled.
+    pub require_red_green: bool,
     /// Custom test command override.
     pub custom_test_cmd: Option<String>,
     /// Custom lint command override.
@@ -856,6 +1115,7 @@ impl Default for EvaluationConfig {
             total_timeout_secs: 900,
             post_pr_comment: true,
             fail_on_regression: false,
+            require_red_green: false,
             custom_test_cmd: None,
             custom_lint_cmd: None,
             custom_analysis_cmd: None,
@@ -1071,6 +1331,20 @@ pub struct DiscordConfig {
     pub guild_id: Option<String>,
     /// Polling interval in milliseconds for Discord source (overrides global).
     pub poll_interval_ms: Option<u64>,
+    /// Bot user ID. When set, the Discord source only ingests messages that
+    /// @-mention this bot (so it engages only when tagged). When unset, every
+    /// message in the listen channel is ingested (the legacy behaviour).
+    pub bot_id: Option<String>,
+    /// Bot role ID. Matched in addition to `bot_id` so a role mention
+    /// (`<@&ID>`) is treated the same as a direct user mention (`<@ID>`).
+    pub bot_role_id: Option<String>,
+    /// Verbose per-message polling diagnostics for the Discord source.
+    pub debug_logging: bool,
+    /// Resolve reply threads into conversation context (see
+    /// `DiscordSourceConfig::reply_chain_enabled`).
+    pub reply_chain_enabled: bool,
+    /// Maximum ancestor messages to walk when building reply-chain context.
+    pub reply_chain_max_depth: usize,
 }
 
 /// Email (SMTP) notification configuration.
@@ -1498,6 +1772,63 @@ impl Default for LinearConfig {
     }
 }
 
+/// How a generated reply is posted back to a HelpScout conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyAs {
+    /// Post as an internal note (not visible to the customer). Safe default.
+    #[default]
+    Note,
+    /// Post as a customer-facing reply on the conversation.
+    Reply,
+}
+
+/// HelpScout source configuration (Mailbox API v2, OAuth2 client-credentials).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HelpScoutConfig {
+    /// Whether this source is enabled.
+    pub enabled: bool,
+    /// OAuth2 client id (HelpScout "App ID").
+    pub app_id: SecretValue,
+    /// OAuth2 client secret (HelpScout "App Secret").
+    pub app_secret: SecretValue,
+    /// Mailbox ids to poll. Each mailbox is treated as a distinct "inbox".
+    pub mailbox_ids: Vec<String>,
+    /// Tags that trigger automation (matched case-insensitively against conversation tags).
+    pub trigger_tags: Vec<String>,
+    /// Conversation status to poll (e.g. "active", "open"). Defaults to "active".
+    pub trigger_status: String,
+    /// How generated replies are posted back (`note` or `reply`).
+    pub reply_as: ReplyAs,
+    /// Webhook signature verification secret (HMAC-SHA1).
+    pub webhook_secret: Option<SecretValue>,
+    /// Maximum issues to process per poll cycle for this source (overrides global).
+    pub max_issues_per_cycle: Option<usize>,
+    /// Maximum concurrent issue processing for this source (overrides global).
+    pub max_concurrent: Option<usize>,
+    /// Polling interval in milliseconds for this source (overrides global).
+    pub poll_interval_ms: Option<u64>,
+}
+
+impl Default for HelpScoutConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: SecretValue::new(""),
+            app_secret: SecretValue::new(""),
+            mailbox_ids: Vec::new(),
+            trigger_tags: vec!["auto-implement".to_string(), "claude".to_string()],
+            trigger_status: "active".to_string(),
+            reply_as: ReplyAs::Note,
+            webhook_secret: None,
+            max_issues_per_cycle: None,
+            max_concurrent: None,
+            poll_interval_ms: None,
+        }
+    }
+}
+
 /// Time period for fetching top Sentry issues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1731,6 +2062,42 @@ impl Default for RegressionConfig {
             github_token: None,
             github_search_repos: Vec::new(),
             package_names: std::collections::HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KnowledgebasesConfig {
+    pub discord: Option<DiscordKnowledgebaseConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscordKnowledgebaseConfig {
+    pub enabled: bool,
+    pub bot_token: Option<SecretValue>,
+    /// Guild to index. Falls back to the merged notifier/issue Discord guild_id
+    /// when unset (see `Config::discord_merged`).
+    pub guild_id: Option<String>,
+    pub categories: Vec<String>,
+    pub ignore_channels: Vec<String>,
+    pub backfill_days: Option<u64>,
+    pub reindex_interval_hours: f64,
+}
+
+impl Default for DiscordKnowledgebaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: None,
+            guild_id: None,
+            categories: Vec::new(),
+            ignore_channels: Vec::new(),
+            backfill_days: None,
+            // Match the documented default so periodic reindexing isn't silently
+            // disabled when the field is omitted from an enabled config.
+            reindex_interval_hours: 6.0,
         }
     }
 }
@@ -2923,6 +3290,16 @@ impl Config {
         self.issues.jira.as_ref()
     }
 
+    /// Accessor: get reference to HelpScoutConfig.
+    pub fn helpscout(&self) -> Option<&HelpScoutConfig> {
+        self.issues.helpscout.as_ref()
+    }
+
+    /// Accessor: reply-action configuration, sourced from `[notifiers.helpscout]`.
+    pub fn reply(&self) -> &ReplyConfig {
+        &self.notifiers.helpscout
+    }
+
     /// Accessor: get reference to EmailConfig.
     pub fn email(&self) -> &EmailConfig {
         &self.notifiers.email
@@ -2960,6 +3337,13 @@ impl Config {
                 .clone()
                 .or_else(|| src.and_then(|s| s.guild_id.clone())),
             poll_interval_ms: src.and_then(|s| s.poll_interval_ms),
+            // bot_id gates the source (configured under issues.discord).
+            bot_id: src.and_then(|s| s.bot_id.clone()),
+            bot_role_id: src.and_then(|s| s.bot_role_id.clone()),
+            // Sourced from the global `debug_logging` flag, not per-source.
+            debug_logging: self.debug_logging,
+            reply_chain_enabled: src.and_then(|s| s.reply_chain_enabled).unwrap_or(true),
+            reply_chain_max_depth: src.and_then(|s| s.reply_chain_max_depth).unwrap_or(15),
         }
     }
 
@@ -3110,6 +3494,203 @@ mod tests {
 
     // Mutex to prevent parallel execution of env-modifying tests
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_reply_template_for_precedence() {
+        let mut cfg = ReplyConfig {
+            default_template: Some("default".to_string()),
+            ..Default::default()
+        };
+        cfg.templates
+            .insert("123".to_string(), "mailbox-123".to_string());
+
+        // Exact inbox key wins.
+        assert_eq!(cfg.template_for(Some("123")), Some("mailbox-123"));
+        // Unknown key falls back to default.
+        assert_eq!(cfg.template_for(Some("999")), Some("default"));
+        // None falls back to default.
+        assert_eq!(cfg.template_for(None), Some("default"));
+    }
+
+    #[test]
+    fn test_reply_template_for_no_default() {
+        let cfg = ReplyConfig::default();
+        assert_eq!(cfg.template_for(Some("123")), None);
+        assert_eq!(cfg.template_for(None), None);
+    }
+
+    #[test]
+    fn test_helpscout_config_defaults() {
+        let cfg = HelpScoutConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.trigger_status, "active");
+        assert_eq!(cfg.reply_as, ReplyAs::Note);
+        assert!(cfg.trigger_tags.contains(&"claude".to_string()));
+    }
+
+    #[test]
+    fn test_knowledgebase_discord_parses_from_toml() {
+        // Mirrors the documented [knowledgebase.discord] block: the table name and
+        // every field must deserialize into DiscordKnowledgebaseConfig.
+        let toml = r#"
+            [knowledgebase.discord]
+            enabled = true
+            bot_token = "tok"
+            guild_id = "G123"
+            categories = ["cat1", "cat2"]
+            ignore_channels = ["c9"]
+            backfill_days = 7
+            reindex_interval_hours = 12.0
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let d = cfg
+            .knowledgebase
+            .discord
+            .expect("discord knowledgebase present");
+        assert!(d.enabled);
+        assert_eq!(d.guild_id.as_deref(), Some("G123"));
+        assert_eq!(d.categories, vec!["cat1".to_string(), "cat2".to_string()]);
+        assert_eq!(d.ignore_channels, vec!["c9".to_string()]);
+        assert_eq!(d.backfill_days, Some(7));
+        assert_eq!(d.reindex_interval_hours, 12.0);
+    }
+
+    #[test]
+    fn test_knowledgebase_discord_defaults_reindex_to_six_hours() {
+        // Omitting reindex_interval_hours must default to 6.0, not 0.0 (which would
+        // silently disable periodic reindexing).
+        let toml = r#"
+            [knowledgebase.discord]
+            enabled = true
+            categories = ["cat1"]
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let d = cfg
+            .knowledgebase
+            .discord
+            .expect("discord knowledgebase present");
+        assert!(d.enabled);
+        assert_eq!(d.reindex_interval_hours, 6.0);
+        assert_eq!(
+            DiscordKnowledgebaseConfig::default().reindex_interval_hours,
+            6.0
+        );
+    }
+
+    #[test]
+    fn test_reply_config_parses_from_toml() {
+        let toml = r#"
+            [notifiers.helpscout]
+            enabled = true
+            default_template = "be nice"
+            [notifiers.helpscout.templates]
+            "42" = "warm and apologetic"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        assert!(cfg.reply().enabled);
+        assert_eq!(
+            cfg.reply().template_for(Some("42")),
+            Some("warm and apologetic")
+        );
+        assert_eq!(cfg.reply().template_for(Some("x")), Some("be nice"));
+    }
+
+    #[test]
+    fn test_mcp_config_parses_from_toml() {
+        let toml = r#"
+            [agent.providers.claude.mcp.appwrite]
+            command = "uvx"
+            args = ["mcp-server-appwrite", "--databases"]
+            sources = ["helpscout"]
+            tools = ["databases_get_document"]
+            [agent.providers.claude.mcp.appwrite.env]
+            APPWRITE_ENDPOINT = "https://fra.cloud.appwrite.io/v1"
+            APPWRITE_API_KEY = "${APPWRITE_API_KEY}"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let provider = cfg.agent.providers.get("claude").expect("provider");
+        let appwrite = provider.mcp.get("appwrite").expect("mcp server");
+        assert_eq!(appwrite.command.as_deref(), Some("uvx"));
+        assert_eq!(appwrite.sources, vec!["helpscout".to_string()]);
+        assert_eq!(appwrite.tools, vec!["databases_get_document".to_string()]);
+        assert_eq!(
+            appwrite.env.get("APPWRITE_API_KEY").map(String::as_str),
+            Some("${APPWRITE_API_KEY}")
+        );
+    }
+
+    #[test]
+    fn test_mcp_matches_source() {
+        let helpscout_only = McpServerConfig {
+            sources: vec!["helpscout".to_string()],
+            ..Default::default()
+        };
+        assert!(helpscout_only.matches_source(Some("helpscout")));
+        assert!(!helpscout_only.matches_source(Some("discord")));
+        assert!(!helpscout_only.matches_source(None));
+
+        let all_sources = McpServerConfig::default();
+        assert!(all_sources.matches_source(Some("discord")));
+        assert!(all_sources.matches_source(Some("sentry")));
+        // Runs without an issue never attach, even when unrestricted.
+        assert!(!all_sources.matches_source(None));
+    }
+
+    #[test]
+    fn test_mcp_has_valid_transport() {
+        let stdio = McpServerConfig {
+            command: Some("uvx".to_string()),
+            ..Default::default()
+        };
+        assert!(stdio.has_valid_transport());
+
+        let http = McpServerConfig {
+            url: Some("https://example/mcp".to_string()),
+            transport: Some("http".to_string()),
+            ..Default::default()
+        };
+        assert!(http.has_valid_transport());
+
+        // Contradictions and ambiguity are rejected.
+        let command_with_http = McpServerConfig {
+            command: Some("uvx".to_string()),
+            transport: Some("http".to_string()),
+            ..Default::default()
+        };
+        assert!(!command_with_http.has_valid_transport());
+
+        let url_with_stdio = McpServerConfig {
+            url: Some("https://example/mcp".to_string()),
+            transport: Some("stdio".to_string()),
+            ..Default::default()
+        };
+        assert!(!url_with_stdio.has_valid_transport());
+
+        let both = McpServerConfig {
+            command: Some("uvx".to_string()),
+            url: Some("https://example/mcp".to_string()),
+            ..Default::default()
+        };
+        assert!(!both.has_valid_transport());
+
+        assert!(!McpServerConfig::default().has_valid_transport());
+    }
+
+    #[test]
+    fn test_helpscout_config_parses_from_toml() {
+        let toml = r#"
+            [issues.helpscout]
+            enabled = true
+            mailbox_ids = ["100", "200"]
+            trigger_tags = ["bug"]
+            reply_as = "reply"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let hs = cfg.helpscout().expect("helpscout config");
+        assert!(hs.enabled);
+        assert_eq!(hs.mailbox_ids, vec!["100".to_string(), "200".to_string()]);
+        assert_eq!(hs.reply_as, ReplyAs::Reply);
+    }
 
     // All environment variables that Config reads
     const CONFIG_ENV_VARS: &[&str] = &[
@@ -7547,6 +8128,7 @@ instructions_file = "my-instructions.md"
             total_timeout_secs: 1800,
             post_pr_comment: false,
             fail_on_regression: true,
+            require_red_green: false,
             custom_test_cmd: Some("npm test".to_string()),
             custom_lint_cmd: None,
             custom_analysis_cmd: Some("sonar".to_string()),
@@ -8289,5 +8871,92 @@ workspace = "/tmp/repos"
         }
         let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
         assert!(wrapper.agent.use_llm);
+    }
+
+    #[test]
+    fn test_qa_max_qa_per_cycle_from_toml() {
+        let toml_str = r#"
+            [qa]
+            enabled = true
+            max_qa_per_cycle = 30
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(wrapper.qa.max_qa_per_cycle, 30);
+    }
+
+    #[test]
+    fn test_qa_max_qa_per_cycle_defaults_when_omitted() {
+        // `[qa]` present but key omitted falls back to the QaConfig default.
+        let toml_str = r#"
+            [qa]
+            enabled = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            wrapper.qa.max_qa_per_cycle,
+            QaConfig::default().max_qa_per_cycle
+        );
+    }
+
+    #[test]
+    fn test_qa_max_concurrent_from_toml() {
+        let toml_str = r#"
+            [qa]
+            enabled = true
+            max_concurrent = 5
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(wrapper.qa.max_concurrent, 5);
+    }
+
+    #[test]
+    fn test_qa_max_concurrent_defaults_when_omitted() {
+        // `[qa]` present but key omitted falls back to the QaConfig default.
+        let toml_str = r#"
+            [qa]
+            enabled = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            wrapper.qa.max_concurrent,
+            QaConfig::default().max_concurrent
+        );
+    }
+
+    #[test]
+    fn test_qa_use_llm_default_false() {
+        // Intent classification defaults to the agent backend.
+        assert!(!QaConfig::default().use_llm);
+    }
+
+    #[test]
+    fn test_qa_use_llm_from_toml() {
+        let toml_str = r#"
+            [qa]
+            enabled = true
+            use_llm = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert!(wrapper.qa.use_llm);
     }
 }

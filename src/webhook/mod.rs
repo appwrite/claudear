@@ -3,6 +3,7 @@
 //! Handlers and types are provided by `claudear_integrations::webhook`.
 //! The webhook server (which orchestrates processing) lives here.
 
+pub mod self_test;
 mod server;
 
 // Re-export everything from the integrations crate's webhook module

@@ -19,6 +19,55 @@ use std::sync::Arc;
 use tower_cookies::CookieManagerLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+/// Apply the standard dashboard middleware stack to a router serving the
+/// dashboard API: security headers, CSRF protection, CORS, and cookie
+/// management. Shared by the standalone [`ApiServer`] and the combined
+/// webhook+dashboard server so both expose identical auth/cookie behavior.
+///
+/// `tls_enabled` controls the CSRF cookie's `Secure` flag and should reflect
+/// whether the server is actually serving HTTPS.
+///
+/// Apply this only to the dashboard routes — the CSRF layer would otherwise
+/// reject inbound webhook `POST`s, which carry no CSRF token.
+pub fn apply_dashboard_middleware(router: axum::Router, tls_enabled: bool) -> axum::Router {
+    // Allow requests from common local dashboard origins.
+    // In production behind a reverse proxy, the proxy should handle CORS.
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin, _| {
+            if let Ok(origin_str) = origin.to_str() {
+                // Allow localhost and 127.0.0.1 on any port (common dev/local setup)
+                origin_str.starts_with("http://localhost")
+                    || origin_str.starts_with("https://localhost")
+                    || origin_str.starts_with("http://127.0.0.1")
+                    || origin_str.starts_with("https://127.0.0.1")
+            } else {
+                false
+            }
+        }))
+        .allow_methods([
+            http::Method::GET,
+            http::Method::POST,
+            http::Method::PUT,
+            http::Method::DELETE,
+            http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            http::header::CONTENT_TYPE,
+            http::header::AUTHORIZATION,
+            http::header::COOKIE,
+            http::HeaderName::from_static("x-csrf-token"),
+        ])
+        .allow_credentials(true);
+
+    router
+        .layer(axum::middleware::from_fn(security::security_headers))
+        .layer(axum::middleware::from_fn(move |req, next| {
+            security::csrf_protection(req, next, tls_enabled)
+        }))
+        .layer(cors)
+        .layer(CookieManagerLayer::new())
+}
+
 /// API server configuration.
 pub struct ApiServer {
     config: Config,
@@ -76,52 +125,20 @@ impl ApiServer {
 
     /// Start the API server.
     pub async fn start(self) -> Result<()> {
-        // Allow requests from common local dashboard origins.
-        // In production behind a reverse proxy, the proxy should handle CORS.
-        let cors = CorsLayer::new()
-            .allow_origin(AllowOrigin::predicate(|origin, _| {
-                if let Ok(origin_str) = origin.to_str() {
-                    // Allow localhost and 127.0.0.1 on any port (common dev/local setup)
-                    origin_str.starts_with("http://localhost")
-                        || origin_str.starts_with("https://localhost")
-                        || origin_str.starts_with("http://127.0.0.1")
-                        || origin_str.starts_with("https://127.0.0.1")
-                } else {
-                    false
-                }
-            }))
-            .allow_methods([
-                http::Method::GET,
-                http::Method::POST,
-                http::Method::PUT,
-                http::Method::DELETE,
-                http::Method::OPTIONS,
-            ])
-            .allow_headers([
-                http::header::CONTENT_TYPE,
-                http::header::AUTHORIZATION,
-                http::header::COOKIE,
-                http::HeaderName::from_static("x-csrf-token"),
-            ])
-            .allow_credentials(true);
-
         // Subscribe to indexing progress from the tracker's watch channel
         let indexing_rx = self.tracker.subscribe_indexing_progress();
 
-        let tls_enabled_for_csrf = self.config.tls.enabled;
-        let app = create_api_router_with_dashboard(
-            self.config.clone(),
-            self.tracker.clone(),
-            self.config_path,
-            indexing_rx,
-            self.dashboard_dir.clone(),
+        let tls_enabled = self.config.tls.enabled;
+        let app = apply_dashboard_middleware(
+            create_api_router_with_dashboard(
+                self.config.clone(),
+                self.tracker.clone(),
+                self.config_path,
+                indexing_rx,
+                self.dashboard_dir.clone(),
+            ),
+            tls_enabled,
         )
-        .layer(axum::middleware::from_fn(security::security_headers))
-        .layer(axum::middleware::from_fn(move |req, next| {
-            security::csrf_protection(req, next, tls_enabled_for_csrf)
-        }))
-        .layer(cors)
-        .layer(CookieManagerLayer::new())
         // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
         .layer(SentryHttpLayer::new().enable_transaction())
         .layer(NewSentryLayer::new_from_top());

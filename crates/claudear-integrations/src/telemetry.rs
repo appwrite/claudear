@@ -15,7 +15,9 @@ use crate::source::IssueSource;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
-use claudear_core::types::{AgentResult, AskDelivery, AskReply, AskRequest, Issue, MatchResult};
+use claudear_core::types::{
+    AgentResult, AskDelivery, AskReply, AskRequest, Issue, MatchResult, ReplyKind, VerifyResult,
+};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -210,6 +212,22 @@ impl Notifier for InstrumentedNotifier {
         }
     }
 
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<Vec<String>> {
+        // Forward to the inner notifier so reply-capable channels (e.g. Discord)
+        // actually run and return their sent message ids. Without this the trait
+        // default would run here and the ids would be lost.
+        match self.inner.notify_answer(issue, answer).await {
+            Ok(ids) => {
+                tracing::info!(component = self.inner.name(), issue = %issue.short_id, sent = ids.len(), "Notified answer");
+                Ok(ids)
+            }
+            Err(e) => {
+                tracing::warn!(component = self.inner.name(), issue = %issue.short_id, error = %e, "Failed to notify answer");
+                Err(e)
+            }
+        }
+    }
+
     async fn notify_urgent_issues(&self, issues: &[Issue]) -> Result<()> {
         match self.inner.notify_urgent_issues(issues).await {
             Ok(v) => {
@@ -336,6 +354,25 @@ impl ScmProvider for InstrumentedScm {
     ) -> Result<Vec<ReviewComment>> {
         self.inner
             .get_new_review_comments(project, number, since)
+            .await
+    }
+    async fn get_pr_conversation_comments(
+        &self,
+        project: &str,
+        number: i64,
+    ) -> Result<Vec<ReviewComment>> {
+        self.inner
+            .get_pr_conversation_comments(project, number)
+            .await
+    }
+    async fn get_new_conversation_comments(
+        &self,
+        project: &str,
+        number: i64,
+        since: Option<&str>,
+    ) -> Result<Vec<ReviewComment>> {
+        self.inner
+            .get_new_conversation_comments(project, number, since)
             .await
     }
     async fn list_repos(&self, org_or_group: &str) -> Result<Vec<RemoteRepo>> {
@@ -479,5 +516,49 @@ impl AgentRunner for InstrumentedRunner {
                 Err(e)
             }
         }
+    }
+
+    async fn answer_question(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<String> {
+        self.inner
+            .answer_question(issue, context, project_dir)
+            .await
+    }
+
+    async fn verify_issue(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<VerifyResult> {
+        self.inner.verify_issue(issue, context, project_dir).await
+    }
+
+    async fn generate_reply(
+        &self,
+        issue: &Issue,
+        context: &str,
+        guideline: Option<&str>,
+        kind: ReplyKind,
+        project_dir: &Path,
+    ) -> Result<String> {
+        self.inner
+            .generate_reply(issue, context, guideline, kind, project_dir)
+            .await
+    }
+
+    async fn structured_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+    ) -> Result<serde_json::Value> {
+        self.inner
+            .structured_query(prompt, json_schema, project_dir)
+            .await
     }
 }

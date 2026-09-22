@@ -3,6 +3,7 @@
 pub mod s1_lifecycle;
 pub mod s2_ask;
 pub mod s3_cascade;
+pub mod s4_action;
 
 use claudear::scm::ScmProvider;
 use claudear::source::IssueSource;
@@ -104,6 +105,54 @@ impl<'a> ScenarioContext<'a> {
                 "git clone failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+
+        // Configure a repo-local credential helper that returns the SCM bot
+        // token. This ensures git push authenticates as the bot user even if
+        // Claude Code (or macOS keychain) injects different credentials.
+        let scm_token = match self.scm_name {
+            "github" => std::env::var("CLAUDEAR_E2E_GITHUB_TOKEN").ok(),
+            "gitlab" => std::env::var("CLAUDEAR_E2E_GITLAB_TOKEN").ok(),
+            _ => None,
+        };
+        if let Some(token) = scm_token {
+            let helper_script = clone_dest.join(".git-credential-helper.sh");
+            let username = if self.scm_name == "gitlab" {
+                "oauth2"
+            } else {
+                "x-access-token"
+            };
+            std::fs::write(
+                &helper_script,
+                format!(
+                    "#!/bin/sh\nprintf 'username={}\\npassword={}\\n'\n",
+                    username, token
+                ),
+            )
+            .context("write credential helper")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&helper_script, std::fs::Permissions::from_mode(0o700))
+                    .context("chmod credential helper")?;
+            }
+            let set_helper = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    clone_dest.to_str().unwrap_or(""),
+                    "config",
+                    "--local",
+                    "credential.helper",
+                    &format!("!{}", helper_script.display()),
+                ])
+                .output()
+                .context("git config credential.helper")?;
+            if !set_helper.status.success() {
+                tracing::warn!(
+                    "Failed to set repo-local credential helper: {}",
+                    String::from_utf8_lossy(&set_helper.stderr)
+                );
+            }
         }
 
         Ok(clone_dest)

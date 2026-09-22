@@ -1,6 +1,7 @@
 //! Sentry issue source adapter.
 
 use super::IssueSource;
+use crate::webhook::{sentry_map_priority as map_priority, sentry_map_status as map_status};
 use async_trait::async_trait;
 use claudear_config::config::SentryConfig;
 use claudear_core::error::{Error, Result};
@@ -254,8 +255,8 @@ impl<H: SentryHttpClient> SentrySource<H> {
         );
 
         issue.description = api_issue.metadata.as_ref().and_then(|m| m.value.clone());
-        issue.priority = Self::map_priority(&api_issue.level, event_count);
-        issue.status = Self::map_status(&api_issue.status);
+        issue.priority = map_priority(&api_issue.level, event_count);
+        issue.status = map_status(&api_issue.status);
 
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&api_issue.first_seen) {
             issue.created_at = Some(dt.with_timezone(&chrono::Utc));
@@ -294,26 +295,6 @@ impl<H: SentryHttpClient> SentrySource<H> {
         }
 
         issue
-    }
-
-    fn map_priority(level: &str, event_count: i64) -> IssuePriority {
-        if level == "fatal" || (level == "error" && event_count > 1000) {
-            IssuePriority::Critical
-        } else if level == "error" {
-            IssuePriority::High
-        } else if level == "warning" {
-            IssuePriority::Medium
-        } else {
-            IssuePriority::Low
-        }
-    }
-
-    fn map_status(status: &str) -> IssueStatus {
-        match status {
-            "resolved" => IssueStatus::Resolved,
-            "ignored" => IssueStatus::Ignored,
-            _ => IssueStatus::Open,
-        }
     }
 
     /// Check if a Sentry status represents a terminal/resolved state.
@@ -608,7 +589,7 @@ impl<H: SentryHttpClient + 'static> IssueSource for SentrySource<H> {
         let escalation_rate: Option<f64> = issue.get_metadata("escalation_rate");
 
         // Check minimum event count
-        if event_count < self.config.min_event_count as i64 {
+        if event_count < i64::try_from(self.config.min_event_count).unwrap_or(i64::MAX) {
             return MatchResult::not_matched(format!(
                 "Event count {} below threshold {}",
                 event_count, self.config.min_event_count
@@ -1348,42 +1329,18 @@ mod tests {
 
     #[test]
     fn test_map_priority() {
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("fatal", 0),
-            IssuePriority::Critical
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("error", 1001),
-            IssuePriority::Critical
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("error", 100),
-            IssuePriority::High
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("warning", 100),
-            IssuePriority::Medium
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("info", 100),
-            IssuePriority::Low
-        );
+        assert_eq!(map_priority("fatal", 0), IssuePriority::Critical);
+        assert_eq!(map_priority("error", 1001), IssuePriority::Critical);
+        assert_eq!(map_priority("error", 100), IssuePriority::High);
+        assert_eq!(map_priority("warning", 100), IssuePriority::Medium);
+        assert_eq!(map_priority("info", 100), IssuePriority::Low);
     }
 
     #[test]
     fn test_map_status() {
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_status("resolved"),
-            IssueStatus::Resolved
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_status("ignored"),
-            IssueStatus::Ignored
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_status("unresolved"),
-            IssueStatus::Open
-        );
+        assert_eq!(map_status("resolved"), IssueStatus::Resolved);
+        assert_eq!(map_status("ignored"), IssueStatus::Ignored);
+        assert_eq!(map_status("unresolved"), IssueStatus::Open);
     }
 
     #[test]
@@ -1548,74 +1505,26 @@ mod tests {
 
     #[test]
     fn test_map_priority_all_levels() {
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("fatal", 0),
-            IssuePriority::Critical
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("fatal", 1),
-            IssuePriority::Critical
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("error", 1001),
-            IssuePriority::Critical
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("error", 1000),
-            IssuePriority::High
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("error", 999),
-            IssuePriority::High
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("error", 1),
-            IssuePriority::High
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("warning", 0),
-            IssuePriority::Medium
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("warning", 10000),
-            IssuePriority::Medium
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("info", 0),
-            IssuePriority::Low
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("debug", 0),
-            IssuePriority::Low
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_priority("unknown", 0),
-            IssuePriority::Low
-        );
+        assert_eq!(map_priority("fatal", 0), IssuePriority::Critical);
+        assert_eq!(map_priority("fatal", 1), IssuePriority::Critical);
+        assert_eq!(map_priority("error", 1001), IssuePriority::Critical);
+        assert_eq!(map_priority("error", 1000), IssuePriority::High);
+        assert_eq!(map_priority("error", 999), IssuePriority::High);
+        assert_eq!(map_priority("error", 1), IssuePriority::High);
+        assert_eq!(map_priority("warning", 0), IssuePriority::Medium);
+        assert_eq!(map_priority("warning", 10000), IssuePriority::Medium);
+        assert_eq!(map_priority("info", 0), IssuePriority::Low);
+        assert_eq!(map_priority("debug", 0), IssuePriority::Low);
+        assert_eq!(map_priority("unknown", 0), IssuePriority::Low);
     }
 
     #[test]
     fn test_map_status_all_values() {
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_status("resolved"),
-            IssueStatus::Resolved
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_status("ignored"),
-            IssueStatus::Ignored
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_status("unresolved"),
-            IssueStatus::Open
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_status("reprocessing"),
-            IssueStatus::Open
-        );
-        assert_eq!(
-            SentrySource::<ReqwestSentryClient>::map_status(""),
-            IssueStatus::Open
-        );
+        assert_eq!(map_status("resolved"), IssueStatus::Resolved);
+        assert_eq!(map_status("ignored"), IssueStatus::Ignored);
+        assert_eq!(map_status("unresolved"), IssueStatus::Open);
+        assert_eq!(map_status("reprocessing"), IssueStatus::Open);
+        assert_eq!(map_status(""), IssueStatus::Open);
     }
 
     #[test]

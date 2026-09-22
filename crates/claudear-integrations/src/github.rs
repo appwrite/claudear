@@ -42,6 +42,17 @@ struct PullRequestRef {
     ref_name: String,
 }
 
+/// Minimal shape of the response from creating a PR / reading repo metadata.
+#[derive(Debug, Deserialize)]
+struct CreatedPr {
+    html_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoMeta {
+    default_branch: String,
+}
+
 /// A GitHub issue from the Issues API.
 #[derive(Debug, Deserialize)]
 pub struct GitHubIssue {
@@ -272,6 +283,97 @@ impl<H: HttpClient> GitHubClient<H> {
             page += 1;
             if page > MAX_PAGES {
                 tracing::warn!(repo = %repo, pr_number, "Hit pagination limit for PR review comments");
+                break;
+            }
+        }
+
+        Ok(all_comments)
+    }
+
+    /// Get a PR's *conversation* comments (the issue-comment timeline), as opposed
+    /// to inline review-thread comments. GitHub models a PR as an issue, so these
+    /// come from `/repos/{repo}/issues/{n}/comments` — a plain "@claudear fix this"
+    /// left on the PR conversation lands here, not in `/pulls/{n}/comments`.
+    ///
+    /// They are mapped into [`ReviewComment`] with an empty `path`/absent `line`
+    /// and no `pull_request_review_id`, so they flow through the same standalone
+    /// review-feedback pipeline as inline comments.
+    pub async fn get_pr_issue_comments(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Vec<ReviewComment>> {
+        // A PR conversation comment as returned by the issues-comments endpoint.
+        // Only the fields we carry forward are deserialized.
+        #[derive(serde::Deserialize)]
+        struct GitHubIssueComment {
+            id: i64,
+            #[serde(default)]
+            body: Option<String>,
+            user: ReviewUser,
+            created_at: String,
+            updated_at: String,
+            html_url: String,
+        }
+
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let base_url = format!(
+            "https://api.github.com/repos/{}/issues/{}/comments",
+            repo, pr_number
+        );
+        let headers = self.build_headers(token);
+
+        let mut all_comments = Vec::new();
+        let mut page = 1usize;
+        const DEFAULT_PAGE_SIZE: usize = 30;
+        const MAX_PAGES: usize = 100;
+
+        loop {
+            let url = if page == 1 {
+                base_url.clone()
+            } else {
+                format!("{}?page={}", base_url, page)
+            };
+            let response = self.http.get(&url, headers.clone()).await?;
+
+            if !response.is_success() {
+                return Err(Error::Other(format!(
+                    "GitHub API error ({}): {}",
+                    response.status, response.body
+                )));
+            }
+
+            let comments: Vec<GitHubIssueComment> = response.json()?;
+            let count = comments.len();
+            all_comments.extend(comments.into_iter().map(|c| ReviewComment {
+                id: c.id,
+                path: String::new(),
+                position: None,
+                original_position: None,
+                body: c.body.unwrap_or_default(),
+                user: c.user,
+                created_at: c.created_at,
+                updated_at: c.updated_at,
+                html_url: c.html_url,
+                pull_request_review_id: None,
+                line: None,
+                start_line: None,
+                side: None,
+            }));
+
+            if count < DEFAULT_PAGE_SIZE {
+                break;
+            }
+
+            page += 1;
+            if page > MAX_PAGES {
+                tracing::warn!(repo = %repo, pr_number, "Hit pagination limit for PR issue comments");
                 break;
             }
         }
@@ -841,6 +943,66 @@ impl<H: HttpClient> GitHubClient<H> {
         }
         Ok(())
     }
+
+    pub async fn get_default_branch(&self, repo: &str) -> Result<String> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let url = format!("https://api.github.com/repos/{}", repo);
+        let headers = self.build_headers(token);
+
+        let response = self.http.get(&url, headers).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to fetch repo {}: {}",
+                repo, response.body
+            )));
+        }
+        let meta: RepoMeta = response.json()?;
+        Ok(meta.default_branch)
+    }
+
+    /// Open a new pull request from `head` into `base`. Returns the html_url of
+    /// the created PR (a real `/pull/<number>` link).
+    pub async fn create_pr(
+        &self,
+        repo: &str,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<String> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let url = format!("https://api.github.com/repos/{}/pulls", repo);
+        let headers = self.build_headers(token);
+        let payload = serde_json::json!({
+            "title": title,
+            "head": head,
+            "base": base,
+            "body": body,
+        })
+        .to_string();
+
+        let response = self.http.post(&url, headers, &payload).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to create PR in {} ({} -> {}): {}",
+                repo, head, base, response.body
+            )));
+        }
+        let created: CreatedPr = response.json()?;
+        Ok(created.html_url)
+    }
 }
 
 #[async_trait]
@@ -879,6 +1041,14 @@ impl<H: HttpClient> ScmProvider for GitHubClient<H> {
 
     async fn get_review_comments(&self, project: &str, number: i64) -> Result<Vec<ReviewComment>> {
         self.get_pr_review_comments(project, number).await
+    }
+
+    async fn get_pr_conversation_comments(
+        &self,
+        project: &str,
+        number: i64,
+    ) -> Result<Vec<ReviewComment>> {
+        self.get_pr_issue_comments(project, number).await
     }
 
     async fn list_repos(&self, org_or_group: &str) -> Result<Vec<RemoteRepo>> {
@@ -1219,6 +1389,71 @@ mod tests {
 
         let status = client.get_pr_status("owner/repo", 1).await.unwrap();
         assert_eq!(status, PrStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_returns_real_url() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls",
+            201,
+            r#"{"html_url": "https://github.com/owner/repo/pull/123"}"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".into()),
+            review_trigger: "@claudear".to_string(),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let url = client
+            .create_pr("owner/repo", "fix/branch", "main", "Fix: thing", "body")
+            .await
+            .unwrap();
+        assert_eq!(url, "https://github.com/owner/repo/pull/123");
+    }
+
+    #[tokio::test]
+    async fn test_get_default_branch() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo",
+            200,
+            r#"{"default_branch": "develop"}"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".into()),
+            review_trigger: "@claudear".to_string(),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let branch = client.get_default_branch("owner/repo").await.unwrap();
+        assert_eq!(branch, "develop");
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_errors_on_failure() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls",
+            422,
+            r#"{"message": "Validation Failed"}"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".into()),
+            review_trigger: "@claudear".to_string(),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        assert!(client
+            .create_pr("owner/repo", "fix/branch", "main", "t", "b")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

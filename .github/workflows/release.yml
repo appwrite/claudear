@@ -215,7 +215,7 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${{ github.repository_owner }}/homebrew-tap.git
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/abnegate/homebrew-tap.git
           mkdir -p homebrew-tap/Formula
           cp claudear.rb homebrew-tap/Formula/
           cd homebrew-tap
@@ -316,14 +316,16 @@ jobs:
         env:
           APT_REPO_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
         run: |
-          git clone https://x-access-token:${APT_REPO_TOKEN}@github.com/${{ github.repository_owner }}/apt-repo.git
+          git clone https://x-access-token:${APT_REPO_TOKEN}@github.com/abnegate/apt-repo.git
 
       - name: Update APT repository
         env:
           GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
         run: |
-          # Copy new packages
+          # Replace this package's debs rather than adding to them, so the
+          # pool holds one version per package and the Pages site stays small
           mkdir -p apt-repo/pool/main
+          rm -f apt-repo/pool/main/claudear_*.deb
           cp debs/*.deb apt-repo/pool/main/
 
           cd apt-repo
@@ -340,13 +342,13 @@ jobs:
           # Generate Release file
           cd dists/stable
           cat > Release << EOF
-          Origin: claudear
-          Label: claudear
+          Origin: abnegate
+          Label: abnegate
           Suite: stable
           Codename: stable
           Architectures: amd64 arm64
           Components: main
-          Description: Claudear APT Repository
+          Description: APT repository for abnegate packages
           EOF
 
           # Add checksums

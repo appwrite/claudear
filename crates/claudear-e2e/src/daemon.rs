@@ -36,6 +36,12 @@ impl DaemonHandle {
     }
 }
 
+impl Drop for DaemonHandle {
+    fn drop(&mut self) {
+        stop(self);
+    }
+}
+
 /// Start a native daemon process.
 pub fn start_process(
     binary: &str,
@@ -55,6 +61,7 @@ pub fn start_process(
             config_path.to_str().unwrap_or(""),
             "--verbose",
             "start",
+            "--foreground",
             "--poll",
             "--poll-interval",
             "5000",

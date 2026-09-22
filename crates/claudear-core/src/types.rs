@@ -343,6 +343,9 @@ pub enum FixAttemptStatus {
     /// Max retries reached, issue cannot be automatically fixed.
     #[serde(rename = "cannot_fix")]
     CannotFix,
+    /// Input was a question and was answered (no PR/fix attempted).
+    #[serde(rename = "answered")]
+    Answered,
 }
 
 impl std::fmt::Display for FixAttemptStatus {
@@ -354,6 +357,7 @@ impl std::fmt::Display for FixAttemptStatus {
             Self::Merged => write!(f, "merged"),
             Self::Closed => write!(f, "closed"),
             Self::CannotFix => write!(f, "cannot_fix"),
+            Self::Answered => write!(f, "answered"),
         }
     }
 }
@@ -369,6 +373,7 @@ impl std::str::FromStr for FixAttemptStatus {
             "merged" => Ok(Self::Merged),
             "closed" => Ok(Self::Closed),
             "cannot_fix" => Ok(Self::CannotFix),
+            "answered" => Ok(Self::Answered),
             _ => Err(format!("Unknown status: {}", s)),
         }
     }
@@ -456,6 +461,135 @@ impl FixAttempt {
             BUG_LABELS.iter().any(|bug_label| lower.contains(bug_label))
         })
     }
+}
+
+/// A first-class action that can be run against a payload (issue/conversation).
+///
+/// Actions chain: classification routes a bug/security report into `Verify`,
+/// which on success starts `Resolve` (the fix pipeline); non-bug messages and
+/// terminal states start `Reply`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// Generate and post a grounded, human-sounding reply to the ticket.
+    Reply,
+    /// Attempt to reproduce a reported bug/security issue.
+    Verify,
+    /// Run the bug-resolution pipeline to create/watch/merge a PR.
+    Resolve,
+}
+
+impl std::fmt::Display for ActionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ActionKind::Reply => "reply",
+            ActionKind::Verify => "verify",
+            ActionKind::Resolve => "resolve",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for ActionKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "reply" => Ok(ActionKind::Reply),
+            "verify" => Ok(ActionKind::Verify),
+            "resolve" => Ok(ActionKind::Resolve),
+            other => Err(format!("unknown action: {other}")),
+        }
+    }
+}
+
+/// What kind of reply is being generated, which selects the framing the agent uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyKind {
+    /// General grounded answer to a non-bug message (question / feature request).
+    Answer,
+    /// The reported bug could not be reproduced; ask the reporter for repro steps.
+    NeedRepro,
+    /// A fix shipped and is live; let the reporter know.
+    FixShipped,
+}
+
+impl ReplyKind {
+    /// Stable lowercase identifier (for logging / persistence).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReplyKind::Answer => "answer",
+            ReplyKind::NeedRepro => "need_repro",
+            ReplyKind::FixShipped => "fix_shipped",
+        }
+    }
+}
+
+/// Classification of a Discord entity tracked in the `discord_channels` table.
+/// The integer values mirror Discord's own `channel_type` codes
+/// for easy cross-reference against the raw `channel_type` column: `Channel` = 0
+/// (GUILD_TEXT), `Category` = 4 (GUILD_CATEGORY), `Thread` = 11 (PUBLIC_THREAD,
+/// the representative thread type). Whether a thread is archived is tracked
+/// separately by the `discord_channels.archived` flag, not by this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordChannelKind {
+    /// A regular text/forum channel (Discord type 0).
+    Channel,
+    /// A thread (Discord thread type 10/11/12). Archived state is a separate flag.
+    Thread,
+    /// A category (Discord type 4) — groups channels; not indexable itself, but
+    /// tracked so `categories` config selections can be resolved.
+    Category,
+}
+
+impl DiscordChannelKind {
+    /// Integer value persisted in the `discord_channels.kind` column. Mirrors
+    /// Discord `channel_type` codes (see type docs).
+    pub fn as_i64(&self) -> i64 {
+        match self {
+            DiscordChannelKind::Channel => 0,
+            DiscordChannelKind::Category => 4,
+            DiscordChannelKind::Thread => 11,
+        }
+    }
+
+    /// Parse from the persisted integer; unknown values fall back to `Channel`.
+    pub fn from_i64(value: i64) -> Self {
+        match value {
+            4 => DiscordChannelKind::Category,
+            11 => DiscordChannelKind::Thread,
+            _ => DiscordChannelKind::Channel,
+        }
+    }
+
+    /// Whether this entity is a thread rather than a channel or category.
+    pub fn is_thread(&self) -> bool {
+        matches!(self, DiscordChannelKind::Thread)
+    }
+}
+
+/// Outcome of a `Verify` action: whether the agent reproduced the reported issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyResult {
+    /// Whether the issue was reproduced as described.
+    pub reproduced: bool,
+    /// One-line summary of the verification verdict.
+    #[serde(default)]
+    pub summary: String,
+    /// Why the reported behavior is a problem (user-facing impact).
+    #[serde(default)]
+    pub impact: String,
+    /// The underlying cause traced in the code.
+    #[serde(default)]
+    pub root_cause: String,
+    /// A proposed fix direction (not applied — verify is read-only).
+    #[serde(default)]
+    pub suggested_fix: String,
+    /// Evidence supporting the verdict (repro steps, failing output, etc.).
+    #[serde(default)]
+    pub evidence: String,
 }
 
 /// Statistics about fix attempts.
@@ -1412,6 +1546,12 @@ pub struct AnalyticsSummary {
     /// Per-repo leaderboard.
     #[serde(default)]
     pub repo_leaderboard: Vec<RepoLeaderboardEntry>,
+    /// Daily commit-production trend (commits per day).
+    #[serde(default)]
+    pub commit_trend: Vec<CommitTrendPoint>,
+    /// Support-reply rating + response-time summary (QA channels + HelpScout).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub support_rating: Option<SupportRatingSummary>,
 }
 
 /// PR rejection/review-change reason category.
@@ -1447,6 +1587,68 @@ pub struct RepoLeaderboardEntry {
     pub success_rate: f64,
     pub merge_rate: f64,
     pub avg_time_to_merge_mins: Option<f64>,
+}
+
+/// A single point in the daily commit-production trend.
+///
+/// Derived from `claude_executions`: counts executions that actually produced
+/// a commit (commit hash changed) on a given day. This approximates "≥1 commit
+/// per execution" since multi-commit runs only expose before/after endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitTrendPoint {
+    /// Day bucket (YYYY-MM-DD).
+    pub period_start: String,
+    /// Number of commit-producing executions that day.
+    pub commits: i64,
+}
+
+/// A support reply (QA channel or HelpScout) eligible for an admin quality rating.
+///
+/// Backed by an `action_runs` row of kind `reply`; `action_run_id` is the join key
+/// for the optional `support_reply_ratings` record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupportReply {
+    /// The originating `action_runs.id` (also the rating key).
+    pub action_run_id: i64,
+    /// Source channel (discord/slack/telegram/whatsapp/helpscout).
+    pub source: String,
+    /// Human-facing short id (e.g. "HS-7").
+    pub short_id: String,
+    /// Reply kind: answer | need_repro | fix_shipped (the action_runs status).
+    pub kind: String,
+    /// Truncated reply text preview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When the reply was sent.
+    pub created_at: DateTime<Utc>,
+    /// Minutes from issue/conversation received to reply sent, if derivable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_time_mins: Option<f64>,
+    /// Admin rating (1..5), if rated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<i32>,
+    /// Optional free-text note from the rater.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Email of the admin who rated, if rated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rated_by: Option<String>,
+}
+
+/// Aggregate support-reply rating + response-time summary for the dashboard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SupportRatingSummary {
+    /// Total rateable replies (QA + HelpScout).
+    pub total_replies: i64,
+    /// How many of those have been rated.
+    pub rated_count: i64,
+    /// Average rating across rated replies (1..5).
+    pub avg_rating: Option<f64>,
+    /// Average response time in minutes across replies with a derivable time.
+    pub avg_response_time_mins: Option<f64>,
+    /// Average rating per source.
+    #[serde(default)]
+    pub avg_rating_by_source: HashMap<String, f64>,
 }
 
 /// Engineering time savings estimate.
@@ -1718,6 +1920,50 @@ pub struct PromotedInstruction {
     pub confidence: f64,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Scope of an operator-authored agent instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionScope {
+    /// Applies to every repo.
+    Global,
+    /// Applies to a single repo (keyed by `org/name`).
+    Repo,
+}
+
+impl std::fmt::Display for InstructionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Global => write!(f, "global"),
+            Self::Repo => write!(f, "repo"),
+        }
+    }
+}
+
+impl std::str::FromStr for InstructionScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "global" => Ok(Self::Global),
+            "repo" => Ok(Self::Repo),
+            _ => Err(format!("Unknown instruction scope: {}", s)),
+        }
+    }
+}
+
+/// Operator-authored instruction injected into the agent's context on every run.
+/// Scoped either globally or to a single repo; see `InstructionScope`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInstruction {
+    pub id: i64,
+    pub scope: InstructionScope,
+    /// Some(`org/name`) when scope is `Repo`; None for global.
+    pub repo: Option<String>,
+    pub instruction_text: String,
+    pub is_active: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -2358,6 +2604,85 @@ pub struct CodeSearchResult {
     pub score: f64,
 }
 
+/// One retrieved chunk recorded against a fix attempt, for retrieval-quality
+/// assessment. Mirrors a row of the `retrieval_usage` table. Covers all four
+/// RAG sources via `source_kind`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalUsageRecord {
+    /// Set when read back from the DB; ignored on insert.
+    pub id: Option<i64>,
+    pub attempt_id: i64,
+    /// One of: `code_chunk`, `similar_issue`, `discord_chunk`, `qa`.
+    pub source_kind: String,
+    /// Identifier of the retrieved item within its source (stringified).
+    pub chunk_ref: String,
+    /// Code: file path; Discord: channel id; issue: url.
+    pub file_path: Option<String>,
+    /// 0-based retrieval order.
+    pub rank: i64,
+    /// Cosine similarity in [0,1] as returned by the retriever.
+    pub similarity_score: f64,
+    /// Whether the chunk made it into the final prompt context.
+    pub injected: bool,
+    /// Rendered length contributed to the prompt, if known.
+    pub char_len: Option<i64>,
+    /// Relevance quality score in [0,1]; `None` until the judge runs.
+    pub quality_score: Option<f64>,
+}
+
+impl RetrievalUsageRecord {
+    /// Build a record for insertion (id/quality_score unset).
+    pub fn new(
+        attempt_id: i64,
+        source_kind: impl Into<String>,
+        chunk_ref: impl Into<String>,
+        file_path: Option<String>,
+        rank: i64,
+        similarity_score: f64,
+        char_len: Option<i64>,
+    ) -> Self {
+        Self {
+            id: None,
+            attempt_id,
+            source_kind: source_kind.into(),
+            chunk_ref: chunk_ref.into(),
+            file_path,
+            rank,
+            similarity_score,
+            injected: true,
+            char_len,
+            quality_score: None,
+        }
+    }
+}
+
+/// A range-based Discord message chunk for embedding (a span of consecutive
+/// messages in a channel or thread). Mirrors the `discord_message_chunks` table.
+/// `channel_id` is the channel *or* thread id (a thread is itself a channel in
+/// Discord); `channel_kind` disambiguates which it is.
+#[derive(Debug, Clone)]
+pub struct DiscordMessageChunk {
+    pub id: Option<i64>,
+    pub guild_id: Option<String>,
+    pub channel_id: String,
+    pub channel_kind: DiscordChannelKind,
+    pub start_message_id: String,
+    pub end_message_id: String,
+    pub participant_ids: Option<Vec<String>>,
+    pub start_message_time: String,
+    pub end_message_time: String,
+    pub chunk_text: String,
+    pub context_text: String,
+    pub content_hash: Option<String>,
+}
+
+/// A Discord chunk search result with similarity score.
+#[derive(Debug, Clone)]
+pub struct DiscordSearchResult {
+    pub chunk: DiscordMessageChunk,
+    pub score: f64,
+}
+
 /// Statistics from a code indexing run.
 #[derive(Debug, Clone, Default)]
 pub struct CodeIndexStats {
@@ -2384,6 +2709,38 @@ impl std::fmt::Display for CodeIndexStats {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DiscordIndexStats {
+    pub messages_processed: usize,
+    pub messages_skipped: usize,
+    pub messages_failed: usize,
+
+    pub channels_processed: usize,
+    pub channels_skipped: usize,
+    pub channels_failed: usize,
+
+    pub threads_processed: usize,
+    pub threads_skipped: usize,
+    pub threads_failed: usize,
+}
+
+impl std::fmt::Display for DiscordIndexStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "messages(processed={}, skipped={}, failed={}), channels(processed={}, skipped={}, failed={}), threads(processed={}, skipped={}, failed={})",
+            self.messages_processed,
+            self.messages_skipped,
+            self.messages_failed,
+            self.channels_processed,
+            self.channels_skipped,
+            self.channels_failed,
+            self.threads_processed,
+            self.threads_skipped,
+            self.threads_failed,
+        )
+    }
+}
 /// Complexity metrics for a single function.
 #[derive(Debug, Clone, Default)]
 pub struct FunctionComplexity {
@@ -2658,6 +3015,11 @@ pub struct PrReviewState {
     pub last_review_time: Option<String>,
     pub last_comment_id: Option<i64>,
     pub last_comment_time: Option<String>,
+    /// Cursor for PR *conversation* comments (the `issues/{n}/comments` timeline),
+    /// tracked separately from inline review comments because the two live in
+    /// distinct GitHub comment id spaces and are fetched from different endpoints.
+    pub last_issue_comment_id: Option<i64>,
+    pub last_issue_comment_time: Option<String>,
     pub is_active: bool,
 }
 
@@ -2679,6 +3041,8 @@ impl PrReviewState {
             last_review_time: None,
             last_comment_id: None,
             last_comment_time: None,
+            last_issue_comment_id: None,
+            last_issue_comment_time: None,
             is_active: true,
         }
     }
@@ -2898,9 +3262,250 @@ pub trait SentryHttpClient: Send + Sync {
     ) -> crate::Result<crate::http::HttpResponse>;
 }
 
+/// timeline for metadata of an issue
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimelineEventStatus {
+    #[serde(rename = "processing_started")]
+    ProcessingStarted,
+
+    #[serde(rename = "repo_resolved")]
+    RepoResolved,
+
+    #[serde(rename = "embeddings_generated")]
+    EmbeddingsGenerated,
+
+    #[serde(rename = "fix_started")]
+    FixStarted,
+
+    #[serde(rename = "verify_started")]
+    VerifyStarted,
+
+    #[serde(rename = "verify_completed")]
+    VerifyCompleted,
+
+    /// Red-green: the failing-test (red) phase began.
+    #[serde(rename = "red_green_started")]
+    RedGreenStarted,
+
+    /// Red-green: the authored test failed on the unfixed code (red confirmed).
+    #[serde(rename = "red_confirmed")]
+    RedConfirmed,
+
+    /// Red-green: the authored test passed after the fix (green confirmed).
+    #[serde(rename = "green_confirmed")]
+    GreenConfirmed,
+
+    #[serde(rename = "reply_started")]
+    ReplyStarted,
+
+    #[serde(rename = "reply_sent")]
+    ReplySent,
+
+    #[serde(rename = "fix_succeeded")]
+    FixSucceeded,
+
+    #[serde(rename = "fix_failed")]
+    FixFailed,
+
+    #[serde(rename = "completed_no_pr")]
+    CompletedNoPr,
+
+    /// A question-answering (QA) run began.
+    #[serde(rename = "qa_started")]
+    QaStarted,
+
+    /// A QA run finished successfully (question answered).
+    #[serde(rename = "qa_completed")]
+    QaCompleted,
+
+    /// A QA run failed (no answer produced).
+    #[serde(rename = "qa_failed")]
+    QaFailed,
+
+    /// The (opt-in) retrieval-quality relevance judge was spawned for an attempt.
+    #[serde(rename = "retrieval_scoring_started")]
+    RetrievalScoringStarted,
+
+    /// The retrieval-quality judge finished scoring the retrieved chunks.
+    #[serde(rename = "retrieval_scoring_completed")]
+    RetrievalScoringCompleted,
+
+    /// The retrieval-quality judge could not run (e.g. no backend available).
+    #[serde(rename = "retrieval_scoring_failed")]
+    RetrievalScoringFailed,
+
+    #[serde(rename = "pr_merged")]
+    PrMerged,
+
+    #[serde(rename = "pr_closed")]
+    PrClosed,
+
+    #[serde(rename = "fix_abandoned")]
+    FixAbandoned,
+}
+
+impl TimelineEventStatus {
+    /// Stable identifier used as the `activity_log.activity_type` for this event
+    /// (matches the `#[serde(rename)]` value).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProcessingStarted => "processing_started",
+            Self::RepoResolved => "repo_resolved",
+            Self::EmbeddingsGenerated => "embeddings_generated",
+            Self::FixStarted => "fix_started",
+            Self::VerifyStarted => "verify_started",
+            Self::VerifyCompleted => "verify_completed",
+            Self::RedGreenStarted => "red_green_started",
+            Self::RedConfirmed => "red_confirmed",
+            Self::GreenConfirmed => "green_confirmed",
+            Self::ReplyStarted => "reply_started",
+            Self::ReplySent => "reply_sent",
+            Self::FixSucceeded => "fix_succeeded",
+            Self::FixFailed => "fix_failed",
+            Self::CompletedNoPr => "completed_no_pr",
+            Self::QaStarted => "qa_started",
+            Self::QaCompleted => "qa_completed",
+            Self::QaFailed => "qa_failed",
+            Self::RetrievalScoringStarted => "retrieval_scoring_started",
+            Self::RetrievalScoringCompleted => "retrieval_scoring_completed",
+            Self::RetrievalScoringFailed => "retrieval_scoring_failed",
+            Self::PrMerged => "pr_merged",
+            Self::PrClosed => "pr_closed",
+            Self::FixAbandoned => "fix_abandoned",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEvent {
+    pub time: DateTime<Utc>,
+    pub event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Context carried from the activity's metadata, flattened onto the event
+    /// (e.g. `"repo": "appwrite"`, `"pr": 123`).
+    #[serde(flatten)]
+    pub context: serde_json::Map<String, serde_json::Value>,
+}
+
+impl From<ActivityLogEntry> for TimelineEvent {
+    fn from(e: ActivityLogEntry) -> Self {
+        let context = match e.metadata {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        TimelineEvent {
+            time: e.timestamp,
+            event: e.activity_type,
+            message: if e.message.is_empty() {
+                None
+            } else {
+                Some(e.message)
+            },
+            context,
+        }
+    }
+}
+
+/// Ordered state timeline for a single issue, keyed by `short_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueTimeline {
+    /// Human-readable issue id (`short_id`), e.g. `"GH-123"`.
+    pub issue: String,
+    /// Events in chronological order.
+    pub events: Vec<TimelineEvent>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `TimelineEventStatus` variant. Update when adding a variant so the
+    /// drift test below stays exhaustive.
+    const ALL_TIMELINE_EVENTS: [TimelineEventStatus; 17] = [
+        TimelineEventStatus::ProcessingStarted,
+        TimelineEventStatus::RepoResolved,
+        TimelineEventStatus::EmbeddingsGenerated,
+        TimelineEventStatus::FixStarted,
+        TimelineEventStatus::VerifyStarted,
+        TimelineEventStatus::VerifyCompleted,
+        TimelineEventStatus::ReplyStarted,
+        TimelineEventStatus::ReplySent,
+        TimelineEventStatus::FixSucceeded,
+        TimelineEventStatus::FixFailed,
+        TimelineEventStatus::CompletedNoPr,
+        TimelineEventStatus::QaStarted,
+        TimelineEventStatus::QaCompleted,
+        TimelineEventStatus::QaFailed,
+        TimelineEventStatus::PrMerged,
+        TimelineEventStatus::PrClosed,
+        TimelineEventStatus::FixAbandoned,
+    ];
+
+    #[test]
+    fn timeline_event_as_str_matches_serde_rename() {
+        // `as_str()` is what gets persisted as `activity_log.activity_type`, and
+        // `#[serde(rename)]` is what the API serializes — they must never drift.
+        for ev in ALL_TIMELINE_EVENTS {
+            let serialized = serde_json::to_value(ev).unwrap();
+            assert_eq!(
+                serialized,
+                serde_json::json!(ev.as_str()),
+                "as_str()/serde drift for {:?}",
+                ev
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_event_as_str_values_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for ev in ALL_TIMELINE_EVENTS {
+            assert!(
+                seen.insert(ev.as_str()),
+                "duplicate event name {}",
+                ev.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_event_from_activity_flattens_object_metadata() {
+        let entry = ActivityLogEntry::new(TimelineEventStatus::RepoResolved.as_str(), "resolved")
+            .with_source("linear")
+            .with_issue("i1", "S-1")
+            .with_metadata(serde_json::json!({ "repo": "appwrite" }));
+        let ev = TimelineEvent::from(entry);
+        assert_eq!(ev.event, "repo_resolved");
+        assert_eq!(ev.context.get("repo").unwrap(), "appwrite");
+    }
+
+    #[test]
+    fn timeline_event_from_activity_ignores_non_object_metadata() {
+        // None metadata -> empty context.
+        let ev = TimelineEvent::from(ActivityLogEntry::new("fix_started", "m"));
+        assert!(ev.context.is_empty());
+        // A scalar (non-object) metadata value -> empty context, not a panic.
+        let entry = ActivityLogEntry::new("x", "m").with_metadata(serde_json::json!("scalar"));
+        assert!(TimelineEvent::from(entry).context.is_empty());
+    }
+
+    #[test]
+    fn issue_timeline_serializes_with_flattened_context() {
+        let events = vec![TimelineEvent::from(
+            ActivityLogEntry::new(TimelineEventStatus::FixSucceeded.as_str(), "ok")
+                .with_metadata(serde_json::json!({ "pr": 123 })),
+        )];
+        let tl = IssueTimeline {
+            issue: "GH-123".to_string(),
+            events,
+        };
+        let v = serde_json::to_value(&tl).unwrap();
+        assert_eq!(v["issue"], "GH-123");
+        assert_eq!(v["events"][0]["event"], "fix_succeeded");
+        // Context is flattened onto the event, not nested under a key.
+        assert_eq!(v["events"][0]["pr"], 123);
+    }
 
     #[test]
     fn test_issue_creation() {
@@ -5557,11 +6162,24 @@ mod tests {
                 merge_rate: 0.8,
                 avg_time_to_merge_mins: Some(60.0),
             }],
+            commit_trend: vec![CommitTrendPoint {
+                period_start: "2026-01-01".into(),
+                commits: 7,
+            }],
+            support_rating: Some(SupportRatingSummary {
+                total_replies: 10,
+                rated_count: 4,
+                avg_rating: Some(4.25),
+                avg_response_time_mins: Some(15.0),
+                avg_rating_by_source: HashMap::new(),
+            }),
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: AnalyticsSummary = serde_json::from_str(&json).unwrap();
         assert!((parsed.success_rate - 0.85).abs() < f64::EPSILON);
         assert_eq!(parsed.repo_leaderboard.len(), 1);
+        assert_eq!(parsed.commit_trend.len(), 1);
+        assert_eq!(parsed.support_rating.unwrap().rated_count, 4);
         assert!(parsed.cost_estimate.is_some());
     }
 

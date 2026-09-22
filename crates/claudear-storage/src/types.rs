@@ -38,6 +38,49 @@ pub struct IndexStats {
     pub last_indexed_at: Option<String>,
 }
 
+/// A Discord channel/thread tracked in the knowledgebase index, enriched with
+/// derived indexing stats (chunk count + indexed timeline) for the dashboard.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredDiscordChannel {
+    pub channel_id: String,
+    pub guild_id: Option<String>,
+    pub parent_id: Option<String>,
+    /// Name of the category this channel/thread belongs to, resolved from the
+    /// persisted category rows. For a channel this is its parent category; for a
+    /// thread it is the category of its parent channel. `None` if uncategorised
+    /// or the category has not been indexed yet.
+    pub category_name: Option<String>,
+    pub name: Option<String>,
+    /// "channel" | "thread" | "category".
+    pub kind: String,
+    /// Whether this is an archived thread.
+    pub archived: bool,
+    /// Whether the full history (within the backfill window) has been scraped.
+    pub backfill_complete: bool,
+    /// Forward cursor: newest indexed message id.
+    pub last_indexed_message_id: Option<String>,
+    pub last_indexed_at: Option<String>,
+    /// Number of indexed (embedded or pending) message chunks for this channel.
+    pub chunk_count: i64,
+    /// Timestamp of the oldest indexed message (start of the indexed window).
+    pub indexed_from: Option<String>,
+    /// Timestamp of the newest indexed message (end of the indexed window).
+    pub indexed_to: Option<String>,
+}
+
+/// Aggregate statistics for the Discord knowledgebase index.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscordKnowledgebaseStats {
+    /// Number of tracked regular channels (excludes threads/categories).
+    pub channel_count: usize,
+    /// Number of tracked threads.
+    pub thread_count: usize,
+    /// Total indexed message chunks across all channels.
+    pub chunk_count: usize,
+    /// Most recent index run across all channels.
+    pub last_indexed_at: Option<String>,
+}
+
 /// Current indexing progress.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IndexingProgress {
@@ -121,6 +164,60 @@ pub struct StoredDependency {
 }
 
 /// Diagnostic counts for all major tables.
+#[derive(Debug, Clone, Serialize)]
+pub struct PurgeResult {
+    pub fix_attempts: usize,
+    pub prs: usize,
+    pub pr_reviews: usize,
+    pub pr_review_comments: usize,
+    pub pr_review_states: usize,
+    pub claude_executions: usize,
+    pub strategy_fingerprints: usize,
+    pub diff_analyses: usize,
+    pub regression_watches: usize,
+    pub release_tracking: usize,
+    pub regression_checks: usize,
+    pub qa_usage: usize,
+    pub activity_log: usize,
+    pub processing_metrics: usize,
+    pub webhook_deliveries: usize,
+    pub issue_clusters: usize,
+    pub issue_cluster_members: usize,
+    pub content_clusters: usize,
+    pub severity_scores: usize,
+    pub suppression_log: usize,
+    pub eval_snapshots: usize,
+    pub eval_deltas: usize,
+    pub feedback_outcomes_detached: usize,
+}
+
+impl PurgeResult {
+    pub fn total_deleted(&self) -> usize {
+        self.fix_attempts
+            + self.prs
+            + self.pr_reviews
+            + self.pr_review_comments
+            + self.pr_review_states
+            + self.claude_executions
+            + self.strategy_fingerprints
+            + self.diff_analyses
+            + self.regression_watches
+            + self.release_tracking
+            + self.regression_checks
+            + self.qa_usage
+            + self.activity_log
+            + self.processing_metrics
+            + self.webhook_deliveries
+            + self.issue_clusters
+            + self.issue_cluster_members
+            + self.content_clusters
+            + self.severity_scores
+            + self.suppression_log
+            + self.eval_snapshots
+            + self.eval_deltas
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticCounts {
     pub fix_attempts: i64,

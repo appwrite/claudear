@@ -3,10 +3,12 @@ import useSWR from 'swr'
 import {
   fetchIssues,
   fetchAttempts,
+  fetchIssueTimeline,
   type IssuesResponse,
   type IssueSummary,
   type AttemptsResponse,
   type AttemptSummary,
+  type IssueTimeline,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
 import { DataTable, type Column } from '../components/shared/data-table'
@@ -36,6 +38,15 @@ export default function IssuesPage() {
         source: selectedIssue!.source,
         per_page: 100,
       }),
+    { refreshInterval: 0 },
+  )
+
+  // Fetch the activity timeline for the selected issue when the modal opens
+  const { data: timelineData } = useSWR<IssueTimeline>(
+    selectedIssue
+      ? `issue-timeline-${selectedIssue.source}-${selectedIssue.issue_id}`
+      : null,
+    () => fetchIssueTimeline(selectedIssue!.source, selectedIssue!.issue_id),
     { refreshInterval: 0 },
   )
 
@@ -256,6 +267,32 @@ export default function IssuesPage() {
                         )}
                       </div>
                     ))}
+                </div>
+              </div>
+            )}
+
+            {timelineData && timelineData.events.length > 0 && (
+              <div>
+                <p className="text-sm font-medium mb-2">
+                  Timeline ({timelineData.events.length})
+                </p>
+                <div className="relative space-y-3 border-l border-border pl-4">
+                  {timelineData.events.map((event, i) => (
+                    <div key={`${event.time}-${i}`} className="relative">
+                      <span className="absolute -left-[21px] top-1.5 h-2 w-2 rounded-full bg-primary" />
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="px-2 py-0.5 rounded text-xs font-medium bg-muted text-muted-foreground">
+                          {event.event}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          {formatDate(event.time)}
+                        </span>
+                      </div>
+                      {typeof event.message === 'string' && event.message && (
+                        <p className="text-sm mt-0.5">{event.message}</p>
+                      )}
+                    </div>
+                  ))}
                 </div>
               </div>
             )}

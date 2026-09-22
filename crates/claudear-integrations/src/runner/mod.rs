@@ -11,7 +11,7 @@ pub mod orchestrator;
 
 use async_trait::async_trait;
 use claudear_core::error::Result;
-use claudear_core::types::{AgentResult, Issue};
+use claudear_core::types::{AgentResult, Issue, ReplyKind, VerifyResult};
 use std::path::Path;
 
 // Re-export concrete implementations and key types.
@@ -54,6 +54,75 @@ pub trait AgentRunner: Send + Sync {
         attempt_id: Option<i64>,
         project_dir: &Path,
     ) -> Result<AgentResult>;
+
+    /// Answer a question in read-only mode, grounded in `context` (RAG code
+    /// search) and the repository at `project_dir`. Returns the answer text.
+    ///
+    /// Default: not supported. Providers that can run read-only (e.g. Claude)
+    /// override this.
+    async fn answer_question(
+        &self,
+        _issue: &Issue,
+        _context: &str,
+        _project_dir: &Path,
+    ) -> Result<String> {
+        Err(claudear_core::error::Error::runner(
+            "answer_question is not supported by this provider",
+        ))
+    }
+
+    /// Attempt to reproduce a reported bug/security issue as described, grounded
+    /// in `context` and the repository at `project_dir`. Read-only — no fix, no
+    /// PR. Returns a structured verdict.
+    ///
+    /// Default: not supported. Providers that can run read-only (e.g. Claude)
+    /// override this.
+    async fn verify_issue(
+        &self,
+        _issue: &Issue,
+        _context: &str,
+        _project_dir: &Path,
+    ) -> Result<VerifyResult> {
+        Err(claudear_core::error::Error::runner(
+            "verify_issue is not supported by this provider",
+        ))
+    }
+
+    /// Generate a grounded, human-sounding reply to a ticket. `guideline` is an
+    /// optional per-inbox template treated as a soft style guideline (not
+    /// reproduced verbatim); `kind` selects the framing. Read-only.
+    ///
+    /// Default: not supported. Providers that can run read-only (e.g. Claude)
+    /// override this.
+    async fn generate_reply(
+        &self,
+        _issue: &Issue,
+        _context: &str,
+        _guideline: Option<&str>,
+        _kind: ReplyKind,
+        _project_dir: &Path,
+    ) -> Result<String> {
+        Err(claudear_core::error::Error::runner(
+            "generate_reply is not supported by this provider",
+        ))
+    }
+
+    /// Run a read-only, schema-constrained query and return the JSON object the
+    /// model produced under constrained decoding. Providers that support it
+    /// (e.g. Claude via `--json-schema`) guarantee the result matches `json_schema`.
+    ///
+    /// Default: not supported. Callers should fall back (e.g. to a heuristic)
+    /// when this returns an error.
+    async fn structured_query(
+        &self,
+        _prompt: &str,
+        _json_schema: &str,
+        _project_dir: &Path,
+    ) -> Result<serde_json::Value> {
+        Err(claudear_core::error::Error::runner(
+            "structured_query is not supported by this provider",
+        ))
+    }
 }
 
 /// Best-effort detection for rate limit failures (generic, not provider-specific).

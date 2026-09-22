@@ -37,6 +37,7 @@ pub(crate) struct WhatsAppInboundMessage {
 #[derive(Default)]
 struct InboxState {
     ask_delivery_ids: HashMap<String, Vec<String>>,
+    ask_poll_channels: HashMap<String, String>,
     telegram_messages: Vec<TelegramInboundMessage>,
     whatsapp_messages: Vec<WhatsAppInboundMessage>,
 }
@@ -90,6 +91,38 @@ pub(crate) fn ask_delivery_ids(channel: &str, correlation_id: &str) -> Vec<Strin
         .get(&ask_key(channel, correlation_id))
         .cloned()
         .unwrap_or_default()
+}
+
+/// Remember the actual channel ID where an ask message was delivered.
+///
+/// This is needed when a webhook posts to a channel that differs from the
+/// configured `channel_id` (e.g. Discord webhook targets a different channel).
+pub(crate) fn remember_ask_poll_channel(
+    channel: &str,
+    correlation_id: &str,
+    poll_channel_id: String,
+) {
+    if poll_channel_id.trim().is_empty() {
+        return;
+    }
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .ask_poll_channels
+        .insert(ask_key(channel, correlation_id), poll_channel_id);
+    if guard.ask_poll_channels.len() > 512 {
+        let live_keys: std::collections::HashSet<String> =
+            guard.ask_delivery_ids.keys().cloned().collect();
+        guard.ask_poll_channels.retain(|k, _| live_keys.contains(k));
+    }
+}
+
+/// Get the remembered poll channel for a channel/correlation pair.
+pub(crate) fn ask_poll_channel(channel: &str, correlation_id: &str) -> Option<String> {
+    let guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .ask_poll_channels
+        .get(&ask_key(channel, correlation_id))
+        .cloned()
 }
 
 /// Record an inbound Telegram message for ask-reply matching.
