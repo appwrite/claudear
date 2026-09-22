@@ -202,7 +202,7 @@ impl IssueSource for WhatsAppSource {
             ));
         }
 
-        let http = reqwest::Client::new();
+        let http = claudear_core::tls::client();
         let url = format!(
             "https://graph.facebook.com/v21.0/{}/messages",
             phone_number_id

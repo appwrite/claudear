@@ -72,7 +72,7 @@ pub async fn download_gguf(
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let client = reqwest::Client::builder()
+    let client = claudear_core::tls::client_builder()
         .timeout(std::time::Duration::from_secs(3600))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;

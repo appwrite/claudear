@@ -5,8 +5,10 @@
 
 pub mod error;
 pub mod http;
+pub mod platform;
 pub mod secret;
 pub mod templates;
+pub mod tls;
 pub mod types;
 
 pub use error::{Error, Result};

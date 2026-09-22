@@ -393,7 +393,7 @@ fn health_timeout_diagnostics(handle: &DaemonHandle) -> String {
 /// Wait for the daemon's health endpoint to respond.
 pub async fn wait_healthy(handle: &DaemonHandle, port: u16, timeout: Duration) -> Result<()> {
     let url = format!("http://127.0.0.1:{}/api/health", port);
-    let client = reqwest::Client::new();
+    let client = claudear_core::tls::client();
     let start = std::time::Instant::now();
 
     loop {

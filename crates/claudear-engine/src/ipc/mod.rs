@@ -1,57 +1,108 @@
-//! Inter-process communication via Unix socket.
+//! Inter-process communication for the watcher daemon.
 //!
-//! Enables the CLI to communicate with a running watcher daemon.
+//! Platform-specific transport details (Unix domain sockets vs TCP) live in
+//! the [`transport`] module.  This file exposes the high-level helpers that the
+//! rest of the crate uses for daemon lifecycle management.
 
 mod client;
 mod protocol;
 mod server;
+pub(crate) mod transport;
 
 pub use client::{print_response, IpcClient};
 pub use protocol::{IpcCommand, IpcData, IpcResponse, WatcherState};
 pub use server::IpcServer;
 
+use claudear_core::platform;
 use std::path::PathBuf;
 
 /// Returns a private runtime directory for IPC files, scoped to the current user.
 ///
-/// On Linux, prefers `XDG_RUNTIME_DIR` (already user-private, typically mode 0700).
-/// Otherwise, creates a subdirectory `claudear-{uid}` under the system temp dir
-/// with mode 0700 to prevent other users from accessing the socket/PID files.
+/// * **Linux** — prefers `XDG_RUNTIME_DIR` (already user-private, mode 0700).
+/// * **Windows** — uses `%LOCALAPPDATA%\claudear` or falls back to `%TEMP%\claudear`.
+/// * **macOS / other** — creates `claudear-{uid}` under the system temp dir with
+///   mode 0700.
 fn ipc_runtime_dir() -> PathBuf {
-    // On Linux, XDG_RUNTIME_DIR is already user-private
-    if !cfg!(target_os = "macos") {
-        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(xdg);
+    #[cfg(windows)]
+    {
+        // Prefer %LOCALAPPDATA%\claudear (user-private on Windows)
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let dir = PathBuf::from(local_app_data).join("claudear");
+            if !dir.exists() {
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    tracing::error!(
+                        "Failed to create IPC runtime dir {:?}: {} — falling back to temp dir",
+                        dir,
+                        e
+                    );
+                    return windows_temp_dir();
+                }
+            }
+            return dir;
         }
+        windows_temp_dir()
     }
 
-    // Fallback: create a user-scoped subdirectory in the temp dir with restricted permissions
-    let uid = unsafe { libc::getuid() };
-    let dir = std::env::temp_dir().join(format!("claudear-{}", uid));
-    if !dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            // SECURITY: Falling back to the system temp dir is unsafe because it is
-            // world-readable, which could allow other users to access or tamper with
-            // the IPC socket. This should be treated as a critical failure.
-            tracing::error!("Failed to create IPC runtime dir {:?}: {} — falling back to world-readable temp dir", dir, e);
-            return std::env::temp_dir();
+    #[cfg(not(windows))]
+    {
+        // On Linux, XDG_RUNTIME_DIR is already user-private
+        if !cfg!(target_os = "macos") {
+            if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+                return PathBuf::from(xdg);
+            }
         }
-        // Set directory permissions to 0700 (owner-only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            if let Err(e) = std::fs::set_permissions(&dir, perms) {
+
+        // Fallback: create a user-scoped subdirectory in the temp dir
+        let uid = unsafe { libc::getuid() };
+        let dir = std::env::temp_dir().join(format!("claudear-{}", uid));
+        if !dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::error!(
+                    "Failed to create IPC runtime dir {:?}: {} — falling back to world-readable temp dir",
+                    dir,
+                    e
+                );
+                return std::env::temp_dir();
+            }
+            if let Err(e) = platform::set_dir_permissions_secure(&dir) {
                 tracing::warn!("Failed to set IPC runtime dir permissions: {}", e);
             }
+        }
+        dir
+    }
+}
+
+/// The Windows fallback runtime directory, created if it does not exist.
+///
+/// It has to exist before it is returned: every caller writes into it, and a
+/// first run on a machine where it is missing would otherwise fail with
+/// NotFound the moment the daemon writes its pid file.
+#[cfg(windows)]
+fn windows_temp_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("claudear");
+    if !dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::error!(
+                "Failed to create the fallback IPC runtime dir {:?}: {}",
+                dir,
+                e
+            );
+            return std::env::temp_dir();
         }
     }
     dir
 }
 
-/// Default socket path for the IPC server.
+/// Default socket path for the IPC server (Unix) or port file path (Windows).
 pub fn default_socket_path() -> PathBuf {
-    ipc_runtime_dir().join("claudear.sock")
+    #[cfg(windows)]
+    {
+        ipc_runtime_dir().join("claudear.port")
+    }
+    #[cfg(not(windows))]
+    {
+        ipc_runtime_dir().join("claudear.sock")
+    }
 }
 
 /// Default PID file path.
@@ -61,8 +112,7 @@ pub fn default_pid_path() -> PathBuf {
 
 /// Check if a watcher daemon is running.
 pub fn is_daemon_running() -> bool {
-    let socket_path = default_socket_path();
-    socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok()
+    transport::check_connection(&default_socket_path())
 }
 
 /// Get the PID of the running daemon, if any.
@@ -89,7 +139,7 @@ pub fn remove_pid_file() {
     let _ = std::fs::remove_file(&pid_path);
 }
 
-/// Remove the socket file.
+/// Remove the socket file (Unix) or port file (Windows).
 pub fn remove_socket_file() {
     let socket_path = default_socket_path();
     let _ = std::fs::remove_file(&socket_path);
@@ -98,49 +148,18 @@ pub fn remove_socket_file() {
 /// Clean up stale socket/pid files from a previous crash.
 pub fn cleanup_stale_files() {
     if let Some(pid) = get_daemon_pid() {
-        // Check if process is still running by trying to read /proc/{pid} or using kill -0
-        let is_running = is_process_running(pid);
-        if !is_running {
+        if !platform::is_process_running(pid) {
             tracing::info!("Cleaning up stale files from previous run (PID {})", pid);
             remove_pid_file();
             remove_socket_file();
         }
     } else {
-        // No PID file but socket exists - stale
+        // No PID file but socket/port file exists — check if stale
         let socket_path = default_socket_path();
-        if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
+        if transport::is_stale(&socket_path) {
             tracing::info!("Cleaning up stale socket file");
             remove_socket_file();
         }
-    }
-}
-
-/// Check if a process with the given PID is running.
-fn is_process_running(pid: u32) -> bool {
-    // Try to check /proc on Linux
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{}", pid)).exists()
-    }
-
-    // On macOS/BSD, use kill(pid, 0) to check if process exists
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: kill with signal 0 doesn't actually send a signal,
-        // it just checks if the process exists and we have permission to signal it.
-        // Returns 0 if process exists, -1 if not (with errno set to ESRCH).
-        match i32::try_from(pid) {
-            Ok(pid_i32) => unsafe { libc::kill(pid_i32, 0) == 0 },
-            Err(_) => false, // PID exceeds i32::MAX, cannot be valid
-        }
-    }
-
-    // Fallback for other platforms
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid; // Suppress unused warning
-                     // Assume running if we can't check
-        true
     }
 }
 
@@ -148,24 +167,76 @@ fn is_process_running(pid: u32) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_default_socket_path_ends_with_claudear_sock() {
-        let path = default_socket_path();
+    #[tokio::test]
+    async fn an_endpoint_round_trips_a_message_on_this_platform() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let endpoint = dir.path().join("round-trip");
+
+        let listener = transport::bind(&endpoint).expect("bind");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read");
+            writer
+                .write_all(format!("echo:{}", line.trim()).as_bytes())
+                .await
+                .expect("write");
+        });
+
+        let mut client = transport::connect(&endpoint).await.expect("connect");
+        client.write_all(b"hello\n").await.expect("send");
+
+        let mut echoed = String::new();
+        client.read_to_string(&mut echoed).await.expect("receive");
+
+        assert_eq!(echoed, "echo:hello");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_reports_whether_anyone_is_listening() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let endpoint = dir.path().join("liveness");
+
         assert!(
-            path.ends_with("claudear.sock"),
-            "Expected socket path to end with 'claudear.sock', got: {:?}",
-            path
+            !transport::check_connection(&endpoint),
+            "nothing exists yet"
+        );
+        assert!(
+            !transport::is_stale(&endpoint),
+            "a missing file is not stale"
+        );
+
+        let listener = transport::bind(&endpoint).expect("bind");
+
+        assert!(
+            transport::check_connection(&endpoint),
+            "a bound endpoint answers"
+        );
+        assert!(!transport::is_stale(&endpoint));
+
+        drop(listener);
+
+        assert!(
+            !transport::check_connection(&endpoint),
+            "a dropped listener stops answering"
         );
     }
 
+    /// The secret is what stands in for a socket's owner-only mode, so an
+    /// unrelated local process presenting the wrong one must get nowhere.
     #[test]
-    fn test_default_pid_path_ends_with_claudear_pid() {
-        let path = default_pid_path();
-        assert!(
-            path.ends_with("claudear.pid"),
-            "Expected pid path to end with 'claudear.pid', got: {:?}",
-            path
-        );
+    fn a_wrong_secret_is_never_accepted() {
+        let secret = "0123456789abcdef";
+
+        assert!(transport::secret_matches(secret, secret));
+        assert!(!transport::secret_matches("", secret));
+        assert!(!transport::secret_matches("0123456789abcdee", secret));
+        assert!(!transport::secret_matches("0123456789abcdef0", secret));
     }
 
     #[test]
@@ -180,12 +251,7 @@ mod tests {
 
     #[test]
     fn test_get_daemon_pid_returns_option() {
-        // This tests that get_daemon_pid does not panic and returns an Option<u32>.
-        // If no PID file exists, it returns None. If one does exist (from a running
-        // daemon), it returns Some(pid). Either outcome is acceptable.
         let result = get_daemon_pid();
-        // Just verify the function completes without panicking.
-        // If a daemon happens to be running, the PID should be > 0.
         if let Some(pid) = result {
             assert!(pid > 0, "PID should be positive, got: {}", pid);
         }
@@ -193,23 +259,16 @@ mod tests {
 
     #[test]
     fn test_write_and_remove_pid_file_does_not_panic() {
-        // We avoid actually writing the PID file if a daemon is running,
-        // as that could interfere with the running daemon. Instead, we test
-        // the functions only when no daemon is active.
         if is_daemon_running() {
-            // A daemon is running; skip this test to avoid interfering.
             return;
         }
 
-        // Save any existing PID file content so we can restore it.
         let pid_path = default_pid_path();
         let existing_content = std::fs::read_to_string(&pid_path).ok();
 
-        // Write our PID file.
         let write_result = write_pid_file();
         assert!(write_result.is_ok(), "write_pid_file should succeed");
 
-        // Verify get_daemon_pid returns our PID.
         let read_pid = get_daemon_pid();
         assert_eq!(
             read_pid,
@@ -217,12 +276,9 @@ mod tests {
             "get_daemon_pid should return our process PID after write_pid_file"
         );
 
-        // Remove the PID file.
         remove_pid_file();
 
-        // Verify the PID file is gone (or restore the original if there was one).
         if let Some(content) = existing_content {
-            // Restore original content for the running daemon.
             let _ = std::fs::write(&pid_path, content);
         } else {
             assert!(
@@ -234,50 +290,19 @@ mod tests {
 
     #[test]
     fn test_remove_socket_file_does_not_panic_when_no_socket() {
-        // remove_socket_file should silently succeed even if no socket file exists.
-        // We cannot unconditionally call it because a daemon might be using the socket.
-        // Instead, we verify a remove on a non-existent path is safe by checking the
-        // implementation pattern (let _ = remove_file), or we call it only when no daemon
-        // is running.
         if !is_daemon_running() {
-            // The socket file may or may not exist; either way this should not panic.
             remove_socket_file();
         }
     }
 
     #[test]
     fn test_is_daemon_running_returns_bool() {
-        // When no daemon is running, this should return false.
-        // If a daemon happens to be running (e.g., in a dev environment), true is also valid.
         let result = is_daemon_running();
-        // We simply verify the function completes and returns a bool.
         let _: bool = result;
     }
 
     #[test]
-    fn test_is_process_running_with_own_pid() {
-        // Our own process is guaranteed to be running and we have permission to signal it.
-        let own_pid = std::process::id();
-        assert!(
-            is_process_running(own_pid),
-            "Our own PID ({}) should be reported as running",
-            own_pid
-        );
-    }
-
-    #[test]
-    fn test_is_process_running_with_invalid_pid() {
-        // u32::MAX is extremely unlikely to be a valid PID on any system.
-        assert!(
-            !is_process_running(u32::MAX),
-            "PID u32::MAX should not be reported as running"
-        );
-    }
-
-    #[test]
     fn test_cleanup_stale_files_does_not_panic() {
-        // cleanup_stale_files should handle all cases gracefully:
-        // no PID file, stale socket, running daemon, etc.
         cleanup_stale_files();
     }
 }

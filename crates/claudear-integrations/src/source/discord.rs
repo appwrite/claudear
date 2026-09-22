@@ -345,7 +345,7 @@ impl IssueSource for DiscordSource {
         // user-posted messages to the daemon's poll_issues.
         if let Some(ref webhook_url) = self.config.webhook_url {
             let url = format!("{}?wait=true", webhook_url.expose());
-            let http = reqwest::Client::new();
+            let http = claudear_core::tls::client();
             let resp = http
                 .post(&url)
                 .json(&serde_json::json!({ "content": content }))

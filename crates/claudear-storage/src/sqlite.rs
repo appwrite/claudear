@@ -214,12 +214,11 @@ impl SqliteTracker {
                     ));
                 }
                 let embedding: Vec<f32> = b
-                    .chunks_exact(4)
-                    .map(|chunk| {
-                        let arr: [u8; 4] =
-                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                        f32::from_le_bytes(arr)
-                    })
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(f32::from_le_bytes)
                     .collect();
                 Ok(Some(embedding))
             }
@@ -359,11 +358,11 @@ impl SqliteTracker {
             return None;
         }
         Some(
-            blob.chunks_exact(4)
-                .map(|chunk| {
-                    let arr: [u8; 4] = chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                    f32::from_le_bytes(arr)
-                })
+            blob.as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(f32::from_le_bytes)
                 .collect(),
         )
     }
@@ -3714,12 +3713,11 @@ impl EmbeddingStore for SqliteTracker {
                         return None;
                     }
                     Some(
-                        blob.chunks_exact(4)
-                            .map(|chunk| {
-                                let arr: [u8; 4] =
-                                    chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                                f32::from_le_bytes(arr)
-                            })
+                        blob.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .copied()
+                            .map(f32::from_le_bytes)
                             .collect(),
                     )
                 });
@@ -5811,12 +5809,11 @@ impl SqliteTracker {
                 return None;
             }
             Some(
-                blob.chunks_exact(4)
-                    .map(|chunk| {
-                        let arr: [u8; 4] =
-                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                        f32::from_le_bytes(arr)
-                    })
+                blob.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(f32::from_le_bytes)
                     .collect(),
             )
         });

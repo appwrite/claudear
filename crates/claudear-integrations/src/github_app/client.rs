@@ -79,11 +79,11 @@ pub struct GitHubAppClient {
 impl GitHubAppClient {
     /// Create a new GitHubAppClient from configuration.
     pub fn new(config: GitHubAppConfig) -> Self {
-        let http_client = reqwest::Client::builder()
+        let http_client = claudear_core::tls::client_builder()
             .timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| claudear_core::tls::client());
 
         Self {
             auth: GitHubAppAuth::new(config),
@@ -407,7 +407,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     #[test]
     fn test_client_with_http_client() {
         let config = create_test_config();
-        let http = reqwest::Client::new();
+        let http = claudear_core::tls::client();
         let client = GitHubAppClient::with_http_client(config, http);
         assert_eq!(client.app_id(), Some(12345));
     }
@@ -1117,7 +1117,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     async fn test_list_installations_fails_on_network_error() {
         // Use a client that points to a non-existent server
         let config = create_test_config();
-        let http_client = reqwest::Client::builder()
+        let http_client = claudear_core::tls::client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -1154,7 +1154,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     #[tokio::test]
     async fn test_get_installation_token_misses_cache_and_requests() {
         let config = create_test_config();
-        let http_client = reqwest::Client::builder()
+        let http_client = claudear_core::tls::client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -1168,7 +1168,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     #[tokio::test]
     async fn test_get_installation_token_skips_expired_cache() {
         let config = create_test_config();
-        let http_client = reqwest::Client::builder()
+        let http_client = claudear_core::tls::client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -1192,7 +1192,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     #[tokio::test]
     async fn test_list_installation_repos_fails_without_network() {
         let config = create_test_config();
-        let http_client = reqwest::Client::builder()
+        let http_client = claudear_core::tls::client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -1212,7 +1212,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     #[tokio::test]
     async fn test_api_request_fails_without_network() {
         let config = create_test_config();
-        let http_client = reqwest::Client::builder()
+        let http_client = claudear_core::tls::client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -1239,7 +1239,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     #[tokio::test]
     async fn test_api_request_with_body_fails_without_network() {
         let config = create_test_config();
-        let http_client = reqwest::Client::builder()
+        let http_client = claudear_core::tls::client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -1270,7 +1270,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     #[tokio::test]
     async fn test_get_app_info_fails_without_network() {
         let config = create_test_config();
-        let http_client = reqwest::Client::builder()
+        let http_client = claudear_core::tls::client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -1378,7 +1378,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     #[test]
     fn test_client_with_custom_timeout() {
         let config = create_test_config();
-        let http_client = reqwest::Client::builder()
+        let http_client = claudear_core::tls::client_builder()
             .timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(2))
             .build()
@@ -1390,7 +1390,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     #[tokio::test]
     async fn test_find_installation_for_repo_fails_without_network() {
         let config = create_test_config();
-        let http_client = reqwest::Client::builder()
+        let http_client = claudear_core::tls::client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();

@@ -54,11 +54,11 @@ pub struct SlackSource {
 impl SlackSource {
     /// Create a new Slack source from config.
     pub fn new(config: SlackConfig) -> Self {
-        let client = reqwest::Client::builder()
+        let client = claudear_core::tls::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| claudear_core::tls::client());
         Self {
             config,
             last_seen_ts: RwLock::new(None),

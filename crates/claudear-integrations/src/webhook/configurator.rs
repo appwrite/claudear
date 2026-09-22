@@ -573,11 +573,11 @@ impl WebhookConfigurator {
             .unwrap_or(true)
             .then(|| secret.clone());
 
-        let client = reqwest::Client::builder()
+        let client = claudear_core::tls::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| claudear_core::tls::client());
 
         let mut configured_count = 0usize;
         let mut repo_failures: Vec<String> = Vec::new();
@@ -650,11 +650,11 @@ impl WebhookConfigurator {
         let headers = auth.jwt_headers()?;
         let callback_url = format!("{}/webhook/github", base_url.trim_end_matches('/'));
 
-        let client = reqwest::Client::builder()
+        let client = claudear_core::tls::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| claudear_core::tls::client());
 
         let mut request = client.patch("https://api.github.com/app/hook/config");
         for (name, value) in headers {
@@ -702,11 +702,11 @@ impl WebhookConfigurator {
                 Error::config("Discord channel_id is required for notifier webhook auto-setup")
             })?;
 
-        let client = reqwest::Client::builder()
+        let client = claudear_core::tls::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| claudear_core::tls::client());
 
         let url = format!(
             "https://discord.com/api/v10/channels/{}/webhooks",
@@ -747,11 +747,11 @@ impl WebhookConfigurator {
 
     async fn configure_jira(&self, config: &JiraConfig, base_url: &str) -> Result<bool> {
         let callback_url = format!("{}/webhook/jira", base_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
+        let client = claudear_core::tls::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| claudear_core::tls::client());
         let auth_header = Self::jira_auth_header(config);
 
         if self
@@ -800,11 +800,11 @@ impl WebhookConfigurator {
             .unwrap_or(true)
             .then(|| secret.clone());
 
-        let client = reqwest::Client::builder()
+        let client = claudear_core::tls::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| claudear_core::tls::client());
         let url = format!("https://api.telegram.org/bot{}/setWebhook", token);
         let payload = serde_json::json!({
             "url": callback_url,
@@ -862,11 +862,11 @@ impl WebhookConfigurator {
             })?;
 
         let callback_url = format!("{}/webhook/slack", base_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
+        let client = claudear_core::tls::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| claudear_core::tls::client());
 
         let export_resp = client
             .post("https://slack.com/api/apps.manifest.export")
@@ -995,11 +995,11 @@ impl WebhookConfigurator {
             .unwrap_or(true)
             .then(|| verify_token.clone());
 
-        let client = reqwest::Client::builder()
+        let client = claudear_core::tls::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| claudear_core::tls::client());
         let url = format!(
             "https://graph.facebook.com/v21.0/{}/subscribed_apps",
             business_account_id
@@ -1090,11 +1090,11 @@ impl WebhookConfigurator {
             .unwrap_or(true)
             .then(|| secret.clone());
 
-        let client = reqwest::Client::builder()
+        let client = claudear_core::tls::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| claudear_core::tls::client());
 
         let mut configured_count = 0usize;
         let mut group_failures: Vec<String> = Vec::new();
