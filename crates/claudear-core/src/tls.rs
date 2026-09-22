@@ -20,3 +20,19 @@ pub fn ensure_crypto_provider() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
+
+/// Build a reqwest client, with the provider installed first.
+///
+/// Every client in the workspace is built through here or through
+/// [`client_builder`]; calling `reqwest::Client::new` directly reintroduces
+/// the panic this module exists to prevent.
+pub fn client() -> reqwest::Client {
+    ensure_crypto_provider();
+    reqwest::Client::new()
+}
+
+/// Start building a reqwest client, with the provider installed first.
+pub fn client_builder() -> reqwest::ClientBuilder {
+    ensure_crypto_provider();
+    reqwest::Client::builder()
+}

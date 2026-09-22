@@ -37,7 +37,7 @@ impl ReqwestDiscordClient {
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let client = reqwest::Client::builder()
+        let client = claudear_core::tls::client_builder()
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
             .build()

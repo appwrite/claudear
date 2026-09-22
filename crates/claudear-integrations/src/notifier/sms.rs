@@ -28,11 +28,11 @@ pub struct ReqwestSmsClient {
 impl ReqwestSmsClient {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: claudear_core::tls::client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .unwrap_or_else(|_| claudear_core::tls::client()),
         }
     }
 }

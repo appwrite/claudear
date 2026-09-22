@@ -25,7 +25,7 @@ impl ReqwestSentryClient {
     /// Create a new reqwest-based HTTP client with a default timeout.
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: claudear_core::tls::client_builder()
                 .timeout(std::time::Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
                 .build()
                 .expect("Failed to build HTTP client"),

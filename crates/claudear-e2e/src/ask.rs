@@ -41,7 +41,7 @@ impl DiscordAsk {
             client,
             channel_id,
             webhook_url,
-            http: reqwest::Client::new(),
+            http: claudear_core::tls::client(),
         })
     }
 }
@@ -148,7 +148,7 @@ impl SlackAsk {
             bot_token,
             channel_id,
             webhook_url,
-            client: reqwest::Client::new(),
+            client: claudear_core::tls::client(),
         }
     }
 

@@ -94,11 +94,11 @@ impl ReqwestHttpClient {
         crate::tls::ensure_crypto_provider();
 
         Self {
-            client: reqwest::Client::builder()
+            client: crate::tls::client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .unwrap_or_else(|_| crate::tls::client()),
         }
     }
 }

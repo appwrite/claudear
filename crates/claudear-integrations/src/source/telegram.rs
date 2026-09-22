@@ -95,7 +95,7 @@ impl TelegramSource {
         Self {
             config,
             last_update_id: RwLock::new(None),
-            client: reqwest::Client::new(),
+            client: claudear_core::tls::client(),
             cache: RwLock::new(HashMap::new()),
         }
     }

@@ -245,11 +245,11 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 async fn exchange_code_for_credentials(code: &str) -> Result<ManifestConversionResponse> {
     let url = format!("https://api.github.com/app-manifests/{}/conversions", code);
 
-    let client = reqwest::Client::builder()
+    let client = claudear_core::tls::client_builder()
         .timeout(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
         .connect_timeout(std::time::Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| claudear_core::tls::client());
 
     let response = client
         .post(&url)

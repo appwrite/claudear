@@ -431,7 +431,7 @@ impl Watcher {
         };
 
         tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = claudear_core::tls::client();
             let req = if let Some(body) = body {
                 client.post(&url).json(&body)
             } else {

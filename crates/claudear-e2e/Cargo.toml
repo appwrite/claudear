@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 claudear = { path = "../.." }
+claudear-core = { path = "../claudear-core" }
 
 # Async runtime
 tokio = { workspace = true }

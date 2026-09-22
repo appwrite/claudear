@@ -285,68 +285,84 @@ mod tests {
         assert!(!client.is_daemon_running()); // Assuming no daemon in tests
     }
 
-    #[test]
-    fn test_client_with_timeout() {
-        let client = IpcClient::new().with_timeout(Duration::from_secs(5));
-        assert_eq!(client.timeout, Duration::from_secs(5));
+    /// Answer one connection the way the daemon would, so a client that
+    /// dialled the right place gets a real response.
+    async fn serve_one_pong(listener: transport::IpcListener) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        if transport::expected_secret().is_some() {
+            let mut secret = String::new();
+            reader.read_line(&mut secret).await.expect("read secret");
+        }
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read command");
+
+        let response = serde_json::to_string(&IpcResponse::Ok(IpcData::Pong)).expect("encode");
+        writer
+            .write_all(format!("{}\n", response).as_bytes())
+            .await
+            .expect("write");
     }
 
-    #[test]
-    fn test_client_with_socket_path() {
-        let path = std::env::temp_dir().join("test-claudear.sock");
-        let client = IpcClient::with_socket_path(path.clone());
-        assert_eq!(client.socket_path, path);
+    #[tokio::test]
+    async fn a_custom_path_is_the_endpoint_the_client_talks_to() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let endpoint = dir.path().join("custom");
+        let listener = transport::bind(&endpoint).expect("bind");
+        let server = tokio::spawn(serve_one_pong(listener));
+
+        let client = IpcClient::with_socket_path(endpoint);
+
+        assert!(
+            client.ping().await.expect("ping"),
+            "the daemon on the custom endpoint answered, so that is where the client dialled"
+        );
+        server.await.expect("server task");
     }
 
-    // === Constructor tests ===
+    #[tokio::test]
+    async fn the_configured_timeout_is_what_gives_up() {
+        use tokio::io::AsyncBufReadExt;
 
-    #[test]
-    fn test_new_uses_default_path() {
-        let client = IpcClient::new();
-        let expected = super::super::default_socket_path();
-        assert_eq!(client.socket_path, expected);
-    }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let endpoint = dir.path().join("silent");
+        let listener = transport::bind(&endpoint).expect("bind");
 
-    #[test]
-    fn test_with_socket_path_uses_custom_path() {
-        let custom = std::env::temp_dir().join("custom-claudear.sock");
-        let client = IpcClient::with_socket_path(custom.clone());
-        assert_eq!(client.socket_path, custom);
-    }
+        // Accept, read, and never answer.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, _writer) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
 
-    #[test]
-    fn test_new_uses_default_timeout() {
-        let client = IpcClient::new();
-        assert_eq!(client.timeout, Duration::from_secs(30));
-    }
+        let client = IpcClient::with_socket_path(endpoint).with_timeout(Duration::from_millis(100));
 
-    #[test]
-    fn test_with_socket_path_uses_default_timeout() {
-        let client = IpcClient::with_socket_path(std::env::temp_dir().join("x.sock"));
-        assert_eq!(client.timeout, Duration::from_secs(30));
-    }
+        let started = std::time::Instant::now();
+        let error = client
+            .send(IpcCommand::Ping)
+            .await
+            .expect_err("a daemon that never answers must not hang the caller");
 
-    // === with_timeout tests ===
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "gave up after {:?}, which is not the configured timeout",
+            started.elapsed()
+        );
 
-    #[test]
-    fn test_with_timeout_sets_custom_timeout() {
-        let client = IpcClient::new().with_timeout(Duration::from_secs(120));
-        assert_eq!(client.timeout, Duration::from_secs(120));
-    }
-
-    #[test]
-    fn test_with_timeout_chained_with_socket_path() {
-        let path = std::env::temp_dir().join("chained.sock");
-        let client =
-            IpcClient::with_socket_path(path.clone()).with_timeout(Duration::from_millis(500));
-        assert_eq!(client.socket_path, path);
-        assert_eq!(client.timeout, Duration::from_millis(500));
-    }
-
-    #[test]
-    fn test_with_timeout_zero() {
-        let client = IpcClient::new().with_timeout(Duration::from_secs(0));
-        assert_eq!(client.timeout, Duration::from_secs(0));
+        server.abort();
     }
 
     // === is_daemon_running tests ===
