@@ -71,6 +71,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "fix_attempt_routing_intent",
         sql: include_str!("../../../migrations/V11__fix_attempt_routing_intent.sql"),
     },
+    Migration {
+        version: 12,
+        name: "deploy_qa_tips",
+        sql: include_str!("../../../migrations/V12__deploy_qa_tips.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -131,7 +136,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
 
         // Verify a table from V1 exists
         let count: u32 = conn
@@ -201,6 +206,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_routing_intent, 1);
+
+        let has_deploy_qa: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='deploy_qa_tips'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_deploy_qa, 1);
     }
 
     #[test]
@@ -215,7 +229,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
     }
 
     #[test]

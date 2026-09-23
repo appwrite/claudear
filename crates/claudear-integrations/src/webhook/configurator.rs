@@ -1699,6 +1699,7 @@ mod tests {
             ask: claudear_config::config::AskConfig::default(),
             retry: claudear_config::config::RetryConfig::default(),
             regression: claudear_config::config::RegressionConfig::default(),
+            deploy_qa: claudear_config::config::DeployQaConfig::default(),
             cascade: claudear_config::config::CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: claudear_config::config::LearningConfig::default(),

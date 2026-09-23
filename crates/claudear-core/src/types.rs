@@ -1816,6 +1816,122 @@ pub struct ReleaseTracking {
     pub created_at: DateTime<Utc>,
 }
 
+/// Status of a `[deploy_qa]` release-tip attempt.
+///
+/// Separate from [`RegressionWatchStatus`] — deploy QA tracks live verification
+/// of a new tip, not post-fix regression watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployQaTipStatus {
+    /// Tip detected; waiting to be enqueued.
+    #[default]
+    Pending,
+    /// An observe/report agent attempt is in flight.
+    Running,
+    /// All LIVE-TESTABLE PRs verified (no live failures).
+    Verified,
+    /// At least one LIVE-TESTABLE PR failed or was blocked as a fail.
+    Failed,
+    /// Intentionally not enqueued (duplicate / skip-if-running).
+    Skipped,
+}
+
+impl std::fmt::Display for DeployQaTipStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Running => write!(f, "running"),
+            Self::Verified => write!(f, "verified"),
+            Self::Failed => write!(f, "failed"),
+            Self::Skipped => write!(f, "skipped"),
+        }
+    }
+}
+
+impl std::str::FromStr for DeployQaTipStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "verified" => Ok(Self::Verified),
+            "failed" => Ok(Self::Failed),
+            "skipped" => Ok(Self::Skipped),
+            other => Err(format!("unknown deploy_qa tip status: {other}")),
+        }
+    }
+}
+
+/// One persisted GitHub release tip watched by `[deploy_qa]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployQaTip {
+    /// Database ID.
+    pub id: i64,
+    /// Track name from `[[deploy_qa.tracks]]`.
+    pub track: String,
+    /// GitHub `owner/repo`.
+    pub repo: String,
+    /// Release tag.
+    pub tag: String,
+    /// Synthetic issue id (`repo:tag`) used when enqueueing the agent.
+    pub issue_id: String,
+    /// GitHub `published_at` (RFC3339) when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    /// HTML URL of the GitHub release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+    /// GitHub login of the release author (for FAIL `@releaser` mapping).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_login: Option<String>,
+    /// Attempt status.
+    pub status: DeployQaTipStatus,
+    /// Linked `fix_attempts.id` when an agent run was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<i64>,
+    /// Discord `#releases` message this tip replies under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discord_message_id: Option<String>,
+    /// Discord thread created on FAIL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discord_thread_id: Option<String>,
+    /// Cached release body for agent context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_body: Option<String>,
+    /// When the row was created.
+    pub created_at: String,
+    /// When the row was last updated.
+    pub updated_at: String,
+}
+
+impl DeployQaTip {
+    /// Build a pending tip for `track` / `repo` / `tag`.
+    pub fn new(track: impl Into<String>, repo: impl Into<String>, tag: impl Into<String>) -> Self {
+        let track = track.into();
+        let repo = repo.into();
+        let tag = tag.into();
+        let issue_id = format!("{repo}:{tag}");
+        Self {
+            id: 0,
+            track,
+            repo,
+            tag,
+            issue_id,
+            published_at: None,
+            html_url: None,
+            author_login: None,
+            status: DeployQaTipStatus::Pending,
+            attempt_id: None,
+            discord_message_id: None,
+            discord_thread_id: None,
+            release_body: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+}
+
 impl ReleaseTracking {
     /// Create a new release tracking entry.
     pub fn new(

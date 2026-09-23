@@ -7,7 +7,7 @@ mod client;
 mod thread_manager;
 mod types;
 
-pub use client::DiscordClient;
+pub use client::{DiscordClient, DiscordHttpClient, ReqwestDiscordClient};
 pub use thread_manager::ThreadManager;
 pub use types::{
     CreateMessageParams, CreateThreadParams, DiscordChannel, DiscordMessage,

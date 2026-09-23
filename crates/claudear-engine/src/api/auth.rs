@@ -902,9 +902,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use claudear_config::config::{
-        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, Config, IssuesConfig,
-        LearningConfig, NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig,
-        ScmConfig,
+        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, Config, DeployQaConfig,
+        IssuesConfig, LearningConfig, NotifiersConfig, PrioritisationConfig, RegressionConfig,
+        RetryConfig, ScmConfig,
     };
     use claudear_storage::SqliteTracker;
     use http_body_util::BodyExt;
@@ -933,6 +933,7 @@ mod tests {
             ask: AskConfig::default(),
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
+            deploy_qa: DeployQaConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),

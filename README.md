@@ -38,6 +38,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
   - [Human Q&A Loop](#human-qa-loop)
   - [Inference Analytics](#inference-analytics)
   - [Release Tracking](#release-tracking)
+  - [Deploy QA](#deploy-qa)
   - [Diagnostics](#diagnostics)
   - [Code Chat](#code-chat)
   - [Dry Run](#dry-run)
@@ -180,6 +181,12 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Dependency-aware release detection across repository graphs
 - Tracks when fixes land in production through dependency paths
 - Semantic versioning support
+
+### Deploy QA
+- Durable last-seen watches for GitHub release tips (separate from regression inclusion tracking)
+- Tag filters (`any`, `suffix:-db`, `not_suffix:-db`) per track
+- Observe/report agent enqueue — never opens fix PRs for a release announcement
+- Discord `#releases` verified reply vs FAIL thread + mapped `@releaser`
 
 ### Notifications
 - **Discord**: Webhook messages + bot reply polling for Q&A, rich embeds, thread tracking
@@ -459,6 +466,7 @@ api_key = "lin_api_xxxx"
 | `ask` | Human Q&A loop: timeout, poll interval, max rounds, semantic thresholds |
 | `retry` | Max retries, base delay, max delay (exponential backoff) |
 | `regression` | Check interval, monitoring duration, event thresholds |
+| `deploy_qa` | Live release-tip watches (tracks, tag filters, Discord `#releases`) |
 | `cascade` | Enable/disable cascading, max depth, per-dependency rules |
 | `learning` | Continuous learning: log extraction, diff analysis, Q&A promotion, repo knowledge |
 | `prioritisation` | Composite scoring weights, blast radius paths, clustering, suppression rules |
@@ -713,6 +721,35 @@ claudear inference history --limit 50
 claudear inference feedback 42 --correct
 claudear inference feedback 43 --actual-repo my-other-repo
 ```
+
+### Deploy QA
+
+Durable driver for **new GitHub release tips** (Appwrite Labs cloud / edge / vibes). Separate from `[regression]` release tracking, which watches **bug-fix inclusion** after a merge.
+
+```toml
+[deploy_qa]
+enabled = true
+poll_interval_ms = 300000
+skip_if_previous_running = true
+discord_channel_id = "990878183580651571"
+github_discord_map_path = "github-discord-map.json"
+
+[[deploy_qa.tracks]]
+name = "cloud"
+repo = "appwrite-labs/cloud"
+tag_filter = "any"                 # any | suffix:-db | not_suffix:-db
+```
+
+On a new tip Claudear:
+
+1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates.
+2. Skips enqueue if a previous attempt on that track is still running.
+3. Enqueues a synthetic `deploy_qa` issue (`repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs.
+4. Posts to Discord `#releases`: all-verified reply (no @), or a FAIL thread that `@`s the releaser via `github-discord-map.json`.
+
+See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
+
+Required for a live host (not CI): `CLAUDEAR_GITHUB_TOKEN`, Discord bot token with message + create-thread permissions.
 
 ### Release Tracking
 

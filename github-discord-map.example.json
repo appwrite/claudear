@@ -1,0 +1,38 @@
+{
+  "guildId": "938747207446839356",
+  "guildName": "Appwrite Labs",
+  "updatedAt": "2026-09-23T18:41:00+12:00",
+  "notes": "Verified via get_user_id_by_name after Discorder loadMembers fix. Ping as <@discordUserId>. Discord name for abnegate is abnegate. (trailing period).",
+  "byGithubLogin": {
+    "abnegate": {
+      "discordUsername": "abnegate.",
+      "discordUserId": "452316113016193024",
+      "status": "verified",
+      "source": "get_user_id_by_name 2026-09-23 Discorder"
+    },
+    "Meldiron": {
+      "discordUsername": "meldiron",
+      "discordUserId": "287294735054274560",
+      "status": "verified",
+      "source": "get_user_id_by_name 2026-09-23 Discorder"
+    },
+    "ChiragAgg5k": {
+      "discordUsername": "chiragagg5k",
+      "discordUserId": "743532656767270934",
+      "status": "verified",
+      "source": "get_user_id_by_name 2026-09-23 Discorder"
+    },
+    "eldadfux": {
+      "discordUsername": "eldadfux",
+      "discordUserId": "564158268319203348",
+      "status": "verified",
+      "source": "get_user_id_by_name"
+    },
+    "HarshMN2345": {
+      "discordUsername": "blackx2345",
+      "discordUserId": "818812780630507521",
+      "status": "verified_probable",
+      "source": "get_user_id_by_name blackx2345; GitHub link probable HarshMN2345"
+    }
+  }
+}

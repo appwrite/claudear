@@ -3238,7 +3238,15 @@ Create a PR with your changes.{custom_instructions}"#,
             && crate::processing::qa_eligible_source(source.name())
             && self.intent_classifier.is_some();
 
-        let to_process: Vec<(Issue, MatchResult, Option<Intent>)> = if qa_split_enabled {
+        let to_process: Vec<(Issue, MatchResult, Option<Intent>)> = if source.name() == "deploy_qa"
+        {
+            // Release announcements are observe/report only — never open a fix PR.
+            ordered
+                .into_iter()
+                .take(source_max_issues)
+                .map(|(issue, match_result)| (issue, match_result, Some(Intent::Question)))
+                .collect()
+        } else if qa_split_enabled {
             // Classify each ordered issue via the configured backend. The local LLM
             // backend offloads its synchronous inference to a blocking thread; the
             // agent backend awaits an agent run. Fix-bias on ambiguity / errors,
@@ -3801,6 +3809,24 @@ Create a PR with your changes.{custom_instructions}"#,
             &labels,
         ) {
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
+        }
+
+        if source.name() == "deploy_qa" {
+            if let Ok(Some(tip)) = self.tracker.get_deploy_qa_tip_by_issue_id(&issue.id) {
+                let attempt_id = self
+                    .tracker
+                    .get_attempt(source.name(), &issue.id)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.id);
+                if let Err(e) = self.tracker.update_deploy_qa_tip_status(
+                    tip.id,
+                    claudear_core::types::DeployQaTipStatus::Running,
+                    attempt_id,
+                ) {
+                    tracing::debug!(error = %e, "Failed to mark deploy_qa tip running");
+                }
+            }
         }
 
         // Timeline: attempt created (pending).
@@ -5055,6 +5081,7 @@ mod tests {
             ask: claudear_config::config::AskConfig::default(),
             retry: claudear_config::config::RetryConfig::default(),
             regression: claudear_config::config::RegressionConfig::default(),
+            deploy_qa: claudear_config::config::DeployQaConfig::default(),
             cascade: claudear_config::config::CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: claudear_config::config::LearningConfig::default(),

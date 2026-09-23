@@ -3012,8 +3012,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use claudear_config::config::{
-        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, IssuesConfig, LearningConfig,
-        NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig, ScmConfig,
+        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, DeployQaConfig, IssuesConfig,
+        LearningConfig, NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig,
+        ScmConfig,
     };
     use claudear_core::secret::SecretValue;
     use claudear_storage::{IndexingProgress, SqliteTracker};
@@ -3043,6 +3044,7 @@ mod tests {
             ask: AskConfig::default(),
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
+            deploy_qa: DeployQaConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),

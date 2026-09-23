@@ -1019,9 +1019,9 @@ mod tests {
 
     use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
     use claudear_storage::{
-        ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore, EvaluationStore,
-        ExperimentStore, KnowledgeStore, RegressionStore, RepoStore, SimilarityStore, UserStore,
-        WebhookStore,
+        ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
+        EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
+        SimilarityStore, UserStore, WebhookStore,
     };
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -1190,6 +1190,7 @@ mod tests {
     impl WebhookStore for MockTracker {}
     impl SimilarityStore for MockTracker {}
     impl DiscordStore for MockTracker {}
+    impl DeployQaStore for MockTracker {}
 
     // --- Helper to create a mock EmbeddingClient for tests ---
     // We use the real EmbeddingClient with the fast (AllMiniLML6V2) model.

@@ -461,6 +461,9 @@ pub struct Config {
     /// Regression monitoring configuration.
     #[serde(default)]
     pub regression: RegressionConfig,
+    /// Live deploy QA for GitHub release tips (separate from `[regression]`).
+    #[serde(default)]
+    pub deploy_qa: DeployQaConfig,
     /// Cascade configuration for multi-repo chaining.
     #[serde(default)]
     pub cascade: CascadeConfig,
@@ -687,6 +690,7 @@ impl Default for Config {
             ask: AskConfig::default(),
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
+            deploy_qa: DeployQaConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
@@ -2062,6 +2066,147 @@ impl Default for RegressionConfig {
             github_token: None,
             github_search_repos: Vec::new(),
             package_names: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Tag filter for a `[deploy_qa]` track.
+///
+/// TOML values: `"any"`, `"suffix:-db"`, `"not_suffix:-db"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeployQaTagFilter {
+    /// Match every release tag.
+    Any,
+    /// Match tags that end with the given suffix (e.g. `-db`).
+    Suffix(String),
+    /// Match tags that do **not** end with the given suffix.
+    NotSuffix(String),
+}
+
+impl Default for DeployQaTagFilter {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
+impl DeployQaTagFilter {
+    /// Parse a tag filter from its TOML string form.
+    pub fn parse(raw: &str) -> std::result::Result<Self, String> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("any") {
+            return Ok(Self::Any);
+        }
+        if let Some(suffix) = raw.strip_prefix("suffix:") {
+            let suffix = suffix.trim();
+            if suffix.is_empty() {
+                return Err("tag_filter 'suffix:' requires a non-empty suffix".to_string());
+            }
+            return Ok(Self::Suffix(suffix.to_string()));
+        }
+        if let Some(suffix) = raw.strip_prefix("not_suffix:") {
+            let suffix = suffix.trim();
+            if suffix.is_empty() {
+                return Err("tag_filter 'not_suffix:' requires a non-empty suffix".to_string());
+            }
+            return Ok(Self::NotSuffix(suffix.to_string()));
+        }
+        Err(format!(
+            "unknown tag_filter '{raw}' (expected any | suffix:<text> | not_suffix:<text>)"
+        ))
+    }
+
+    /// Whether `tag` matches this filter.
+    pub fn matches(&self, tag: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Suffix(suffix) => tag.ends_with(suffix),
+            Self::NotSuffix(suffix) => !tag.ends_with(suffix),
+        }
+    }
+
+    /// Canonical TOML string for this filter.
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::Any => "any".to_string(),
+            Self::Suffix(suffix) => format!("suffix:{suffix}"),
+            Self::NotSuffix(suffix) => format!("not_suffix:{suffix}"),
+        }
+    }
+}
+
+impl Serialize for DeployQaTagFilter {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeployQaTagFilter {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One GitHub repo + tag-filter track watched by `[deploy_qa]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployQaTrackConfig {
+    /// Stable track name (e.g. `cloud`, `edge-db`).
+    pub name: String,
+    /// GitHub `owner/repo`.
+    pub repo: String,
+    /// Which release tags this track consumes.
+    #[serde(default)]
+    pub tag_filter: DeployQaTagFilter,
+}
+
+/// Live deploy QA for new GitHub release tips.
+///
+/// Distinct from `[regression]`, which watches **bug-fix inclusion** after a
+/// merge. `[deploy_qa]` durable-watches **new tips** and runs observe/report
+/// live QA against them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeployQaConfig {
+    /// Whether the deploy-QA poller is enabled (default: false).
+    pub enabled: bool,
+    /// How often to poll GitHub for new tips (milliseconds, default: 300000).
+    pub poll_interval_ms: u64,
+    /// Skip enqueueing a new tip on a track while a previous attempt is running.
+    pub skip_if_previous_running: bool,
+    /// Discord `#releases` channel to reply under.
+    pub discord_channel_id: Option<String>,
+    /// Discord guild for `#releases` (used when resolving releaser mentions).
+    pub discord_guild_id: Option<String>,
+    /// Path to a GitHub login → Discord user id map (FAIL `@releaser`).
+    pub github_discord_map_path: Option<String>,
+    /// Optional path to the live-QA playbook. When unset, the bundled playbook
+    /// shipped with Claudear is used.
+    pub instructions_path: Option<String>,
+    /// Tracks to poll. Each track is a repo + tag filter.
+    pub tracks: Vec<DeployQaTrackConfig>,
+}
+
+impl DeployQaConfig {
+    /// Poll interval, clamped to at least 1 ms so timers never panic.
+    pub fn effective_poll_interval_ms(&self) -> u64 {
+        self.poll_interval_ms.max(1)
+    }
+}
+
+impl Default for DeployQaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: 300_000,
+            skip_if_previous_running: true,
+            discord_channel_id: None,
+            discord_guild_id: None,
+            github_discord_map_path: None,
+            instructions_path: None,
+            tracks: Vec::new(),
         }
     }
 }
@@ -4988,6 +5133,111 @@ monitoring_duration_hours = 12
             assert_eq!(config.regression.monitoring_duration_hours, 12);
             // Defaults should apply for unspecified fields
             assert_eq!(config.regression.sentry_event_threshold, 1);
+        });
+    }
+
+    #[test]
+    fn test_deploy_qa_config_default() {
+        let config = DeployQaConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.poll_interval_ms, 300_000);
+        assert!(config.skip_if_previous_running);
+        assert!(config.discord_channel_id.is_none());
+        assert!(config.tracks.is_empty());
+        assert_eq!(config.effective_poll_interval_ms(), 300_000);
+    }
+
+    #[test]
+    fn test_deploy_qa_tag_filter_parse_and_match() {
+        assert_eq!(
+            DeployQaTagFilter::parse("any").unwrap(),
+            DeployQaTagFilter::Any
+        );
+        assert_eq!(
+            DeployQaTagFilter::parse("suffix:-db").unwrap(),
+            DeployQaTagFilter::Suffix("-db".into())
+        );
+        assert_eq!(
+            DeployQaTagFilter::parse("not_suffix:-db").unwrap(),
+            DeployQaTagFilter::NotSuffix("-db".into())
+        );
+        assert!(DeployQaTagFilter::parse("suffix:").is_err());
+        assert!(DeployQaTagFilter::parse("glob:*").is_err());
+
+        assert!(DeployQaTagFilter::Any.matches("v1.0.0"));
+        assert!(DeployQaTagFilter::Suffix("-db".into()).matches("1.2.3-db"));
+        assert!(!DeployQaTagFilter::Suffix("-db".into()).matches("1.2.3"));
+        assert!(DeployQaTagFilter::NotSuffix("-db".into()).matches("1.2.3"));
+        assert!(!DeployQaTagFilter::NotSuffix("-db".into()).matches("1.2.3-db"));
+    }
+
+    #[test]
+    fn test_config_includes_deploy_qa() {
+        let config = Config::default();
+        assert!(!config.deploy_qa.enabled);
+        assert!(config.deploy_qa.tracks.is_empty());
+    }
+
+    #[test]
+    fn test_config_deploy_qa_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+workspace = "/tmp/test"
+
+[deploy_qa]
+enabled = true
+poll_interval_ms = 120000
+skip_if_previous_running = false
+discord_channel_id = "990878183580651571"
+discord_guild_id = "938747207446839356"
+github_discord_map_path = "github-discord-map.json"
+instructions_path = "playbooks/deploy_qa.md"
+
+[[deploy_qa.tracks]]
+name = "cloud"
+repo = "appwrite-labs/cloud"
+tag_filter = "any"
+
+[[deploy_qa.tracks]]
+name = "edge-db"
+repo = "appwrite-labs/edge"
+tag_filter = "suffix:-db"
+
+[[deploy_qa.tracks]]
+name = "edge-network"
+repo = "appwrite-labs/edge"
+tag_filter = "not_suffix:-db"
+
+[[deploy_qa.tracks]]
+name = "vibes"
+repo = "appwrite/vibes"
+tag_filter = "any"
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert!(config.deploy_qa.enabled);
+            assert_eq!(config.deploy_qa.poll_interval_ms, 120_000);
+            assert!(!config.deploy_qa.skip_if_previous_running);
+            assert_eq!(
+                config.deploy_qa.discord_channel_id.as_deref(),
+                Some("990878183580651571")
+            );
+            assert_eq!(config.deploy_qa.tracks.len(), 4);
+            assert_eq!(config.deploy_qa.tracks[0].name, "cloud");
+            assert_eq!(
+                config.deploy_qa.tracks[0].tag_filter,
+                DeployQaTagFilter::Any
+            );
+            assert_eq!(
+                config.deploy_qa.tracks[1].tag_filter,
+                DeployQaTagFilter::Suffix("-db".into())
+            );
+            assert_eq!(
+                config.deploy_qa.tracks[2].tag_filter,
+                DeployQaTagFilter::NotSuffix("-db".into())
+            );
+            assert_eq!(config.deploy_qa.tracks[3].repo, "appwrite/vibes");
+            // Regression defaults must stay unchanged when only [deploy_qa] is set.
+            assert!(config.regression.enabled);
         });
     }
 

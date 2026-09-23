@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use claudear::{
     api::ApiServer,
     config::Config,
+    deploy_qa::DeployQaTracker,
     feedback::{EmbeddingClient, IssueEmbeddingService},
     github::GitHubClient,
     housekeeping::HousekeepingWorker,
@@ -24,8 +25,8 @@ use claudear::{
     runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
     source::{
-        DiscordSource, HelpScoutSource, IssueSource, JiraSource, LinearSource, SentrySource,
-        SlackSource, TelegramSource, WhatsAppSource,
+        DeployQaSource, DiscordSource, HelpScoutSource, IssueSource, JiraSource, LinearSource,
+        SentrySource, SlackSource, TelegramSource, WhatsAppSource,
     },
     storage::{
         ActivityStore, EmbeddingStore, FixAttemptTracker, RepoStore, SqliteTracker, UserStore,
@@ -718,7 +719,7 @@ async fn build_watcher_deps(
     config: &Config,
     tracker: &Arc<dyn FixAttemptTracker>,
 ) -> anyhow::Result<WatcherDeps> {
-    let sources = create_sources(config);
+    let sources = create_sources(config, tracker);
 
     // GitHub client for API-based repo discovery
     let github_client = GitHubClient::new(config.github().clone());
@@ -1042,7 +1043,10 @@ fn create_review_watcher(
     Some(Arc::new(review_watcher))
 }
 
-fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
+fn create_sources(
+    config: &Config,
+    tracker: &Arc<dyn FixAttemptTracker>,
+) -> Vec<Arc<dyn IssueSource>> {
     let mut sources: Vec<Arc<dyn IssueSource>> = Vec::new();
 
     if let Some(linear_config) = config.linear() {
@@ -1132,7 +1136,63 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
         }
     }
 
+    if config.deploy_qa.enabled {
+        match attach_deploy_qa_source(config, tracker.clone()) {
+            Some(source) => {
+                sources.push(source);
+                tracing::info!("Deploy QA source initialized (observe/report only)");
+            }
+            None => {
+                tracing::warn!("[deploy_qa] enabled but source could not be initialized");
+            }
+        }
+    }
+
     sources.into_iter().map(InstrumentedSource::wrap).collect()
+}
+
+/// Build the synthetic `deploy_qa` issue source when config is valid.
+fn attach_deploy_qa_source(
+    config: &Config,
+    tracker: Arc<dyn FixAttemptTracker>,
+) -> Option<Arc<dyn IssueSource>> {
+    let map = config
+        .deploy_qa
+        .github_discord_map_path
+        .as_ref()
+        .and_then(|path| match claudear::deploy_qa::GitHubDiscordMap::load_from_path(path) {
+            Ok(map) => Some(map),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load github-discord map; FAIL @releaser disabled");
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    let bot_token = config
+        .discord_merged()
+        .bot_token
+        .as_ref()
+        .map(|t| t.expose().to_string());
+    let discord = match claudear::try_build_discord(
+        bot_token.as_deref(),
+        config.deploy_qa.discord_channel_id.as_deref(),
+        map,
+    ) {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(error = %e, "deploy_qa Discord reporter unavailable");
+            None
+        }
+    };
+
+    match DeployQaSource::new(config.deploy_qa.clone(), tracker, discord) {
+        Ok(source) => Some(Arc::new(source)),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create deploy_qa source");
+            None
+        }
+    }
 }
 
 fn create_webhook_handlers(config: &Config) -> WebhookHandlerRegistry {
@@ -1544,6 +1604,95 @@ fn start_regression_monitoring(
         }
     });
 
+    Some(handle)
+}
+
+/// Start the `[deploy_qa]` background poller.
+///
+/// Distinct from [`start_regression_monitoring`]: this watches **new GitHub
+/// release tips** and enqueues observe/report live QA. It does not use
+/// `ReleaseTracker` or `[regression]` watches.
+fn start_deploy_qa_monitoring(
+    config: &Config,
+    tracker: Arc<dyn FixAttemptTracker>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.deploy_qa.enabled {
+        tracing::info!("Deploy QA disabled in configuration");
+        return None;
+    }
+    if config.deploy_qa.tracks.is_empty() {
+        tracing::warn!("[deploy_qa] enabled but no [[deploy_qa.tracks]] configured");
+        return None;
+    }
+
+    let github_token = config
+        .github()
+        .token
+        .as_ref()
+        .map(|t| t.expose().to_string())
+        .filter(|t| !t.is_empty());
+    let github_token = match github_token {
+        Some(token) => token,
+        None => {
+            tracing::warn!("No GitHub token configured, deploy QA disabled");
+            return None;
+        }
+    };
+
+    let poller = match DeployQaTracker::new(github_token, tracker, config.deploy_qa.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to start deploy QA poller");
+            return None;
+        }
+    };
+
+    let interval_ms = config.deploy_qa.effective_poll_interval_ms();
+    let handle = tokio::spawn(async move {
+        let mut tick = interval(Duration::from_millis(interval_ms));
+        tracing::info!(
+            component = "deploy_qa",
+            poll_interval_ms = interval_ms,
+            "Deploy QA poller started"
+        );
+        loop {
+            tick.tick().await;
+            match poller.poll_once().await {
+                Ok(results) => {
+                    for result in results {
+                        match result.action {
+                            claudear::deploy_qa::DeployQaPollAction::Enqueued => {
+                                tracing::info!(
+                                    component = "deploy_qa",
+                                    track = %result.track,
+                                    tag = result.tip.as_ref().map(|t| t.tag.as_str()).unwrap_or("?"),
+                                    "Enqueued observe/report attempt for new release tip"
+                                );
+                            }
+                            claudear::deploy_qa::DeployQaPollAction::SkippedDuplicate => {
+                                tracing::debug!(
+                                    component = "deploy_qa",
+                                    track = %result.track,
+                                    "Tip unchanged; not re-fired"
+                                );
+                            }
+                            claudear::deploy_qa::DeployQaPollAction::SkippedPreviousRunning => {
+                                tracing::info!(
+                                    component = "deploy_qa",
+                                    track = %result.track,
+                                    "Skipping new tip; previous attempt still running"
+                                );
+                            }
+                            claudear::deploy_qa::DeployQaPollAction::NoMatchingTip => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(component = "deploy_qa", error = %e, "Error polling release tips");
+                }
+            }
+        }
+    });
     Some(handle)
 }
 
@@ -3321,6 +3470,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("  Regression monitoring: enabled");
         }
 
+        let deploy_qa_handle = start_deploy_qa_monitoring(&config, tracker.clone());
+        if deploy_qa_handle.is_some() {
+            tracing::info!("  Deploy QA: enabled");
+        }
+
         print_startup_banner_and_status(
             &config,
             &config_path,
@@ -3477,7 +3631,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         let github_client = GitHubClient::new(config.github().clone());
         let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
-        let sources = create_sources(&config);
+        let sources = create_sources(&config, &tracker);
         let pr_monitor = if config.regression.enabled {
             PrMonitor::with_regression_tracking(
                 provider,
@@ -3730,7 +3884,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         println!("\nProcessing {} retries...", ready.len());
 
         // Need sources and watcher for processing
-        let sources = create_sources(&config);
+        let sources = create_sources(&config, &tracker);
         if sources.is_empty() {
             anyhow::bail!("No sources were initialized");
         }
@@ -4066,12 +4220,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let regression_handle = start_regression_monitoring(
                 &config,
                 tracker.clone(),
-                create_sources(&config),
+                create_sources(&config, &tracker),
                 notifier.clone(),
             );
             if regression_handle.is_some() {
                 tracing::info!("Regression monitoring: enabled");
             }
+            let _deploy_qa_handle = start_deploy_qa_monitoring(&config, tracker.clone());
 
             // Handle shutdown signals
             let watcher_for_shutdown = watcher.clone();
@@ -4124,7 +4279,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         _ => {
             // Initialize sources for polling/seed/dry-run modes
             tracing::info!("Initializing sources...");
-            let sources = create_sources(&config);
+            let sources = create_sources(&config, &tracker);
 
             if sources.is_empty() {
                 anyhow::bail!("No sources were initialized");
@@ -4332,6 +4487,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         sources_for_regression.clone(),
                         notifier_for_regression.clone(),
                     );
+                    let _deploy_qa_handle =
+                        start_deploy_qa_monitoring(&config, tracker_for_api.clone());
 
                     let shutdown = async {
                         tokio::signal::ctrl_c()

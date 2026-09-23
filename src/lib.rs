@@ -41,6 +41,7 @@ pub use claudear_config::users;
 pub use claudear_storage as storage;
 
 // Re-exported from claudear-analysis
+pub use claudear_analysis::deploy_qa;
 pub use claudear_analysis::evaluation;
 pub use claudear_analysis::feedback;
 pub use claudear_analysis::inference;
@@ -50,6 +51,7 @@ pub use claudear_analysis::prioritisation;
 pub use claudear_analysis::qa;
 pub use claudear_analysis::regression;
 pub use claudear_analysis::release;
+pub use claudear_integrations::deploy_qa::{try_build_discord, DeployQaDiscord};
 
 // Re-exported from claudear-integrations
 pub use claudear_integrations::ask_reply_inbox;
@@ -220,8 +222,13 @@ pub async fn build_app(
     // Notifier
     let notifier = build_notifier(&config, user_registry.clone());
 
-    // Sources
-    let sources = build_sources(&config);
+    // Sources (including optional synthetic deploy_qa source)
+    let mut sources = build_sources(&config);
+    if config.deploy_qa.enabled {
+        if let Some(source) = build_deploy_qa_source(&config, tracker.clone()) {
+            sources.push(source);
+        }
+    }
 
     // GitHub client for inferrer
     let github_client = github::GitHubClient::new(config.github().clone());
@@ -326,6 +333,35 @@ fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notif
     }
 
     Arc::new(composite)
+}
+
+fn build_deploy_qa_source(
+    config: &Config,
+    tracker: Arc<dyn storage::FixAttemptTracker>,
+) -> Option<Arc<dyn source::IssueSource>> {
+    use source::DeployQaSource;
+
+    let map = config
+        .deploy_qa
+        .github_discord_map_path
+        .as_ref()
+        .and_then(|path| deploy_qa::GitHubDiscordMap::load_from_path(path).ok())
+        .unwrap_or_default();
+    let bot_token = config
+        .discord_merged()
+        .bot_token
+        .as_ref()
+        .map(|t| t.expose().to_string());
+    let discord = try_build_discord(
+        bot_token.as_deref(),
+        config.deploy_qa.discord_channel_id.as_deref(),
+        map,
+    )
+    .ok()
+    .flatten();
+    DeployQaSource::new(config.deploy_qa.clone(), tracker, discord)
+        .ok()
+        .map(|s| telemetry::InstrumentedSource::wrap(Arc::new(s)))
 }
 
 fn build_sources(config: &Config) -> Vec<Arc<dyn source::IssueSource>> {

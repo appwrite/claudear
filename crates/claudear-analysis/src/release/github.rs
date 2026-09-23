@@ -30,6 +30,24 @@ pub struct GitHubRelease {
     pub html_url: String,
 }
 
+/// A repository tag (used when a repo has tags but no GitHub Releases).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubTag {
+    /// Tag name.
+    pub name: String,
+    /// Lightweight commit pointer.
+    #[serde(default)]
+    pub commit: Option<GitHubTagCommit>,
+}
+
+/// Commit pointer on a GitHub tag.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GitHubTagCommit {
+    /// Commit SHA.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
 /// GitHub Release API client.
 pub struct ReleaseClient<H: HttpClient = ReqwestHttpClient> {
     token: String,
@@ -189,6 +207,26 @@ impl<H: HttpClient> ReleaseClient<H> {
     pub async fn get_releases(&self, repo: &str, per_page: u32) -> Result<Vec<GitHubRelease>> {
         let url = format!(
             "https://api.github.com/repos/{}/releases?per_page={}",
+            repo, per_page
+        );
+        let headers = self.build_headers();
+
+        let response = self.http.get(&url, headers).await?;
+
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "GitHub API error ({}): {}",
+                response.status, response.body
+            )));
+        }
+
+        response.json()
+    }
+
+    /// List recent tags for a repository (fallback when Releases is empty).
+    pub async fn get_tags(&self, repo: &str, per_page: u32) -> Result<Vec<GitHubTag>> {
+        let url = format!(
+            "https://api.github.com/repos/{}/tags?per_page={}",
             repo, per_page
         );
         let headers = self.build_headers();
@@ -874,6 +912,15 @@ mod tests {
         assert_eq!(releases.len(), 2);
         assert_eq!(releases[0].tag_name, "v1.1.0");
         assert_eq!(releases[1].tag_name, "v1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_get_tags_success() {
+        let mock = MockHttpClient::new(200, r#"[{"name":"v1.0.0","commit":{"sha":"abc123"}}]"#);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let tags = client.get_tags("org/repo", 10).await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "v1.0.0");
     }
 
     #[tokio::test]

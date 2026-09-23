@@ -7,7 +7,7 @@ use super::types::{
 };
 use super::{
     is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
-    DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
+    DeployQaStore, DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
     RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
 };
 use chrono::{DateTime, Utc};
@@ -4347,6 +4347,63 @@ impl RegressionStore for SqliteTracker {
     }
 }
 
+impl DeployQaStore for SqliteTracker {
+    fn upsert_deploy_qa_tip(
+        &self,
+        tip: &claudear_core::types::DeployQaTip,
+    ) -> Result<claudear_core::types::DeployQaTip> {
+        SqliteTracker::upsert_deploy_qa_tip(self, tip)
+    }
+
+    fn get_deploy_qa_tip(
+        &self,
+        track: &str,
+        tag: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::get_deploy_qa_tip(self, track, tag)
+    }
+
+    fn get_deploy_qa_tip_by_issue_id(
+        &self,
+        issue_id: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::get_deploy_qa_tip_by_issue_id(self, issue_id)
+    }
+
+    fn get_last_seen_deploy_qa_tip(
+        &self,
+        track: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::get_last_seen_deploy_qa_tip(self, track)
+    }
+
+    fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::list_pending_deploy_qa_tips(self)
+    }
+
+    fn track_has_in_flight_deploy_qa(&self, track: &str) -> Result<bool> {
+        SqliteTracker::track_has_in_flight_deploy_qa(self, track)
+    }
+
+    fn update_deploy_qa_tip_status(
+        &self,
+        id: i64,
+        status: claudear_core::types::DeployQaTipStatus,
+        attempt_id: Option<i64>,
+    ) -> Result<()> {
+        SqliteTracker::update_deploy_qa_tip_status(self, id, status, attempt_id)
+    }
+
+    fn update_deploy_qa_discord_ids(
+        &self,
+        id: i64,
+        message_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        SqliteTracker::update_deploy_qa_discord_ids(self, id, message_id, thread_id)
+    }
+}
+
 impl ChatStore for SqliteTracker {
     fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
         SqliteTracker::create_chat_session(self, id, repo_id)
@@ -7688,6 +7745,214 @@ impl SqliteTracker {
             created_at: Self::parse_datetime(&row.get::<_, String>(5)?)?,
         })
     }
+
+    fn row_to_deploy_qa_tip(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<claudear_core::types::DeployQaTip> {
+        let status_str: String = row.get(8)?;
+        let status = status_str
+            .parse()
+            .unwrap_or(claudear_core::types::DeployQaTipStatus::Pending);
+        Ok(claudear_core::types::DeployQaTip {
+            id: row.get(0)?,
+            track: row.get(1)?,
+            repo: row.get(2)?,
+            tag: row.get(3)?,
+            issue_id: row.get(4)?,
+            published_at: row.get(5)?,
+            html_url: row.get(6)?,
+            author_login: row.get(7)?,
+            status,
+            attempt_id: row.get(9)?,
+            discord_message_id: row.get(10)?,
+            discord_thread_id: row.get(11)?,
+            release_body: row.get(12)?,
+            created_at: row.get(13)?,
+            updated_at: row.get(14)?,
+        })
+    }
+
+    /// Insert a deploy-QA tip, or return the existing row for `(track, tag)`.
+    pub fn upsert_deploy_qa_tip(
+        &self,
+        tip: &claudear_core::types::DeployQaTip,
+    ) -> Result<claudear_core::types::DeployQaTip> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO deploy_qa_tips (
+                track, repo, tag, issue_id, published_at, html_url, author_login,
+                status, attempt_id, discord_message_id, discord_thread_id, release_body
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(track, tag) DO NOTHING
+            "#,
+            params![
+                tip.track,
+                tip.repo,
+                tip.tag,
+                tip.issue_id,
+                tip.published_at,
+                tip.html_url,
+                tip.author_login,
+                tip.status.to_string(),
+                tip.attempt_id,
+                tip.discord_message_id,
+                tip.discord_thread_id,
+                tip.release_body,
+            ],
+        )?;
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE track = ?1 AND tag = ?2
+            "#,
+        )?;
+        stmt.query_row(params![tip.track, tip.tag], Self::row_to_deploy_qa_tip)
+            .map_err(|e| claudear_core::error::Error::storage(e.to_string()))
+    }
+
+    /// Fetch a deploy-QA tip by track + tag.
+    pub fn get_deploy_qa_tip(
+        &self,
+        track: &str,
+        tag: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE track = ?1 AND tag = ?2
+            "#,
+        )?;
+        Ok(stmt
+            .query_row(params![track, tag], Self::row_to_deploy_qa_tip)
+            .optional()?)
+    }
+
+    /// Fetch a deploy-QA tip by synthetic issue id.
+    pub fn get_deploy_qa_tip_by_issue_id(
+        &self,
+        issue_id: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE issue_id = ?1
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )?;
+        Ok(stmt
+            .query_row(params![issue_id], Self::row_to_deploy_qa_tip)
+            .optional()?)
+    }
+
+    /// Most recently recorded tip for a track.
+    pub fn get_last_seen_deploy_qa_tip(
+        &self,
+        track: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE track = ?1
+            ORDER BY COALESCE(published_at, created_at) DESC, id DESC
+            LIMIT 1
+            "#,
+        )?;
+        Ok(stmt
+            .query_row(params![track], Self::row_to_deploy_qa_tip)
+            .optional()?)
+    }
+
+    /// Tips waiting to be picked up by the `deploy_qa` source.
+    pub fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], Self::row_to_deploy_qa_tip)?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Whether the track has a pending or running attempt.
+    pub fn track_has_in_flight_deploy_qa(&self, track: &str) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let count: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM deploy_qa_tips
+            WHERE track = ?1 AND status IN ('pending', 'running')
+            "#,
+            params![track],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Update tip status and optional attempt id.
+    pub fn update_deploy_qa_tip_status(
+        &self,
+        id: i64,
+        status: claudear_core::types::DeployQaTipStatus,
+        attempt_id: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE deploy_qa_tips
+            SET status = ?1,
+                attempt_id = COALESCE(?2, attempt_id),
+                updated_at = datetime('now')
+            WHERE id = ?3
+            "#,
+            params![status.to_string(), attempt_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// Store Discord release-message / FAIL-thread ids.
+    pub fn update_deploy_qa_discord_ids(
+        &self,
+        id: i64,
+        message_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE deploy_qa_tips
+            SET discord_message_id = COALESCE(?1, discord_message_id),
+                discord_thread_id = COALESCE(?2, discord_thread_id),
+                updated_at = datetime('now')
+            WHERE id = ?3
+            "#,
+            params![message_id, thread_id, id],
+        )?;
+        Ok(())
+    }
 }
 
 impl SqliteTracker {
@@ -10776,6 +11041,38 @@ mod tests {
 
         let watch_id = tracker.create_regression_watch(&watch).unwrap();
         assert!(watch_id > 0);
+    }
+
+    #[test]
+    fn test_deploy_qa_tip_last_seen_and_no_overwrite() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut first = DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.0.0");
+        first.published_at = Some("2026-01-01T00:00:00Z".into());
+        tracker.upsert_deploy_qa_tip(&first).unwrap();
+
+        let mut second = DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.1.0");
+        second.published_at = Some("2026-02-01T00:00:00Z".into());
+        tracker.upsert_deploy_qa_tip(&second).unwrap();
+
+        let last = tracker
+            .get_last_seen_deploy_qa_tip("cloud")
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.tag, "1.1.0");
+
+        // Same tag must not overwrite status.
+        tracker
+            .update_deploy_qa_tip_status(last.id, DeployQaTipStatus::Running, Some(9))
+            .unwrap();
+        let mut again = DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.1.0");
+        again.status = DeployQaTipStatus::Pending;
+        let stored = tracker.upsert_deploy_qa_tip(&again).unwrap();
+        assert_eq!(stored.status, DeployQaTipStatus::Running);
+        assert_eq!(stored.attempt_id, Some(9));
+        assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
+        assert_eq!(tracker.list_pending_deploy_qa_tips().unwrap().len(), 1);
     }
 
     #[test]
