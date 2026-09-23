@@ -2073,20 +2073,15 @@ impl Default for RegressionConfig {
 /// Tag filter for a `[deploy_qa]` track.
 ///
 /// TOML values: `"any"`, `"suffix:-db"`, `"not_suffix:-db"`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DeployQaTagFilter {
     /// Match every release tag.
+    #[default]
     Any,
     /// Match tags that end with the given suffix (e.g. `-db`).
     Suffix(String),
     /// Match tags that do **not** end with the given suffix.
     NotSuffix(String),
-}
-
-impl Default for DeployQaTagFilter {
-    fn default() -> Self {
-        Self::Any
-    }
 }
 
 impl DeployQaTagFilter {
