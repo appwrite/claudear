@@ -214,12 +214,10 @@ impl SqliteTracker {
                     ));
                 }
                 let embedding: Vec<f32> = b
-                    .chunks_exact(4)
-                    .map(|chunk| {
-                        let arr: [u8; 4] =
-                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                        f32::from_le_bytes(arr)
-                    })
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| f32::from_le_bytes(*chunk))
                     .collect();
                 Ok(Some(embedding))
             }
@@ -359,11 +357,10 @@ impl SqliteTracker {
             return None;
         }
         Some(
-            blob.chunks_exact(4)
-                .map(|chunk| {
-                    let arr: [u8; 4] = chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                    f32::from_le_bytes(arr)
-                })
+            blob.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect(),
         )
     }
@@ -3714,12 +3711,10 @@ impl EmbeddingStore for SqliteTracker {
                         return None;
                     }
                     Some(
-                        blob.chunks_exact(4)
-                            .map(|chunk| {
-                                let arr: [u8; 4] =
-                                    chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                                f32::from_le_bytes(arr)
-                            })
+                        blob.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|chunk| f32::from_le_bytes(*chunk))
                             .collect(),
                     )
                 });
@@ -5868,12 +5863,10 @@ impl SqliteTracker {
                 return None;
             }
             Some(
-                blob.chunks_exact(4)
-                    .map(|chunk| {
-                        let arr: [u8; 4] =
-                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                        f32::from_le_bytes(arr)
-                    })
+                blob.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| f32::from_le_bytes(*chunk))
                     .collect(),
             )
         });
@@ -7750,9 +7743,7 @@ impl SqliteTracker {
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<claudear_core::types::DeployQaTip> {
         let status_str: String = row.get(8)?;
-        let status = status_str
-            .parse()
-            .unwrap_or(claudear_core::types::DeployQaTipStatus::Pending);
+        let status = status_str.parse().unwrap_or_default();
         Ok(claudear_core::types::DeployQaTip {
             id: row.get(0)?,
             track: row.get(1)?,

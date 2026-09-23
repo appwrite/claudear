@@ -200,12 +200,11 @@ impl<C: HttpClient> DeployQaTracker<C> {
         filter: &DeployQaTagFilter,
     ) -> Result<Option<ReleaseTip>> {
         let releases = self.client.get_releases(repo, 30).await.unwrap_or_default();
-        let matching: Vec<GitHubRelease> = releases
+        if let Some(release) = releases
             .into_iter()
             .filter(|r| !r.draft)
-            .filter(|r| filter.matches(&r.tag_name))
-            .collect();
-        if let Some(release) = matching.into_iter().next() {
+            .find(|r| filter.matches(&r.tag_name))
+        {
             return Ok(Some(ReleaseTip::from_release(repo, release)));
         }
 

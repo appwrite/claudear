@@ -651,7 +651,7 @@ fn get_attempts(tracker: &Arc<dyn FixAttemptTracker>, limit: Option<usize>) -> V
     }
 
     // Sort by attempted_at descending
-    all.sort_by(|a, b| b.attempted_at.cmp(&a.attempted_at));
+    all.sort_by_key(|a| std::cmp::Reverse(a.attempted_at));
 
     let iter = all.into_iter().map(|a| attempt_to_summary(&a));
 
