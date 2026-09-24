@@ -726,7 +726,7 @@ claudear inference feedback 43 --actual-repo my-other-repo
 
 Durable driver for **new GitHub release tips** (Appwrite Labs cloud / edge / vibes). Separate from `[regression]` release tracking, which watches **bug-fix inclusion** after a merge.
 
-Works in every daemon mode — `claudear start` (no `--poll` needed), `claudear webhook` and `claudear poll`. After each release poll, pending tips are dispatched to the QA agent, at most `qa.max_concurrent` at a time, once the daemon has finished warm start. That dispatch is the only path that runs tips inside the daemon: the `--poll` source loop leaves `deploy_qa` tips to it, and a tip another process started or finished in the meantime is skipped.
+Works in every daemon mode — `claudear start` (no `--poll` needed), `claudear webhook` and `claudear poll`. After each release poll, pending tips are dispatched to the QA agent, at most `qa.max_concurrent` at a time, once the daemon has finished warm start. That dispatch is the only path that runs tips inside the daemon: the `--poll` source loop and `claudear seed` leave `deploy_qa` tips to it, and a tip another process started or finished in the meantime is skipped.
 
 ```toml
 [deploy_qa]
@@ -745,7 +745,7 @@ tag_filter = "any"                 # any | suffix:-db | not_suffix:-db
 On a new tip Claudear:
 
 1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates. On first enable a track has no last-seen tag, so its current tip counts as new and gets one QA run.
-2. Skips enqueue if a previous attempt on that track is still pending or running. A tip whose attempt ends without a verdict (agent error or timeout) is marked `errored` so it no longer blocks the track, as is a tip left `running` by an interrupted run when the daemon next starts; the retry manager may still retry a failed attempt. That startup sweep cannot tell an interrupted run from a `claudear trigger`, `claudear retries process` or second `claudear poll` process that shares the database and is still mid-run: its tip is marked `errored` early, which only lets the track take its next tip sooner, and the run's verdict is still recorded when it finishes.
+2. Skips enqueue if a previous attempt on that track is still pending or running. A tip whose attempt ends without a verdict (agent error or timeout) is marked `errored` so it no longer blocks the track, as is a tip left `running` by an interrupted run when the daemon next starts; the retry manager may still retry a failed attempt, but only an `errored` tip is re-run: a tip that is running or has a recorded verdict is never re-run, by a retry or by `claudear trigger`. That startup sweep cannot tell an interrupted run from a `claudear trigger`, `claudear retries process` or second `claudear poll` process that shares the database and is still mid-run: its tip is marked `errored` early, which only lets the track take its next tip sooner, and the run's verdict is still recorded when it finishes.
 3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs. `claudear action` (`reply`, `verify` or `resolve`) refuses these issues.
 4. Classifies the agent's report, records the tip as `verified`, `unverified` or `failed`, and posts the outcome under the release announcement in Discord `#releases` (the agent never posts itself):
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.

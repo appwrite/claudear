@@ -2232,6 +2232,10 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Seed the tracker with existing issues.
+    ///
+    /// The `deploy_qa` source is skipped: its tips are dispatched only by
+    /// [`Self::dispatch_pending_deploy_qa_tips`], and a seeded failed attempt
+    /// would hand a pending tip to the retry manager as well.
     pub async fn seed(&self) -> Result<SeedResult> {
         tracing::info!("");
         tracing::info!("Seeding tracker with existing issues...");
@@ -2239,12 +2243,14 @@ Create a PR with your changes.{custom_instructions}"#,
         let mut results = SeedResult::default();
 
         for source in &self.sources {
+            if source.name() == DEPLOY_QA_SOURCE {
+                continue;
+            }
             match source.fetch_issues().await {
                 Ok(issues) => {
                     let mut seeded = 0;
                     for issue in issues {
                         if !self.tracker.has_attempted(source.name(), &issue.id)? {
-                            // Extract labels from issue metadata for bug detection
                             let labels: Vec<String> =
                                 issue.get_metadata("labels").unwrap_or_default();
                             self.tracker.record_attempt_with_labels(
@@ -3785,7 +3791,8 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Run QA for one dispatched tip unless it is no longer pending: another
-    /// process or path may have started or finished it since it was listed.
+    /// process or path may have started, finished or errored it since it was
+    /// listed, and dispatch leaves an errored tip to the retry manager.
     async fn process_deploy_qa_tip(&self, source: Arc<dyn IssueSource>, issue_id: &str) {
         let still_pending = self
             .find_deploy_qa_tip(issue_id)
@@ -3821,12 +3828,12 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Look up the tip behind a deploy_qa issue, warning when it cannot be found:
-    /// a missed status transition leaves the track blocked.
+    /// QA never runs without a tip to record its status on.
     fn find_deploy_qa_tip(&self, issue_id: &str) -> Option<DeployQaTip> {
         match self.tracker.get_deploy_qa_tip_by_issue_id(issue_id) {
             Ok(Some(tip)) => Some(tip),
             Ok(None) => {
-                tracing::warn!(issue_id, "deploy_qa tip not found; status left unchanged");
+                tracing::warn!(issue_id, "deploy_qa tip not found; skipping QA run");
                 None
             }
             Err(e) => {
@@ -3884,6 +3891,10 @@ Create a PR with your changes.{custom_instructions}"#,
     ///
     /// Uses the RepoInferrer engine to determine which repository to use
     /// for fixing the issue. Delegates to the shared `IssueProcessor` pipeline.
+    ///
+    /// A `deploy_qa` issue is skipped unless its tip
+    /// [is runnable](DeployQaTipStatus::is_runnable), so no retry or trigger
+    /// re-runs a tip that is running or already has a verdict.
     async fn process_issue(
         &self,
         source: Arc<dyn IssueSource>,
@@ -3902,6 +3913,23 @@ Create a PR with your changes.{custom_instructions}"#,
             Some(Intent::Question)
         } else {
             intent
+        };
+        let deploy_qa_tip = if is_deploy_qa {
+            match self.find_deploy_qa_tip(&issue.id) {
+                Some(tip) if tip.status.is_runnable() => Some(tip),
+                Some(tip) => {
+                    tracing::info!(
+                        component = "deploy_qa",
+                        short_id = %issue.short_id,
+                        status = %tip.status,
+                        "Skipping deploy_qa tip that is running or has a verdict"
+                    );
+                    return false;
+                }
+                None => return false,
+            }
+        } else {
+            None
         };
 
         if self.is_rate_limit_paused().await {
@@ -4016,11 +4044,6 @@ Create a PR with your changes.{custom_instructions}"#,
             .flatten()
             .map(|a| a.id);
 
-        let deploy_qa_tip = if is_deploy_qa {
-            self.find_deploy_qa_tip(&issue.id)
-        } else {
-            None
-        };
         if let Some(ref tip) = deploy_qa_tip {
             self.mark_deploy_qa_tip(tip, DeployQaTipStatus::Running, attempt_id);
         }
@@ -9296,7 +9319,11 @@ mod tests {
     #[tokio::test]
     async fn test_dispatched_deploy_qa_tip_finished_elsewhere_is_not_rerun() {
         let harness = DeployQaHarness::dispatching(test_config());
-        for status in [DeployQaTipStatus::Running, DeployQaTipStatus::Verified] {
+        for status in [
+            DeployQaTipStatus::Running,
+            DeployQaTipStatus::Verified,
+            DeployQaTipStatus::Errored,
+        ] {
             harness
                 .tracker
                 .update_deploy_qa_tip_status(harness.tip.id, status, None)
@@ -9318,6 +9345,144 @@ mod tests {
                 "a skipped {status} tip must keep its status"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_trigger_skips_tip_that_is_running_or_has_verdict() {
+        let harness = DeployQaHarness::with_deploy_qa_source(deploy_qa_report(
+            &["- #1 x LIVE FAIL"],
+            VERDICT_FAIL,
+        ));
+        for status in [
+            DeployQaTipStatus::Verified,
+            DeployQaTipStatus::Unverified,
+            DeployQaTipStatus::Failed,
+            DeployQaTipStatus::Running,
+        ] {
+            harness
+                .tracker
+                .update_deploy_qa_tip_status(harness.tip.id, status, None)
+                .unwrap();
+
+            let triggered = harness
+                .watcher
+                .trigger_issue(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+                .await;
+
+            assert!(
+                triggered.is_err(),
+                "a trigger for a {status} tip must report that QA did not start"
+            );
+            assert_eq!(
+                harness.agent_calls(),
+                0,
+                "a {status} tip must not run QA again or post a second report"
+            );
+            assert_eq!(
+                harness.stored_status(),
+                status,
+                "a skipped {status} tip must keep its status"
+            );
+            assert!(
+                harness
+                    .tracker
+                    .get_attempt(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+                    .unwrap()
+                    .is_none(),
+                "a skipped {status} tip must not record an attempt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_trigger_reruns_errored_tip() {
+        let harness = DeployQaHarness::with_deploy_qa_source(deploy_qa_report(
+            &["- #1 x LIVE FAIL"],
+            VERDICT_FAIL,
+        ));
+        harness
+            .tracker
+            .update_deploy_qa_tip_status(harness.tip.id, DeployQaTipStatus::Errored, None)
+            .unwrap();
+
+        harness
+            .watcher
+            .trigger_issue(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness.agent_calls(),
+            1,
+            "an errored tip has no verdict, so a retry must run QA once"
+        );
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Failed,
+            "the retried run must record its verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_of_failed_deploy_qa_attempt_skips_tip_with_verdict() {
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        config.processing_delay_ms = 0;
+        let harness = DeployQaHarness::dispatching(config);
+        let issue = harness.issue();
+        harness
+            .tracker
+            .record_attempt(DEPLOY_QA_SOURCE, &issue.id, &issue.short_id)
+            .unwrap();
+        harness
+            .tracker
+            .mark_failed(DEPLOY_QA_SOURCE, &issue.id, "answer delivery failed")
+            .unwrap();
+        harness
+            .tracker
+            .update_deploy_qa_tip_status(harness.tip.id, DeployQaTipStatus::Verified, None)
+            .unwrap();
+
+        harness.watcher.process_ready_retries().await.unwrap();
+
+        assert_eq!(
+            harness.agent_calls(),
+            0,
+            "retrying a failed attempt must not re-run QA for a tip that already has a verdict"
+        );
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn test_seed_leaves_deploy_qa_tips_to_dispatch() {
+        let harness = DeployQaHarness::dispatching(test_config());
+
+        let seeded = harness.watcher.seed().await.unwrap();
+
+        assert_eq!(
+            seeded.total, 0,
+            "a pending deploy_qa tip must not be seeded"
+        );
+        assert!(!seeded.by_source.contains_key(DEPLOY_QA_SOURCE));
+        assert!(
+            harness
+                .tracker
+                .get_attempt(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+                .unwrap()
+                .is_none(),
+            "seeding must not record a failed attempt that the retry manager would re-run"
+        );
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Pending);
+
+        finish_deploy_qa_runs(harness.dispatch_pending_tips().await).await;
+
+        assert_eq!(
+            harness.agent_calls(),
+            1,
+            "dispatch should still run the tip once"
+        );
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Verified);
     }
 
     #[tokio::test]
