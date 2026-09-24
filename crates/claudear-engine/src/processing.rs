@@ -156,8 +156,11 @@ pub(crate) fn qa_scratch_directory() -> std::path::PathBuf {
     directory
 }
 
-/// Create `directory`, owner-only on Unix, unless it already exists as a
-/// directory. Its parent must exist.
+/// Create `directory`, owner-only on Unix. Its parent must exist.
+///
+/// A `directory` that already exists must be a real directory, never a
+/// symbolic link that could lead anywhere, and on Unix is
+/// [restricted to its owner](restrict_to_owner), who must be the current user.
 fn create_private_directory(directory: &std::path::Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -166,11 +169,56 @@ fn create_private_directory(directory: &std::path::Path) -> std::io::Result<()> 
         builder.mode(LIVE_QA_DIRECTORY_MODE);
     }
     match builder.create(directory) {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(directory)?;
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::other(
+                    "it is a symbolic link, not a directory",
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "it is not a directory",
+                ));
+            }
+            #[cfg(unix)]
+            restrict_to_owner(directory, &metadata, current_user_id())?;
             Ok(())
         }
         result => result,
     }
+}
+
+/// Restrict the existing `directory`, described by `metadata`, to its owner,
+/// refusing it unless that owner is `user`: any other owner could still swap
+/// out whatever it holds.
+#[cfg(unix)]
+fn restrict_to_owner(
+    directory: &std::path::Path,
+    metadata: &std::fs::Metadata,
+    user: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let owner = metadata.uid();
+    if owner != user {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("it is owned by user {owner}, not by user {user} that Claudear runs as"),
+        ));
+    }
+    std::fs::set_permissions(
+        directory,
+        std::fs::Permissions::from_mode(LIVE_QA_DIRECTORY_MODE),
+    )
+}
+
+/// The user id that owns what this process creates.
+#[cfg(unix)]
+fn current_user_id() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// `short_id` as the name prefix of a live-QA run directory. Anything but ASCII
@@ -2602,9 +2650,10 @@ impl IssueProcessor {
     /// the returned guard drops.
     ///
     /// It is randomly named and owner-only on Unix, inside
-    /// [`LIVE_QA_DIRECTORY`] under the configured `workspace` (created
-    /// owner-only too when missing), so neither another local user nor an
-    /// earlier run can create it first or plant files the agent would load.
+    /// [`LIVE_QA_DIRECTORY`] under the configured `workspace`, which is
+    /// [private](create_private_directory) too whether or not it already
+    /// existed, so neither another local user nor an earlier run can create it
+    /// first, redirect it, or plant files the agent would load.
     fn create_live_qa_directory(&self, issue: &Issue) -> std::io::Result<tempfile::TempDir> {
         std::fs::create_dir_all(&self.config.workspace)?;
         let base = self.live_qa_base_directory();
@@ -6570,6 +6619,93 @@ mod tests {
             "live QA must not fall back to running anywhere else"
         );
         assert!(context.replies().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_deploy_qa_refuses_a_base_directory_that_is_a_symbolic_link() {
+        let fixture = AnsweringFixture::new();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), fixture.live_qa_base()).unwrap();
+        let context = RecordingContextProvider::default();
+
+        let error = expect_failed(
+            fixture
+                .run(question_input(DEPLOY_QA_SOURCE), &context)
+                .await,
+        );
+
+        assert!(
+            error.contains(&fixture.live_qa_base().display().to_string())
+                && error.contains("symbolic link"),
+            "the error must say the base directory is a symbolic link: {error}"
+        );
+        assert!(
+            fixture.agent.calls().is_empty(),
+            "live QA must never run behind a link to a directory Claudear does not control"
+        );
+        assert!(
+            std::fs::read_dir(elsewhere.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "live QA must create nothing where the link points"
+        );
+        assert!(context.replies().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_deploy_qa_restricts_an_existing_base_directory_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = AnsweringFixture::new();
+        std::fs::create_dir(fixture.live_qa_base()).unwrap();
+        std::fs::set_permissions(
+            fixture.live_qa_base(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        assert_completed_no_pr(
+            fixture
+                .run(
+                    question_input(DEPLOY_QA_SOURCE),
+                    &RecordingContextProvider::default(),
+                )
+                .await,
+        );
+
+        let permissions = std::fs::metadata(fixture.live_qa_base())
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            permissions.mode() & 0o777,
+            0o700,
+            "an existing base other local users can read must be restricted to its owner"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_directory_another_user_owns_is_refused_untouched() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = std::fs::symlink_metadata(directory.path()).unwrap();
+        let another_user = metadata.uid().wrapping_add(1);
+
+        let error = restrict_to_owner(directory.path(), &metadata, another_user)
+            .expect_err("another owner could swap out what the directory holds");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let permissions = std::fs::metadata(directory.path()).unwrap().permissions();
+        assert_eq!(
+            permissions.mode() & 0o777,
+            0o755,
+            "a refused directory must be left as it was"
+        );
     }
 
     #[tokio::test]
