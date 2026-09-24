@@ -49,6 +49,16 @@ const REPLY_FAILURE_MESSAGE: &str = "Failed to generate reply";
 /// Error for a reply run that finished without any reply text.
 const EMPTY_REPLY_MESSAGE: &str = "Reply run produced no reply";
 
+/// Warning for a live-QA run that may not run any shell command.
+const LIVE_QA_NO_SHELL_WARNING: &str = "deploy_qa live QA has no shell access, so curl and \
+     CLIs are unavailable; set `skip_permissions` or grant `Bash` in `permissions` to allow them";
+
+/// Warning for a live-QA run whose shell access is limited to scoped
+/// `Bash(...)` rules.
+const LIVE_QA_SCOPED_SHELL_WARNING: &str = "deploy_qa live QA may only run shell commands \
+     matching its `Bash(...)` rules, so curl and other CLIs each need a matching rule such as \
+     `Bash(curl:*)`; set `skip_permissions` or grant unscoped `Bash` to allow any command";
+
 /// What a CLI run returns and which tools it may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunProfile {
@@ -76,13 +86,37 @@ impl RunProfile {
     }
 }
 
-/// Whether an `--allowedTools` permission lets a run execute shell commands:
-/// the bare shell tool or a scoped `Bash(...)` rule.
-fn grants_shell(permission: &str) -> bool {
-    permission
-        .trim()
-        .strip_prefix(SHELL_TOOL)
-        .is_some_and(|rule| rule.is_empty() || rule.starts_with('('))
+/// Which shell commands `--allowedTools` permissions let a run execute,
+/// ordered from least to most access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ShellAccess {
+    /// No shell command.
+    Unavailable,
+    /// Only the commands a scoped `Bash(...)` rule matches.
+    Scoped,
+    /// Any shell command.
+    Unrestricted,
+}
+
+impl ShellAccess {
+    /// The shell access one permission grants: the bare shell tool allows
+    /// any command, a scoped `Bash(...)` rule only the ones it matches.
+    fn of(permission: &str) -> Self {
+        match permission.trim().strip_prefix(SHELL_TOOL) {
+            Some("") => Self::Unrestricted,
+            Some(rule) if rule.starts_with('(') => Self::Scoped,
+            _ => Self::Unavailable,
+        }
+    }
+
+    /// The widest shell access any of `permissions` grants.
+    fn granted_by(permissions: &[String]) -> Self {
+        permissions
+            .iter()
+            .map(|permission| Self::of(permission))
+            .max()
+            .unwrap_or(Self::Unavailable)
+    }
 }
 
 /// Resolve the root directory for execution logs.
@@ -1028,14 +1062,18 @@ The PR title should include the issue ID: {}
         profile != RunProfile::Reply && self.config.skip_permissions
     }
 
-    /// Whether a live-QA run may execute shell commands at all.
-    fn live_qa_has_shell(&self) -> bool {
-        self.config.skip_permissions
-            || self
-                .config
-                .permissions
-                .iter()
-                .any(|permission| grants_shell(permission))
+    /// The warning to log when a live-QA run's shell access would block curl
+    /// or CLI checks: unless it skips permission prompts, only the `Bash`
+    /// permissions among its allowed tools let it run shell commands.
+    fn live_qa_shell_warning(&self) -> Option<&'static str> {
+        if self.skips_permissions(RunProfile::LiveQa) {
+            return None;
+        }
+        match ShellAccess::granted_by(&self.allowed_tools(RunProfile::LiveQa)) {
+            ShellAccess::Unrestricted => None,
+            ShellAccess::Scoped => Some(LIVE_QA_SCOPED_SHELL_WARNING),
+            ShellAccess::Unavailable => Some(LIVE_QA_NO_SHELL_WARNING),
+        }
     }
 
     /// How long a run under `profile` may take before it is killed: the
@@ -1241,13 +1279,10 @@ The PR title should include the issue ID: {}
             mcp_config_file.as_ref().map(|file| file.path()),
             &mcp_tool_globs,
         );
-        if profile == RunProfile::LiveQa && !self.live_qa_has_shell() {
-            tracing::warn!(
-                component = "claude",
-                label = label,
-                "deploy_qa live QA has no shell access, so curl and CLIs are unavailable; \
-                 set `skip_permissions` or grant `Bash` in `permissions` to allow them"
-            );
+        if profile == RunProfile::LiveQa {
+            if let Some(warning) = self.live_qa_shell_warning() {
+                tracing::warn!(component = "claude", label = label, "{warning}");
+            }
         }
 
         let log_files = Self::create_execution_log_files(label);
@@ -3703,30 +3738,81 @@ mod tests {
     }
 
     #[test]
-    fn test_grants_shell_matches_bash_and_scoped_bash_rules_only() {
-        for permission in ["Bash", "Bash(curl *)", "Bash(git *)", " Bash "] {
-            assert!(grants_shell(permission), "{permission} grants a shell");
+    fn test_shell_access_of_a_permission_matches_bash_and_scoped_bash_rules_only() {
+        for permission in ["Bash", " Bash "] {
+            assert_eq!(
+                ShellAccess::of(permission),
+                ShellAccess::Unrestricted,
+                "{permission}"
+            );
+        }
+        for permission in ["Bash(curl *)", "Bash(git:*)", " Bash(gh *) "] {
+            assert_eq!(
+                ShellAccess::of(permission),
+                ShellAccess::Scoped,
+                "{permission}"
+            );
         }
         for permission in ["BashOutput", "Read", "WebFetch", "mcp__bash", ""] {
-            assert!(!grants_shell(permission), "{permission} grants no shell");
+            assert_eq!(
+                ShellAccess::of(permission),
+                ShellAccess::Unavailable,
+                "{permission}"
+            );
         }
     }
 
-    #[test]
-    fn test_live_qa_has_shell_needs_skip_permissions_or_a_bash_permission() {
-        let has_shell = |permissions: &[&str], skip_permissions: bool| {
-            new_simple(ClaudeRunnerConfig {
-                permissions: permissions.iter().map(|p| p.to_string()).collect(),
-                skip_permissions,
-                ..ClaudeRunnerConfig::default()
-            })
-            .live_qa_has_shell()
-        };
+    /// The shell warning a live-QA run logs under a config with
+    /// `permissions`, `readonly_tools` and `skip_permissions`.
+    fn live_qa_shell_warning_for(
+        permissions: &[&str],
+        readonly_tools: &[&str],
+        skip_permissions: bool,
+    ) -> Option<&'static str> {
+        new_simple(ClaudeRunnerConfig {
+            permissions: permissions.iter().map(|tool| tool.to_string()).collect(),
+            readonly_tools: readonly_tools.iter().map(|tool| tool.to_string()).collect(),
+            skip_permissions,
+            ..ClaudeRunnerConfig::default()
+        })
+        .live_qa_shell_warning()
+    }
 
-        assert!(!has_shell(&[], false));
-        assert!(!has_shell(&["Read", "Edit"], false));
-        assert!(has_shell(&["Read", "Bash(curl *)"], false));
-        assert!(has_shell(&[], true));
+    #[test]
+    fn test_live_qa_shell_warning_is_silent_when_any_command_may_run() {
+        assert_eq!(live_qa_shell_warning_for(&[], &[], true), None);
+        assert_eq!(
+            live_qa_shell_warning_for(&["Bash(git *)", "Bash"], &[], false),
+            None
+        );
+        assert_eq!(
+            live_qa_shell_warning_for(&["Edit"], &["Read", "Bash"], false),
+            None
+        );
+    }
+
+    #[test]
+    fn test_live_qa_shell_warning_flags_shell_access_limited_to_scoped_rules() {
+        assert_eq!(
+            live_qa_shell_warning_for(&["Bash(git *)", "Edit"], &[], false),
+            Some(LIVE_QA_SCOPED_SHELL_WARNING)
+        );
+        assert_eq!(
+            live_qa_shell_warning_for(&["Edit"], &["Read", "Bash(curl:*)"], false),
+            Some(LIVE_QA_SCOPED_SHELL_WARNING)
+        );
+    }
+
+    #[test]
+    fn test_live_qa_shell_warning_flags_a_run_without_shell_access() {
+        assert_eq!(
+            live_qa_shell_warning_for(&[], &[], false),
+            Some(LIVE_QA_NO_SHELL_WARNING)
+        );
+        assert_eq!(
+            live_qa_shell_warning_for(&["Edit", "BashOutput", "mcp__bash"], &["Read"], false),
+            Some(LIVE_QA_NO_SHELL_WARNING)
+        );
     }
 
     #[cfg(unix)]
