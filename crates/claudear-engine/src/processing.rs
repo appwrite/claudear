@@ -2339,6 +2339,10 @@ impl IssueProcessor {
     /// receive `body` as a comment on the ticket, falling back to the notifier
     /// when posting fails. Any notifier message ids are recorded so a later
     /// reply maps back to this issue.
+    ///
+    /// A [live-QA](AnswerRun::LiveQa) report only ever goes to its source,
+    /// which redacts it before posting, so a report the source rejects is an
+    /// error instead of an unredacted broadcast to every notifier channel.
     async fn deliver_answer(
         &self,
         issue: &Issue,
@@ -2347,7 +2351,17 @@ impl IssueProcessor {
         notify_body: &str,
         context_provider: &dyn ContextProvider,
     ) -> Result<()> {
-        let sent_ids = if qa_eligible_source(source_name) {
+        let sent_ids = if AnswerRun::for_issue(issue) == AnswerRun::LiveQa {
+            if let Err(error) = context_provider.post_reply(&issue.id, body).await {
+                tracing::warn!(
+                    short_id = %issue.short_id,
+                    error = %error,
+                    "Source rejected the live-QA report; not falling back to the notifier"
+                );
+                return Err(error);
+            }
+            Vec::new()
+        } else if qa_eligible_source(source_name) {
             self.notifier.notify_answer(issue, notify_body).await?
         } else {
             match context_provider.post_reply(&issue.id, body).await {
@@ -2378,7 +2392,8 @@ impl IssueProcessor {
     /// [private directory](Self::create_live_qa_directory) kept until its report
     /// is delivered, and processing waits on it only until the
     /// [backstop](claudear_config::config::DeployQaConfig::backstop_timeout)
-    /// instead of `[qa] answer_timeout_secs`.
+    /// instead of `[qa] answer_timeout_secs`. A report its source rejects fails
+    /// the run, so the tip ends without a verdict and can be retried.
     async fn answer_question_issue(
         &self,
         issue: &Issue,
@@ -2512,7 +2527,7 @@ impl IssueProcessor {
                 } else {
                     format!("{}{}", answer, discord_refs)
                 };
-                if let Err(e) = self
+                match self
                     .deliver_answer(
                         issue,
                         source_name,
@@ -2522,33 +2537,18 @@ impl IssueProcessor {
                     )
                     .await
                 {
-                    tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to deliver answer");
-                }
-                // Store the FULL answer so it can ground a later reply-chain
-                // continuation; truncation is a display/send concern only.
-                let routing_intent = issue.get_metadata::<String>("routing_intent");
-                if let Err(e) = self.tracker.mark_answered(
-                    source_name,
-                    &issue.id,
-                    &answer,
-                    routing_intent.as_deref(),
-                ) {
-                    tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to mark answered");
-                }
-                self.record_issue_decision(
-                    issue,
-                    run.delivered_decision(),
-                    run.delivered_message(&issue.short_id),
-                    json!({ "answer_chars": answer.len() }),
-                );
-                self.record_timeline_event(
-                    issue,
-                    TimelineEventStatus::QaCompleted,
-                    format!("QA completed (answered) for {}", issue.short_id),
-                    json!({}),
-                );
-                ProcessingOutcome::CompletedNoPr {
-                    reason: "answered question".to_string(),
+                    Err(error) if run == AnswerRun::LiveQa => self.fail_answer(
+                        issue,
+                        source_name,
+                        format!("Live-QA report was not delivered: {error}"),
+                        format!("QA failed for {}", issue.short_id),
+                    ),
+                    delivery => {
+                        if let Err(error) = delivery {
+                            tracing::warn!(short_id = %issue.short_id, error = %error, "Failed to deliver answer");
+                        }
+                        self.record_answered(issue, source_name, run, &answer)
+                    }
                 }
             }
             Ok(Err(e)) => self.fail_answer(
@@ -2572,6 +2572,39 @@ impl IssueProcessor {
             remove_live_qa_directory(directory);
         }
         outcome
+    }
+
+    /// Record `issue` as answered by `run` with the full `answer`, untruncated
+    /// so it can ground a later reply-chain continuation.
+    fn record_answered(
+        &self,
+        issue: &Issue,
+        source_name: &str,
+        run: AnswerRun,
+        answer: &str,
+    ) -> ProcessingOutcome {
+        let routing_intent = issue.get_metadata::<String>("routing_intent");
+        if let Err(error) =
+            self.tracker
+                .mark_answered(source_name, &issue.id, answer, routing_intent.as_deref())
+        {
+            tracing::warn!(short_id = %issue.short_id, error = %error, "Failed to mark answered");
+        }
+        self.record_issue_decision(
+            issue,
+            run.delivered_decision(),
+            run.delivered_message(&issue.short_id),
+            json!({ "answer_chars": answer.len() }),
+        );
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::QaCompleted,
+            format!("QA completed (answered) for {}", issue.short_id),
+            json!({}),
+        );
+        ProcessingOutcome::CompletedNoPr {
+            reason: "answered question".to_string(),
+        }
     }
 
     /// Record `issue`'s answer or live-QA run as failed with `error`, with
@@ -6640,6 +6673,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_live_qa_report_the_source_rejects_never_reaches_the_notifier() {
+        let mut fixture = AnsweringFixture::new();
+        let notifier = Arc::new(RecordingNotifier::default());
+        fixture.processor.notifier = Arc::clone(&notifier) as Arc<dyn Notifier>;
+        let input = question_input(DEPLOY_QA_SOURCE);
+        let issue_id = input.issue.id.clone();
+        let context = RecordingContextProvider::rejecting();
+
+        let error = expect_failed(fixture.run(input, &context).await);
+
+        assert_eq!(
+            context.replies(),
+            vec![(issue_id, QA_REPORT.to_string())],
+            "the report must be offered to its source, which redacts it before posting"
+        );
+        assert!(
+            notifier
+                .sent()
+                .iter()
+                .all(|message| !message.contains(QA_REPORT)),
+            "a report its source rejected must not be broadcast unredacted: {:?}",
+            notifier.sent()
+        );
+        assert!(
+            error.contains(REJECTED_REPLY_ERROR),
+            "the run must fail with why the report was not delivered: {error}"
+        );
+        let decisions = fixture.decisions();
+        assert!(
+            !decisions
+                .iter()
+                .any(|decision| decision == "live_qa_reported"),
+            "an undelivered report must not be recorded as reported: {decisions:?}"
+        );
+        let directories = fixture.agent.project_dirs();
+        assert!(
+            directories.iter().all(|directory| !directory.exists()),
+            "an undelivered run's directory must be removed too: {directories:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_question_answer_the_ticket_rejects_falls_back_to_the_notifier() {
+        let mut fixture = AnsweringFixture::new();
+        let notifier = Arc::new(RecordingNotifier::default());
+        fixture.processor.notifier = Arc::clone(&notifier) as Arc<dyn Notifier>;
+        let context = RecordingContextProvider::rejecting();
+
+        assert_completed_no_pr(fixture.run(question_input(TRACKER_SOURCE), &context).await);
+
+        assert_eq!(
+            notifier.sent(),
+            vec![QA_REPORT.to_string()],
+            "an answer the ticket rejected must still reach the asker through the notifier"
+        );
+    }
+
+    #[tokio::test]
     async fn test_question_answer_runs_in_resolved_checkout() {
         let checkout = tempfile::tempdir().unwrap();
         let fixture = AnsweringFixture::new();
@@ -6843,13 +6934,27 @@ mod tests {
         }
     }
 
+    /// Error a [`RecordingContextProvider::rejecting`] provider fails every
+    /// `post_reply` with.
+    const REJECTED_REPLY_ERROR: &str = "the source's store is unavailable";
+
     /// Context provider that records every `post_reply` as `(issue_id, body)`.
     #[derive(Default)]
     struct RecordingContextProvider {
         replies: std::sync::Mutex<Vec<(String, String)>>,
+        rejects_replies: bool,
     }
 
     impl RecordingContextProvider {
+        /// A provider whose source records each reply but then rejects it with
+        /// [`REJECTED_REPLY_ERROR`].
+        fn rejecting() -> Self {
+            Self {
+                rejects_replies: true,
+                ..Self::default()
+            }
+        }
+
         fn replies(&self) -> Vec<(String, String)> {
             self.replies.lock().unwrap().clone()
         }
@@ -6869,7 +6974,85 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((issue_id.to_string(), body.to_string()));
+            if self.rejects_replies {
+                return Err(claudear_core::error::Error::Other(
+                    REJECTED_REPLY_ERROR.to_string(),
+                ));
+            }
             Ok(())
+        }
+    }
+
+    /// Notifier that records the text of every answer and status message it
+    /// is asked to send.
+    #[derive(Default)]
+    struct RecordingNotifier {
+        sent: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingNotifier {
+        fn sent(&self) -> Vec<String> {
+            self.sent.lock().unwrap().clone()
+        }
+
+        fn record(&self, text: &str) {
+            self.sent.lock().unwrap().push(text.to_string());
+        }
+    }
+
+    #[async_trait]
+    impl Notifier for RecordingNotifier {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+
+        async fn notify_start(&self, _issue: &Issue) -> claudear_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn notify_success(
+            &self,
+            _issue: &Issue,
+            _pr_url: &str,
+        ) -> claudear_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn notify_completed(&self, _issue: &Issue) -> claudear_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn notify_failed(
+            &self,
+            _issue: &Issue,
+            _error: &str,
+        ) -> claudear_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn notify_status(&self, message: &str) -> claudear_core::error::Result<()> {
+            self.record(message);
+            Ok(())
+        }
+
+        async fn notify_urgent_issues(
+            &self,
+            _issues: &[Issue],
+        ) -> claudear_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn notify_answer(
+            &self,
+            _issue: &Issue,
+            answer: &str,
+        ) -> claudear_core::error::Result<Vec<String>> {
+            self.record(answer);
+            Ok(Vec::new())
         }
     }
 }
