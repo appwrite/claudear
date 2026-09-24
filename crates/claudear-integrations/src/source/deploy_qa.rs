@@ -18,8 +18,6 @@ use claudear_storage::FixAttemptTracker;
 use std::path::Path;
 use std::sync::Arc;
 
-const DISCORD_MESSAGE_METADATA_KEY: &str = "discord_message_id";
-
 /// Issue source that drains pending `[deploy_qa]` tips from SQLite.
 pub struct DeployQaSource {
     config: DeployQaConfig,
@@ -72,9 +70,6 @@ impl DeployQaSource {
         };
         let mut issue = build_deploy_qa_issue(&track, &release, &self.playbook);
         issue.id = tip.issue_id.clone();
-        if let Some(ref message_id) = tip.discord_message_id {
-            issue.set_metadata(DISCORD_MESSAGE_METADATA_KEY, message_id.clone());
-        }
         issue
     }
 }
@@ -173,7 +168,7 @@ mod tests {
         let sqlite = SqliteTracker::in_memory().unwrap();
         let mut tip = DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.0.0");
         tip.html_url = None;
-        tip.discord_message_id = Some("1234567890".into());
+        tip.release_body = Some("Adds #1".into());
         let stored = sqlite.upsert_deploy_qa_tip(&tip).unwrap();
 
         let store: Arc<dyn FixAttemptTracker> = Arc::new(sqlite);
@@ -181,15 +176,15 @@ mod tests {
         let fetched = source.fetch_issues().await.unwrap().remove(0);
         let resolved = source.get_issue(&stored.issue_id).await.unwrap();
 
-        assert_eq!(fetched.id, resolved.id);
+        assert_eq!(fetched.id, stored.issue_id);
+        assert_eq!(resolved.id, stored.issue_id);
         assert_eq!(fetched.url, resolved.url);
         assert!(!resolved.url.is_empty());
-        for issue in [&fetched, &resolved] {
-            assert_eq!(
-                issue.get_metadata::<String>(DISCORD_MESSAGE_METADATA_KEY),
-                stored.discord_message_id
-            );
-        }
+        assert_eq!(fetched.description, resolved.description);
+        assert!(resolved
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("Adds #1")));
     }
 
     #[tokio::test]
