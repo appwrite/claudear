@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Deserialize a value that can be either a single string or a list of strings.
 /// Accepts `"value"` or `["a", "b"]` in TOML/JSON and always returns `Vec<String>`.
@@ -2158,11 +2159,16 @@ pub struct DeployQaTrackConfig {
     pub tag_filter: DeployQaTagFilter,
 }
 
+/// How many [`DeployQaConfig::timeout_secs`] a `[deploy_qa]` tip may stay
+/// `running` before it is treated as orphaned: a live run cannot outlast its
+/// timeout, and the margin covers setup and delivery around the agent call.
+const DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER: u32 = 2;
+
 /// Live deploy QA for new GitHub release tips.
 ///
 /// Distinct from `[regression]`, which watches **bug-fix inclusion** after a
-/// merge. `[deploy_qa]` durable-watches **new tips** and runs observe/report
-/// live QA against them.
+/// merge. `[deploy_qa]` durable-watches **new tips** and runs live QA against
+/// them, reporting the outcome without opening fix PRs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeployQaConfig {
@@ -2179,6 +2185,10 @@ pub struct DeployQaConfig {
     /// Optional path to the live-QA playbook. When unset, the bundled playbook
     /// shipped with Claudear is used.
     pub instructions_path: Option<String>,
+    /// How long one live-QA run may take before it is killed and its tip
+    /// marked `errored`, in seconds (default: 1800). Separate from
+    /// `[qa] answer_timeout_secs` because live QA runs real checks.
+    pub timeout_secs: u64,
     /// Tracks to poll. Each track is a repo + tag filter.
     pub tracks: Vec<DeployQaTrackConfig>,
 }
@@ -2187,6 +2197,18 @@ impl DeployQaConfig {
     /// Poll interval, clamped to at least 1 ms so timers never panic.
     pub fn effective_poll_interval_ms(&self) -> u64 {
         self.poll_interval_ms.max(1)
+    }
+
+    /// Live-QA run timeout, clamped to at least 1 second.
+    pub fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs.max(1)
+    }
+
+    /// How long a tip may stay `running` before the poller treats its run as
+    /// orphaned and marks it `errored`.
+    pub fn stale_run_after(&self) -> Duration {
+        Duration::from_secs(self.effective_timeout_secs())
+            .saturating_mul(DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER)
     }
 
     /// Validate `[[deploy_qa.tracks]]`.
@@ -2237,6 +2259,7 @@ impl Default for DeployQaConfig {
             discord_channel_id: None,
             github_discord_map_path: None,
             instructions_path: None,
+            timeout_secs: 1800,
             tracks: Vec::new(),
         }
     }
@@ -5204,9 +5227,44 @@ monitoring_duration_hours = 12
         };
         assert!(zero_interval.effective_poll_interval_ms() >= 1);
 
+        assert!(
+            config.effective_timeout_secs() > QaConfig::default().answer_timeout_secs,
+            "live QA runs real checks, so it must get longer than a Q&A answer by default"
+        );
+        let zero_timeout = DeployQaConfig {
+            timeout_secs: 0,
+            ..Default::default()
+        };
+        assert!(zero_timeout.effective_timeout_secs() >= 1);
+
+        assert!(
+            config.stale_run_after() > Duration::from_secs(config.effective_timeout_secs()),
+            "a run must be able to use its whole timeout before it is swept as stale"
+        );
+        let doubled_timeout = DeployQaConfig {
+            timeout_secs: config.timeout_secs * 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            doubled_timeout.stale_run_after(),
+            config.stale_run_after() * 2
+        );
+        let unbounded_timeout = DeployQaConfig {
+            timeout_secs: u64::MAX,
+            ..Default::default()
+        };
+        assert!(unbounded_timeout.stale_run_after() >= Duration::from_secs(u64::MAX));
+
         let root = Config::default();
         assert!(!root.deploy_qa.enabled);
         assert!(root.deploy_qa.tracks.is_empty());
+    }
+
+    #[test]
+    fn test_deploy_qa_timeout_from_toml() {
+        let config: Config = toml::from_str("[deploy_qa]\ntimeout_secs = 42\n").expect("parse");
+        assert_eq!(config.deploy_qa.timeout_secs, 42);
+        assert_eq!(config.deploy_qa.effective_timeout_secs(), 42);
     }
 
     #[test]

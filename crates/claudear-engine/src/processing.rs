@@ -30,6 +30,7 @@ use claudear_storage::{classify_error, compute_error_hash, FixAttemptTracker};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::intent::{Intent, IntentClassifier};
 
@@ -305,13 +306,13 @@ impl IssueProcessor {
         input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
-        // Release QA is observe-only: it must never enter the action, fix, or
+        // Release QA only reports: it must never enter the action, fix, or
         // customer-reply pipelines, whatever `[reply]` says.
         if input.source_name == DEPLOY_QA_SOURCE {
             tracing::info!(
                 short_id = %input.issue.short_id,
                 source = %input.source_name,
-                "Routing release QA to read-only answer path"
+                "Routing release tip to live QA"
             );
             return self
                 .answer_question_issue(
@@ -2206,6 +2207,9 @@ impl IssueProcessor {
     /// Answer a pure question with RAG-grounded context, read-only (no PR).
     /// Delivery follows [`Self::deliver_answer`]: conversational sources get the
     /// answer via the notifier, tracker-style sources as a comment on the ticket.
+    ///
+    /// `[deploy_qa]` release tips take this path as live QA, bounded by
+    /// `[deploy_qa] timeout_secs` instead of `[qa] answer_timeout_secs`.
     async fn answer_question_issue(
         &self,
         issue: &Issue,
@@ -2214,7 +2218,6 @@ impl IssueProcessor {
         attempt_id: Option<i64>,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
-        // Timeline: QA run started.
         self.record_timeline_event(
             issue,
             TimelineEventStatus::QaStarted,
@@ -2302,18 +2305,31 @@ impl IssueProcessor {
         // when a repo resolved).
         let context = self.prepend_operator_instructions(context, resolution.repo_name());
 
+        let live_qa = source_name == DEPLOY_QA_SOURCE;
+        let (decision, activity, timeout_secs) = if live_qa {
+            (
+                format!("Running live QA for {}", issue.short_id),
+                "Live QA",
+                self.config.deploy_qa.effective_timeout_secs(),
+            )
+        } else {
+            (
+                format!("Answering {} as a question (read-only)", issue.short_id),
+                "Answer generation",
+                self.config.qa.answer_timeout_secs.max(1),
+            )
+        };
         self.record_issue_decision(
             issue,
             "question_detected",
-            format!("Answering {} as a question (read-only)", issue.short_id),
+            decision,
             json!({ "context_chars": context.len() }),
         );
 
-        let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
         // Answer with the QA-specific runner when configured, else the main agent.
         let qa_agent = self.qa_agent.as_ref().unwrap_or(&self.agent);
         let answer_result = tokio::time::timeout(
-            timeout,
+            Duration::from_secs(timeout_secs),
             qa_agent.answer_question(issue, &context, &project_dir),
         )
         .await;
@@ -2378,15 +2394,15 @@ impl IssueProcessor {
                 ProcessingOutcome::Failed { error }
             }
             Err(_) => {
-                let error = format!(
-                    "Answer generation timed out after {}s",
-                    self.config.qa.answer_timeout_secs
-                );
+                let error = format!("{activity} timed out after {timeout_secs}s");
                 let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
                 self.record_timeline_event(
                     issue,
                     TimelineEventStatus::QaFailed,
-                    format!("QA timed out for {}", issue.short_id),
+                    format!(
+                        "QA timed out for {} after {}s",
+                        issue.short_id, timeout_secs
+                    ),
                     json!({ "error": error }),
                 );
                 ProcessingOutcome::Failed { error }
@@ -5992,11 +6008,28 @@ mod tests {
     const TRACKER_SOURCE: &str = "linear";
 
     fn answering_processor() -> IssueProcessor {
+        processor_answering_with(Arc::new(AnsweringAgent::default()))
+    }
+
+    fn processor_answering_with(agent: Arc<AnsweringAgent>) -> IssueProcessor {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
         let mut processor = make_reply_chain_processor(tracker);
-        processor.agent = Arc::new(AnsweringAgent);
+        processor.agent = agent;
         processor
+    }
+
+    fn expect_failed(outcome: ProcessingOutcome) -> String {
+        match outcome {
+            ProcessingOutcome::Failed { error } => error,
+            ProcessingOutcome::CompletedNoPr { reason } => {
+                panic!("expected Failed, got CompletedNoPr: {reason}")
+            }
+            ProcessingOutcome::Success { pr_url } => {
+                panic!("expected Failed, got Success: {pr_url}")
+            }
+            ProcessingOutcome::WrongRepo { .. } => panic!("expected Failed, got WrongRepo"),
+        }
     }
 
     fn question_input(source: &str) -> ProcessingInput {
@@ -6098,6 +6131,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_deploy_qa_is_bounded_by_its_own_timeout() {
+        let mut processor =
+            processor_answering_with(Arc::new(AnsweringAgent::slow(Duration::from_secs(3))));
+        processor.config.deploy_qa.timeout_secs = 0;
+        processor.config.qa.answer_timeout_secs = 3600;
+        let timeout_secs = processor.config.deploy_qa.effective_timeout_secs();
+        let context = RecordingContextProvider::default();
+
+        let error = expect_failed(
+            processor
+                .run(question_input(DEPLOY_QA_SOURCE), &context)
+                .await,
+        );
+
+        assert!(
+            error.contains(&format!("after {timeout_secs}s")),
+            "the timeout error must report the [deploy_qa] timeout that stopped the run: {error}"
+        );
+        assert!(
+            context.replies().is_empty(),
+            "a timed-out live QA run must not post a report"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_question_answer_keeps_qa_timeout_when_deploy_qa_timeout_differs() {
+        let mut processor =
+            processor_answering_with(Arc::new(AnsweringAgent::slow(Duration::from_secs(2))));
+        processor.config.qa.answer_timeout_secs = 1;
+        processor.config.deploy_qa.timeout_secs = 3600;
+        let context = RecordingContextProvider::default();
+
+        let error = expect_failed(
+            processor
+                .run(question_input(TRACKER_SOURCE), &context)
+                .await,
+        );
+
+        assert!(
+            error.contains("after 1s"),
+            "questions from other sources must stay bounded by [qa] answer_timeout_secs: {error}"
+        );
+        assert!(context.replies().is_empty());
+    }
+
     /// Intent classifier stub returning a fixed verdict (for routing tests).
     struct StubIntentClassifier(Option<Intent>);
 
@@ -6169,8 +6248,17 @@ mod tests {
         }
     }
 
-    /// Agent runner whose `answer_question` always returns [`QA_REPORT`].
-    struct AnsweringAgent;
+    /// Agent runner whose `answer_question` returns [`QA_REPORT`] after `delay`.
+    #[derive(Default)]
+    struct AnsweringAgent {
+        delay: Duration,
+    }
+
+    impl AnsweringAgent {
+        fn slow(delay: Duration) -> Self {
+            Self { delay }
+        }
+    }
 
     #[async_trait]
     impl claudear_integrations::runner::AgentRunner for AnsweringAgent {
@@ -6209,6 +6297,7 @@ mod tests {
             _context: &str,
             _project_dir: &std::path::Path,
         ) -> claudear_core::error::Result<String> {
+            tokio::time::sleep(self.delay).await;
             Ok(QA_REPORT.to_string())
         }
     }

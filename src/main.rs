@@ -1555,16 +1555,11 @@ fn start_regression_monitoring(
     Some(handle)
 }
 
-/// How many QA answer timeouts a `[deploy_qa]` tip may stay `running` before
-/// it is treated as orphaned: a live run cannot outlast its answer timeout,
-/// and the margin covers setup and delivery around the agent call.
-const DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER: u32 = 2;
-
 /// Start the `[deploy_qa]` background poller.
 ///
 /// Distinct from [`start_regression_monitoring`]: this watches **new GitHub
-/// release tips** and enqueues observe/report live QA. It does not use
-/// `ReleaseTracker` or `[regression]` watches.
+/// release tips** and enqueues live QA runs that report without fixing. It
+/// does not use `ReleaseTracker` or `[regression]` watches.
 ///
 /// After every poll it dispatches pending tips through `watcher`, including
 /// tips a previous process left pending. That dispatch is the only path that
@@ -1573,11 +1568,11 @@ const DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER: u32 = 2;
 /// seen before then run after the next poll.
 ///
 /// Every tick, starting with the first, begins by marking tips left `running`
-/// longer than [`DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER`] QA answer timeouts
-/// as `errored`, so a run orphaned by a crash, restart or shutdown stops
-/// blocking its track under `skip_if_previous_running` without waiting for a
-/// restart. A run still live in this or another process sharing the database
-/// is younger than that and is left alone.
+/// longer than [`claudear::config::DeployQaConfig::stale_run_after`] as
+/// `errored`, so a run orphaned by a crash, restart or shutdown stops blocking
+/// its track under `skip_if_previous_running` without waiting for a restart. A
+/// run still live in this or another process sharing the database is younger
+/// than that and is left alone.
 fn start_deploy_qa_monitoring(
     config: &Config,
     tracker: Arc<dyn FixAttemptTracker>,
@@ -1615,8 +1610,7 @@ fn start_deploy_qa_monitoring(
             }
         };
 
-    let stale_after = Duration::from_secs(config.qa.answer_timeout_secs.max(1))
-        .saturating_mul(DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER);
+    let stale_after = config.deploy_qa.stale_run_after();
     let interval_ms = config.deploy_qa.effective_poll_interval_ms();
     let handle = tokio::spawn(async move {
         let mut tick = interval(Duration::from_millis(interval_ms));
@@ -1636,7 +1630,7 @@ fn start_deploy_qa_monitoring(
                             component = "deploy_qa",
                             track = %result.track,
                             tag = result.tip.as_ref().map(|tip| tip.tag.as_str()).unwrap_or("?"),
-                            "Enqueued observe/report attempt for new release tip"
+                            "Enqueued live QA attempt for new release tip"
                         );
                     }
                     DeployQaPollAction::SkippedDuplicate => {
@@ -1669,7 +1663,7 @@ fn start_deploy_qa_monitoring(
                 Ok(runs) => tracing::info!(
                     component = "deploy_qa",
                     dispatched = runs.len(),
-                    "Dispatched pending release tips for observe/report QA"
+                    "Dispatched pending release tips for live QA"
                 ),
                 Err(error) => tracing::warn!(
                     component = "deploy_qa",
