@@ -8914,6 +8914,7 @@ mod tests {
     }
 
     const CUSTOMER_REPLY: &str = "Thanks for reaching out, we are looking into this for you.";
+    const SCRIPTED_QA_PROVIDER: &str = "scripted-qa-agent";
 
     /// How [`ScriptedQaAgent`] answers a QA question.
     enum QaAnswer {
@@ -8941,7 +8942,7 @@ mod tests {
     #[async_trait]
     impl AgentRunner for ScriptedQaAgent {
         fn name(&self) -> &str {
-            "scripted-qa-agent"
+            SCRIPTED_QA_PROVIDER
         }
         fn capabilities(&self) -> claudear_integrations::runner::ProviderCapabilities {
             claudear_integrations::runner::ProviderCapabilities::default()
@@ -9315,32 +9316,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deploy_qa_usage_limit_pauses_provider_until_reset() {
-        let reset_epoch = (Utc::now() + chrono::Duration::hours(3)).timestamp();
+    async fn test_deploy_qa_usage_limit_defers_qa_until_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        let mut config = test_config();
+        config.agent.default_provider = SCRIPTED_QA_PROVIDER.to_string();
         let harness = DeployQaHarness::answering(
-            test_config(),
-            QaAnswer::Fail(format!("Claude AI usage limit reached|{reset_epoch}")),
+            config,
+            QaAnswer::Fail(format!(
+                "Claude AI usage limit reached|{}",
+                reset.timestamp()
+            )),
         );
 
-        harness
-            .watcher
-            .process_issue(
-                harness.source.clone(),
-                harness.issue(),
-                MatchResult::matched("deploy_qa pending tip", MatchPriority::High),
-                None,
-                None,
-                Some(Intent::Question),
-            )
-            .await;
+        for _ in 0..2 {
+            harness
+                .watcher
+                .process_issue(
+                    harness.source.clone(),
+                    harness.issue(),
+                    MatchResult::matched("deploy_qa pending tip", MatchPriority::High),
+                    None,
+                    None,
+                    Some(Intent::Question),
+                )
+                .await;
+        }
 
-        let expected =
-            DateTime::<Utc>::from_timestamp(reset_epoch, 0).unwrap() + chrono::Duration::minutes(1);
-        let pauses = harness.watcher.rate_limit_pause_until.read().await;
         assert_eq!(
-            pauses.get(harness.watcher.agent.name()),
-            Some(&expected),
-            "a usage-limit result must pause the provider until its reset"
+            harness.agent_calls(),
+            1,
+            "a usage-limited provider must not be asked again before its reset"
+        );
+        let pause_until = harness
+            .tracker
+            .get_recent_activities(50, None)
+            .unwrap()
+            .into_iter()
+            .find(|activity| activity.activity_type == "watcher_paused")
+            .and_then(|activity| activity.metadata)
+            .and_then(|metadata| metadata["pause_until"].as_str().map(str::to_string))
+            .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .expect("the usage limit should be logged as a pause");
+        assert!(
+            pause_until >= reset,
+            "the pause must last until the usage limit resets at {reset}, got {pause_until}"
         );
     }
 
