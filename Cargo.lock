@@ -991,6 +991,7 @@ dependencies = [
  "imap",
  "jsonwebtoken",
  "lettre",
+ "libc",
  "llama-cpp-2",
  "mailparse",
  "mockall",

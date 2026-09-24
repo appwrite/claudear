@@ -102,6 +102,9 @@ encoding_rs = "0.8"
 # System info
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
+# Unix process and signal APIs
+libc = "0.2"
+
 # Parallel iteration
 rayon = "1"
 
@@ -317,9 +320,9 @@ tempfile = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
 
-# Process checking and IPC on Unix
+# Daemonizing, IPC and signal handling on Unix
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }
