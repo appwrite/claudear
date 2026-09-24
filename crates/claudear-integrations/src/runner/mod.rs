@@ -146,19 +146,38 @@ fn is_rate_limit_error_lower(lower: &str) -> bool {
     let simple_patterns = [
         "rate limit",
         "ratelimit",
-        "hit your limit",
+        "usage limit reached",
+        "5-hour limit reached",
+        "weekly limit reached",
         "too many requests",
         "quota exceeded",
         "resource exhausted",
         "retry-after",
         "try again later",
     ];
-    if simple_patterns.iter().any(|needle| lower.contains(needle)) {
+    if simple_patterns.iter().any(|needle| lower.contains(needle)) || contains_hit_your_limit(lower)
+    {
         return true;
     }
     // "429" must appear as a standalone token (not inside a UUID, hex string, or
     // longer number like "4299"). Check that surrounding characters are non-alphanumeric.
     contains_standalone_429(lower)
+}
+
+/// Claude names the exhausted limit: "You've hit your limit", "You've hit your
+/// weekly limit", "You've hit your Opus limit · resets 3pm".
+fn contains_hit_your_limit(lower: &str) -> bool {
+    lower.match_indices("hit your ").any(|(index, needle)| {
+        lower[index + needle.len()..]
+            .split(['.', ',', '|', '·', '∙', '\n'])
+            .next()
+            .is_some_and(|clause| {
+                clause
+                    .split_whitespace()
+                    .take(4)
+                    .any(|word| word.starts_with("limit"))
+            })
+    })
 }
 
 /// Check if "429" appears as a standalone HTTP status code token, not embedded
@@ -300,6 +319,61 @@ mod tests {
         assert!(is_rate_limit_error(
             "You've hit your limit · resets 6am (UTC)"
         ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_claude_usage_limit_with_reset_epoch() {
+        assert!(is_rate_limit_error(
+            "Claude AI usage limit reached|1790262000"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_claude_usage_limit_banner() {
+        assert!(is_rate_limit_error(
+            "Usage limit reached · continuing automatically at 3pm · esc to cancel"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_five_hour_limit() {
+        assert!(is_rate_limit_error("5-hour limit reached ∙ resets 3pm"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_weekly_limit() {
+        assert!(is_rate_limit_error(
+            "Opus weekly limit reached ∙ resets Oct 9, 10am"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_named_claude_limits() {
+        assert!(is_rate_limit_error(
+            "You've hit your weekly limit · resets Oct 9, 10am"
+        ));
+        assert!(is_rate_limit_error(
+            "You've hit your session limit · resets 3pm"
+        ));
+        assert!(is_rate_limit_error("You've hit your Opus limit"));
+        assert!(is_rate_limit_error("You've hit your monthly spend limit."));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_hit_your_without_a_limit() {
+        assert!(!is_rate_limit_error("The retry hit your webhook twice"));
+        assert!(!is_rate_limit_error(
+            "It hit your cache. Limit the TTL instead"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_other_limits_reached_are_not_rate_limits() {
+        assert!(!is_rate_limit_error("Context limit reached"));
+        assert!(!is_rate_limit_error(
+            "Subagent nesting limit reached (depth 3)"
+        ));
+        assert!(!is_rate_limit_error("Budget limit reached ($5.00 of $5)"));
     }
 
     #[test]
