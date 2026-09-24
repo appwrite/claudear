@@ -236,6 +236,13 @@ struct FinalResult {
     is_error: bool,
 }
 
+impl FinalResult {
+    /// The CLI's own error message, when it flagged the run as an error.
+    fn error(&self) -> Option<&str> {
+        self.text.as_deref().filter(|_| self.is_error)
+    }
+}
+
 /// A finished run: its [`AgentResult`] plus the CLI's [`FinalResult`], which
 /// plain-text runs need but [`AgentResult::output`] does not carry.
 #[derive(Debug)]
@@ -499,37 +506,27 @@ The PR title should include the issue ID: {}
         })
     }
 
-    fn compose_failure_message(exit_code: i32, stdout_output: &str, stderr_output: &str) -> String {
-        let stderr_trimmed = stderr_output.trim();
-        let stdout_trimmed = stdout_output.trim();
-
-        // Only check stderr for rate limits — stdout (assistant text) can contain
-        // rate-limit strings from analyzed code and cause false positives.
-        if Self::is_rate_limit_error(stderr_trimmed) {
-            let msg = if stderr_trimmed.is_empty() {
-                "Too many requests"
-            } else {
-                stderr_trimmed
-            };
-            return format!(
-                "Claude rate limit hit: {}",
-                Self::truncate(msg, EXECUTION_LOG_PREVIEW_LIMIT)
-            );
+    /// The error for a failed process, built only from text the CLI controls:
+    /// its error-flagged final result and stderr. Assistant text is left out
+    /// because it can mention rate limits or 429s from the analyzed code, and
+    /// callers pause the provider on any rate-limit match in this message.
+    fn compose_failure_message(exit_code: i32, cli_error: &str, stderr_output: &str) -> String {
+        let details = [cli_error.trim(), stderr_output.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if details.is_empty() {
+            return format!("Process exited with code {}", exit_code);
         }
 
-        if !stderr_trimmed.is_empty() {
-            return Self::truncate(stderr_trimmed, EXECUTION_LOG_PREVIEW_LIMIT);
+        let rate_limited = Self::is_rate_limit_error(&details);
+        let details = Self::truncate(&details, EXECUTION_LOG_PREVIEW_LIMIT);
+        if rate_limited {
+            format!("Claude rate limit hit: {}", details)
+        } else {
+            details
         }
-
-        if !stdout_trimmed.is_empty() {
-            return format!(
-                "Process exited with code {}. Output: {}",
-                exit_code,
-                Self::truncate(stdout_trimmed, EXECUTION_LOG_PREVIEW_LIMIT)
-            );
-        }
-
-        format!("Process exited with code {}", exit_code)
     }
 
     /// Legacy fallback: extract a blocking question from raw text output.
@@ -2006,7 +2003,7 @@ The PR title should include the issue ID: {}
         } else {
             Some(Self::compose_failure_message(
                 exit_code,
-                &text_output,
+                final_result.error().unwrap_or_default(),
                 &stderr_output,
             ))
         };
@@ -2497,34 +2494,30 @@ Write only the QA report."#,
 /// retried `LIVE FAIL`) is never classified. When the CLI emitted no final
 /// answer (an older CLI, or a stream without a `result` event), the
 /// accumulated assistant text is used instead. A run that failed, or that the
-/// CLI flagged as an error, is an `Err` carrying the CLI's error message and
-/// the runner error, so partial output is never posted as a report and
-/// usage-limit messages still reach rate-limit detection. A final answer the
-/// CLI did not flag is the model's report, not an error message, so it stays
-/// out of the error.
+/// CLI flagged as an error, is an `Err` so partial output is never posted as a
+/// report. The error is the runner's, which already carries the CLI's own
+/// error message but never assistant text, so usage limits still reach
+/// rate-limit detection and narration cannot fake one.
 fn live_qa_report(outcome: RunOutcome) -> Result<String> {
     let RunOutcome {
         agent,
         final_result,
     } = outcome;
-    let final_text = final_result.text.filter(|text| !text.trim().is_empty());
 
     if !agent.success || final_result.is_error {
-        let cli_error = final_text.filter(|_| final_result.is_error);
-        let message = [cli_error, agent.error]
+        let message = [agent.error.as_deref(), final_result.error()]
             .into_iter()
             .flatten()
-            .filter(|part| !part.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(Error::runner(if message.is_empty() {
-            LIVE_QA_FAILURE_MESSAGE.to_string()
-        } else {
-            message
-        }));
+            .map(str::trim)
+            .find(|message| !message.is_empty())
+            .unwrap_or(LIVE_QA_FAILURE_MESSAGE);
+        return Err(Error::runner(message));
     }
 
-    let report = final_text.unwrap_or(agent.output);
+    let report = final_result
+        .text
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(agent.output);
     if report.trim().is_empty() {
         return Err(Error::runner(LIVE_QA_EMPTY_REPORT_MESSAGE));
     }
@@ -2768,6 +2761,18 @@ mod tests {
         )
     }
 
+    /// Assistant text that mentions rate limits the way analysed code or
+    /// dashboards do, without the CLI reporting one.
+    #[cfg(unix)]
+    fn rate_limit_narration() -> [serde_json::Value; 4] {
+        [
+            assistant_text_event("The upload API returns 429 when you hit the rate limit."),
+            assistant_text_event("Let me look at the retry-after handling."),
+            assistant_text_event("Billing logs show quota exceeded and resource exhausted."),
+            assistant_text_event("The dashboard banner says usage limit reached."),
+        ]
+    }
+
     /// Run [`ClaudeAgentRunner::run_reply`] for an issue from `source` against a
     /// stub CLI emitting `events`, with execution logs kept in a temp dir.
     #[cfg(unix)]
@@ -2876,6 +2881,8 @@ mod tests {
         );
     }
 
+    const LEGACY_USAGE_LIMIT_MESSAGE: &str = "Claude AI usage limit reached|1790262000";
+
     #[cfg(unix)]
     #[test]
     fn test_run_reply_customer_reply_keeps_accumulated_output() {
@@ -2901,6 +2908,19 @@ mod tests {
                 .expect("customer replies still return partial output from a failed run");
 
         assert_eq!(reply, "Partial answer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_deploy_qa_narration_about_rate_limits_is_not_a_rate_limit() {
+        let error = run_reply_with_fake_cli(DEPLOY_QA_SOURCE, &rate_limit_narration(), 1)
+            .expect_err("a failed live QA run must not yield a report")
+            .to_string();
+
+        assert!(
+            !ClaudeAgentRunner::is_rate_limit_error(&error),
+            "assistant narration must not look like a rate limit, got: {error}"
+        );
     }
 
     fn reply_outcome(
@@ -3005,21 +3025,38 @@ mod tests {
     }
 
     #[test]
-    fn test_live_qa_report_failed_run_puts_the_cli_error_before_the_runner_error() {
+    fn test_live_qa_report_failed_run_does_not_repeat_the_cli_error_the_runner_error_carries() {
+        let runner_error = format!("Claude rate limit hit: {USAGE_LIMIT_MESSAGE}");
+
         let error = live_qa_report(reply_outcome(
             false,
             &narrated_report(),
-            Some("Process exited with code 1"),
+            Some(&runner_error),
             final_error(USAGE_LIMIT_MESSAGE),
         ))
         .unwrap_err();
 
         assert!(
-            matches!(&error, Error::Runner(message)
-                if message == &format!("{USAGE_LIMIT_MESSAGE}\nProcess exited with code 1")),
+            matches!(&error, Error::Runner(message) if message == &runner_error),
             "got: {error}"
         );
         assert!(ClaudeAgentRunner::is_rate_limit_error(&error.to_string()));
+    }
+
+    #[test]
+    fn test_live_qa_report_failed_run_without_a_runner_error_uses_the_cli_error() {
+        let error = live_qa_report(reply_outcome(
+            false,
+            &narrated_report(),
+            Some(" \n"),
+            final_error(USAGE_LIMIT_MESSAGE),
+        ))
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::Runner(message) if message == USAGE_LIMIT_MESSAGE),
+            "got: {error}"
+        );
     }
 
     #[test]
@@ -4002,18 +4039,18 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_failure_message_only_stdout() {
+    fn test_compose_failure_message_only_cli_error() {
         assert_eq!(
-            ClaudeAgentRunner::compose_failure_message(1, "some output", ""),
-            "Process exited with code 1. Output: some output"
+            ClaudeAgentRunner::compose_failure_message(1, "API Error: 500 Internal error", ""),
+            "API Error: 500 Internal error"
         );
     }
 
     #[test]
-    fn test_compose_failure_message_both_present_stderr_takes_priority() {
+    fn test_compose_failure_message_joins_the_cli_error_and_stderr() {
         assert_eq!(
-            ClaudeAgentRunner::compose_failure_message(1, "stdout text", "stderr text"),
-            "stderr text"
+            ClaudeAgentRunner::compose_failure_message(1, "cli error", "stderr text"),
+            "cli error\nstderr text"
         );
     }
 
@@ -4024,17 +4061,18 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_failure_message_rate_limit_in_stdout_not_detected() {
-        // Rate-limit strings in stdout (assistant text) are NOT detected by
-        // compose_failure_message — only stderr is trusted to avoid false
-        // positives from codebase content.
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "429 too many requests", "");
-        assert!(msg.starts_with("Process exited with code 1"));
+    fn test_compose_failure_message_rate_limit_in_cli_error() {
+        let msg = ClaudeAgentRunner::compose_failure_message(1, LEGACY_USAGE_LIMIT_MESSAGE, "");
+        assert_eq!(
+            msg,
+            format!("Claude rate limit hit: {LEGACY_USAGE_LIMIT_MESSAGE}")
+        );
     }
 
     #[test]
-    fn test_compose_failure_message_rate_limit_in_combined() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "some output", "rate limit hit");
+    fn test_compose_failure_message_rate_limit_past_the_preview_limit() {
+        let stderr = format!("{}\nrate limit exceeded", "e".repeat(5000));
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "", &stderr);
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
@@ -5076,17 +5114,15 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_whitespace_stderr_ignored() {
-        let msg = ClaudeAgentRunner::compose_failure_message(2, "actual output", "   ");
-        assert!(msg.contains("actual output"));
-        assert!(msg.contains("Process exited with code 2"));
+        let msg = ClaudeAgentRunner::compose_failure_message(2, "API Error: overloaded", "   ");
+        assert_eq!(msg, "API Error: overloaded");
     }
 
     #[test]
-    fn test_compose_failure_message_very_long_stdout_truncated() {
-        let long_stdout = "o".repeat(5000);
-        let msg = ClaudeAgentRunner::compose_failure_message(1, &long_stdout, "");
-        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 50); // +50 for prefix
-        assert!(msg.contains("Process exited with code 1"));
+    fn test_compose_failure_message_very_long_cli_error_truncated() {
+        let msg = ClaudeAgentRunner::compose_failure_message(1, &"o".repeat(5000), "");
+        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT);
+        assert!(msg.ends_with("..."));
     }
 
     #[test]
@@ -5733,25 +5769,11 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_rate_limit_only_in_combined_not_individual() {
-        // stderr has "rate" and stdout has "limit" -- combined has "rate limit"
-        // but each alone does not
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "limit issues", "check rate");
-        // Combined is "check rate\nlimit issues" which contains "rate" and "limit"
-        // but not "rate limit" as a substring (there's a newline between).
-        // So this should NOT trigger rate limit detection
-        // The combined is "check rate\nlimit issues"
-        // "rate limit" is NOT a substring because of the newline
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "check rate", "limit issues");
         assert!(
             !msg.starts_with("Claude rate limit hit:"),
             "Should not detect rate limit in separate words across lines"
         );
-    }
-
-    #[test]
-    fn test_compose_failure_message_quota_exceeded_in_stdout_not_detected() {
-        // Rate-limit strings in stdout are not detected — only stderr is checked.
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "quota exceeded for project", "");
-        assert!(msg.starts_with("Process exited with code 1"));
     }
 
     #[test]
@@ -5762,8 +5784,7 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_resource_exhausted_in_combined() {
-        let msg =
-            ClaudeAgentRunner::compose_failure_message(1, "some output", "resource exhausted");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "cli error", "resource exhausted");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
@@ -6601,17 +6622,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_failure_message_both_stderr_and_stdout() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "stdout text", "stderr text");
-        // When both present and no rate limit, stderr is used (priority)
-        assert_eq!(msg, "stderr text");
-    }
-
-    #[test]
-    fn test_compose_failure_message_rate_limit_429_in_stdout_not_detected() {
-        // Rate-limit strings in stdout are not detected — only stderr is checked.
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "Error 429 too many requests", "");
-        assert!(msg.starts_with("Process exited with code 1"));
+    fn test_compose_failure_message_rate_limit_429_in_cli_error() {
+        let msg =
+            ClaudeAgentRunner::compose_failure_message(1, "API Error: 429 Too Many Requests", "");
+        assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
@@ -6628,18 +6642,15 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_failure_message_long_stdout_truncated() {
-        let long_stdout = "o".repeat(3000);
-        let msg = ClaudeAgentRunner::compose_failure_message(1, &long_stdout, "");
-        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 50); // prefix + "..."
+    fn test_compose_failure_message_long_cli_error_truncated() {
+        let msg = ClaudeAgentRunner::compose_failure_message(1, &"o".repeat(3000), "");
+        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT);
     }
 
     #[test]
     fn test_compose_failure_message_whitespace_only_stderr() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "output", "   \n  ");
-        // Whitespace-only stderr is trimmed to empty, so stdout is used
-        assert!(msg.contains("output"));
-        assert!(msg.contains("Process exited with code 1"));
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "API Error: 500", "   \n  ");
+        assert_eq!(msg, "API Error: 500");
     }
 
     #[test]
@@ -7245,10 +7256,8 @@ more output"#;
     }
 
     #[test]
-    fn test_compose_failure_message_both_stderr_stdout_with_rate_limit_in_combined() {
-        // Combined text contains "rate limit" but it spans stderr + stdout
-        let msg =
-            ClaudeAgentRunner::compose_failure_message(1, "some stdout", "rate limit exceeded");
+    fn test_compose_failure_message_rate_limit_in_stderr_alongside_a_cli_error() {
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "cli error", "rate limit exceeded");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
@@ -7685,14 +7694,6 @@ more output"#;
     fn test_compose_failure_message_rate_limit_retry_after_in_stderr() {
         let msg = ClaudeAgentRunner::compose_failure_message(1, "", "retry-after: 120 seconds");
         assert!(msg.starts_with("Claude rate limit hit:"));
-    }
-
-    #[test]
-    fn test_compose_failure_message_rate_limit_resource_exhausted_in_stdout_not_detected() {
-        // Rate-limit strings in stdout are not detected — only stderr is checked.
-        let msg =
-            ClaudeAgentRunner::compose_failure_message(1, "resource exhausted for billing", "");
-        assert!(msg.starts_with("Process exited with code 1"));
     }
 
     #[test]
