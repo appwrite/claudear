@@ -504,6 +504,25 @@ mod tests {
     }
 
     #[test]
+    fn issue_carries_no_discord_routing() {
+        let repo = "appwrite-labs/edge";
+        let issue = build_deploy_qa_issue(
+            &track("edge-db", repo, DeployQaTagFilter::Any),
+            &release_tip(repo, "1.2.3", "Adds #99"),
+            bundled_playbook(),
+        );
+
+        for key in ["channel_id", "guild_id"] {
+            assert_eq!(
+                issue.get_metadata::<String>(key),
+                None,
+                "a deploy_qa issue must not carry Discord routing metadata ({key}): the \
+                 notifier would post raw agent answers into #releases beside the curated report"
+            );
+        }
+    }
+
+    #[test]
     fn prompt_teaches_verdict_footers_the_classifier_understands() {
         let repo = "appwrite-labs/edge";
         for (name, playbook) in [("empty", ""), ("bundled", bundled_playbook())] {
