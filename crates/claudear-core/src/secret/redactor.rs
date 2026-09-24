@@ -40,14 +40,39 @@ const SECRET_NAME_MARKERS: &[&str] = &[
 /// Name endings that mark a credential, as in `ENCRYPTION_KEY` or `DB_PASS`.
 const SECRET_NAME_SUFFIXES: &[&str] = &["_KEY", "_PASS"];
 
+/// Leading name segments that mark a credential, as in Appwrite's
+/// `a_session_<project ID>` session cookies.
+const SECRET_NAME_PREFIXES: &[&str] = &["A_SESSION"];
+
 /// Name segments that contain a marker without naming a credential, as in
 /// `GIT_AUTHOR_NAME`.
 const NON_SECRET_NAME_SEGMENTS: &[&str] = &["AUTHOR", "AUTHORS"];
 
+/// Labels that name a credential only when the value after them looks
+/// generated, as `key` does in `API key: …` but not in `{"key": "title"}`.
+const CREDENTIAL_LABELS: &[&str] = &["KEY", "KEYS"];
+
+/// Shortest token taken as generated rather than written; shorter ones are
+/// mostly words and identifiers.
+const MINIMUM_GENERATED_LENGTH: usize = 20;
+
+/// Appwrite API key types whose secret is hex, as in `standard_<hex>`.
+const APPWRITE_HEX_KEY_TYPES: &[&str] = &["standard", "organization", "account"];
+
+/// Appwrite API key types whose secret is a JWT, as in `ephemeral_<JWT>`;
+/// `dynamic` is the older name for `ephemeral`.
+const APPWRITE_JWT_KEY_TYPES: &[&str] = &["ephemeral", "dynamic"];
+
+/// Shortest secret masked after a hex Appwrite key type. Real keys have 256
+/// hex digits; a shorter minimum would mask identifiers like
+/// `account_2faRecoveryCodes`.
+const MINIMUM_APPWRITE_KEY_SECRET_LENGTH: usize = 32;
+
 /// Characters found in tokens but not in words.
 const TOKEN_SYMBOLS: &str = "_.~+/=";
 
-/// Ends an unquoted header value that sits in a markdown table cell.
+/// Borders a markdown table cell: it ends an unquoted header value in a
+/// cell, and stands in for the colon after a header's name or a label.
 const TABLE_CELL_BORDER: char = '|';
 
 /// Markdown emphasis that may wrap a header's name or value.
@@ -56,8 +81,11 @@ const EMPHASIS: char = '*';
 /// Capture group holding the text to mask.
 const SECRET_GROUP: &str = "secret";
 
-/// Capture group holding a variable or field name.
+/// Capture group holding a variable, field or label name.
 const NAME_GROUP: &str = "name";
+
+/// Capture group holding a command-line flag's name, without its `--`.
+const FLAG_GROUP: &str = "flag";
 
 /// Capture group holding a quote before a header's name.
 const LEAD_QUOTE_GROUP: &str = "lead";
@@ -125,10 +153,36 @@ static JSON_FIELD: LazyLock<Regex> = LazyLock::new(|| {
     .expect("JSON field pattern is valid")
 });
 
+/// A value after a label or command-line flag: `API key: value`,
+/// `key=value`, `--key=value`, `--key value`, or a markdown table row's
+/// `| key | value |`. The label and the value may be quoted or emphasised.
+static LABELLED_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(?:--(?<{FLAG_GROUP}>[A-Za-z][A-Za-z0-9_-]*)[ \t]+|\b(?<{NAME_GROUP}>[A-Za-z][A-Za-z0-9_-]*)["'`{EMPHASIS}]*[ \t]*[:={TABLE_CELL_BORDER}])[ \t"'`{EMPHASIS}]*(?<{SECRET_GROUP}>[A-Za-z0-9._~+/-]*[A-Za-z0-9_~+/-]=*)"#
+    ))
+    .expect("labelled value pattern is valid")
+});
+
+/// An Appwrite API key: its type and `_`, then an alphanumeric secret of at
+/// least [`MINIMUM_APPWRITE_KEY_SECRET_LENGTH`] characters or, for the JWT
+/// key types, a JWT.
+static APPWRITE_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"\b(?<{SECRET_GROUP}>(?:{})_[A-Za-z0-9]{{{MINIMUM_APPWRITE_KEY_SECRET_LENGTH},}}|(?:{})_eyJ[A-Za-z0-9_.-]*[A-Za-z0-9_-])",
+        APPWRITE_HEX_KEY_TYPES.join("|"),
+        APPWRITE_JWT_KEY_TYPES.join("|")
+    ))
+    .expect("Appwrite key pattern is valid")
+});
+
 /// A JSON Web Token: base64url JSON header and payload, then the signature.
+/// It may follow `_`, as the secret of a typed token like an Appwrite
+/// `ephemeral_` key does.
 static JWT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
-        .expect("JWT pattern is valid")
+    Regex::new(&format!(
+        r"(?:\b|_)(?<{SECRET_GROUP}>eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)"
+    ))
+    .expect("JWT pattern is valid")
 });
 
 /// Masks credentials in untrusted text, such as an agent's report, before it
@@ -191,7 +245,10 @@ impl Redactor {
     /// Replace every credential in `text` with [`REDACTED`]: the known
     /// secrets, PEM blocks, credential header values, `Bearer` and `Basic`
     /// credentials, URL passwords, the values of secret-named `NAME=value`
-    /// assignments and JSON fields, JWTs, and tokens with a known prefix.
+    /// assignments and JSON fields (Appwrite `a_session_*` cookies among
+    /// them), Appwrite API keys, generated-looking values after a credential
+    /// label or flag such as `API key:` or `--key`, JWTs, and tokens with a
+    /// known prefix.
     pub fn redact(&self, text: &str) -> String {
         let text = self.redact_known(text);
         let text = PEM_BLOCK.replace_all(&text, NoExpand(REDACTED));
@@ -201,7 +258,9 @@ impl Redactor {
         let text = redact_matches(&text, &URL_PASSWORD, |_, _| true);
         let text = redact_matches(&text, &VARIABLE_ASSIGNMENT, has_secret_name);
         let text = redact_matches(&text, &JSON_FIELD, has_secret_name);
-        let text = JWT.replace_all(&text, NoExpand(REDACTED));
+        let text = redact_matches(&text, &APPWRITE_KEY, |_, key| looks_generated(key));
+        let text = redact_matches(&text, &LABELLED_VALUE, is_labelled_credential);
+        let text = redact_matches(&text, &JWT, |_, _| true);
         redact_secrets(&text)
     }
 
@@ -294,6 +353,25 @@ fn has_secret_name(assignment: &Captures<'_>, _: &str) -> bool {
         .is_some_and(|name| is_secret_name(name.as_str()))
 }
 
+/// Whether a labelled value is a credential: its label or flag names one,
+/// and the value looks generated.
+fn is_labelled_credential(value: &Captures<'_>, token: &str) -> bool {
+    value
+        .name(NAME_GROUP)
+        .or_else(|| value.name(FLAG_GROUP))
+        .is_some_and(|label| is_credential_label(label.as_str()))
+        && looks_generated(token)
+}
+
+/// Whether `label` names a credential: by naming convention, as
+/// [`is_secret_name`] decides, or as one of [`CREDENTIAL_LABELS`].
+fn is_credential_label(label: &str) -> bool {
+    is_secret_name(label)
+        || CREDENTIAL_LABELS
+            .iter()
+            .any(|name| label.eq_ignore_ascii_case(name))
+}
+
 /// Whether `token` is shaped like a credential rather than a word: at least
 /// eight characters, with a digit, a token symbol or a capital after the
 /// first character.
@@ -307,9 +385,18 @@ fn looks_like_credential(token: &str) -> bool {
             .any(|character| character.is_ascii_uppercase()))
 }
 
+/// Whether `token` looks generated rather than written: at least
+/// [`MINIMUM_GENERATED_LENGTH`] characters, mixing letters and digits, which
+/// identifiers like `createEmailPasswordSession` do not.
+fn looks_generated(token: &str) -> bool {
+    token.chars().count() >= MINIMUM_GENERATED_LENGTH
+        && token.contains(|character: char| character.is_ascii_digit())
+        && token.contains(|character: char| character.is_ascii_alphabetic())
+}
+
 /// Whether a variable or field called `name` holds a credential by naming
-/// convention: `GITHUB_TOKEN`, `DB_PASSWORD`, `apiKey` and `ENCRYPTION_KEY`
-/// do; `GIT_AUTHOR_NAME` and `twoWayKey` do not.
+/// convention: `GITHUB_TOKEN`, `DB_PASSWORD`, `apiKey`, `ENCRYPTION_KEY` and
+/// `a_session_console` do; `GIT_AUTHOR_NAME` and `twoWayKey` do not.
 fn is_secret_name(name: &str) -> bool {
     let name = name
         .to_ascii_uppercase()
@@ -324,6 +411,10 @@ fn is_secret_name(name: &str) -> bool {
         || SECRET_NAME_SUFFIXES
             .iter()
             .any(|suffix| name.ends_with(suffix))
+        || SECRET_NAME_PREFIXES.iter().any(|prefix| {
+            name.strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+        })
 }
 
 #[cfg(test)]
@@ -332,8 +423,52 @@ mod tests {
 
     const KNOWN_SECRET: &str = "configured-bot-token-0001";
 
+    const SAMPLE_JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl";
+
+    /// A token shaped like a generated credential, with no known prefix.
+    const GENERATED_TOKEN: &str = "9fK2mQ7xL4pR8sT1vW3yZ6aB";
+
+    /// A hex Appwrite API key from before keys carried their type.
+    const LEGACY_APPWRITE_KEY: &str =
+        "4f1c9a8b7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b";
+
+    /// An encoded Appwrite session, as its session cookie holds it.
+    const SESSION: &str = "eyJpZCI6IjZhODQxNWI4MDAyZWE2NWVlYzljIiwic2VjcmV0IjoiNGYxYyJ9";
+
     fn redact(text: &str) -> String {
         Redactor::default().redact(text)
+    }
+
+    /// An Appwrite API key of every type: hex project, organization and
+    /// account keys, and JWT ephemeral keys under their current and former
+    /// names.
+    fn appwrite_keys() -> Vec<String> {
+        ["standard", "organization", "account"]
+            .map(|kind| format!("{kind}_{LEGACY_APPWRITE_KEY}"))
+            .into_iter()
+            .chain(["ephemeral", "dynamic"].map(|kind| format!("{kind}_{SAMPLE_JWT}")))
+            .collect()
+    }
+
+    /// `credential` labelled the ways a live-QA report labels a key: in
+    /// prose, after a command-line flag and in a query string.
+    fn labelled_as_key(credential: &str) -> [String; 6] {
+        [
+            format!("created API key: {credential} for qa-1044"),
+            format!("key: {credential}"),
+            format!("appwrite client --key {credential} --project-id qa-1044"),
+            format!("appwrite client --key={credential}"),
+            format!("GET /v1/health?key={credential}"),
+            format!("GET /v1/users?project=qa-1044&key={credential}&limit=5"),
+        ]
+    }
+
+    /// `credential` mentioned without a label: in backticks and in prose.
+    fn unlabelled(credential: &str) -> [String; 2] {
+        [
+            format!("set `{credential}` on the QA function"),
+            format!("rotated {credential} after the check"),
+        ]
     }
 
     #[test]
@@ -614,12 +749,110 @@ mod tests {
 
     #[test]
     fn jwts_are_redacted() {
-        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl";
-
         assert_eq!(
-            redact(&format!("session jwt {jwt} expired")),
+            redact(&format!("session jwt {SAMPLE_JWT} expired")),
             format!("session jwt {REDACTED} expired")
         );
+    }
+
+    #[test]
+    fn jwts_after_an_underscore_are_redacted() {
+        assert_eq!(
+            redact(&format!("minted refresh_{SAMPLE_JWT} for qa-1044")),
+            format!("minted refresh_{REDACTED} for qa-1044")
+        );
+    }
+
+    #[test]
+    fn appwrite_api_keys_are_redacted_wherever_they_appear() {
+        for key in appwrite_keys() {
+            let texts = labelled_as_key(&key).into_iter().chain(unlabelled(&key));
+            let redacted = labelled_as_key(REDACTED)
+                .into_iter()
+                .chain(unlabelled(REDACTED));
+            for (text, expected) in texts.zip(redacted) {
+                assert_eq!(redact(&text), expected, "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn generated_values_after_a_credential_label_are_redacted() {
+        for credential in [GENERATED_TOKEN, LEGACY_APPWRITE_KEY] {
+            for (text, expected) in labelled_as_key(credential)
+                .into_iter()
+                .zip(labelled_as_key(REDACTED))
+            {
+                assert_eq!(redact(&text), expected, "{text}");
+            }
+        }
+        let cases = [
+            (
+                format!("**API key:** `{GENERATED_TOKEN}`"),
+                format!("**API key:** `{REDACTED}`"),
+            ),
+            (
+                format!("key: {GENERATED_TOKEN}."),
+                format!("key: {REDACTED}."),
+            ),
+            (
+                format!("Access token: {GENERATED_TOKEN}"),
+                format!("Access token: {REDACTED}"),
+            ),
+            (
+                format!(r#"appwrite login --api-key "{GENERATED_TOKEN}""#),
+                format!(r#"appwrite login --api-key "{REDACTED}""#),
+            ),
+            (
+                format!("| API key | {GENERATED_TOKEN} |"),
+                format!("| API key | {REDACTED} |"),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(redact(&text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn appwrite_session_cookies_are_redacted() {
+        let cases = [
+            (
+                format!("curl -b 'a_session_6a8415b8002ea65eec9c={SESSION}' https://cloud.appwrite.io/v1/account"),
+                format!("curl -b 'a_session_6a8415b8002ea65eec9c={REDACTED}' https://cloud.appwrite.io/v1/account"),
+            ),
+            (
+                format!("got a_session_6a8415b8002ea65eec9c_legacy={SESSION}; Path=/; HttpOnly"),
+                format!("got a_session_6a8415b8002ea65eec9c_legacy={REDACTED}; Path=/; HttpOnly"),
+            ),
+            (
+                format!(r#"cookieFallback: {{"a_session_console": "{SESSION}"}}"#),
+                format!(r#"cookieFallback: {{"a_session_console": "{REDACTED}"}}"#),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(redact(&text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn words_and_identifiers_that_resemble_credentials_are_kept() {
+        for text in [
+            "p95 standard_deviation stayed under 40ms",
+            "dynamic_programming cache hit rate 98%",
+            "standard_deviation_of_response_times_in_milliseconds: 12",
+            "Attribute key: standard_deviation",
+            "- #1234 key rotation LIVE PASS",
+            "- #42 Auth: createEmailPasswordSession returns 201 LIVE PASS",
+            "account_createEmailPasswordSessionWithMfaChallenge and account_2faRecoveryCodes",
+            "key: title, Primary key: $id, API key: rotated",
+            "| Key | Value |",
+            "Request ID: 9fK2mQ7xL4pR8sT1vW3yZ6aB",
+            "commit 4f1c9a8b7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b",
+            "Released 1.2.3-db to fra.cloud.appwrite.io and nyc.cloud.appwrite.io:443",
+            "DEPLOY_QA_VERDICT: ALL_VERIFIED",
+        ] {
+            assert_eq!(redact(text), text);
+        }
     }
 
     #[test]
@@ -640,6 +873,9 @@ mod tests {
             "X-Api-Key",
             "APPWRITE_JWT",
             "SESSION_COOKIE",
+            "a_session",
+            "a_session_console",
+            "a_session_6a8415b8002ea65eec9c_legacy",
         ] {
             assert!(is_secret_name(name), "{name} should be secret");
         }
@@ -652,6 +888,8 @@ mod tests {
             "key",
             "twoWayKey",
             "PASSTHROUGH",
+            "SESSION_ID",
+            "a_sessions",
         ] {
             assert!(!is_secret_name(name), "{name} should not be secret");
         }
@@ -674,7 +912,8 @@ mod tests {
     fn redaction_is_idempotent() {
         let redactor = Redactor::new([KNOWN_SECRET]);
         let once = redactor.redact(&format!(
-            "Authorization: Bearer abc123\ntoken {KNOWN_SECRET} ghp_abc123 postgres://u:p4ss@h/db"
+            "Authorization: Bearer abc123\ntoken {KNOWN_SECRET} ghp_abc123 postgres://u:p4ss@h/db\n\
+             API key: {GENERATED_TOKEN} --key dynamic_{SAMPLE_JWT} a_session_console={SESSION}"
         ));
 
         assert_eq!(redactor.redact(&once), once);
