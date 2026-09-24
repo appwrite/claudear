@@ -45,6 +45,8 @@ type QueuedIssue = (Issue, MatchResult, Option<Intent>);
 /// on (marked handled) instead of re-triggering the fix agent every cycle.
 const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
 
+const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
+
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
@@ -4425,12 +4427,16 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     fn extract_rate_limit_reset_time(error: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        Self::extract_rate_limit_reset_from_resets_at(error)
+        Self::extract_rate_limit_reset_from_resets_at(error, now)
+            .or_else(|| Self::extract_rate_limit_reset_from_usage_limit(error, now))
             .or_else(|| Self::extract_rate_limit_reset_from_banner_utc(error, now))
             .or_else(|| Self::extract_rate_limit_reset_from_retry_after(error, now))
     }
 
-    fn extract_rate_limit_reset_from_resets_at(error: &str) -> Option<DateTime<Utc>> {
+    fn extract_rate_limit_reset_from_resets_at(
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
         let key = "\"resetsAt\"";
         let mut start = 0usize;
 
@@ -4446,12 +4452,40 @@ Create a PR with your changes.{custom_instructions}"#,
                             return Some(parsed.with_timezone(&Utc));
                         }
                     }
+                } else if let Some(reset) = Self::parse_leading_digits(after_colon)
+                    .and_then(|seconds| Self::plausible_rate_limit_reset(seconds, now))
+                {
+                    return Some(reset);
                 }
             }
             start = idx;
         }
 
         None
+    }
+
+    fn extract_rate_limit_reset_from_usage_limit(
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let marker = "usage limit reached|";
+        let lower = error.to_ascii_lowercase();
+        let idx = lower.find(marker)?;
+        let seconds = Self::parse_leading_digits(&lower[idx + marker.len()..])?;
+        Self::plausible_rate_limit_reset(seconds, now)
+    }
+
+    fn plausible_rate_limit_reset(epoch_seconds: i64, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let reset = DateTime::<Utc>::from_timestamp(epoch_seconds, 0)?;
+        let horizon = now + chrono::Duration::days(MAX_RATE_LIMIT_RESET_DAYS_AHEAD);
+        (reset > now && reset <= horizon).then_some(reset)
+    }
+
+    fn parse_leading_digits(text: &str) -> Option<i64> {
+        let end = text
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len());
+        text[..end].parse().ok()
     }
 
     fn extract_rate_limit_reset_from_banner_utc(
@@ -4517,11 +4551,7 @@ Create a PR with your changes.{custom_instructions}"#,
         let idx = lower.find("retry-after")?;
         let tail = &lower[idx + "retry-after".len()..];
         let digits_start = tail.find(|c: char| c.is_ascii_digit())?;
-        let digit_slice = &tail[digits_start..];
-        let digits_end = digit_slice
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(digit_slice.len());
-        let seconds: i64 = digit_slice[..digits_end].parse().ok()?;
+        let seconds = Self::parse_leading_digits(&tail[digits_start..])?;
         if seconds <= 0 {
             return None;
         }
@@ -5194,13 +5224,6 @@ mod tests {
         fn get_call_count(&self) -> usize {
             self.call_count.load(AtomicOrdering::SeqCst)
         }
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_json() {
-        let msg = r#"Claude rate limit hit: {"type":"rate_limit_event","resetsAt":"2026-02-23T06:00:00Z"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg).unwrap();
-        assert_eq!(parsed.to_rfc3339(), "2026-02-23T06:00:00+00:00");
     }
 
     #[test]
@@ -8884,11 +8907,13 @@ mod tests {
     }
 
     const CUSTOMER_REPLY: &str = "Thanks for reaching out, we are looking into this for you.";
+    const SCRIPTED_QA_PROVIDER: &str = "scripted-qa-agent";
 
     /// How [`ScriptedQaAgent`] answers a QA question.
     enum QaAnswer {
         Report(String),
         Crash,
+        Fail(String),
         Panic,
         /// Panics on the first question, then answers with the report.
         PanicOnce(String),
@@ -8910,7 +8935,7 @@ mod tests {
     #[async_trait]
     impl AgentRunner for ScriptedQaAgent {
         fn name(&self) -> &str {
-            "scripted-qa-agent"
+            SCRIPTED_QA_PROVIDER
         }
         fn capabilities(&self) -> claudear_integrations::runner::ProviderCapabilities {
             claudear_integrations::runner::ProviderCapabilities::default()
@@ -8947,6 +8972,7 @@ mod tests {
                 QaAnswer::Crash => {
                     Err(claudear_core::error::Error::runner("live QA probe crashed"))
                 }
+                QaAnswer::Fail(message) => Err(claudear_core::error::Error::runner(message)),
                 QaAnswer::Panic => panic!("live QA probe panicked"),
                 QaAnswer::PanicOnce(report) => {
                     if self.calls.load(AtomicOrdering::SeqCst) == 1 {
@@ -9042,7 +9068,12 @@ mod tests {
     impl DeployQaHarness {
         /// A mock `deploy_qa` source whose QA agent crashes.
         fn new(config: Config) -> Self {
-            Self::build(config, QaAnswer::Crash, |_, tip| {
+            Self::answering(config, QaAnswer::Crash)
+        }
+
+        /// A mock `deploy_qa` source whose QA agent answers as `answer`.
+        fn answering(config: Config, answer: QaAnswer) -> Self {
+            Self::build(config, answer, |_, tip| {
                 Arc::new(MockSource::with_issues(
                     DEPLOY_QA_SOURCE,
                     vec![deploy_qa_issue(tip)],
@@ -9275,6 +9306,160 @@ mod tests {
                 .unwrap(),
             "an errored tip must not block the track"
         );
+    }
+
+    async fn run_rate_limited_deploy_qa(failure: String) -> (usize, DateTime<Utc>) {
+        let mut config = test_config();
+        config.agent.default_provider = SCRIPTED_QA_PROVIDER.to_string();
+        let harness = DeployQaHarness::answering(config, QaAnswer::Fail(failure));
+
+        for _ in 0..2 {
+            harness
+                .watcher
+                .process_issue(
+                    harness.source.clone(),
+                    harness.issue(),
+                    MatchResult::matched("deploy_qa pending tip", MatchPriority::High),
+                    None,
+                    None,
+                    Some(Intent::Question),
+                )
+                .await;
+        }
+
+        let pause_until = harness
+            .tracker
+            .get_recent_activities(50, None)
+            .unwrap()
+            .into_iter()
+            .find(|activity| activity.activity_type == "watcher_paused")
+            .and_then(|activity| activity.metadata)
+            .and_then(|metadata| metadata["pause_until"].as_str().map(str::to_string))
+            .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .expect("the rate limit should be logged as a pause")
+            .with_timezone(&Utc);
+        (harness.agent_calls(), pause_until)
+    }
+
+    async fn assert_deploy_qa_deferred_until(failure: String, reset: DateTime<Utc>) {
+        let (agent_calls, pause_until) = run_rate_limited_deploy_qa(failure).await;
+        assert_eq!(
+            agent_calls, 1,
+            "a rate-limited provider must not be asked again before its reset"
+        );
+        assert!(
+            pause_until >= reset,
+            "the pause must last until the limit resets at {reset}, got {pause_until}"
+        );
+    }
+
+    async fn assert_deploy_qa_briefly_deferred(failure: String) {
+        let (agent_calls, pause_until) = run_rate_limited_deploy_qa(failure).await;
+        assert_eq!(
+            agent_calls, 1,
+            "a rate-limited provider must stay paused when its reset cannot be trusted"
+        );
+        assert!(
+            pause_until < Utc::now() + chrono::Duration::hours(1),
+            "an untrusted reset must not hold the provider past a short pause, got {pause_until}"
+        );
+    }
+
+    fn usage_limit_failure(reset: DateTime<Utc>) -> String {
+        format!("Claude AI usage limit reached|{}", reset.timestamp())
+    }
+
+    fn rate_limit_event_failure(resets_at: serde_json::Value) -> String {
+        format!(
+            "Claude rate limit hit: {}",
+            json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": { "status": "rejected", "resetsAt": resets_at },
+            })
+        )
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_defers_qa_until_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_deferred_until(usage_limit_failure(reset), reset).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_epoch_reset_defers_qa_until_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_deferred_until(rate_limit_event_failure(json!(reset.timestamp())), reset)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_rfc3339_reset_defers_qa_until_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_deferred_until(rate_limit_event_failure(json!(reset.to_rfc3339())), reset)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_falls_back_to_top_level_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        let failure = format!(
+            "Claude rate limit hit: {}",
+            json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": { "status": "rejected", "resetsAt": "invalid" },
+                "resetsAt": reset.to_rfc3339(),
+            })
+        );
+        assert_deploy_qa_deferred_until(failure, reset).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_invalid_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(json!("not-a-valid-date")))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_empty_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(json!(""))).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_without_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred("Claude rate limit hit: some error".to_string()).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_with_elapsed_reset_still_defers_qa() {
+        let reset = Utc::now() - chrono::Duration::hours(1);
+        assert_deploy_qa_briefly_deferred(usage_limit_failure(reset)).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_elapsed_reset_still_defers_qa() {
+        let reset = Utc::now() - chrono::Duration::hours(1);
+        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(json!(reset.timestamp()))).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_with_implausibly_distant_reset_defers_qa_briefly() {
+        let reset = Utc::now() + chrono::Duration::days(30);
+        assert_deploy_qa_briefly_deferred(usage_limit_failure(reset)).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_with_millisecond_reset_defers_qa_briefly() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_briefly_deferred(format!(
+            "Claude AI usage limit reached|{}",
+            reset.timestamp_millis()
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_without_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred("Claude AI usage limit reached|".to_string()).await;
     }
 
     #[tokio::test]
@@ -13539,38 +13724,6 @@ mod tests {
         let msg = "Wait 120 seconds";
         let parsed = Watcher::extract_rate_limit_reset_from_retry_after(msg, now);
         assert!(parsed.is_none());
-    }
-
-    // --- Rate limit extraction: resets_at edge cases ---
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_no_key() {
-        let msg = "Claude rate limit hit: some error";
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_invalid_timestamp() {
-        let msg = r#"{"resetsAt": "not-a-valid-date"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_empty_key() {
-        let msg = r#"{"resetsAt": ""}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_multiple_keys() {
-        // Multiple occurrences: first invalid, second valid
-        let msg = r#"{"resetsAt": "invalid"} and {"resetsAt": "2026-03-01T12:00:00Z"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
-        assert!(parsed.is_some());
-        assert_eq!(parsed.unwrap().to_rfc3339(), "2026-03-01T12:00:00+00:00");
     }
 
     // --- extract_rate_limit_reset_time combined ---
