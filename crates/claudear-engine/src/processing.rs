@@ -38,6 +38,28 @@ use crate::intent::{Intent, IntentClassifier};
 /// relevance judge — each call spawns an agent process, so keep the fan-out small.
 const RETRIEVAL_JUDGE_CONCURRENCY: usize = 4;
 
+/// Scratch directory, under the system temp dir, for read-only runs with no
+/// resolved repo.
+const QA_SCRATCH_DIRECTORY: &str = "claudear-qa";
+
+/// Scratch directory, under the system temp dir, that every `[deploy_qa]`
+/// live-QA run works in. Live QA runs with full tool access, so it must never
+/// run inside a repo checkout that fix runs also use.
+const DEPLOY_QA_SCRATCH_DIRECTORY: &str = "claudear-deploy-qa";
+
+/// `name` under the system temp dir, created if missing.
+fn scratch_directory(name: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(name);
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        tracing::warn!(
+            directory = %directory.display(),
+            error = %error,
+            "Failed to create scratch directory"
+        );
+    }
+    directory
+}
+
 /// Strip Discord mention tokens (`<@ID>`, `<@!ID>`, `<@&ID>`) from text and trim.
 /// Used when rendering reply-chain turns so mention noise doesn't reach the agent.
 fn strip_discord_mentions(content: &str) -> String {
@@ -2208,7 +2230,8 @@ impl IssueProcessor {
     /// Delivery follows [`Self::deliver_answer`]: conversational sources get the
     /// answer via the notifier, tracker-style sources as a comment on the ticket.
     ///
-    /// `[deploy_qa]` release tips take this path as live QA, bounded by
+    /// `[deploy_qa]` release tips take this path as live QA: they run in
+    /// [`DEPLOY_QA_SCRATCH_DIRECTORY`] whatever repo resolved, bounded by
     /// `[deploy_qa] timeout_secs` instead of `[qa] answer_timeout_secs`.
     async fn answer_question_issue(
         &self,
@@ -2225,15 +2248,11 @@ impl IssueProcessor {
             json!({}),
         );
 
-        // Run in the resolved repo when available (lets the agent read real code),
-        // otherwise a scratch dir (answer is grounded purely in RAG context).
-        let project_dir = match resolution {
-            RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
-            RepoResolution::Skip { .. } => {
-                let dir = std::env::temp_dir().join("claudear-qa");
-                let _ = std::fs::create_dir_all(&dir);
-                dir
-            }
+        let live_qa = source_name == DEPLOY_QA_SOURCE;
+        let project_dir = if live_qa {
+            scratch_directory(DEPLOY_QA_SCRATCH_DIRECTORY)
+        } else {
+            self.action_project_dir(resolution)
         };
 
         // Retrieve grounding context from the code index across ALL repos, plus
@@ -2305,7 +2324,6 @@ impl IssueProcessor {
         // when a repo resolved).
         let context = self.prepend_operator_instructions(context, resolution.repo_name());
 
-        let live_qa = source_name == DEPLOY_QA_SOURCE;
         let (decision, activity, timeout_secs) = if live_qa {
             (
                 format!("Running live QA for {}", issue.short_id),
@@ -2860,11 +2878,7 @@ impl IssueProcessor {
     fn action_project_dir(&self, resolution: &RepoResolution) -> std::path::PathBuf {
         match resolution {
             RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
-            RepoResolution::Skip { .. } => {
-                let dir = std::env::temp_dir().join("claudear-qa");
-                let _ = std::fs::create_dir_all(&dir);
-                dir
-            }
+            RepoResolution::Skip { .. } => scratch_directory(QA_SCRATCH_DIRECTORY),
         }
     }
 
@@ -6019,6 +6033,17 @@ mod tests {
         processor
     }
 
+    fn resolved_to(project_dir: &std::path::Path) -> RepoResolution {
+        RepoResolution::Resolved {
+            project_dir: project_dir.to_path_buf(),
+            repo_name: "org/repo".to_string(),
+            scm_url: "https://github.com/org/repo".to_string(),
+            default_branch: "main".to_string(),
+            repo_id: None,
+            confidence: None,
+        }
+    }
+
     fn expect_failed(outcome: ProcessingOutcome) -> String {
         match outcome {
             ProcessingOutcome::Failed { error } => error,
@@ -6177,6 +6202,49 @@ mod tests {
         assert!(context.replies().is_empty());
     }
 
+    #[tokio::test]
+    async fn test_deploy_qa_runs_in_scratch_directory_not_resolved_checkout() {
+        let checkout = tempfile::tempdir().unwrap();
+        let agent = Arc::new(AnsweringAgent::default());
+        let processor = processor_answering_with(Arc::clone(&agent));
+        let mut input = question_input(DEPLOY_QA_SOURCE);
+        input.resolution = resolved_to(checkout.path());
+
+        assert_completed_no_pr(
+            processor
+                .run(input, &RecordingContextProvider::default())
+                .await,
+        );
+
+        let project_dirs = agent.project_dirs();
+        assert!(
+            !project_dirs.iter().any(|dir| dir == checkout.path()),
+            "live QA must never run inside a resolved repo checkout: {project_dirs:?}"
+        );
+        assert_eq!(
+            project_dirs,
+            vec![std::env::temp_dir().join(DEPLOY_QA_SCRATCH_DIRECTORY)]
+        );
+        assert!(project_dirs[0].is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_question_answer_runs_in_resolved_checkout() {
+        let checkout = tempfile::tempdir().unwrap();
+        let agent = Arc::new(AnsweringAgent::default());
+        let processor = processor_answering_with(Arc::clone(&agent));
+        let mut input = question_input(TRACKER_SOURCE);
+        input.resolution = resolved_to(checkout.path());
+
+        assert_completed_no_pr(
+            processor
+                .run(input, &RecordingContextProvider::default())
+                .await,
+        );
+
+        assert_eq!(agent.project_dirs(), vec![checkout.path().to_path_buf()]);
+    }
+
     /// Intent classifier stub returning a fixed verdict (for routing tests).
     struct StubIntentClassifier(Option<Intent>);
 
@@ -6248,15 +6316,24 @@ mod tests {
         }
     }
 
-    /// Agent runner whose `answer_question` returns [`QA_REPORT`] after `delay`.
+    /// Agent runner whose `answer_question` returns [`QA_REPORT`] after
+    /// `delay`, recording every `project_dir` it is asked to answer in.
     #[derive(Default)]
     struct AnsweringAgent {
         delay: Duration,
+        project_dirs: std::sync::Mutex<Vec<std::path::PathBuf>>,
     }
 
     impl AnsweringAgent {
         fn slow(delay: Duration) -> Self {
-            Self { delay }
+            Self {
+                delay,
+                ..Self::default()
+            }
+        }
+
+        fn project_dirs(&self) -> Vec<std::path::PathBuf> {
+            self.project_dirs.lock().unwrap().clone()
         }
     }
 
@@ -6295,8 +6372,12 @@ mod tests {
             &self,
             _issue: &Issue,
             _context: &str,
-            _project_dir: &std::path::Path,
+            project_dir: &std::path::Path,
         ) -> claudear_core::error::Result<String> {
+            self.project_dirs
+                .lock()
+                .unwrap()
+                .push(project_dir.to_path_buf());
             tokio::time::sleep(self.delay).await;
             Ok(QA_REPORT.to_string())
         }
