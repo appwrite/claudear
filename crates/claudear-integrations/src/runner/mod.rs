@@ -147,6 +147,9 @@ fn is_rate_limit_error_lower(lower: &str) -> bool {
         "rate limit",
         "ratelimit",
         "hit your limit",
+        "usage limit reached",
+        "5-hour limit reached",
+        "weekly limit reached",
         "too many requests",
         "quota exceeded",
         "resource exhausted",
@@ -300,6 +303,41 @@ mod tests {
         assert!(is_rate_limit_error(
             "You've hit your limit · resets 6am (UTC)"
         ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_claude_usage_limit_with_reset_epoch() {
+        assert!(is_rate_limit_error(
+            "Claude AI usage limit reached|1790262000"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_claude_usage_limit_banner() {
+        assert!(is_rate_limit_error(
+            "Usage limit reached · continuing automatically at 3pm · esc to cancel"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_five_hour_limit() {
+        assert!(is_rate_limit_error("5-hour limit reached ∙ resets 3pm"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_weekly_limit() {
+        assert!(is_rate_limit_error(
+            "Opus weekly limit reached ∙ resets Oct 9, 10am"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_other_limits_reached_are_not_rate_limits() {
+        assert!(!is_rate_limit_error("Context limit reached"));
+        assert!(!is_rate_limit_error(
+            "Subagent nesting limit reached (depth 3)"
+        ));
+        assert!(!is_rate_limit_error("Budget limit reached ($5.00 of $5)"));
     }
 
     #[test]
