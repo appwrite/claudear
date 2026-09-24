@@ -179,6 +179,10 @@ enum StreamEvent {
         /// `is_error` is set (e.g. a usage-limit notice).
         #[serde(default)]
         result: Option<String>,
+        /// What went wrong for error subtypes such as `error_max_turns`,
+        /// which carry no `result` text.
+        #[serde(default)]
+        errors: Option<Vec<serde_json::Value>>,
         #[serde(default)]
         is_error: bool,
     },
@@ -229,14 +233,43 @@ struct FinalResult {
     /// The session's last answer, or the CLI's own error message when
     /// `is_error` is set.
     text: Option<String>,
+    /// The CLI's error details for error subtypes.
+    errors: Vec<String>,
     /// Whether the CLI reported the run as an error.
     is_error: bool,
 }
 
 impl FinalResult {
+    fn new(text: Option<String>, errors: Option<Vec<serde_json::Value>>, is_error: bool) -> Self {
+        let errors = errors
+            .unwrap_or_default()
+            .into_iter()
+            .map(|error| match error {
+                serde_json::Value::String(message) => message,
+                other => other.to_string(),
+            })
+            .collect();
+        Self {
+            text,
+            errors,
+            is_error,
+        }
+    }
+
     /// The CLI's own error message, when it flagged the run as an error.
-    fn error(&self) -> Option<&str> {
-        self.text.as_deref().filter(|_| self.is_error)
+    fn error(&self) -> Option<String> {
+        if !self.is_error {
+            return None;
+        }
+        let message = self
+            .text
+            .iter()
+            .chain(&self.errors)
+            .map(|part| part.trim())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!message.is_empty()).then_some(message)
     }
 }
 
@@ -503,12 +536,10 @@ The PR title should include the issue ID: {}
         })
     }
 
-    /// The error for a failed process, built only from text the CLI controls:
-    /// its error-flagged final result and stderr. Assistant text is left out
-    /// because it can mention rate limits or 429s from the analyzed code, and
-    /// callers pause the provider on any rate-limit match in this message.
-    fn compose_failure_message(exit_code: i32, cli_error: &str, stderr_output: &str) -> String {
-        let details = [cli_error.trim(), stderr_output.trim()]
+    /// Never pass assistant text here: callers pause the provider on any
+    /// rate-limit match in this message.
+    fn compose_failure_message(exit_code: i32, cli_error: &str, stderr: &str) -> String {
+        let details = [cli_error.trim(), stderr.trim()]
             .into_iter()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
@@ -1365,12 +1396,10 @@ The PR title should include the issue ID: {}
                             duration_api_ms,
                             usage,
                             result: final_text,
+                            errors,
                             is_error,
                         }) => {
-                            final_result = FinalResult {
-                                text: final_text,
-                                is_error,
-                            };
+                            final_result = FinalResult::new(final_text, errors, is_error);
                             if let Some(obj) = structured_output {
                                 structured_result = Some(obj);
                             }
@@ -1988,7 +2017,7 @@ The PR title should include the issue ID: {}
         } else {
             Some(Self::compose_failure_message(
                 exit_code,
-                final_result.error().unwrap_or_default(),
+                &final_result.error().unwrap_or_default(),
                 &stderr_output,
             ))
         };
@@ -2473,16 +2502,9 @@ Write only the QA report."#,
     )
 }
 
-/// The reply from a finished reply run.
-///
-/// Only the CLI's final answer is returned, so mid-run narration ("Let me
-/// check.", a retried `LIVE FAIL`) is never posted or classified. When the CLI
-/// emitted no final answer (an older CLI, or a stream without a `result`
-/// event), the accumulated assistant text is used instead. A run that failed,
-/// or that the CLI flagged as an error, is an `Err` so partial output is never
-/// posted. The error is the runner's, which already carries the CLI's own
-/// error message but never assistant text, so usage limits still reach
-/// rate-limit detection and narration cannot fake one.
+/// The CLI's final answer, falling back to the accumulated assistant text only
+/// when the CLI emitted none. Failed or CLI-flagged runs are an `Err` carrying
+/// the runner error, which already includes the CLI's own error message.
 fn final_reply(outcome: RunOutcome) -> Result<String> {
     let RunOutcome {
         agent,
@@ -2490,7 +2512,8 @@ fn final_reply(outcome: RunOutcome) -> Result<String> {
     } = outcome;
 
     if !agent.success || final_result.is_error {
-        let message = [agent.error.as_deref(), final_result.error()]
+        let cli_error = final_result.error();
+        let message = [agent.error.as_deref(), cli_error.as_deref()]
             .into_iter()
             .flatten()
             .map(str::trim)
@@ -2749,12 +2772,13 @@ mod tests {
     /// Assistant text that mentions rate limits the way analysed code or
     /// dashboards do, without the CLI reporting one.
     #[cfg(unix)]
-    fn rate_limit_narration() -> [serde_json::Value; 4] {
+    fn rate_limit_narration() -> [serde_json::Value; 5] {
         [
             assistant_text_event("The upload API returns 429 when you hit the rate limit."),
             assistant_text_event("Let me look at the retry-after handling."),
             assistant_text_event("Billing logs show quota exceeded and resource exhausted."),
             assistant_text_event("The dashboard banner says usage limit reached."),
+            result_event("Uploads return 429 once you've hit your limit.", false),
         ]
     }
 
@@ -2866,14 +2890,7 @@ mod tests {
         );
     }
 
-    const REPLY_SOURCES: [&str; 6] = [
-        "helpscout",
-        "linear",
-        "github",
-        "discord",
-        "slack",
-        DEPLOY_QA_SOURCE,
-    ];
+    const REPLY_SOURCES: [&str; 3] = [HELPSCOUT_SOURCE, "linear", DEPLOY_QA_SOURCE];
     const REPLY_NARRATION: &str = "Let me check.";
     const REPLY_FINAL_ANSWER: &str = "Thanks for reaching out!";
     const LEGACY_USAGE_LIMIT_MESSAGE: &str = "Claude AI usage limit reached|1790262000";
@@ -2897,7 +2914,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_drops_narration_for_every_source() {
+    fn test_run_reply_drops_narration_across_sources() {
         for source in REPLY_SOURCES {
             let reply = run_reply_with_fake_cli(
                 source,
@@ -2933,7 +2950,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_failed_run_is_an_error_for_every_source() {
+    fn test_run_reply_failed_run_is_an_error_across_sources() {
         for source in REPLY_SOURCES {
             let error = run_reply_with_fake_cli(
                 source,
@@ -2972,7 +2989,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_cli_error_is_an_error_for_every_source() {
+    fn test_run_reply_cli_error_is_an_error_across_sources() {
         for source in REPLY_SOURCES {
             let error = run_reply_with_fake_cli(
                 source,
@@ -2995,6 +3012,33 @@ mod tests {
             );
             assert!(!error.contains(REPLY_NARRATION), "got: {error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_error_subtype_is_an_error_carrying_the_cli_errors() {
+        let error = run_reply_with_fake_cli(
+            "linear",
+            &[
+                assistant_text_event(REPLY_NARRATION),
+                json!({
+                    "type": "result",
+                    "subtype": "error_max_turns",
+                    "is_error": true,
+                    "num_turns": 30,
+                    "errors": ["Reached maximum number of turns (30)"]
+                }),
+            ],
+            1,
+        )
+        .expect_err("a run that hit an error subtype must not yield a reply")
+        .to_string();
+
+        assert!(
+            error.contains("Reached maximum number of turns (30)"),
+            "got: {error}"
+        );
+        assert!(!error.contains(REPLY_NARRATION), "got: {error}");
     }
 
     #[cfg(unix)]
@@ -3036,17 +3080,11 @@ mod tests {
     }
 
     fn final_answer(text: &str) -> FinalResult {
-        FinalResult {
-            text: Some(text.to_string()),
-            is_error: false,
-        }
+        FinalResult::new(Some(text.to_string()), None, false)
     }
 
     fn final_error(text: &str) -> FinalResult {
-        FinalResult {
-            text: Some(text.to_string()),
-            is_error: true,
-        }
+        FinalResult::new(Some(text.to_string()), None, true)
     }
 
     fn narrated_report() -> String {
@@ -3165,6 +3203,30 @@ mod tests {
     }
 
     #[test]
+    fn test_final_reply_cli_error_details_fail_a_run_without_result_text() {
+        let error = final_reply(reply_outcome(
+            true,
+            LIVE_QA_NARRATION,
+            None,
+            FinalResult::new(
+                None,
+                Some(vec![
+                    json!("Reached maximum number of turns (30)"),
+                    json!({"code": 7}),
+                ]),
+                true,
+            ),
+        ))
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::Runner(message)
+                if message == "Reached maximum number of turns (30)\n{\"code\":7}"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
     fn test_final_reply_failed_run_keeps_an_unflagged_final_answer_out_of_the_error() {
         let prose = "- #7 throttling returns 429 as designed LIVE PASS";
 
@@ -3237,16 +3299,21 @@ mod tests {
 
     #[test]
     fn test_parse_cli_result_error_subtype_without_result_text() {
-        let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,"session_id":"sess-live-qa"}"#;
+        let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,"session_id":"sess-live-qa","errors":["Reached maximum number of turns (30)"]}"#;
 
         match serde_json::from_str::<StreamEvent>(line).unwrap() {
             StreamEvent::Result {
                 result,
+                errors,
                 is_error,
                 num_turns,
                 ..
             } => {
                 assert!(result.is_none());
+                assert_eq!(
+                    errors,
+                    Some(vec![json!("Reached maximum number of turns (30)")])
+                );
                 assert!(is_error);
                 assert_eq!(num_turns, Some(30));
             }
@@ -4987,6 +5054,7 @@ mod tests {
                 duration_api_ms: Some(api_ms),
                 usage: Some(ref u),
                 result: None,
+                errors: None,
                 is_error: false,
             } => {
                 assert_eq!(so["summary"], "all done");
@@ -5016,6 +5084,7 @@ mod tests {
                 duration_api_ms: None,
                 usage: None,
                 result: None,
+                errors: None,
                 is_error: false,
             } => {}
             other => panic!("Expected Result with all None, got: {:?}", other),
@@ -6277,10 +6346,7 @@ mod tests {
     fn test_stdout_parse_result_field_assignment() {
         let result = StdoutParseResult {
             text_output: "hello".to_string(),
-            final_result: FinalResult {
-                text: Some("hello".to_string()),
-                is_error: false,
-            },
+            final_result: FinalResult::new(Some("hello".to_string()), None, false),
             structured_result: Some(json!({"summary": "done", "success": true})),
             cost_usd: Some(0.05),
             num_turns: Some(3),
@@ -6965,8 +7031,10 @@ more output"#;
                 duration_api_ms,
                 usage,
                 result,
+                errors,
                 is_error,
             } => {
+                assert!(errors.is_none());
                 assert!(structured_output.is_some());
                 assert_eq!(total_cost_usd, Some(0.05));
                 assert_eq!(num_turns, Some(3));
@@ -6995,8 +7063,10 @@ more output"#;
                 duration_api_ms,
                 usage,
                 result,
+                errors,
                 is_error,
             } => {
+                assert!(errors.is_none());
                 assert!(structured_output.is_none());
                 assert!(total_cost_usd.is_none());
                 assert!(num_turns.is_none());
@@ -7480,6 +7550,7 @@ more output"#;
                 duration_api_ms: None,
                 usage: None,
                 result: None,
+                errors: None,
                 is_error: false,
             } => {
                 assert_eq!(sid, "sess-xyz");
