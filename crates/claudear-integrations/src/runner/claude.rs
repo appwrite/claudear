@@ -29,6 +29,9 @@ const EXECUTION_LOG_PREVIEW_LIMIT: usize = 2000;
 /// doesn't specify its own set
 const DEFAULT_READONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebFetch", "WebSearch"];
 
+/// Tool whose permission lets a run execute shell commands.
+const SHELL_TOOL: &str = "Bash";
+
 /// Timeout for read-only structured queries (classification-scale, not the long
 /// fix-run timeout).
 const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
@@ -41,6 +44,40 @@ const REPLY_FAILURE_MESSAGE: &str = "Failed to generate reply";
 
 /// Error for a reply run that finished without any reply text.
 const EMPTY_REPLY_MESSAGE: &str = "Reply run produced no reply";
+
+/// What a CLI run returns and which tools it may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunProfile {
+    /// A fix run: the [`RESULT_SCHEMA`] structured result, with the configured
+    /// `permissions` and `skip_permissions`.
+    Fix,
+    /// A read-only Q&A, reply or verification run: plain text, limited to the
+    /// read-only tools, and never skipping permission prompts.
+    Reply,
+    /// A [`DEPLOY_QA_SOURCE`] live-QA run: plain text with the fix-run access
+    /// plus the read-only tools, so it can probe live hosts.
+    LiveQa,
+}
+
+impl RunProfile {
+    /// The profile for a reply to an issue from `source`.
+    fn for_reply(source: &str) -> Self {
+        if source == DEPLOY_QA_SOURCE {
+            Self::LiveQa
+        } else {
+            Self::Reply
+        }
+    }
+}
+
+/// Whether an `--allowedTools` permission lets a run execute shell commands:
+/// the bare shell tool or a scoped `Bash(...)` rule.
+fn grants_shell(permission: &str) -> bool {
+    permission
+        .trim()
+        .strip_prefix(SHELL_TOOL)
+        .is_some_and(|rule| rule.is_empty() || rule.starts_with('('))
+}
 
 /// Resolve the root directory for execution logs.
 /// Used by both the runner and the API to validate log file paths.
@@ -306,12 +343,14 @@ pub struct ClaudeRunnerConfig {
     pub model: Option<String>,
     /// Custom instructions appended to Claude's system prompt.
     pub instructions: Option<String>,
-    /// Tool permissions granted without prompting (--allowedTools).
+    /// Tool permissions granted without prompting (--allowedTools) to fix and
+    /// deploy_qa live-QA runs.
     pub permissions: Vec<String>,
-    /// Tools allowed for read-only Q&A (question) runs. Empty means fall back to
-    /// [`DEFAULT_READONLY_TOOLS`].
+    /// Tools allowed for read-only Q&A (question) runs, and added to deploy_qa
+    /// live-QA runs. Empty means fall back to [`DEFAULT_READONLY_TOOLS`].
     pub readonly_tools: Vec<String>,
-    /// Skip all permission prompts (default: false).
+    /// Skip all permission prompts on fix and deploy_qa live-QA runs (default:
+    /// false). Read-only runs never skip them.
     pub skip_permissions: bool,
     /// CLI binary name or absolute path (default: "claude").
     pub binary: String,
@@ -672,9 +711,17 @@ The PR title should include the issue ID: {}
         project_dir: &Path,
         source: Option<&str>,
     ) -> Result<AgentResult> {
-        self.execute_with_env_and_attempt(prompt, label, env, None, project_dir, true, source)
-            .await
-            .map(|outcome| outcome.agent)
+        self.execute_with_env_and_attempt(
+            prompt,
+            label,
+            env,
+            None,
+            project_dir,
+            RunProfile::Fix,
+            source,
+        )
+        .await
+        .map(|outcome| outcome.agent)
     }
 
     /// Run a read-only, schema-constrained query via `--json-schema` and return
@@ -701,17 +748,9 @@ The PR title should include the issue ID: {}
             args.push("--append-system-prompt".to_string());
             args.push(instructions.clone());
         }
-        let readonly_tools: Vec<String> = if self.config.readonly_tools.is_empty() {
-            DEFAULT_READONLY_TOOLS
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            self.config.readonly_tools.clone()
-        };
-        for perm in &readonly_tools {
+        for tool in self.readonly_tools() {
             args.push("--allowedTools".to_string());
-            args.push(perm.clone());
+            args.push(tool);
         }
         // Deliver the prompt via stdin, not as a CLI argument. Large prompts
         // (e.g. the repo classifier's all-candidates prompt) otherwise overflow
@@ -809,7 +848,7 @@ The PR title should include the issue ID: {}
                 env,
                 None,
                 project_dir,
-                false,
+                RunProfile::Reply,
                 Some(issue.source.as_str()),
             )
             .await?;
@@ -817,9 +856,12 @@ The PR title should include the issue ID: {}
     }
 
     /// Generate a grounded, human-sounding reply, read-only. `guideline` is an
-    /// optional per-inbox style guideline; `kind` selects the framing. Release
-    /// tips from [`DEPLOY_QA_SOURCE`] get a live-QA report instead. Either way
-    /// the result is the run's [`final_reply`].
+    /// optional per-inbox style guideline; `kind` selects the framing.
+    ///
+    /// Release tips from [`DEPLOY_QA_SOURCE`] are the exception: they run live
+    /// QA with the fix-run tool access (`permissions`, `skip_permissions`) plus
+    /// the read-only tools, so the agent can probe live hosts, and return a
+    /// live-QA report. Either way the result is the run's [`final_reply`].
     pub async fn run_reply(
         &self,
         issue: &Issue,
@@ -830,6 +872,7 @@ The PR title should include the issue ID: {}
     ) -> Result<String> {
         let prompt = build_reply_prompt(issue, context, guideline, kind);
         let (env, _) = self.prepare_env_and_label(Some(issue));
+        let profile = RunProfile::for_reply(&issue.source);
         let outcome = self
             .execute_with_env_and_attempt(
                 &prompt,
@@ -837,7 +880,7 @@ The PR title should include the issue ID: {}
                 env,
                 None,
                 project_dir,
-                false,
+                profile,
                 Some(issue.source.as_str()),
             )
             .await?;
@@ -934,6 +977,106 @@ The PR title should include the issue ID: {}
         json!({ "mcpServers": serde_json::Value::Object(out) })
     }
 
+    /// The configured read-only tools, or [`DEFAULT_READONLY_TOOLS`] when none
+    /// are configured.
+    fn readonly_tools(&self) -> Vec<String> {
+        if self.config.readonly_tools.is_empty() {
+            DEFAULT_READONLY_TOOLS
+                .iter()
+                .map(|tool| tool.to_string())
+                .collect()
+        } else {
+            self.config.readonly_tools.clone()
+        }
+    }
+
+    /// The tools a run under `profile` may use without prompting. A live-QA
+    /// run gets the fix-run permissions followed by every read-only tool not
+    /// already among them, so it never has less access than a read-only reply.
+    fn allowed_tools(&self, profile: RunProfile) -> Vec<String> {
+        match profile {
+            RunProfile::Fix => self.config.permissions.clone(),
+            RunProfile::Reply => self.readonly_tools(),
+            RunProfile::LiveQa => {
+                let mut tools = self.config.permissions.clone();
+                for tool in self.readonly_tools() {
+                    if !tools.contains(&tool) {
+                        tools.push(tool);
+                    }
+                }
+                tools
+            }
+        }
+    }
+
+    /// Whether a run under `profile` skips permission prompts. Read-only runs
+    /// never do, so they cannot mutate the repository.
+    fn skips_permissions(&self, profile: RunProfile) -> bool {
+        profile != RunProfile::Reply && self.config.skip_permissions
+    }
+
+    /// Whether a live-QA run may execute shell commands at all.
+    fn live_qa_has_shell(&self) -> bool {
+        self.config.skip_permissions
+            || self
+                .config
+                .permissions
+                .iter()
+                .any(|permission| grants_shell(permission))
+    }
+
+    /// The CLI arguments for a run under `profile`, attaching the rendered
+    /// `mcp_config` and allowlisting `mcp_tool_globs` when servers matched.
+    ///
+    /// The prompt is not among them: it is piped via stdin to stay clear of the
+    /// OS argv size limit (E2BIG), and `--print` with no positional prompt
+    /// reads it from there.
+    fn run_args(
+        &self,
+        profile: RunProfile,
+        mcp_config: Option<&Path>,
+        mcp_tool_globs: &[String],
+    ) -> Vec<String> {
+        let mut args = vec![
+            "--verbose".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
+        // --strict ignores any repo .mcp.json, so only the rendered config loads.
+        if let Some(path) = mcp_config {
+            args.push("--mcp-config".to_string());
+            args.push(path.display().to_string());
+            args.push("--strict-mcp-config".to_string());
+        }
+        if profile == RunProfile::Fix {
+            args.push("--json-schema".to_string());
+            args.push(RESULT_SCHEMA.to_string());
+        }
+        if self.skips_permissions(profile) {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+        if let Some(ref model) = self.config.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+        if let Some(ref instructions) = self.config.instructions {
+            args.push("--append-system-prompt".to_string());
+            args.push(instructions.clone());
+        }
+        for tool in self.allowed_tools(profile) {
+            args.push("--allowedTools".to_string());
+            args.push(tool);
+        }
+        for glob in mcp_tool_globs {
+            if !args.iter().any(|arg| arg == glob) {
+                args.push("--allowedTools".to_string());
+                args.push(glob.clone());
+            }
+        }
+        args.push("--print".to_string());
+        args
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_with_env_and_attempt(
         &self,
@@ -942,7 +1085,7 @@ The PR title should include the issue ID: {}
         env: HashMap<String, String>,
         attempt_id: Option<i64>,
         project_dir: &Path,
-        structured: bool,
+        profile: RunProfile,
         source: Option<&str>,
     ) -> Result<RunOutcome> {
         // Create execution record for analytics
@@ -1036,7 +1179,7 @@ The PR title should include the issue ID: {}
         }
         // Tools to allowlist for the attached servers. An explicit `tools` list is
         // scoped to `mcp__<server>__<tool>`; empty grants all of the server's tools
-        // via `mcp__<server>`. Applied uniformly to fix and read-only runs.
+        // via `mcp__<server>`. Applied uniformly to every run profile.
         let mcp_tool_globs: Vec<String> = if mcp_config_file.is_some() {
             matched_mcp
                 .iter()
@@ -1055,64 +1198,19 @@ The PR title should include the issue ID: {}
             Vec::new()
         };
 
-        let mut args = vec![
-            "--verbose".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-        ];
-        // When we attach a rendered config, load only it (--strict ignores any repo
-        // .mcp.json). With no servers matched, no MCP flags are added at all.
-        if let Some(ref file) = mcp_config_file {
-            args.push("--mcp-config".to_string());
-            args.push(file.path().display().to_string());
-            args.push("--strict-mcp-config".to_string());
+        let args = self.run_args(
+            profile,
+            mcp_config_file.as_ref().map(|file| file.path()),
+            &mcp_tool_globs,
+        );
+        if profile == RunProfile::LiveQa && !self.live_qa_has_shell() {
+            tracing::warn!(
+                component = "claude",
+                label = label,
+                "deploy_qa live QA has no shell access, so curl and CLIs are unavailable; \
+                 set `skip_permissions` or grant `Bash` in `permissions` to allow them"
+            );
         }
-        // Structured (fix) runs enforce the result JSON schema. Read-only Q&A
-        // runs return plain assistant text instead.
-        if structured {
-            args.push("--json-schema".to_string());
-            args.push(RESULT_SCHEMA.to_string());
-        }
-        // Read-only Q&A runs must never skip permission prompts, and are
-        // restricted to a read-only tool set so the repo cannot be mutated.
-        if structured && self.config.skip_permissions {
-            args.push("--dangerously-skip-permissions".to_string());
-        }
-        if let Some(ref model) = self.config.model {
-            args.push("--model".to_string());
-            args.push(model.clone());
-        }
-        if let Some(ref instructions) = self.config.instructions {
-            args.push("--append-system-prompt".to_string());
-            args.push(instructions.clone());
-        }
-        if structured {
-            for perm in &self.config.permissions {
-                args.push("--allowedTools".to_string());
-                args.push(perm.clone());
-            }
-        } else if self.config.readonly_tools.is_empty() {
-            for perm in DEFAULT_READONLY_TOOLS {
-                args.push("--allowedTools".to_string());
-                args.push((*perm).to_string());
-            }
-        } else {
-            for perm in &self.config.readonly_tools {
-                args.push("--allowedTools".to_string());
-                args.push(perm.clone());
-            }
-        }
-        // Allowlist the attached MCP servers' tools for both fix and Q&A runs.
-        for glob in &mcp_tool_globs {
-            if !args.iter().any(|a| a == glob) {
-                args.push("--allowedTools".to_string());
-                args.push(glob.clone());
-            }
-        }
-        // Prompt is delivered via stdin (see spawn below), not as a CLI argument,
-        // to avoid the OS argv size limit (E2BIG) on large prompts. `--print`
-        // with no positional prompt reads it from stdin.
-        args.push("--print".to_string());
 
         let log_files = Self::create_execution_log_files(label);
         if let Some(ref files) = log_files {
@@ -2273,7 +2371,7 @@ impl AgentRunner for ClaudeAgentRunner {
             env,
             attempt_id,
             project_dir,
-            true,
+            RunProfile::Fix,
             issue.map(|i| i.source.as_str()),
         )
         .await
@@ -2453,11 +2551,15 @@ Write only the reply message."#,
     )
 }
 
-/// Build the prompt for a read-only, observe/report live QA run of a release tip.
+/// Build the prompt for a live QA run of a release tip.
 ///
-/// The output is an internal report, not a customer reply: its per-PR lines and
-/// verdict footer are machine-classified, so the exact line format and allowed
-/// footer values come from the ticket's own Agent constraints.
+/// The run has fix-run tool access, so the agent actually runs the playbook's
+/// checks against live hosts, bounded by the rules here: state changes only in
+/// the playbook's throwaway QA project, no repository changes, no posting, no
+/// secrets in the report. The output is an internal report, not a customer
+/// reply: its per-PR lines and verdict footer are machine-classified, so the
+/// exact line format and allowed footer values come from the ticket's own
+/// Agent constraints.
 fn build_live_qa_prompt(issue: &Issue, context: &str) -> String {
     format!(
         r#"You are a release QA engineer running live QA on a new release tip ({source}).
@@ -2470,12 +2572,18 @@ Your output is an internal QA report that a machine parses. It is NOT a message
 to a customer: no greeting, sign-off, first-person pleasantries, or support tone.
 
 STRICT RULES:
-- Observe and report only. Do NOT modify files, run write commands, or create
-  branches, commits, or PRs.
-- Do NOT post to Discord, Slack, or any other external channel. Claudear posts
-  your report itself, so skip any posting steps in the playbook.
-- Report any check you cannot actually run with the tools available to you as
-  BLOCKED. Never guess or assume PASS.
+- Run every check yourself against the hosts the playbook lists: use curl or
+  another HTTP client, CLIs, and any browser or MCP tools available to you.
+- Make state-changing calls (anything that creates, updates, or deletes) only
+  against the throwaway QA project the playbook names. Never touch production
+  or customer data. If the playbook names no such project, make none.
+- Do NOT modify any repository or checkout, and do NOT create branches,
+  commits, or PRs.
+- Do NOT post to Discord, Slack, or any other channel. Claudear posts your
+  report itself, so skip any posting steps in the playbook.
+- Never include secrets, tokens, API keys, or credentials in the report.
+- Report any check you did not actually run as BLOCKED, whatever the reason.
+  Never guess or assume PASS.
 - Ground every result in what you actually observed; do not invent behavior.
 
 REPORT FORMAT:
@@ -2758,13 +2866,22 @@ mod tests {
         })
     }
 
-    /// A stub `claude` binary that drains the prompt from stdin, prints
-    /// `events` as stream-json lines and exits with `exit_code`.
+    /// File name of the stub CLI binary.
+    #[cfg(unix)]
+    const FAKE_CLI_BINARY: &str = "claude";
+
+    /// File, beside the stub CLI, that it records its NUL-separated arguments to.
+    #[cfg(unix)]
+    const FAKE_CLI_ARGS_FILE: &str = "args";
+
+    /// A stub `claude` binary that records its arguments, drains the prompt
+    /// from stdin, prints `events` as stream-json lines and exits with
+    /// `exit_code`.
     #[cfg(unix)]
     fn fake_cli_script(events: &[serde_json::Value], exit_code: i32) -> String {
         let lines: Vec<String> = events.iter().map(|event| event.to_string()).collect();
         format!(
-            "#!/bin/sh\ncat > /dev/null\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$(dirname \"$0\")/{FAKE_CLI_ARGS_FILE}\"\ncat > /dev/null\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
             lines.join("\n")
         )
     }
@@ -2782,45 +2899,400 @@ mod tests {
         ]
     }
 
-    /// Run [`ClaudeAgentRunner::run_reply`] for an issue from `source` against a
-    /// stub CLI emitting `events`, with execution logs kept in a temp dir.
+    /// A stub `claude` binary installed in a temp dir that also holds the
+    /// execution logs. Holds [`ENV_MUTEX`] for its lifetime and restores
+    /// `CLAUDEAR_LOG_DIR` when dropped.
+    #[cfg(unix)]
+    struct FakeCli {
+        directory: tempfile::TempDir,
+        previous_log_dir: Option<String>,
+        _env_guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl FakeCli {
+        fn install(script: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let directory = tempfile::tempdir().unwrap();
+            let binary = directory.path().join(FAKE_CLI_BINARY);
+            std::fs::write(&binary, script).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let previous_log_dir = std::env::var("CLAUDEAR_LOG_DIR").ok();
+            std::env::set_var("CLAUDEAR_LOG_DIR", directory.path().join("logs"));
+            Self {
+                directory,
+                previous_log_dir,
+                _env_guard: env_guard,
+            }
+        }
+
+        /// A runner with `config` that spawns this stub.
+        fn runner(&self, config: ClaudeRunnerConfig) -> ClaudeAgentRunner {
+            new_simple(ClaudeRunnerConfig {
+                binary: self.directory().join(FAKE_CLI_BINARY).display().to_string(),
+                ..config
+            })
+        }
+
+        fn directory(&self) -> &Path {
+            self.directory.path()
+        }
+
+        /// The arguments the stub was last spawned with.
+        fn recorded_args(&self) -> Vec<String> {
+            let recorded = std::fs::read_to_string(self.directory().join(FAKE_CLI_ARGS_FILE))
+                .expect("the stub CLI was never spawned");
+            recorded
+                .strip_suffix('\0')
+                .unwrap_or(&recorded)
+                .split('\0')
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeCli {
+        fn drop(&mut self) {
+            match self.previous_log_dir.take() {
+                Some(value) => std::env::set_var("CLAUDEAR_LOG_DIR", value),
+                None => std::env::remove_var("CLAUDEAR_LOG_DIR"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    /// Run [`ClaudeAgentRunner::run_reply`] for an issue from `source` with
+    /// `config` against a stub CLI emitting `events`, returning the reply and
+    /// the arguments the CLI was spawned with.
+    #[cfg(unix)]
+    fn run_reply_with_fake_cli_config(
+        source: &str,
+        config: ClaudeRunnerConfig,
+        events: &[serde_json::Value],
+        exit_code: i32,
+    ) -> (Result<String>, Vec<String>) {
+        let cli = FakeCli::install(&fake_cli_script(events, exit_code));
+        let runner = cli.runner(config);
+        let reply = block_on(runner.run_reply(
+            &deploy_qa_issue(source),
+            "ctx",
+            None,
+            ReplyKind::Answer,
+            cli.directory(),
+        ));
+        (reply, cli.recorded_args())
+    }
+
+    /// Run [`ClaudeAgentRunner::run_reply`] for an issue from `source` with the
+    /// default config against a stub CLI emitting `events`.
     #[cfg(unix)]
     fn run_reply_with_fake_cli(
         source: &str,
         events: &[serde_json::Value],
         exit_code: i32,
     ) -> Result<String> {
-        use std::os::unix::fs::PermissionsExt;
+        run_reply_with_fake_cli_config(source, ClaudeRunnerConfig::default(), events, exit_code).0
+    }
 
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let directory = tempfile::tempdir().unwrap();
-        let binary = directory.path().join("claude");
-        std::fs::write(&binary, fake_cli_script(events, exit_code)).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let previous_log_dir = std::env::var("CLAUDEAR_LOG_DIR").ok();
-        std::env::set_var("CLAUDEAR_LOG_DIR", directory.path().join("logs"));
+    /// The arguments a successful reply run for an issue from `source` spawns
+    /// the CLI with under `config`.
+    #[cfg(unix)]
+    fn reply_cli_args(source: &str, config: ClaudeRunnerConfig) -> Vec<String> {
+        let (reply, args) = run_reply_with_fake_cli_config(
+            source,
+            config,
+            &[result_event(LIVE_QA_FINAL_REPORT, false)],
+            0,
+        );
+        reply.expect("the stub reply run succeeds");
+        args
+    }
 
+    #[cfg(unix)]
+    const FULL_ACCESS_PERMISSIONS: &[&str] = &["Bash(git *)", "Edit"];
+    #[cfg(unix)]
+    const TEST_MODEL: &str = "opus";
+    #[cfg(unix)]
+    const TEST_INSTRUCTIONS: &str = "Follow AGENT.md";
+
+    /// A config that grants fix runs full access.
+    #[cfg(unix)]
+    fn full_access_config() -> ClaudeRunnerConfig {
+        ClaudeRunnerConfig {
+            skip_permissions: true,
+            permissions: FULL_ACCESS_PERMISSIONS
+                .iter()
+                .map(|permission| permission.to_string())
+                .collect(),
+            model: Some(TEST_MODEL.to_string()),
+            instructions: Some(TEST_INSTRUCTIONS.to_string()),
+            ..ClaudeRunnerConfig::default()
+        }
+    }
+
+    /// The CLI arguments of a run without MCP servers: the fixed stream flags,
+    /// then `flags`, one `--allowedTools` per tool, and `--print`.
+    #[cfg(unix)]
+    fn expected_cli_args(flags: &[&str], tools: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = ["--verbose", "--output-format", "stream-json"]
+            .iter()
+            .chain(flags)
+            .map(|arg| arg.to_string())
+            .collect();
+        for tool in tools {
+            args.push("--allowedTools".to_string());
+            args.push(tool.to_string());
+        }
+        args.push("--print".to_string());
+        args
+    }
+
+    #[cfg(unix)]
+    fn model_and_instruction_flags() -> Vec<&'static str> {
+        vec![
+            "--model",
+            TEST_MODEL,
+            "--append-system-prompt",
+            TEST_INSTRUCTIONS,
+        ]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_deploy_qa_gets_fix_run_access_plus_read_only_tools() {
+        let args = reply_cli_args(DEPLOY_QA_SOURCE, full_access_config());
+
+        let mut flags = vec!["--dangerously-skip-permissions"];
+        flags.extend(model_and_instruction_flags());
+        let tools: Vec<&str> = FULL_ACCESS_PERMISSIONS
+            .iter()
+            .chain(DEFAULT_READONLY_TOOLS)
+            .copied()
+            .collect();
+        assert_eq!(args, expected_cli_args(&flags, &tools));
+        assert!(
+            !args.iter().any(|arg| arg == "--json-schema"),
+            "a live QA run returns a plain-text report, not the fix schema"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_deploy_qa_keeps_read_only_tools_without_fix_access() {
+        let args = reply_cli_args(DEPLOY_QA_SOURCE, ClaudeRunnerConfig::default());
+
+        assert_eq!(args, expected_cli_args(&[], DEFAULT_READONLY_TOOLS));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_customer_reply_stays_read_only_under_full_access_config() {
+        let args = reply_cli_args(HELPSCOUT_SOURCE, full_access_config());
+
+        assert_eq!(
+            args,
+            expected_cli_args(&model_and_instruction_flags(), DEFAULT_READONLY_TOOLS)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_verify_stays_read_only_under_full_access_config() {
+        let cli = FakeCli::install(&fake_cli_script(
+            &[result_event(r#"{"reproduced": false}"#, false)],
+            0,
+        ));
+        let runner = cli.runner(full_access_config());
+
+        block_on(runner.run_verify(&verify_issue(), "ctx", cli.directory()))
+            .expect("the stub verify run succeeds");
+
+        assert_eq!(
+            cli.recorded_args(),
+            expected_cli_args(&model_and_instruction_flags(), DEFAULT_READONLY_TOOLS)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fix_run_keeps_schema_and_configured_access() {
+        let cli = FakeCli::install(&fake_cli_script(
+            &[json!({
+                "type": "result",
+                "is_error": false,
+                "result": "done",
+                "structured_output": {"summary": "done", "success": true, "confidence": 90}
+            })],
+            0,
+        ));
+        let runner = cli.runner(full_access_config());
+        let issue = Issue::new("1", "SENTRY-1", "Crash on login", "url", "sentry");
+
+        block_on(runner.execute_with_attempt("Fix it", Some(&issue), None, cli.directory()))
+            .expect("the stub fix run succeeds");
+
+        let mut flags = vec![
+            "--json-schema",
+            RESULT_SCHEMA,
+            "--dangerously-skip-permissions",
+        ];
+        flags.extend(model_and_instruction_flags());
+        assert_eq!(
+            cli.recorded_args(),
+            expected_cli_args(&flags, FULL_ACCESS_PERMISSIONS)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_deploy_qa_attaches_its_mcp_servers() {
+        let browser = McpServerConfig {
+            command: Some("npx".to_string()),
+            args: vec!["@playwright/mcp".to_string()],
+            sources: vec![DEPLOY_QA_SOURCE.to_string()],
+            ..Default::default()
+        };
+        let helpdesk = McpServerConfig {
+            command: Some("uvx".to_string()),
+            sources: vec![HELPSCOUT_SOURCE.to_string()],
+            ..Default::default()
+        };
+        let config = ClaudeRunnerConfig {
+            mcp: HashMap::from([
+                ("browser".to_string(), browser),
+                ("helpdesk".to_string(), helpdesk),
+            ]),
+            ..full_access_config()
+        };
+
+        let args = reply_cli_args(DEPLOY_QA_SOURCE, config);
+
+        let config_path = args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .and_then(|index| args.get(index + 1))
+            .expect("a matched MCP server is passed via --mcp-config");
+        assert!(config_path.ends_with(".json"), "got: {config_path}");
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--allowedTools", "mcp__browser"]),
+            "the deploy_qa MCP server's tools must be allowlisted, got: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("mcp__helpdesk")),
+            "servers for other sources must stay detached, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_live_qa_prompt_runs_live_checks_within_safety_rules() {
+        let mut issue = deploy_qa_issue(DEPLOY_QA_SOURCE);
+        issue.description = Some("Follow the playbook.".to_string());
+        let prompt = build_live_qa_prompt(&issue, "ctx");
+
+        for rule in [
+            "Run every check yourself",
+            "curl",
+            "throwaway QA project",
+            "Do NOT modify any repository or checkout",
+            "Do NOT post to Discord, Slack",
+            "Never include secrets",
+            "BLOCKED",
+        ] {
+            assert!(
+                prompt.contains(rule),
+                "live QA prompt is missing `{rule}`:\n{prompt}"
+            );
+        }
+        for forbidden in ["Observe and report only", "run write commands"] {
+            assert!(
+                !prompt.contains(forbidden),
+                "live QA prompt still forbids running checks with `{forbidden}`:\n{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_run_profile_for_reply_is_live_qa_only_for_deploy_qa() {
+        assert_eq!(RunProfile::for_reply(DEPLOY_QA_SOURCE), RunProfile::LiveQa);
+        for source in [HELPSCOUT_SOURCE, "discord", "slack", "linear", "sentry"] {
+            assert_eq!(
+                RunProfile::for_reply(source),
+                RunProfile::Reply,
+                "{source} replies must stay read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn test_allowed_tools_live_qa_adds_read_only_tools_not_already_permitted() {
         let runner = new_simple(ClaudeRunnerConfig {
-            binary: binary.display().to_string(),
+            permissions: vec!["Read".to_string(), "Bash".to_string()],
+            readonly_tools: vec!["Read".to_string(), "Grep".to_string()],
             ..ClaudeRunnerConfig::default()
         });
-        let reply = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(runner.run_reply(
-                &deploy_qa_issue(source),
-                "ctx",
-                None,
-                ReplyKind::Answer,
-                directory.path(),
-            ));
 
-        match previous_log_dir {
-            Some(value) => std::env::set_var("CLAUDEAR_LOG_DIR", value),
-            None => std::env::remove_var("CLAUDEAR_LOG_DIR"),
+        assert_eq!(
+            runner.allowed_tools(RunProfile::LiveQa),
+            vec!["Read", "Bash", "Grep"]
+        );
+        assert_eq!(runner.allowed_tools(RunProfile::Fix), vec!["Read", "Bash"]);
+        assert_eq!(
+            runner.allowed_tools(RunProfile::Reply),
+            vec!["Read", "Grep"]
+        );
+    }
+
+    #[test]
+    fn test_skips_permissions_never_for_read_only_runs() {
+        let runner = new_simple(ClaudeRunnerConfig {
+            skip_permissions: true,
+            ..ClaudeRunnerConfig::default()
+        });
+
+        assert!(runner.skips_permissions(RunProfile::Fix));
+        assert!(runner.skips_permissions(RunProfile::LiveQa));
+        assert!(!runner.skips_permissions(RunProfile::Reply));
+        assert!(!new_simple(ClaudeRunnerConfig::default()).skips_permissions(RunProfile::LiveQa));
+    }
+
+    #[test]
+    fn test_grants_shell_matches_bash_and_scoped_bash_rules_only() {
+        for permission in ["Bash", "Bash(curl *)", "Bash(git *)", " Bash "] {
+            assert!(grants_shell(permission), "{permission} grants a shell");
         }
-        reply
+        for permission in ["BashOutput", "Read", "WebFetch", "mcp__bash", ""] {
+            assert!(!grants_shell(permission), "{permission} grants no shell");
+        }
+    }
+
+    #[test]
+    fn test_live_qa_has_shell_needs_skip_permissions_or_a_bash_permission() {
+        let has_shell = |permissions: &[&str], skip_permissions: bool| {
+            new_simple(ClaudeRunnerConfig {
+                permissions: permissions.iter().map(|p| p.to_string()).collect(),
+                skip_permissions,
+                ..ClaudeRunnerConfig::default()
+            })
+            .live_qa_has_shell()
+        };
+
+        assert!(!has_shell(&[], false));
+        assert!(!has_shell(&["Read", "Edit"], false));
+        assert!(has_shell(&["Read", "Bash(curl *)"], false));
+        assert!(has_shell(&[], true));
     }
 
     #[cfg(unix)]
