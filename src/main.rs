@@ -1561,11 +1561,22 @@ fn start_regression_monitoring(
 /// release tips** and enqueues observe/report live QA. It does not use
 /// `ReleaseTracker` or `[regression]` watches.
 ///
-/// Runs before the watcher starts, so any tip still `running` was orphaned by
-/// a previous process and is marked `errored` to unblock its track.
+/// After every poll it dispatches pending tips through `watcher`, including
+/// tips a previous process left pending, so tips run in every daemon mode, not
+/// only when the watcher polls its sources. Dispatch waits for the watcher to
+/// finish warm start, so tips seen before then run after the next poll.
+///
+/// Before polling starts, every tip still `running` is marked `errored` to
+/// unblock its track. That is usually a run orphaned by a previous process,
+/// but a `claudear trigger`, `claudear retries process` or second
+/// `claudear poll` process sharing the database can legitimately be mid-run.
+/// Its tip is then errored early, which only relaxes
+/// `skip_if_previous_running` for that track until the run finishes and
+/// records its verdict.
 fn start_deploy_qa_monitoring(
     config: &Config,
     tracker: Arc<dyn FixAttemptTracker>,
+    watcher: Arc<Watcher>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.deploy_qa.enabled {
         tracing::info!("Deploy QA disabled in configuration");
@@ -1655,6 +1666,19 @@ fn start_deploy_qa_monitoring(
                         );
                     }
                 }
+            }
+            match watcher.dispatch_pending_deploy_qa_tips().await {
+                Ok(runs) if runs.is_empty() => {}
+                Ok(runs) => tracing::info!(
+                    component = "deploy_qa",
+                    dispatched = runs.len(),
+                    "Dispatched pending release tips for observe/report QA"
+                ),
+                Err(error) => tracing::warn!(
+                    component = "deploy_qa",
+                    error = %error,
+                    "Failed to dispatch pending release tips"
+                ),
             }
         }
     });
@@ -3435,7 +3459,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("  Regression monitoring: enabled");
         }
 
-        let deploy_qa_handle = start_deploy_qa_monitoring(&config, tracker.clone());
+        let deploy_qa_handle =
+            start_deploy_qa_monitoring(&config, tracker.clone(), watcher.clone());
         if deploy_qa_handle.is_some() {
             tracing::info!("  Deploy QA: enabled");
         }
@@ -4191,7 +4216,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             if regression_handle.is_some() {
                 tracing::info!("Regression monitoring: enabled");
             }
-            let _deploy_qa_handle = start_deploy_qa_monitoring(&config, tracker.clone());
+            let _deploy_qa_handle =
+                start_deploy_qa_monitoring(&config, tracker.clone(), watcher.clone());
 
             // Handle shutdown signals
             let watcher_for_shutdown = watcher.clone();
@@ -4452,8 +4478,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         sources_for_regression.clone(),
                         notifier_for_regression.clone(),
                     );
-                    let _deploy_qa_handle =
-                        start_deploy_qa_monitoring(&config, tracker_for_api.clone());
+                    let _deploy_qa_handle = start_deploy_qa_monitoring(
+                        &config,
+                        tracker_for_api.clone(),
+                        watcher.clone(),
+                    );
 
                     let shutdown = async {
                         tokio::signal::ctrl_c()
