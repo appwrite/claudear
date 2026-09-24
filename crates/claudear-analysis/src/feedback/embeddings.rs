@@ -378,6 +378,28 @@ impl EmbeddingClient {
     }
 }
 
+#[cfg(test)]
+impl EmbeddingClient {
+    /// Process-wide client for tests. Tests must share it rather than build
+    /// their own: concurrent first-time loads race on the model download lock.
+    pub(crate) fn for_tests() -> Arc<Self> {
+        static CLIENT: std::sync::OnceLock<Arc<EmbeddingClient>> = std::sync::OnceLock::new();
+        CLIENT
+            .get_or_init(|| {
+                Arc::new(
+                    Self::new(EmbeddingConfig {
+                        model: EmbeddingModel::AllMiniLML6V2,
+                        show_download_progress: false,
+                        pool_size: 1,
+                        ..EmbeddingConfig::default()
+                    })
+                    .expect("Failed to create test embedding client"),
+                )
+            })
+            .clone()
+    }
+}
+
 /// Calculate cosine similarity between two vectors.
 ///
 /// Uses an iterator pattern that is more amenable to LLVM auto-vectorization

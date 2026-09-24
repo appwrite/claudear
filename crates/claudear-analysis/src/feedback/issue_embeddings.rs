@@ -1192,35 +1192,17 @@ mod tests {
     impl DiscordStore for MockTracker {}
     impl DeployQaStore for MockTracker {}
 
-    // --- Helper to create a mock EmbeddingClient for tests ---
-    // We use the real EmbeddingClient with the fast (AllMiniLML6V2) model.
-    // This is cached after first download and runs locally.
-    fn make_embedding_client() -> Arc<EmbeddingClient> {
-        use crate::feedback::EmbeddingConfig;
-        use fastembed::EmbeddingModel;
-        Arc::new(
-            EmbeddingClient::new(EmbeddingConfig {
-                model: EmbeddingModel::AllMiniLML6V2,
-                show_download_progress: false,
-                cache_dir: None,
-                pool_size: 1,
-                ..EmbeddingConfig::default()
-            })
-            .expect("Failed to create test embedding client"),
-        )
-    }
-
     fn make_service(
         tracker: Arc<dyn claudear_storage::FixAttemptTracker>,
     ) -> IssueEmbeddingService {
-        let client = make_embedding_client();
+        let client = EmbeddingClient::for_tests();
         IssueEmbeddingService::new(client, tracker, IssueEmbeddingConfig::default())
     }
 
     fn make_service_disabled(
         tracker: Arc<dyn claudear_storage::FixAttemptTracker>,
     ) -> IssueEmbeddingService {
-        let client = make_embedding_client();
+        let client = EmbeddingClient::for_tests();
         IssueEmbeddingService::new(
             client,
             tracker,
@@ -1235,7 +1217,7 @@ mod tests {
         tracker: Arc<dyn claudear_storage::FixAttemptTracker>,
         config: IssueEmbeddingConfig,
     ) -> IssueEmbeddingService {
-        let client = make_embedding_client();
+        let client = EmbeddingClient::for_tests();
         IssueEmbeddingService::new(client, tracker, config)
     }
 
@@ -1256,7 +1238,7 @@ mod tests {
     #[test]
     fn test_service_with_defaults_constructor() {
         let tracker = Arc::new(MockTracker::new());
-        let client = make_embedding_client();
+        let client = EmbeddingClient::for_tests();
         let service = IssueEmbeddingService::with_defaults(client, tracker);
         // with_defaults uses IssueEmbeddingConfig::default(), which has enabled=true
         assert!(service.is_enabled());
