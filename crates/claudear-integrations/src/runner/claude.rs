@@ -1163,7 +1163,6 @@ The PR title should include the issue ID: {}
         profile: RunProfile,
         source: Option<&str>,
     ) -> Result<RunOutcome> {
-        // Create execution record for analytics
         let mut execution = AgentExecution::new();
         if let Some(id) = attempt_id {
             execution = execution.with_attempt_id(id);
@@ -1186,7 +1185,6 @@ The PR title should include the issue ID: {}
             "Starting execution"
         );
 
-        // Log claude_started activity
         let activity = ActivityLogEntry::new(
             "claude_started",
             format!("Claude execution started for {}", label),
@@ -1513,7 +1511,6 @@ The PR title should include the issue ID: {}
                 )
                 .await;
 
-                // Parse NDJSON stream events; accumulate decoded text.
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     match serde_json::from_str::<StreamEvent>(trimmed) {
@@ -1698,7 +1695,6 @@ The PR title should include the issue ID: {}
             }
         });
 
-        // Stream stderr
         let stderr_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             let mut output = String::new();
@@ -1894,7 +1890,6 @@ The PR title should include the issue ID: {}
                     }),
                 )
                 .await;
-                // Timeout occurred - try to kill the process
                 tracing::error!(
                     component = "claude",
                     label = label,
@@ -1921,7 +1916,6 @@ The PR title should include the issue ID: {}
                     tracing::error!(component = "claude", error = %e, "Failed to kill timed-out process");
                 }
 
-                // Log claude_timed_out activity
                 let activity = ActivityLogEntry::new(
                     "claude_timed_out",
                     format!("Claude timed out for {}", label),
@@ -1933,7 +1927,6 @@ The PR title should include the issue ID: {}
                 }));
                 self.tracker.record_activity(&activity).ok();
 
-                // Record the timed-out execution
                 execution.complete(None, true);
                 execution.stderr_preview =
                     Some(format!("Process timed out after {} seconds", timeout_secs));
@@ -1960,7 +1953,6 @@ The PR title should include the issue ID: {}
                     .await;
                 }
 
-                // Return a result indicating timeout
                 return Ok(RunOutcome {
                     agent: AgentResult {
                         success: false,
@@ -2101,7 +2093,6 @@ The PR title should include the issue ID: {}
         )
         .await;
 
-        // Extract fields from structured result, falling back to legacy extraction.
         let legacy_fallback = || {
             let pr = Self::extract_pr_url(&text_output);
             let bq = Self::extract_blocking_question(&text_output)
@@ -2197,7 +2188,6 @@ The PR title should include the issue ID: {}
             .unwrap_or(false)
             || Self::is_rate_limit_error(&stderr_output);
 
-        // Complete and record the execution
         execution.complete(status.code(), timed_out);
         execution.stdout_preview = Some(Self::truncate(&text_output, EXECUTION_LOG_PREVIEW_LIMIT));
         execution.stderr_preview = if stderr_output.is_empty() {
@@ -2216,7 +2206,6 @@ The PR title should include the issue ID: {}
         execution.cache_read_input_tokens = result_cache_read_tokens;
         execution.cache_creation_input_tokens = result_cache_creation_tokens;
 
-        // Record the execution to the database (don't fail the main operation if this fails)
         if let Err(e) = self.tracker.record_execution(&execution) {
             Self::append_execution_event(
                 &event_writer,
@@ -2241,7 +2230,6 @@ The PR title should include the issue ID: {}
             .await;
         }
 
-        // Log completion activity
         if status.success() {
             let activity = ActivityLogEntry::new(
                 "claude_completed",
