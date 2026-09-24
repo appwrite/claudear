@@ -241,9 +241,16 @@ fn live_qa_directory_prefix(short_id: &str) -> String {
 }
 
 /// Remove a finished live-QA run's directory, warning when some of it remains.
-fn remove_live_qa_directory(directory: tempfile::TempDir) {
+///
+/// A run can leave a large tree behind, so removal runs on the blocking pool
+/// instead of an async worker. Its guard moves there too, so the removal still
+/// finishes if the run's future is dropped while waiting on it.
+async fn remove_live_qa_directory(directory: tempfile::TempDir) {
     let path = directory.path().to_path_buf();
-    if let Err(error) = directory.close() {
+    let removal = tokio::task::spawn_blocking(move || directory.close())
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error)));
+    if let Err(error) = removal {
         tracing::warn!(
             directory = %path.display(),
             error = %error,
@@ -2552,7 +2559,7 @@ impl IssueProcessor {
             ),
         };
         if let Some(directory) = live_qa_directory {
-            remove_live_qa_directory(directory);
+            remove_live_qa_directory(directory).await;
         }
         outcome
     }
@@ -6541,6 +6548,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_deploy_qa_directory_is_removed_when_the_agent_fails() {
+        let fixture = AnsweringFixture::with_agent(AnsweringAgent::failing());
+        let context = RecordingContextProvider::default();
+
+        let error = expect_failed(
+            fixture
+                .run(question_input(DEPLOY_QA_SOURCE), &context)
+                .await,
+        );
+
+        assert!(
+            error.contains(FAILED_ANSWER_ERROR),
+            "the run must fail with the agent's error: {error}"
+        );
+        assert!(
+            context.replies().is_empty(),
+            "a failed run must not post a report"
+        );
+        let directories = fixture.agent.project_dirs();
+        assert_eq!(
+            directories.len(),
+            1,
+            "one run, one agent call: {directories:?}"
+        );
+        assert!(
+            !directories[0].exists(),
+            "a failed run's directory must be removed too: {directories:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_directory_is_removed_when_its_run_is_dropped() {
+        let fixture = AnsweringFixture::with_agent(AnsweringAgent::slow(SLOW_AGENT_RUN));
+        let context = RecordingContextProvider::default();
+
+        tokio::select! {
+            _ = fixture.run(question_input(DEPLOY_QA_SOURCE), &context) => {
+                panic!("the run must still be waiting on its slow agent");
+            }
+            () = fixture.agent.called() => {}
+        }
+
+        let directories = fixture.agent.project_dirs();
+        assert_eq!(
+            directories.len(),
+            1,
+            "one run, one agent call: {directories:?}"
+        );
+        assert!(
+            !directories[0].exists(),
+            "a dropped run's directory must be removed with it: {directories:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_deploy_qa_runs_never_share_a_directory() {
         let fixture = AnsweringFixture::new();
 
@@ -7022,12 +7084,16 @@ mod tests {
         }
     }
 
+    /// Error a [`AnsweringAgent::failing`] agent fails every answer with.
+    const FAILED_ANSWER_ERROR: &str = "the agent CLI crashed";
+
     /// Agent runner whose `answer_question` returns [`QA_REPORT`] after
     /// `delay`, recording every directory it is asked to answer, reply or
     /// verify in, with the context it is given.
     #[derive(Default)]
     struct AnsweringAgent {
         delay: Duration,
+        fails: bool,
         calls: std::sync::Mutex<Vec<AgentCall>>,
     }
 
@@ -7045,6 +7111,14 @@ mod tests {
         fn slow(delay: Duration) -> Self {
             Self {
                 delay,
+                ..Self::default()
+            }
+        }
+
+        /// An agent that fails every answer with [`FAILED_ANSWER_ERROR`].
+        fn failing() -> Self {
+            Self {
+                fails: true,
                 ..Self::default()
             }
         }
@@ -7073,6 +7147,13 @@ mod tests {
 
         fn contexts(&self) -> Vec<String> {
             self.calls().into_iter().map(|call| call.context).collect()
+        }
+
+        /// Resolves once the agent has been asked to do anything.
+        async fn called(&self) {
+            while self.calls().is_empty() {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -7115,6 +7196,9 @@ mod tests {
         ) -> claudear_core::error::Result<String> {
             self.record(project_dir, context);
             tokio::time::sleep(self.delay).await;
+            if self.fails {
+                return Err(claudear_core::error::Error::runner(FAILED_ANSWER_ERROR));
+            }
             Ok(QA_REPORT.to_string())
         }
 
