@@ -3782,7 +3782,20 @@ Create a PR with your changes.{custom_instructions}"#,
         Ok(runs)
     }
 
+    /// Run QA for one dispatched tip unless it is no longer pending: another
+    /// process or path may have started or finished it since it was listed.
     async fn process_deploy_qa_tip(&self, source: Arc<dyn IssueSource>, issue_id: &str) {
+        let still_pending = self
+            .find_deploy_qa_tip(issue_id)
+            .is_some_and(|tip| tip.status == DeployQaTipStatus::Pending);
+        if !still_pending {
+            tracing::info!(
+                component = "deploy_qa",
+                issue_id,
+                "Skipping dispatched deploy_qa tip that is no longer pending"
+            );
+            return;
+        }
         match source.get_issue(issue_id).await {
             Ok(issue) => {
                 let match_result = source.matches_criteria(&issue);
@@ -9276,6 +9289,33 @@ mod tests {
             "a finished tip must not run QA again"
         );
         assert_eq!(harness.stored_status(), DeployQaTipStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn test_dispatched_deploy_qa_tip_finished_elsewhere_is_not_rerun() {
+        let harness = DeployQaHarness::dispatching(test_config());
+        for status in [DeployQaTipStatus::Running, DeployQaTipStatus::Verified] {
+            harness
+                .tracker
+                .update_deploy_qa_tip_status(harness.tip.id, status, None)
+                .unwrap();
+
+            harness
+                .watcher
+                .process_deploy_qa_tip(harness.source.clone(), &harness.tip.issue_id)
+                .await;
+
+            assert_eq!(
+                harness.agent_calls(),
+                0,
+                "a tip that left pending after dispatch listed it must not run QA again"
+            );
+            assert_eq!(
+                harness.stored_status(),
+                status,
+                "a skipped {status} tip must keep its status"
+            );
+        }
     }
 
     #[tokio::test]
