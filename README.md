@@ -742,8 +742,8 @@ tag_filter = "any"                 # any | suffix:-db | not_suffix:-db
 
 On a new tip Claudear:
 
-1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates.
-2. Skips enqueue if a previous attempt on that track is still running. An attempt that ends without a verdict is marked `errored` so it no longer blocks the track.
+1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates. On first enable a track has no last-seen tag, so its current tip counts as new and gets one QA run.
+2. Skips enqueue if a previous attempt on that track is still running. A tip whose attempt ends without a verdict (agent error or timeout) is marked `errored` so it no longer blocks the track, as is a tip left `running` by an interrupted run when the daemon next starts; the retry manager may still retry a failed attempt.
 3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs.
 4. Classifies the agent's report and posts the outcome under the release announcement in Discord `#releases` (the agent never posts itself):
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
@@ -752,7 +752,7 @@ On a new tip Claudear:
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
 
-Required for a live host (not CI): `CLAUDEAR_GITHUB_TOKEN`, Discord bot token with message + create-thread permissions.
+Requires a GitHub token (`scm.github.token` or `CLAUDEAR_GITHUB_TOKEN`) for release polling: config validation rejects an enabled `[deploy_qa]` with tracks but no token. A live host also needs a Discord bot token with message + create-thread permissions.
 
 ### Release Tracking
 
