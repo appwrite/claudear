@@ -144,16 +144,19 @@ pub struct ProviderConfig {
     /// Path to a file containing custom instructions.
     /// Resolved relative to the config file directory.
     pub instructions_file: Option<String>,
-    /// Tool permissions granted without prompting (--allowedTools).
+    /// Tool permissions granted without prompting (--allowedTools) to fix and
+    /// `[deploy_qa]` live-QA runs.
     #[serde(default)]
     pub permissions: Vec<String>,
     /// Tools allowed for read-only Q&A (question) runs, which never skip
-    /// permission prompts. Empty means use the built-in default read-only set
-    /// (Read, Grep, Glob, WebFetch, WebSearch). Set this to add/remove tools
-    /// the agent may use when answering questions without mutating the repo.
+    /// permission prompts, and added to `[deploy_qa]` live-QA runs. Empty means
+    /// use the built-in default read-only set (Read, Grep, Glob, WebFetch,
+    /// WebSearch). Set this to add/remove tools the agent may use when
+    /// answering questions without mutating the repo.
     #[serde(default)]
     pub readonly_tools: Vec<String>,
-    /// Skip all permission prompts (default: false).
+    /// Skip all permission prompts on fix and `[deploy_qa]` live-QA runs
+    /// (default: false). Read-only runs never skip them.
     pub skip_permissions: bool,
     /// CLI binary name/path (e.g., "claude", "codex").
     pub binary: Option<String>,

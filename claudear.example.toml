@@ -121,12 +121,12 @@ instructions_file = "./claude-instructions.md"
 # See: https://docs.anthropic.com/en/docs/claude-code/settings
 # permissions and skip_permissions govern fix runs and [deploy_qa] live QA,
 # which gets them on top of readonly_tools: its shell/curl checks need
-# skip_permissions = true or a Bash(...) entry here.
+# skip_permissions = true or a Bash or Bash(...) entry here.
 permissions = ["Bash(git *)", "Read", "Edit"]
 
 readonly_tools = ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]
 
-# Skip all permission prompts (default: true)
+# Skip all permission prompts (default: false)
 skip_permissions = true
 
 # CLI binary name/path (default: auto-detected, e.g., "claude", "codex")
