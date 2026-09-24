@@ -6915,24 +6915,49 @@ mod tests {
     #[tokio::test]
     async fn test_single_actions_are_refused_for_live_qa_issues() {
         let fixture = AnsweringFixture::new();
+        let issue = live_qa_input_from(TRACKER_SOURCE).issue;
+        fixture
+            .processor
+            .tracker
+            .record_attempt(TRACKER_SOURCE, &issue.id, &issue.short_id)
+            .unwrap();
 
         for action in [ActionKind::Reply, ActionKind::Verify, ActionKind::Resolve] {
             let context = RecordingContextProvider::default();
-            let outcome = fixture
-                .processor
-                .run_single_action(action, live_qa_input_from(TRACKER_SOURCE), &context)
-                .await;
-
-            assert_eq!(
-                expect_failed(outcome),
-                expect_failed(refuse_live_qa_action(action)),
-                "{action} must be refused for a deploy_qa issue"
+            let error = expect_failed(
+                fixture
+                    .processor
+                    .run_single_action(action, live_qa_input_from(TRACKER_SOURCE), &context)
+                    .await,
             );
-            assert!(context.replies().is_empty(), "{action} must post nothing");
+
+            assert!(
+                error.contains(&action.to_string()),
+                "the refusal must name the {action} action: {error}"
+            );
+            assert!(
+                context.replies().is_empty(),
+                "a refused {action} must post nothing"
+            );
         }
         assert!(
             fixture.agent.calls().is_empty(),
             "a refused action must never reach the agent"
+        );
+        let attempt = fixture
+            .processor
+            .tracker
+            .get_attempt(TRACKER_SOURCE, &issue.id)
+            .unwrap()
+            .expect("the attempt must still be recorded");
+        assert_eq!(
+            attempt.status,
+            claudear_core::types::FixAttemptStatus::Pending,
+            "a refused action must leave the attempt untouched"
+        );
+        assert!(
+            !fixture.live_qa_base().exists(),
+            "a refused action must not start a live-QA run"
         );
     }
 
