@@ -7742,8 +7742,17 @@ impl SqliteTracker {
     fn row_to_deploy_qa_tip(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<claudear_core::types::DeployQaTip> {
-        let status_str: String = row.get(8)?;
-        let status = status_str.parse().unwrap_or_default();
+        const STATUS_COLUMN: usize = 8;
+        let status = row
+            .get::<_, String>(STATUS_COLUMN)?
+            .parse::<claudear_core::types::DeployQaTipStatus>()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    STATUS_COLUMN,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?;
         Ok(claudear_core::types::DeployQaTip {
             id: row.get(0)?,
             track: row.get(1)?,
@@ -7883,8 +7892,10 @@ impl SqliteTracker {
             ORDER BY created_at ASC
             "#,
         )?;
-        let rows = stmt.query_map([], Self::row_to_deploy_qa_tip)?;
-        Ok(rows.flatten().collect())
+        let tips = stmt
+            .query_map([], Self::row_to_deploy_qa_tip)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tips)
     }
 
     /// Whether the track has a pending or running attempt.
@@ -11062,6 +11073,30 @@ mod tests {
         assert_eq!(stored.attempt_id, Some(9));
         assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
         assert_eq!(tracker.list_pending_deploy_qa_tips().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_deploy_qa_tip_unknown_status_is_an_error() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let stored = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.0.0"))
+            .unwrap();
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE deploy_qa_tips SET status = 'unrecognised' WHERE id = ?1",
+                params![stored.id],
+            )
+            .unwrap();
+
+        assert!(tracker.get_deploy_qa_tip("cloud", "1.0.0").is_err());
+        assert!(tracker
+            .get_deploy_qa_tip_by_issue_id(&stored.issue_id)
+            .is_err());
+        assert!(tracker.get_last_seen_deploy_qa_tip("cloud").is_err());
     }
 
     #[test]
