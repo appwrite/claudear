@@ -3039,90 +3039,137 @@ mod tests {
         args
     }
 
-    #[cfg(unix)]
-    const FULL_ACCESS_PERMISSIONS: &[&str] = &["Bash(git *)", "Edit"];
-    #[cfg(unix)]
-    const TEST_MODEL: &str = "opus";
-    #[cfg(unix)]
-    const TEST_INSTRUCTIONS: &str = "Follow AGENT.md";
-
     /// A config that grants fix runs full access.
     #[cfg(unix)]
     fn full_access_config() -> ClaudeRunnerConfig {
         ClaudeRunnerConfig {
             skip_permissions: true,
-            permissions: FULL_ACCESS_PERMISSIONS
-                .iter()
-                .map(|permission| permission.to_string())
-                .collect(),
-            model: Some(TEST_MODEL.to_string()),
-            instructions: Some(TEST_INSTRUCTIONS.to_string()),
+            permissions: vec!["Bash(git *)".to_string(), "Edit".to_string()],
+            model: Some("opus".to_string()),
+            instructions: Some("Follow AGENT.md".to_string()),
             ..ClaudeRunnerConfig::default()
         }
     }
 
-    /// The CLI arguments of a run without MCP servers: the fixed stream flags,
-    /// then `flags`, one `--allowedTools` per tool, and `--print`.
+    /// [`full_access_config`] with a browser MCP server for deploy_qa runs and
+    /// a helpdesk one for HelpScout runs.
     #[cfg(unix)]
-    fn expected_cli_args(flags: &[&str], tools: &[&str]) -> Vec<String> {
-        let mut args: Vec<String> = ["--verbose", "--output-format", "stream-json"]
-            .iter()
-            .chain(flags)
-            .map(|arg| arg.to_string())
-            .collect();
-        for tool in tools {
-            args.push("--allowedTools".to_string());
-            args.push(tool.to_string());
+    fn full_access_config_with_mcp_servers() -> ClaudeRunnerConfig {
+        let browser = McpServerConfig {
+            command: Some("npx".to_string()),
+            args: vec!["@playwright/mcp".to_string()],
+            sources: vec![DEPLOY_QA_SOURCE.to_string()],
+            ..Default::default()
+        };
+        let helpdesk = McpServerConfig {
+            command: Some("uvx".to_string()),
+            sources: vec![HELPSCOUT_SOURCE.to_string()],
+            ..Default::default()
+        };
+        ClaudeRunnerConfig {
+            mcp: HashMap::from([
+                ("browser".to_string(), browser),
+                ("helpdesk".to_string(), helpdesk),
+            ]),
+            ..full_access_config()
         }
-        args.push("--print".to_string());
-        args
     }
 
+    /// The rendered MCP config file that `args` pass via `--mcp-config`.
     #[cfg(unix)]
-    fn model_and_instruction_flags() -> Vec<&'static str> {
-        vec![
-            "--model",
-            TEST_MODEL,
-            "--append-system-prompt",
-            TEST_INSTRUCTIONS,
-        ]
+    fn mcp_config_path(args: &[String]) -> String {
+        let path = args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .and_then(|index| args.get(index + 1))
+            .expect("a matched MCP server is passed via --mcp-config")
+            .clone();
+        assert!(path.ends_with(".json"), "got: {path}");
+        path
     }
 
     #[cfg(unix)]
     #[test]
     fn test_run_reply_deploy_qa_gets_fix_run_access_plus_read_only_tools() {
-        let args = reply_cli_args(DEPLOY_QA_SOURCE, full_access_config());
-
-        let mut flags = vec!["--dangerously-skip-permissions"];
-        flags.extend(model_and_instruction_flags());
-        let tools: Vec<&str> = FULL_ACCESS_PERMISSIONS
-            .iter()
-            .chain(DEFAULT_READONLY_TOOLS)
-            .copied()
-            .collect();
-        assert_eq!(args, expected_cli_args(&flags, &tools));
-        assert!(
-            !args.iter().any(|arg| arg == "--json-schema"),
-            "a live QA run returns a plain-text report, not the fix schema"
+        assert_eq!(
+            reply_cli_args(DEPLOY_QA_SOURCE, full_access_config()),
+            [
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--dangerously-skip-permissions",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "Follow AGENT.md",
+                "--allowedTools",
+                "Bash(git *)",
+                "--allowedTools",
+                "Edit",
+                "--allowedTools",
+                "Read",
+                "--allowedTools",
+                "Grep",
+                "--allowedTools",
+                "Glob",
+                "--allowedTools",
+                "WebFetch",
+                "--allowedTools",
+                "WebSearch",
+                "--print",
+            ]
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn test_run_reply_deploy_qa_keeps_read_only_tools_without_fix_access() {
-        let args = reply_cli_args(DEPLOY_QA_SOURCE, ClaudeRunnerConfig::default());
-
-        assert_eq!(args, expected_cli_args(&[], DEFAULT_READONLY_TOOLS));
+        assert_eq!(
+            reply_cli_args(DEPLOY_QA_SOURCE, ClaudeRunnerConfig::default()),
+            [
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--allowedTools",
+                "Read",
+                "--allowedTools",
+                "Grep",
+                "--allowedTools",
+                "Glob",
+                "--allowedTools",
+                "WebFetch",
+                "--allowedTools",
+                "WebSearch",
+                "--print",
+            ]
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn test_run_reply_customer_reply_stays_read_only_under_full_access_config() {
-        let args = reply_cli_args(HELPSCOUT_SOURCE, full_access_config());
-
         assert_eq!(
-            args,
-            expected_cli_args(&model_and_instruction_flags(), DEFAULT_READONLY_TOOLS)
+            reply_cli_args(HELPSCOUT_SOURCE, full_access_config()),
+            [
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "Follow AGENT.md",
+                "--allowedTools",
+                "Read",
+                "--allowedTools",
+                "Grep",
+                "--allowedTools",
+                "Glob",
+                "--allowedTools",
+                "WebFetch",
+                "--allowedTools",
+                "WebSearch",
+                "--print",
+            ]
         );
     }
 
@@ -3140,7 +3187,26 @@ mod tests {
 
         assert_eq!(
             cli.recorded_args(),
-            expected_cli_args(&model_and_instruction_flags(), DEFAULT_READONLY_TOOLS)
+            [
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "Follow AGENT.md",
+                "--allowedTools",
+                "Read",
+                "--allowedTools",
+                "Grep",
+                "--allowedTools",
+                "Glob",
+                "--allowedTools",
+                "WebFetch",
+                "--allowedTools",
+                "WebSearch",
+                "--print",
+            ]
         );
     }
 
@@ -3162,57 +3228,102 @@ mod tests {
         block_on(runner.execute_with_attempt("Fix it", Some(&issue), None, cli.directory()))
             .expect("the stub fix run succeeds");
 
-        let mut flags = vec![
-            "--json-schema",
-            RESULT_SCHEMA,
-            "--dangerously-skip-permissions",
-        ];
-        flags.extend(model_and_instruction_flags());
         assert_eq!(
             cli.recorded_args(),
-            expected_cli_args(&flags, FULL_ACCESS_PERMISSIONS)
+            [
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--json-schema",
+                RESULT_SCHEMA,
+                "--dangerously-skip-permissions",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "Follow AGENT.md",
+                "--allowedTools",
+                "Bash(git *)",
+                "--allowedTools",
+                "Edit",
+                "--print",
+            ]
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_deploy_qa_attaches_its_mcp_servers() {
-        let browser = McpServerConfig {
-            command: Some("npx".to_string()),
-            args: vec!["@playwright/mcp".to_string()],
-            sources: vec![DEPLOY_QA_SOURCE.to_string()],
-            ..Default::default()
-        };
-        let helpdesk = McpServerConfig {
-            command: Some("uvx".to_string()),
-            sources: vec![HELPSCOUT_SOURCE.to_string()],
-            ..Default::default()
-        };
-        let config = ClaudeRunnerConfig {
-            mcp: HashMap::from([
-                ("browser".to_string(), browser),
-                ("helpdesk".to_string(), helpdesk),
-            ]),
-            ..full_access_config()
-        };
+    fn test_run_reply_deploy_qa_attaches_only_its_mcp_servers() {
+        let args = reply_cli_args(DEPLOY_QA_SOURCE, full_access_config_with_mcp_servers());
 
-        let args = reply_cli_args(DEPLOY_QA_SOURCE, config);
-
-        let config_path = args
-            .iter()
-            .position(|arg| arg == "--mcp-config")
-            .and_then(|index| args.get(index + 1))
-            .expect("a matched MCP server is passed via --mcp-config");
-        assert!(config_path.ends_with(".json"), "got: {config_path}");
-        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--allowedTools", "mcp__browser"]),
-            "the deploy_qa MCP server's tools must be allowlisted, got: {args:?}"
+        let config_path = mcp_config_path(&args);
+        assert_eq!(
+            args,
+            [
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--mcp-config",
+                config_path.as_str(),
+                "--strict-mcp-config",
+                "--dangerously-skip-permissions",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "Follow AGENT.md",
+                "--allowedTools",
+                "Bash(git *)",
+                "--allowedTools",
+                "Edit",
+                "--allowedTools",
+                "Read",
+                "--allowedTools",
+                "Grep",
+                "--allowedTools",
+                "Glob",
+                "--allowedTools",
+                "WebFetch",
+                "--allowedTools",
+                "WebSearch",
+                "--allowedTools",
+                "mcp__browser",
+                "--print",
+            ]
         );
-        assert!(
-            !args.iter().any(|arg| arg.starts_with("mcp__helpdesk")),
-            "servers for other sources must stay detached, got: {args:?}"
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_customer_reply_attaches_only_its_mcp_servers() {
+        let args = reply_cli_args(HELPSCOUT_SOURCE, full_access_config_with_mcp_servers());
+
+        let config_path = mcp_config_path(&args);
+        assert_eq!(
+            args,
+            [
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--mcp-config",
+                config_path.as_str(),
+                "--strict-mcp-config",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "Follow AGENT.md",
+                "--allowedTools",
+                "Read",
+                "--allowedTools",
+                "Grep",
+                "--allowedTools",
+                "Glob",
+                "--allowedTools",
+                "WebFetch",
+                "--allowedTools",
+                "WebSearch",
+                "--allowedTools",
+                "mcp__helpdesk",
+                "--print",
+            ]
         );
     }
 
