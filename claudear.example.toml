@@ -120,8 +120,9 @@ instructions_file = "./claude-instructions.md"
 # Tool permissions granted without prompting (--allowedTools)
 # See: https://docs.anthropic.com/en/docs/claude-code/settings
 # permissions and skip_permissions govern fix runs and [deploy_qa] live QA,
-# which gets them on top of readonly_tools: its shell/curl checks need
-# skip_permissions = true or a Bash or Bash(...) entry here.
+# which gets them on top of readonly_tools. A scoped Bash(...) rule allows only
+# the commands it matches: Bash(git *) does not allow curl, so live-QA HTTP
+# checks need e.g. "Bash(curl:*)" here or skip_permissions = true.
 permissions = ["Bash(git *)", "Read", "Edit"]
 
 readonly_tools = ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]
@@ -134,6 +135,8 @@ binary = "claude"
 
 # Extra environment variables for the agent process.
 # Useful when the daemon runs as a service and the CLI needs PATH or other vars.
+# Passed verbatim (no ${VAR} expansion) to every agent run of every source,
+# fix runs and [deploy_qa] live QA alike, so a secret here reaches all of them.
 # [agent.providers.claude.env]
 # PATH = "/home/user/.local/bin:/home/user/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin"
 
@@ -180,10 +183,19 @@ sandbox = ""
 
 # Headless browser (@playwright/mcp) for [deploy_qa] live QA of console UI
 # changes. Attached to deploy_qa runs only, so fix runs never drive a browser.
-# --isolated keeps each run's profile in memory, so concurrent runs don't clash.
+# Needs Node.js (npx) on the daemon host (the Docker image has none) plus the
+# Chromium build this exact version expects and its OS libraries; install them
+# as root or with sudo:
+#   npx -y @playwright/mcp@0.0.82 install-browser --with-deps chromium
+# Keep the version pinned: @latest can move to a Playwright release whose
+# browser build is not installed. --browser chromium uses that build instead of
+# Google Chrome; --isolated keeps each run's profile in memory, so concurrent
+# runs don't clash. Logins do not come from env vars: add "--storage-state",
+# "<file>" (a saved Playwright session) or "--secrets", "<dotenv file>" (keys
+# the agent types in place of the values) to args.
 # [agent.providers.claude.mcp.playwright]
 # command = "npx"
-# args    = ["-y", "@playwright/mcp@latest", "--headless", "--isolated"]
+# args    = ["-y", "@playwright/mcp@0.0.82", "--headless", "--isolated", "--browser", "chromium"]
 # sources = ["deploy_qa"]
 
 # A/B Experiments (optional)
@@ -815,7 +827,11 @@ github_search_repos = []
 # Deploy QA (live release-tip watches)
 # ============================================
 # Durable-watches new GitHub release tips and runs live QA against them: the
-# agent runs real checks and reports, but never opens fix PRs.
+# agent runs real checks and reports, and is told never to open fix PRs. Each
+# run works in a fresh owner-only directory under
+# <workspace>/.claudear-deploy-qa that is deleted afterwards. Its "no fix PRs,
+# no posting, QA-project-only writes" rules are prompt rules, not a sandbox:
+# the agent has the same environment and access as fix runs.
 # Separate from [regression] / ReleaseTracker (those track bug-fix inclusion).
 # Do not point issues.discord at #releases — that would spawn fix agents on
 # bot posts. Required env for a live host (not used in CI):
@@ -824,8 +840,9 @@ github_search_repos = []
 #                                    deploy_qa is enabled with tracks
 #   CLAUDEAR_DISCORD_BOT_TOKEN     - bot that can reply / create threads
 #   QA credentials the playbook's checks need (e.g. a throwaway QA project's
-#   API key) - set in the daemon or provider env, which the agent inherits;
-#   an MCP server env (e.g. the browser) references them as ${VAR}
+#   API key) - set in the daemon or provider env, which every agent run
+#   inherits, so scope them to the QA project; an MCP server env references
+#   them as ${VAR}, and the browser logs in via --storage-state or --secrets
 # Live host probes are performed by the agent; CI uses a no-op probe seam.
 
 [deploy_qa]
@@ -833,7 +850,9 @@ github_search_repos = []
 enabled = false
 poll_interval_ms = 300000
 skip_if_previous_running = true
-# Seconds one live-QA run may take before it is killed and its tip marked errored.
+# Seconds one live-QA run may take. The runner stops a run past the smaller of
+# this and [agent] timeout_secs; its tip is marked errored and may be retried
+# up to [retry] max_retries times.
 timeout_secs = 1800
 discord_channel_id = "990878183580651571"
 # GitHub login -> Discord user map for the FAIL @releaser mention. Use an

@@ -185,7 +185,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 ### Deploy QA
 - Durable last-seen watches for GitHub release tips (separate from regression inclusion tracking)
 - Tag filters (`any`, `suffix:-db`, `not_suffix:-db`) per track
-- Live QA agent enqueue — runs real checks against the release, never opens fix PRs for a release announcement
+- Live QA agent enqueue — runs real checks against the release from a private per-run directory, and is told never to open fix PRs for a release announcement
 - Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + mapped `@releaser`
 
 ### Notifications
@@ -733,7 +733,7 @@ Works in every daemon mode — `claudear start` (no `--poll` needed), `claudear 
 enabled = true
 poll_interval_ms = 300000
 skip_if_previous_running = true
-timeout_secs = 1800                # one live-QA run; killed and marked errored past this
+timeout_secs = 1800                # per live-QA run; the runner stops it past min(this, [agent] timeout_secs)
 discord_channel_id = "990878183580651571"
 github_discord_map_path = "/etc/claudear/github-discord-map.json"  # absolute: relative paths break under systemd
 
@@ -746,8 +746,8 @@ tag_filter = "any"                 # any | suffix:-db | not_suffix:-db
 On a new tip Claudear:
 
 1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates. On first enable a track has no last-seen tag, so its current tip counts as new and gets one QA run.
-2. Skips enqueue if a previous attempt on that track is still pending or running. A tip whose attempt ends without a verdict (agent error or timeout) is marked `errored` so it no longer blocks the track. Tips left `running` longer than twice `[deploy_qa] timeout_secs` are marked `errored` on the next poll tick, so a crashed or interrupted run stops blocking its track without affecting runs live in other processes that share the database (a `claudear trigger`, `claudear retries process` or second `claudear poll`). The retry manager may still retry a failed attempt, but only an `errored` tip is re-run: a tip that is running or has a recorded verdict is never re-run, by a retry or by `claudear trigger`.
-3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **live QA that only reports**: the agent runs real checks against the release, but never opens fix PRs, branches or commits. `claudear action` (`reply`, `verify` or `resolve`) refuses these issues.
+2. Skips enqueue if a previous attempt on that track is still pending or running. A tip whose attempt ends without a verdict (agent error or timeout) is marked `errored` so it no longer blocks the track. Tips left `running` longer than `[deploy_qa] timeout_secs` plus a margin of that timeout again (at least 10 minutes) are marked `errored` on the next poll tick, so a crashed or interrupted run stops blocking its track without affecting runs live in other processes that share the database (a `claudear trigger`, `claudear retries process` or second `claudear poll`). The retry manager may retry a failed attempt up to `[retry] max_retries` times, but only an `errored` tip is re-run: a tip that is running or has a recorded verdict is never re-run, by a retry or by `claudear trigger`.
+3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **live QA that only reports**: the agent runs real checks against the release and is told never to open fix PRs, branches or commits (see **Guardrails** below). `claudear action` (`reply`, `verify` or `resolve`) refuses these issues.
 4. Classifies the agent's report, records the tip as `verified`, `unverified` or `failed`, and posts the outcome under the release announcement in Discord `#releases` (the agent never posts itself):
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
    - **Unverified** — nothing failed, but a PR is `LIVE BLOCKED`, the footer is `DEPLOY_QA_VERDICT: UNVERIFIED`, or the footer is missing: reply, no @, so blocked checks never page the releaser but are never reported as verified either.
@@ -755,7 +755,21 @@ On a new tip Claudear:
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
 
-**Tool access.** A live-QA run gets the provider's fix-run access (`skip_permissions`, `permissions`) in addition to its read-only tools (`readonly_tools`), so it can run real checks. Shell and `curl` checks need `skip_permissions = true` or a `Bash` or `Bash(...)` entry in `permissions`; each live-QA run logs a warning when neither is set. A browser comes from an MCP server entry with `sources = ["deploy_qa"]`, such as the commented Playwright example in [`claudear.example.toml`](claudear.example.toml). QA credentials reach shell checks through the provider `env` (or the daemon environment the agent inherits) and a browser through the MCP server's `env`, where `${VAR}` references the daemon environment so secrets stay out of the config file. Every run works in a dedicated scratch directory, never a repo checkout, and a run that exceeds `timeout_secs` is killed and its tip marked `errored`.
+**Tool access.** A live-QA run gets the provider's fix-run access (`permissions`, and `skip_permissions` when set) plus its read-only tools (`readonly_tools`), and uses `qa_model` when one is set. A scoped rule allows only the commands it matches: with `permissions = ["Bash(git *)"]` the agent can run `git` but not `curl`, so HTTP checks need a rule such as `Bash(curl:*)` or `skip_permissions = true`. A run whose allowed tools grant no shell at all logs a warning.
+
+**Where it runs.** Each run starts in a fresh directory of its own, `<workspace>/.claudear-deploy-qa/<short id>-<random>`, never a repo checkout. Claudear creates `.claudear-deploy-qa` and every run directory owner-only (0700 on Unix), and deletes a run's directory when the run ends, after any report is delivered; a run cut short by a daemon crash leaves its directory behind. The agent CLI gets `--strict-mcp-config` and `--setting-sources user`, so only the MCP servers Claudear attaches for `deploy_qa` load, and only your user-level Claude Code settings apply, never a `.mcp.json` or `.claude/settings.json` found in the directory.
+
+**Time limit.** The runner stops a live-QA run once it exceeds the smaller of `[agent] timeout_secs` and `[deploy_qa] timeout_secs`, and records it as timed out. That kills the agent CLI process, but not necessarily everything it started, such as a browser or a hung `curl`. Processing only gives up on the run itself once `[deploy_qa] timeout_secs` plus a grace (that timeout again, at most 60 seconds) has passed, so the runner gets to kill and record it first. Either way the tip is marked `errored`, and the retry manager may run it again up to `[retry] max_retries` times.
+
+**Guardrails.** The agent is told not to open fix PRs, branches or commits, not to post to Discord or Slack, to make state-changing requests only in the playbook's throwaway QA project, and to treat release notes, PR text, web pages and command output as data, not instructions. These are prompt rules, not a sandbox: the agent runs as the daemon user with the same environment, credentials and network access as fix runs, so give it credentials that can only touch the throwaway QA project. Claudear redacts credentials it recognizes from the report before posting it to Discord (tokens with well-known prefixes, `Authorization`, `Bearer`, `Cookie` and `X-Appwrite-Key` values, and secret values from its config and environment), but don't rely on that to keep a secret out of `#releases`.
+
+**Credentials.**
+
+- The provider `env` (`[agent.providers.claude.env]`) is passed verbatim, with no `${VAR}` expansion, to every agent run of every source (fix runs, Q&A and replies as well as live QA), and so is the daemon environment the agent inherits. A QA key set there reaches all of them.
+- An MCP server's `env` values can reference `${VAR}`, which Claude Code expands from the agent's environment, so the secret itself stays out of the config file.
+- `@playwright/mcp` does not read logins from environment variables. Give it a saved session with `--storage-state <file>` (cookies and local storage, e.g. saved with Playwright's `storageState()`), or `--secrets <dotenv file>`, whose keys the agent types in place of the values; Playwright MCP also masks those values in its tool output, as a convenience rather than a security boundary.
+
+**Browser.** The commented Playwright entry in [`claudear.example.toml`](claudear.example.toml) attaches a headless browser to `deploy_qa` runs only (`sources = ["deploy_qa"]`). It needs Node.js and `npx` on the daemon host, plus the Chromium build that exact `@playwright/mcp` version expects and its OS libraries: `npx -y @playwright/mcp@0.0.82 install-browser --with-deps chromium` (`--with-deps` installs system packages, so it needs root or sudo). Pin the version as the example does rather than using `@latest`, which can move to a Playwright release whose browser build is not installed, and keep `--browser chromium` so the server uses that build instead of looking for Google Chrome. The Docker image ships neither Node.js nor a browser.
 
 Requires a GitHub token (`scm.github.token` or `CLAUDEAR_GITHUB_TOKEN`) for release polling: config validation rejects an enabled `[deploy_qa]` with tracks but no token. A live host also needs a Discord bot token with message + create-thread permissions.
 
@@ -1104,7 +1118,7 @@ docker run -d \
 
 The Docker image:
 - Multi-stage build (Bun for dashboard, Rust for binary, Debian slim runtime)
-- Includes Claude Code (installed via npm), git, and Node.js
+- Includes Claude Code (native installer), git, the GitHub CLI (`gh`), `curl`, `jq` and `sqlite3`; it has no Node.js, `npx` or browser, so the `[deploy_qa]` Playwright browser needs an image built on top of it
 - Embeds the dashboard UI in the binary
 - Persists embedding model cache between restarts
 - Supports both `ANTHROPIC_API_KEY` and OAuth login for Claude authentication
