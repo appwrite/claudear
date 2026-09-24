@@ -45,6 +45,8 @@ type QueuedIssue = (Issue, MatchResult, Option<Intent>);
 /// on (marked handled) instead of re-triggering the fix agent every cycle.
 const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
 
+const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
+
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
@@ -4412,12 +4414,16 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     fn extract_rate_limit_reset_time(error: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        Self::extract_rate_limit_reset_from_resets_at(error)
+        Self::extract_rate_limit_reset_from_resets_at(error, now)
+            .or_else(|| Self::extract_rate_limit_reset_from_usage_limit(error, now))
             .or_else(|| Self::extract_rate_limit_reset_from_banner_utc(error, now))
             .or_else(|| Self::extract_rate_limit_reset_from_retry_after(error, now))
     }
 
-    fn extract_rate_limit_reset_from_resets_at(error: &str) -> Option<DateTime<Utc>> {
+    fn extract_rate_limit_reset_from_resets_at(
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
         let key = "\"resetsAt\"";
         let mut start = 0usize;
 
@@ -4433,12 +4439,40 @@ Create a PR with your changes.{custom_instructions}"#,
                             return Some(parsed.with_timezone(&Utc));
                         }
                     }
+                } else if let Some(reset) = Self::parse_leading_digits(after_colon)
+                    .and_then(|seconds| Self::plausible_rate_limit_reset(seconds, now))
+                {
+                    return Some(reset);
                 }
             }
             start = idx;
         }
 
         None
+    }
+
+    fn extract_rate_limit_reset_from_usage_limit(
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let marker = "usage limit reached|";
+        let lower = error.to_ascii_lowercase();
+        let idx = lower.find(marker)?;
+        let seconds = Self::parse_leading_digits(&lower[idx + marker.len()..])?;
+        Self::plausible_rate_limit_reset(seconds, now)
+    }
+
+    fn plausible_rate_limit_reset(epoch_seconds: i64, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let reset = DateTime::<Utc>::from_timestamp(epoch_seconds, 0)?;
+        let horizon = now + chrono::Duration::days(MAX_RATE_LIMIT_RESET_DAYS_AHEAD);
+        (reset > now && reset <= horizon).then_some(reset)
+    }
+
+    fn parse_leading_digits(text: &str) -> Option<i64> {
+        let end = text
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len());
+        text[..end].parse().ok()
     }
 
     fn extract_rate_limit_reset_from_banner_utc(
@@ -4504,11 +4538,7 @@ Create a PR with your changes.{custom_instructions}"#,
         let idx = lower.find("retry-after")?;
         let tail = &lower[idx + "retry-after".len()..];
         let digits_start = tail.find(|c: char| c.is_ascii_digit())?;
-        let digit_slice = &tail[digits_start..];
-        let digits_end = digit_slice
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(digit_slice.len());
-        let seconds: i64 = digit_slice[..digits_end].parse().ok()?;
+        let seconds = Self::parse_leading_digits(&tail[digits_start..])?;
         if seconds <= 0 {
             return None;
         }
@@ -5185,7 +5215,7 @@ mod tests {
     #[test]
     fn test_extract_rate_limit_reset_from_resets_at_json() {
         let msg = r#"Claude rate limit hit: {"type":"rate_limit_event","resetsAt":"2026-02-23T06:00:00Z"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg).unwrap();
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, Utc::now()).unwrap();
         assert_eq!(parsed.to_rfc3339(), "2026-02-23T06:00:00+00:00");
     }
 
@@ -13506,21 +13536,21 @@ mod tests {
     #[test]
     fn test_extract_rate_limit_reset_from_resets_at_no_key() {
         let msg = "Claude rate limit hit: some error";
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, Utc::now());
         assert!(parsed.is_none());
     }
 
     #[test]
     fn test_extract_rate_limit_reset_from_resets_at_invalid_timestamp() {
         let msg = r#"{"resetsAt": "not-a-valid-date"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, Utc::now());
         assert!(parsed.is_none());
     }
 
     #[test]
     fn test_extract_rate_limit_reset_from_resets_at_empty_key() {
         let msg = r#"{"resetsAt": ""}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, Utc::now());
         assert!(parsed.is_none());
     }
 
@@ -13528,7 +13558,7 @@ mod tests {
     fn test_extract_rate_limit_reset_from_resets_at_multiple_keys() {
         // Multiple occurrences: first invalid, second valid
         let msg = r#"{"resetsAt": "invalid"} and {"resetsAt": "2026-03-01T12:00:00Z"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, Utc::now());
         assert!(parsed.is_some());
         assert_eq!(parsed.unwrap().to_rfc3339(), "2026-03-01T12:00:00+00:00");
     }
@@ -13574,6 +13604,96 @@ mod tests {
         let msg = "Some random error with no rate limit info";
         let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_from_usage_limit_epoch() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "Claude rate limit hit: Claude AI usage limit reached|1790262000";
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-09-24T15:00:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_from_usage_limit_epoch_at_horizon() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-16T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "Claude AI usage limit reached|1790262000";
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-09-24T15:00:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_rejects_past_usage_limit_epoch() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T16:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "Claude rate limit hit: Claude AI usage limit reached|1790262000";
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_rejects_usage_limit_epoch_beyond_horizon() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-16T14:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "Claude rate limit hit: Claude AI usage limit reached|1790262000";
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_rejects_usage_limit_epoch_in_milliseconds() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "Claude rate limit hit: Claude AI usage limit reached|1790262000000";
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_rejects_usage_limit_without_epoch() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "Claude rate limit hit: Claude AI usage limit reached|";
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_from_numeric_resets_at() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-26T07:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = r#"Claude rate limit hit: {"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1772096400}}"#;
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-26T09:00:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_rejects_past_numeric_resets_at() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-26T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = r#"Claude rate limit hit: {"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1772096400}}"#;
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_resets_at_skips_implausible_numeric_value() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-26T07:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = r#"{"resetsAt": 1} and {"resetsAt": 1772096400}"#;
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-26T09:00:00+00:00");
     }
 
     // --- is_rate_limit_paused / clear_rate_limit_pause ---
@@ -13717,6 +13837,27 @@ mod tests {
         // The pause should NOT be lowered below the existing far_future value
         let pauses = watcher.rate_limit_pause_until.read().await;
         assert!(*pauses.get("claude").unwrap() >= far_future);
+    }
+
+    #[tokio::test]
+    async fn test_pause_until_rate_limit_reset_targets_usage_limit_epoch() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+
+        let reset_epoch = (Utc::now() + chrono::Duration::hours(3)).timestamp();
+        let error = format!(
+            "Claude rate limit hit: Claude AI usage limit reached|{}",
+            reset_epoch
+        );
+
+        let result = watcher
+            .pause_until_rate_limit_reset(&test_issue(), &error)
+            .await;
+
+        let expected =
+            DateTime::<Utc>::from_timestamp(reset_epoch, 0).unwrap() + chrono::Duration::minutes(1);
+        assert_eq!(result, Some(expected));
     }
 
     // --- check_releases_and_cascade early returns ---
