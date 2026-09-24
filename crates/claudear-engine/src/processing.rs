@@ -5989,6 +5989,8 @@ mod tests {
 
     const QA_REPORT: &str = "QA report";
 
+    const TRACKER_SOURCE: &str = "linear";
+
     fn answering_processor() -> IssueProcessor {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
@@ -6034,7 +6036,8 @@ mod tests {
     #[tokio::test]
     async fn test_question_answer_posts_reply_for_non_conversational_source() {
         let processor = answering_processor();
-        let input = question_input(DEPLOY_QA_SOURCE);
+        assert!(!processor.config.reply().enabled);
+        let input = question_input(TRACKER_SOURCE);
         let issue_id = input.issue.id.clone();
         let context = RecordingContextProvider::default();
 
@@ -6044,6 +6047,23 @@ mod tests {
             context.replies(),
             vec![(issue_id, QA_REPORT.to_string())],
             "tracker-style sources must receive the answer via post_reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_posts_report_via_post_reply_whatever_the_intent() {
+        let processor = answering_processor();
+        let mut input = question_input(DEPLOY_QA_SOURCE);
+        input.intent = Some(Intent::Fix);
+        let issue_id = input.issue.id.clone();
+        let context = RecordingContextProvider::default();
+
+        assert_completed_no_pr(processor.run(input, &context).await);
+
+        assert_eq!(
+            context.replies(),
+            vec![(issue_id, QA_REPORT.to_string())],
+            "release QA must always take the answer path and report via post_reply"
         );
     }
 
