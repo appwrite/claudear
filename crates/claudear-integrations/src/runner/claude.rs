@@ -36,6 +36,15 @@ const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
 /// Issue source whose ticket system renders reply bodies as HTML, not Markdown.
 const HELPSCOUT_SOURCE: &str = "helpscout";
 
+/// Error for a failed reply run that reported no error message.
+const REPLY_FAILURE_MESSAGE: &str = "Failed to generate reply";
+
+/// Error for a failed live-QA run that reported no error message.
+const LIVE_QA_FAILURE_MESSAGE: &str = "Live QA run failed";
+
+/// Error for a live-QA run that finished without any report text.
+const LIVE_QA_EMPTY_REPORT_MESSAGE: &str = "Live QA run produced no report";
+
 /// Resolve the root directory for execution logs.
 /// Used by both the runner and the API to validate log file paths.
 pub fn resolve_log_root() -> PathBuf {
@@ -169,6 +178,12 @@ enum StreamEvent {
         duration_api_ms: Option<i64>,
         #[serde(default)]
         usage: Option<CliUsage>,
+        /// The session's final answer, or the CLI's own error message when
+        /// `is_error` is set (e.g. a usage-limit notice).
+        #[serde(default)]
+        result: Option<String>,
+        #[serde(default)]
+        is_error: bool,
     },
     /// Structured rate-limit signal from the Claude CLI.
     #[serde(rename = "rate_limit_event")]
@@ -211,10 +226,29 @@ struct ExecutionLogFiles {
     events: PathBuf,
 }
 
+/// The final answer carried by the CLI's terminal `result` event.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct FinalResult {
+    /// The session's last answer, or the CLI's own error message when
+    /// `is_error` is set.
+    text: Option<String>,
+    /// Whether the CLI reported the run as an error.
+    is_error: bool,
+}
+
+/// A finished run: its [`AgentResult`] plus the CLI's [`FinalResult`], which
+/// plain-text runs need but [`AgentResult::output`] does not carry.
+#[derive(Debug)]
+struct RunOutcome {
+    agent: AgentResult,
+    final_result: FinalResult,
+}
+
 /// Aggregated result from parsing the stdout stream.
 #[derive(Debug, Default)]
 struct StdoutParseResult {
     text_output: String,
+    final_result: FinalResult,
     structured_result: Option<serde_json::Value>,
     cost_usd: Option<f64>,
     num_turns: Option<i64>,
@@ -615,6 +649,7 @@ The PR title should include the issue ID: {}
     ) -> Result<AgentResult> {
         self.execute_with_env_and_attempt(prompt, label, env, None, project_dir, true, source)
             .await
+            .map(|outcome| outcome.agent)
     }
 
     /// Run a read-only, schema-constrained query via `--json-schema` and return
@@ -742,7 +777,7 @@ The PR title should include the issue ID: {}
     ) -> Result<VerifyResult> {
         let prompt = build_verify_prompt(issue, context);
         let (env, _) = self.prepare_env_and_label(Some(issue));
-        let result = self
+        let outcome = self
             .execute_with_env_and_attempt(
                 &prompt,
                 &issue.short_id,
@@ -753,12 +788,13 @@ The PR title should include the issue ID: {}
                 Some(issue.source.as_str()),
             )
             .await?;
-        Ok(parse_verify_result(&result.output))
+        Ok(parse_verify_result(&outcome.agent.output))
     }
 
     /// Generate a grounded, human-sounding reply, read-only. `guideline` is an
     /// optional per-inbox style guideline; `kind` selects the framing. Release
-    /// tips from [`DEPLOY_QA_SOURCE`] get a live-QA report instead.
+    /// tips from [`DEPLOY_QA_SOURCE`] get a live-QA report instead: only the
+    /// run's final answer, and an error when the run fails.
     pub async fn run_reply(
         &self,
         issue: &Issue,
@@ -769,7 +805,7 @@ The PR title should include the issue ID: {}
     ) -> Result<String> {
         let prompt = build_reply_prompt(issue, context, guideline, kind);
         let (env, _) = self.prepare_env_and_label(Some(issue));
-        let result = self
+        let outcome = self
             .execute_with_env_and_attempt(
                 &prompt,
                 &issue.short_id,
@@ -780,13 +816,17 @@ The PR title should include the issue ID: {}
                 Some(issue.source.as_str()),
             )
             .await?;
+        if issue.source == DEPLOY_QA_SOURCE {
+            return live_qa_report(outcome);
+        }
+        let result = outcome.agent;
         if result.success || !result.output.trim().is_empty() {
             Ok(result.output)
         } else {
             Err(Error::runner(
                 result
                     .error
-                    .unwrap_or_else(|| "Failed to generate reply".to_string()),
+                    .unwrap_or_else(|| REPLY_FAILURE_MESSAGE.to_string()),
             ))
         }
     }
@@ -891,7 +931,7 @@ The PR title should include the issue ID: {}
         project_dir: &Path,
         structured: bool,
         source: Option<&str>,
-    ) -> Result<AgentResult> {
+    ) -> Result<RunOutcome> {
         // Create execution record for analytics
         let mut execution = AgentExecution::new();
         if let Some(id) = attempt_id {
@@ -1216,6 +1256,7 @@ The PR title should include the issue ID: {}
         let stdout_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let mut text_output = String::new();
+            let mut final_result = FinalResult::default();
             let mut line_number: u64 = 0;
             let mut structured_result: Option<serde_json::Value> = None;
             let mut result_cost_usd: Option<f64> = None;
@@ -1341,7 +1382,13 @@ The PR title should include the issue ID: {}
                             session_id,
                             duration_api_ms,
                             usage,
+                            result: final_text,
+                            is_error,
                         }) => {
+                            final_result = FinalResult {
+                                text: final_text,
+                                is_error,
+                            };
                             if let Some(obj) = structured_output {
                                 structured_result = Some(obj);
                             }
@@ -1455,6 +1502,7 @@ The PR title should include the issue ID: {}
             .await;
             StdoutParseResult {
                 text_output,
+                final_result,
                 structured_result,
                 cost_usd: result_cost_usd,
                 num_turns: result_num_turns,
@@ -1732,20 +1780,23 @@ The PR title should include the issue ID: {}
                 }
 
                 // Return a result indicating timeout
-                return Ok(AgentResult {
-                    success: false,
-                    output: String::new(),
-                    pr_url: None,
-                    changelog: None,
-                    error: Some(format!(
-                        "Process timed out after {} seconds",
-                        self.config.timeout_secs
-                    )),
-                    blocking_question: None,
-                    used_qa_ids: Vec::new(),
-                    confidence: 0,
-                    confidence_reasoning: None,
-                    wrong_repo: None,
+                return Ok(RunOutcome {
+                    agent: AgentResult {
+                        success: false,
+                        output: String::new(),
+                        pr_url: None,
+                        changelog: None,
+                        error: Some(format!(
+                            "Process timed out after {} seconds",
+                            self.config.timeout_secs
+                        )),
+                        blocking_question: None,
+                        used_qa_ids: Vec::new(),
+                        confidence: 0,
+                        confidence_reasoning: None,
+                        wrong_repo: None,
+                    },
+                    final_result: FinalResult::default(),
                 });
             }
             WaitOutcome::EarlyFailure(msg) => {
@@ -1836,6 +1887,7 @@ The PR title should include the issue ID: {}
         };
         let StdoutParseResult {
             text_output,
+            final_result,
             structured_result,
             cost_usd: result_cost_usd,
             num_turns: result_num_turns,
@@ -2076,17 +2128,20 @@ The PR title should include the issue ID: {}
             .await;
         }
 
-        Ok(AgentResult {
-            success: result_success,
-            output: result_output,
-            pr_url,
-            changelog,
-            error: failure_msg,
-            blocking_question,
-            used_qa_ids: Vec::new(),
-            confidence,
-            confidence_reasoning,
-            wrong_repo,
+        Ok(RunOutcome {
+            agent: AgentResult {
+                success: result_success,
+                output: result_output,
+                pr_url,
+                changelog,
+                error: failure_msg,
+                blocking_question,
+                used_qa_ids: Vec::new(),
+                confidence,
+                confidence_reasoning,
+                wrong_repo,
+            },
+            final_result,
         })
     }
 
@@ -2211,6 +2266,7 @@ impl AgentRunner for ClaudeAgentRunner {
             issue.map(|i| i.source.as_str()),
         )
         .await
+        .map(|outcome| outcome.agent)
     }
 
     async fn answer_question(
@@ -2435,6 +2491,46 @@ Write only the QA report."#,
     )
 }
 
+/// The report to classify from a finished live-QA run.
+///
+/// Only the CLI's final answer is returned, so mid-run narration (e.g. a
+/// retried `LIVE FAIL`) is never classified. When the CLI emitted no final
+/// answer (an older CLI, or a stream without a `result` event), the
+/// accumulated assistant text is used instead. A run that failed, or that the
+/// CLI flagged as an error, is an `Err` carrying the CLI's error message and
+/// the runner error, so partial output is never posted as a report and
+/// usage-limit messages still reach rate-limit detection. A final answer the
+/// CLI did not flag is the model's report, not an error message, so it stays
+/// out of the error.
+fn live_qa_report(outcome: RunOutcome) -> Result<String> {
+    let RunOutcome {
+        agent,
+        final_result,
+    } = outcome;
+    let final_text = final_result.text.filter(|text| !text.trim().is_empty());
+
+    if !agent.success || final_result.is_error {
+        let cli_error = final_text.filter(|_| final_result.is_error);
+        let message = [cli_error, agent.error]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(Error::runner(if message.is_empty() {
+            LIVE_QA_FAILURE_MESSAGE.to_string()
+        } else {
+            message
+        }));
+    }
+
+    let report = final_text.unwrap_or(agent.output);
+    if report.trim().is_empty() {
+        return Err(Error::runner(LIVE_QA_EMPTY_REPORT_MESSAGE));
+    }
+    Ok(report)
+}
+
 /// Parse a `VerifyResult` from the agent's output. Tolerant of surrounding prose
 /// and code fences. Conservative: any failure yields `reproduced=false`.
 fn parse_verify_result(output: &str) -> VerifyResult {
@@ -2634,6 +2730,401 @@ mod tests {
                 build_reply_prompt(&deploy_qa, "ctx", None, ReplyKind::Answer),
                 "deploy_qa prompt must not vary with the reply kind ({kind:?})"
             );
+        }
+    }
+
+    const LIVE_QA_NARRATION: &str = "#42 returned 500 — LIVE FAIL, retrying.";
+    const LIVE_QA_FINAL_REPORT: &str =
+        "- #42 fix uploads LIVE PASS\nDEPLOY_QA_VERDICT: ALL_VERIFIED";
+    const USAGE_LIMIT_MESSAGE: &str = "You've hit your limit · resets 3pm (UTC)";
+
+    #[cfg(unix)]
+    fn assistant_text_event(text: &str) -> serde_json::Value {
+        json!({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+    }
+
+    #[cfg(unix)]
+    fn result_event(text: &str, is_error: bool) -> serde_json::Value {
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": is_error,
+            "duration_ms": 61000,
+            "num_turns": 7,
+            "result": text,
+            "session_id": "sess-live-qa",
+            "total_cost_usd": 0.42
+        })
+    }
+
+    /// A stub `claude` binary that drains the prompt from stdin, prints
+    /// `events` as stream-json lines and exits with `exit_code`.
+    #[cfg(unix)]
+    fn fake_cli_script(events: &[serde_json::Value], exit_code: i32) -> String {
+        let lines: Vec<String> = events.iter().map(|event| event.to_string()).collect();
+        format!(
+            "#!/bin/sh\ncat > /dev/null\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
+            lines.join("\n")
+        )
+    }
+
+    /// Run [`ClaudeAgentRunner::run_reply`] for an issue from `source` against a
+    /// stub CLI emitting `events`, with execution logs kept in a temp dir.
+    #[cfg(unix)]
+    fn run_reply_with_fake_cli(
+        source: &str,
+        events: &[serde_json::Value],
+        exit_code: i32,
+    ) -> Result<String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("claude");
+        std::fs::write(&binary, fake_cli_script(events, exit_code)).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let previous_log_dir = std::env::var("CLAUDEAR_LOG_DIR").ok();
+        std::env::set_var("CLAUDEAR_LOG_DIR", directory.path().join("logs"));
+
+        let runner = new_simple(ClaudeRunnerConfig {
+            binary: binary.display().to_string(),
+            ..ClaudeRunnerConfig::default()
+        });
+        let reply = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(runner.run_reply(
+                &deploy_qa_issue(source),
+                "ctx",
+                None,
+                ReplyKind::Answer,
+                directory.path(),
+            ));
+
+        match previous_log_dir {
+            Some(value) => std::env::set_var("CLAUDEAR_LOG_DIR", value),
+            None => std::env::remove_var("CLAUDEAR_LOG_DIR"),
+        }
+        reply
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_deploy_qa_returns_only_the_final_report() {
+        let report = run_reply_with_fake_cli(
+            DEPLOY_QA_SOURCE,
+            &[
+                assistant_text_event(LIVE_QA_NARRATION),
+                assistant_text_event(LIVE_QA_FINAL_REPORT),
+                result_event(LIVE_QA_FINAL_REPORT, false),
+            ],
+            0,
+        )
+        .expect("a successful live QA run yields its report");
+
+        assert_eq!(report, LIVE_QA_FINAL_REPORT);
+        assert_ne!(
+            claudear_analysis::deploy_qa::classify_deploy_qa_verdict(&report),
+            claudear_analysis::deploy_qa::DeployQaVerdict::Fail,
+            "mid-run narration must not turn a passing report into a FAIL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_deploy_qa_failed_run_is_an_error_carrying_the_cli_error() {
+        let error = run_reply_with_fake_cli(
+            DEPLOY_QA_SOURCE,
+            &[
+                assistant_text_event(LIVE_QA_NARRATION),
+                assistant_text_event(USAGE_LIMIT_MESSAGE),
+                result_event(USAGE_LIMIT_MESSAGE, true),
+            ],
+            1,
+        )
+        .expect_err("a failed live QA run must not yield a report")
+        .to_string();
+
+        assert!(
+            error.contains(USAGE_LIMIT_MESSAGE),
+            "error must carry the CLI's message, got: {error}"
+        );
+        assert!(
+            ClaudeAgentRunner::is_rate_limit_error(&error),
+            "usage-limit failures must stay recognisable as rate limits, got: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_deploy_qa_cli_error_with_clean_exit_is_an_error() {
+        let error = run_reply_with_fake_cli(
+            DEPLOY_QA_SOURCE,
+            &[
+                assistant_text_event(LIVE_QA_NARRATION),
+                result_event(USAGE_LIMIT_MESSAGE, true),
+            ],
+            0,
+        )
+        .expect_err("a run the CLI flagged as an error must not yield a report")
+        .to_string();
+
+        assert!(
+            error.contains(USAGE_LIMIT_MESSAGE),
+            "error must carry the CLI's message, got: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_customer_reply_keeps_accumulated_output() {
+        let reply = run_reply_with_fake_cli(
+            "helpscout",
+            &[
+                assistant_text_event("Let me check."),
+                assistant_text_event("Thanks for reaching out!"),
+                result_event("Thanks for reaching out!", false),
+            ],
+            0,
+        )
+        .expect("a successful customer reply run yields its reply");
+
+        assert_eq!(reply, "Let me check.Thanks for reaching out!");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_customer_reply_failed_run_keeps_partial_output() {
+        let reply =
+            run_reply_with_fake_cli("helpscout", &[assistant_text_event("Partial answer")], 1)
+                .expect("customer replies still return partial output from a failed run");
+
+        assert_eq!(reply, "Partial answer");
+    }
+
+    fn reply_outcome(
+        success: bool,
+        output: &str,
+        error: Option<&str>,
+        final_result: FinalResult,
+    ) -> RunOutcome {
+        RunOutcome {
+            agent: AgentResult {
+                success,
+                output: output.to_string(),
+                pr_url: None,
+                changelog: None,
+                error: error.map(str::to_string),
+                blocking_question: None,
+                used_qa_ids: Vec::new(),
+                confidence: 0,
+                confidence_reasoning: None,
+                wrong_repo: None,
+            },
+            final_result,
+        }
+    }
+
+    fn final_answer(text: &str) -> FinalResult {
+        FinalResult {
+            text: Some(text.to_string()),
+            is_error: false,
+        }
+    }
+
+    fn final_error(text: &str) -> FinalResult {
+        FinalResult {
+            text: Some(text.to_string()),
+            is_error: true,
+        }
+    }
+
+    fn narrated_report() -> String {
+        format!("{LIVE_QA_NARRATION}{LIVE_QA_FINAL_REPORT}")
+    }
+
+    #[test]
+    fn test_live_qa_report_is_only_the_final_answer() {
+        let report = live_qa_report(reply_outcome(
+            true,
+            &narrated_report(),
+            None,
+            final_answer(LIVE_QA_FINAL_REPORT),
+        ))
+        .unwrap();
+
+        assert_eq!(report, LIVE_QA_FINAL_REPORT);
+    }
+
+    #[test]
+    fn test_live_qa_report_falls_back_to_accumulated_output_without_a_final_answer() {
+        let report = live_qa_report(reply_outcome(
+            true,
+            &narrated_report(),
+            None,
+            FinalResult::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(report, narrated_report());
+    }
+
+    #[test]
+    fn test_live_qa_report_falls_back_to_accumulated_output_for_a_blank_final_answer() {
+        let report = live_qa_report(reply_outcome(
+            true,
+            &narrated_report(),
+            None,
+            final_answer(" \n "),
+        ))
+        .unwrap();
+
+        assert_eq!(report, narrated_report());
+    }
+
+    #[test]
+    fn test_live_qa_report_failed_run_is_an_error_carrying_the_runner_error() {
+        let runner_error = r#"Claude rate limit hit: {"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":"2026-09-24T15:00:00Z"}}"#;
+
+        let error = live_qa_report(reply_outcome(
+            false,
+            &narrated_report(),
+            Some(runner_error),
+            FinalResult::default(),
+        ))
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(runner_error), "got: {error}");
+        assert!(
+            !error.contains(LIVE_QA_NARRATION),
+            "partial output must not leak into the error, got: {error}"
+        );
+        assert!(ClaudeAgentRunner::is_rate_limit_error(&error));
+    }
+
+    #[test]
+    fn test_live_qa_report_failed_run_puts_the_cli_error_before_the_runner_error() {
+        let error = live_qa_report(reply_outcome(
+            false,
+            &narrated_report(),
+            Some("Process exited with code 1"),
+            final_error(USAGE_LIMIT_MESSAGE),
+        ))
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::Runner(message)
+                if message == &format!("{USAGE_LIMIT_MESSAGE}\nProcess exited with code 1")),
+            "got: {error}"
+        );
+        assert!(ClaudeAgentRunner::is_rate_limit_error(&error.to_string()));
+    }
+
+    #[test]
+    fn test_live_qa_report_cli_error_fails_a_cleanly_exited_run() {
+        let error = live_qa_report(reply_outcome(
+            true,
+            LIVE_QA_NARRATION,
+            None,
+            final_error(USAGE_LIMIT_MESSAGE),
+        ))
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::Runner(message) if message == USAGE_LIMIT_MESSAGE),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_live_qa_report_failed_run_keeps_an_unflagged_final_answer_out_of_the_error() {
+        let prose = "- #7 throttling returns 429 as designed LIVE PASS";
+
+        let error = live_qa_report(reply_outcome(
+            false,
+            prose,
+            Some("Process exited with code 1"),
+            final_answer(prose),
+        ))
+        .unwrap_err()
+        .to_string();
+
+        assert!(!error.contains(prose), "got: {error}");
+        assert!(
+            !ClaudeAgentRunner::is_rate_limit_error(&error),
+            "an unflagged report must not look like a rate limit, got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_live_qa_report_failed_run_without_any_message() {
+        let error = live_qa_report(reply_outcome(false, "", None, FinalResult::default()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(LIVE_QA_FAILURE_MESSAGE), "got: {error}");
+    }
+
+    #[test]
+    fn test_live_qa_report_successful_run_without_report_text_is_an_error() {
+        let error = live_qa_report(reply_outcome(true, " \n", None, FinalResult::default()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(LIVE_QA_EMPTY_REPORT_MESSAGE), "got: {error}");
+    }
+
+    #[test]
+    fn test_parse_cli_result_captures_the_final_answer() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":61000,"duration_api_ms":58000,"num_turns":7,"result":"- #42 fix uploads LIVE PASS\nDEPLOY_QA_VERDICT: ALL_VERIFIED","session_id":"sess-live-qa","total_cost_usd":0.42,"usage":{"input_tokens":12,"output_tokens":340}}"#;
+
+        match serde_json::from_str::<StreamEvent>(line).unwrap() {
+            StreamEvent::Result {
+                result, is_error, ..
+            } => {
+                assert_eq!(result.as_deref(), Some(LIVE_QA_FINAL_REPORT));
+                assert!(!is_error);
+            }
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_result_captures_the_error_flag() {
+        let line = r#"{"type":"result","subtype":"success","is_error":true,"num_turns":3,"result":"Claude AI usage limit reached|1790262000","session_id":"sess-live-qa"}"#;
+
+        match serde_json::from_str::<StreamEvent>(line).unwrap() {
+            StreamEvent::Result {
+                result, is_error, ..
+            } => {
+                assert_eq!(
+                    result.as_deref(),
+                    Some("Claude AI usage limit reached|1790262000")
+                );
+                assert!(is_error);
+            }
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_result_error_subtype_without_result_text() {
+        let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,"session_id":"sess-live-qa"}"#;
+
+        match serde_json::from_str::<StreamEvent>(line).unwrap() {
+            StreamEvent::Result {
+                result,
+                is_error,
+                num_turns,
+                ..
+            } => {
+                assert!(result.is_none());
+                assert!(is_error);
+                assert_eq!(num_turns, Some(30));
+            }
+            other => panic!("Unexpected event: {:?}", other),
         }
     }
 
@@ -3933,6 +4424,7 @@ mod tests {
     fn test_stdout_parse_result_default() {
         let result = StdoutParseResult::default();
         assert!(result.text_output.is_empty());
+        assert_eq!(result.final_result, FinalResult::default());
         assert!(result.structured_result.is_none());
         assert!(result.cost_usd.is_none());
         assert!(result.num_turns.is_none());
@@ -4367,6 +4859,8 @@ mod tests {
                 session_id: Some(ref sid),
                 duration_api_ms: Some(api_ms),
                 usage: Some(ref u),
+                result: None,
+                is_error: false,
             } => {
                 assert_eq!(so["summary"], "all done");
                 assert!((cost - 0.123).abs() < 1e-6);
@@ -4394,6 +4888,8 @@ mod tests {
                 session_id: None,
                 duration_api_ms: None,
                 usage: None,
+                result: None,
+                is_error: false,
             } => {}
             other => panic!("Expected Result with all None, got: {:?}", other),
         }
@@ -5671,6 +6167,10 @@ mod tests {
     fn test_stdout_parse_result_field_assignment() {
         let result = StdoutParseResult {
             text_output: "hello".to_string(),
+            final_result: FinalResult {
+                text: Some("hello".to_string()),
+                is_error: false,
+            },
             structured_result: Some(json!({"summary": "done", "success": true})),
             cost_usd: Some(0.05),
             num_turns: Some(3),
@@ -6364,6 +6864,8 @@ more output"#;
                 session_id,
                 duration_api_ms,
                 usage,
+                result,
+                is_error,
             } => {
                 assert!(structured_output.is_some());
                 assert_eq!(total_cost_usd, Some(0.05));
@@ -6373,6 +6875,8 @@ more output"#;
                 let u = usage.unwrap();
                 assert_eq!(u.input_tokens, Some(100));
                 assert_eq!(u.output_tokens, Some(200));
+                assert!(result.is_none());
+                assert!(!is_error);
             }
             other => panic!("Unexpected event: {:?}", other),
         }
@@ -6390,6 +6894,8 @@ more output"#;
                 session_id,
                 duration_api_ms,
                 usage,
+                result,
+                is_error,
             } => {
                 assert!(structured_output.is_none());
                 assert!(total_cost_usd.is_none());
@@ -6397,6 +6903,8 @@ more output"#;
                 assert!(session_id.is_none());
                 assert!(duration_api_ms.is_none());
                 assert!(usage.is_none());
+                assert!(result.is_none());
+                assert!(!is_error);
             }
             other => panic!("Unexpected event: {:?}", other),
         }
@@ -6873,6 +7381,8 @@ more output"#;
                 num_turns: None,
                 duration_api_ms: None,
                 usage: None,
+                result: None,
+                is_error: false,
             } => {
                 assert_eq!(sid, "sess-xyz");
             }
