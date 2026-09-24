@@ -362,10 +362,13 @@ pub fn build_deploy_qa_source(
         .discord_merged()
         .bot_token
         .map(|token| token.expose().to_string());
+    let environment = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)));
     let discord = claudear_integrations::deploy_qa::try_build_discord(
         bot_token.as_deref(),
         config.deploy_qa.discord_channel_id.as_deref(),
         map,
+        deploy_qa_redactor(config, environment),
     )
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "deploy_qa Discord reporter unavailable; reporting disabled");
@@ -382,6 +385,82 @@ pub fn build_deploy_qa_source(
             None
         }
     }
+}
+
+/// Redactor for live-QA reports. Masks every credential in `config` and the
+/// value of every secret-named variable the agent can read: `environment`
+/// (the daemon's, which the agent inherits), each provider's `env`, and each
+/// MCP server's `env` and `headers`.
+fn deploy_qa_redactor(
+    config: &Config,
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> secret::Redactor {
+    let providers = config.agent.providers.values();
+    let server_variables = providers
+        .clone()
+        .flat_map(|provider| provider.mcp.values())
+        .flat_map(|server| server.env.iter().chain(&server.headers));
+    secret::Redactor::new(configured_secrets(config).map(SecretValue::expose))
+        .with_variables(environment)
+        .with_variables(providers.flat_map(|provider| &provider.env))
+        .with_variables(server_variables)
+}
+
+/// Every credential in `config`: bot, API and auth tokens, webhook URLs and
+/// secrets, passwords, the inline GitHub App key and provider API keys.
+fn configured_secrets(config: &Config) -> impl Iterator<Item = &SecretValue> {
+    let notifiers = &config.notifiers;
+    let discord_source = config.issues.discord.as_ref();
+    let slack_source = config.issues.slack.as_ref();
+    let knowledgebase = config.knowledgebase.discord.as_ref();
+    let github = config.github();
+    let gitlab = config.gitlab();
+    let linear = config.linear();
+    let sentry = config.sentry_config();
+    let helpscout = config.helpscout();
+    [
+        notifiers.discord.bot_token.as_ref(),
+        notifiers.discord.webhook_url.as_ref(),
+        discord_source.and_then(|discord| discord.bot_token.as_ref()),
+        knowledgebase.and_then(|discord| discord.bot_token.as_ref()),
+        notifiers.slack.bot_token.as_ref(),
+        notifiers.slack.webhook_url.as_ref(),
+        slack_source.and_then(|slack| slack.bot_token.as_ref()),
+        slack_source.and_then(|slack| slack.signing_secret.as_ref()),
+        slack_source.and_then(|slack| slack.app_config_token.as_ref()),
+        notifiers.email.smtp_password.as_ref(),
+        notifiers.email.imap_password.as_ref(),
+        notifiers.sms.auth_token.as_ref(),
+        notifiers.push.api_token.as_ref(),
+        notifiers.whatsapp.access_token.as_ref(),
+        notifiers.whatsapp.app_secret.as_ref(),
+        notifiers.whatsapp.webhook_verify_token.as_ref(),
+        notifiers.telegram.bot_token.as_ref(),
+        github.token.as_ref(),
+        github.webhook_secret.as_ref(),
+        github.app.private_key.as_ref(),
+        github.app.webhook_secret.as_ref(),
+        github.app.client_secret.as_ref(),
+        gitlab.and_then(|gitlab| gitlab.token.as_ref()),
+        gitlab.and_then(|gitlab| gitlab.webhook_secret.as_ref()),
+        linear.map(|linear| &linear.api_key),
+        linear.and_then(|linear| linear.webhook_secret.as_ref()),
+        sentry.map(|sentry| &sentry.auth_token),
+        sentry.and_then(|sentry| sentry.client_secret.as_ref()),
+        config.jira().map(|jira| &jira.api_token),
+        helpscout.map(|helpscout| &helpscout.app_id),
+        helpscout.map(|helpscout| &helpscout.app_secret),
+        helpscout.and_then(|helpscout| helpscout.webhook_secret.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(
+        config
+            .agent
+            .providers
+            .values()
+            .filter_map(|provider| provider.api_key.as_ref()),
+    )
 }
 
 fn build_sources(config: &Config) -> Vec<Arc<dyn source::IssueSource>> {
@@ -682,6 +761,71 @@ mod tests {
         assert!(
             source.is_some(),
             "a missing GitHub↔Discord map only disables FAIL @releaser mentions"
+        );
+    }
+
+    #[test]
+    fn deploy_qa_redactor_masks_configured_and_inherited_secrets() {
+        let mut config = deploy_qa_config();
+        config.notifiers.discord.bot_token = Some(SecretValue::new("notifier-discord-bot-token"));
+        config.issues.discord = Some(config::DiscordSourceConfig {
+            bot_token: Some(SecretValue::new("source-discord-bot-token")),
+            ..Default::default()
+        });
+        config.knowledgebase.discord = Some(config::DiscordKnowledgebaseConfig {
+            bot_token: Some(SecretValue::new("knowledgebase-discord-bot-token")),
+            ..Default::default()
+        });
+        config.scm.github.token = Some(SecretValue::new("configured-github-token"));
+        config.issues.linear = Some(config::LinearConfig {
+            api_key: SecretValue::new("configured-linear-api-key"),
+            ..Default::default()
+        });
+        let provider = config.agent.default_provider_config_mut();
+        provider.api_key = Some(SecretValue::new("provider-api-key-value"));
+        provider.env.insert(
+            "APPWRITE_API_KEY".to_string(),
+            "provider-env-api-key".to_string(),
+        );
+        provider.env.insert(
+            "APPWRITE_ENDPOINT".to_string(),
+            "https://cloud.appwrite.io/v1".to_string(),
+        );
+        provider.mcp.insert(
+            "appwrite".to_string(),
+            config::McpServerConfig {
+                headers: std::collections::HashMap::from([(
+                    "Authorization".to_string(),
+                    "mcp-authorization-value".to_string(),
+                )]),
+                ..Default::default()
+            },
+        );
+        let environment = [
+            (
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "inherited-oauth-token".to_string(),
+            ),
+            ("HOME".to_string(), "/home/claudear".to_string()),
+        ];
+        let secrets = [
+            "notifier-discord-bot-token",
+            "source-discord-bot-token",
+            "knowledgebase-discord-bot-token",
+            "configured-github-token",
+            "configured-linear-api-key",
+            "provider-api-key-value",
+            "provider-env-api-key",
+            "mcp-authorization-value",
+            "inherited-oauth-token",
+        ];
+        let kept = "https://cloud.appwrite.io/v1 /home/claudear";
+
+        let redactor = deploy_qa_redactor(&config, environment);
+
+        assert_eq!(
+            redactor.redact(&format!("{} {kept}", secrets.join(" "))),
+            format!("{} {kept}", vec![secret::REDACTED; secrets.len()].join(" "))
         );
     }
 }
