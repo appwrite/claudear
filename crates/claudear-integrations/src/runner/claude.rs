@@ -39,11 +39,8 @@ const HELPSCOUT_SOURCE: &str = "helpscout";
 /// Error for a failed reply run that reported no error message.
 const REPLY_FAILURE_MESSAGE: &str = "Failed to generate reply";
 
-/// Error for a failed live-QA run that reported no error message.
-const LIVE_QA_FAILURE_MESSAGE: &str = "Live QA run failed";
-
-/// Error for a live-QA run that finished without any report text.
-const LIVE_QA_EMPTY_REPORT_MESSAGE: &str = "Live QA run produced no report";
+/// Error for a reply run that finished without any reply text.
+const EMPTY_REPLY_MESSAGE: &str = "Reply run produced no reply";
 
 /// Resolve the root directory for execution logs.
 /// Used by both the runner and the API to validate log file paths.
@@ -790,8 +787,8 @@ The PR title should include the issue ID: {}
 
     /// Generate a grounded, human-sounding reply, read-only. `guideline` is an
     /// optional per-inbox style guideline; `kind` selects the framing. Release
-    /// tips from [`DEPLOY_QA_SOURCE`] get a live-QA report instead: only the
-    /// run's final answer, and an error when the run fails.
+    /// tips from [`DEPLOY_QA_SOURCE`] get a live-QA report instead. Either way
+    /// the result is the run's [`final_reply`].
     pub async fn run_reply(
         &self,
         issue: &Issue,
@@ -813,19 +810,7 @@ The PR title should include the issue ID: {}
                 Some(issue.source.as_str()),
             )
             .await?;
-        if issue.source == DEPLOY_QA_SOURCE {
-            return live_qa_report(outcome);
-        }
-        let result = outcome.agent;
-        if result.success || !result.output.trim().is_empty() {
-            Ok(result.output)
-        } else {
-            Err(Error::runner(
-                result
-                    .error
-                    .unwrap_or_else(|| REPLY_FAILURE_MESSAGE.to_string()),
-            ))
-        }
+        final_reply(outcome)
     }
 
     /// Render matched MCP servers into a private temp file (claudear-mcp-*.json,
@@ -2488,17 +2473,17 @@ Write only the QA report."#,
     )
 }
 
-/// The report to classify from a finished live-QA run.
+/// The reply from a finished reply run.
 ///
-/// Only the CLI's final answer is returned, so mid-run narration (e.g. a
-/// retried `LIVE FAIL`) is never classified. When the CLI emitted no final
-/// answer (an older CLI, or a stream without a `result` event), the
-/// accumulated assistant text is used instead. A run that failed, or that the
-/// CLI flagged as an error, is an `Err` so partial output is never posted as a
-/// report. The error is the runner's, which already carries the CLI's own
+/// Only the CLI's final answer is returned, so mid-run narration ("Let me
+/// check.", a retried `LIVE FAIL`) is never posted or classified. When the CLI
+/// emitted no final answer (an older CLI, or a stream without a `result`
+/// event), the accumulated assistant text is used instead. A run that failed,
+/// or that the CLI flagged as an error, is an `Err` so partial output is never
+/// posted. The error is the runner's, which already carries the CLI's own
 /// error message but never assistant text, so usage limits still reach
 /// rate-limit detection and narration cannot fake one.
-fn live_qa_report(outcome: RunOutcome) -> Result<String> {
+fn final_reply(outcome: RunOutcome) -> Result<String> {
     let RunOutcome {
         agent,
         final_result,
@@ -2510,18 +2495,18 @@ fn live_qa_report(outcome: RunOutcome) -> Result<String> {
             .flatten()
             .map(str::trim)
             .find(|message| !message.is_empty())
-            .unwrap_or(LIVE_QA_FAILURE_MESSAGE);
+            .unwrap_or(REPLY_FAILURE_MESSAGE);
         return Err(Error::runner(message));
     }
 
-    let report = final_result
+    let reply = final_result
         .text
         .filter(|text| !text.trim().is_empty())
         .unwrap_or(agent.output);
-    if report.trim().is_empty() {
-        return Err(Error::runner(LIVE_QA_EMPTY_REPORT_MESSAGE));
+    if reply.trim().is_empty() {
+        return Err(Error::runner(EMPTY_REPLY_MESSAGE));
     }
-    Ok(report)
+    Ok(reply)
 }
 
 /// Parse a `VerifyResult` from the agent's output. Tolerant of surrounding prose
@@ -2881,46 +2866,150 @@ mod tests {
         );
     }
 
+    const REPLY_SOURCES: [&str; 6] = [
+        "helpscout",
+        "linear",
+        "github",
+        "discord",
+        "slack",
+        DEPLOY_QA_SOURCE,
+    ];
+    const REPLY_NARRATION: &str = "Let me check.";
+    const REPLY_FINAL_ANSWER: &str = "Thanks for reaching out!";
     const LEGACY_USAGE_LIMIT_MESSAGE: &str = "Claude AI usage limit reached|1790262000";
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_customer_reply_keeps_accumulated_output() {
+    fn test_run_reply_customer_reply_is_only_the_final_answer() {
         let reply = run_reply_with_fake_cli(
             "helpscout",
             &[
-                assistant_text_event("Let me check."),
-                assistant_text_event("Thanks for reaching out!"),
-                result_event("Thanks for reaching out!", false),
+                assistant_text_event(REPLY_NARRATION),
+                assistant_text_event(REPLY_FINAL_ANSWER),
+                result_event(REPLY_FINAL_ANSWER, false),
             ],
             0,
         )
         .expect("a successful customer reply run yields its reply");
 
-        assert_eq!(reply, "Let me check.Thanks for reaching out!");
+        assert_eq!(reply, REPLY_FINAL_ANSWER);
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_customer_reply_failed_run_keeps_partial_output() {
-        let reply =
-            run_reply_with_fake_cli("helpscout", &[assistant_text_event("Partial answer")], 1)
-                .expect("customer replies still return partial output from a failed run");
+    fn test_run_reply_drops_narration_for_every_source() {
+        for source in REPLY_SOURCES {
+            let reply = run_reply_with_fake_cli(
+                source,
+                &[
+                    assistant_text_event(REPLY_NARRATION),
+                    assistant_text_event("Checking the upload handler now."),
+                    assistant_text_event(REPLY_FINAL_ANSWER),
+                    result_event(REPLY_FINAL_ANSWER, false),
+                ],
+                0,
+            )
+            .unwrap_or_else(|error| panic!("{source} reply run failed: {error}"));
 
-        assert_eq!(reply, "Partial answer");
+            assert_eq!(reply, REPLY_FINAL_ANSWER, "narration leaked for {source}");
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_deploy_qa_narration_about_rate_limits_is_not_a_rate_limit() {
-        let error = run_reply_with_fake_cli(DEPLOY_QA_SOURCE, &rate_limit_narration(), 1)
-            .expect_err("a failed live QA run must not yield a report")
+    fn test_run_reply_falls_back_to_accumulated_output_without_a_result_event() {
+        let reply = run_reply_with_fake_cli(
+            "linear",
+            &[
+                assistant_text_event(REPLY_NARRATION),
+                assistant_text_event(REPLY_FINAL_ANSWER),
+            ],
+            0,
+        )
+        .expect("a successful run without a result event still yields its reply");
+
+        assert_eq!(reply, format!("{REPLY_NARRATION}{REPLY_FINAL_ANSWER}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_failed_run_is_an_error_for_every_source() {
+        for source in REPLY_SOURCES {
+            let error = run_reply_with_fake_cli(
+                source,
+                &[
+                    assistant_text_event(REPLY_NARRATION),
+                    assistant_text_event("Partial answer"),
+                ],
+                1,
+            )
+            .expect_err("a failed reply run must not yield a reply")
             .to_string();
 
-        assert!(
-            !ClaudeAgentRunner::is_rate_limit_error(&error),
-            "assistant narration must not look like a rate limit, got: {error}"
-        );
+            assert!(
+                !error.contains("Partial answer") && !error.contains(REPLY_NARRATION),
+                "partial output leaked into the {source} error: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_failed_run_with_a_final_answer_is_an_error() {
+        let error = run_reply_with_fake_cli(
+            "helpscout",
+            &[
+                assistant_text_event(REPLY_FINAL_ANSWER),
+                result_event(REPLY_FINAL_ANSWER, false),
+            ],
+            1,
+        )
+        .expect_err("a run whose process failed must not yield a reply")
+        .to_string();
+
+        assert!(!error.contains(REPLY_FINAL_ANSWER), "got: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_cli_error_is_an_error_for_every_source() {
+        for source in REPLY_SOURCES {
+            let error = run_reply_with_fake_cli(
+                source,
+                &[
+                    assistant_text_event(REPLY_NARRATION),
+                    result_event(LEGACY_USAGE_LIMIT_MESSAGE, true),
+                ],
+                1,
+            )
+            .expect_err("a run the CLI flagged as an error must not yield a reply")
+            .to_string();
+
+            assert!(
+                error.contains(LEGACY_USAGE_LIMIT_MESSAGE),
+                "{source} error must carry the CLI's message, got: {error}"
+            );
+            assert!(
+                ClaudeAgentRunner::is_rate_limit_error(&error),
+                "{source} usage-limit failures must stay recognisable as rate limits, got: {error}"
+            );
+            assert!(!error.contains(REPLY_NARRATION), "got: {error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_narration_about_rate_limits_is_not_a_rate_limit() {
+        for source in REPLY_SOURCES {
+            let error = run_reply_with_fake_cli(source, &rate_limit_narration(), 1)
+                .expect_err("a failed reply run must not yield a reply")
+                .to_string();
+
+            assert!(
+                !ClaudeAgentRunner::is_rate_limit_error(&error),
+                "{source} narration must not look like a rate limit, got: {error}"
+            );
+        }
     }
 
     fn reply_outcome(
@@ -2965,8 +3054,8 @@ mod tests {
     }
 
     #[test]
-    fn test_live_qa_report_is_only_the_final_answer() {
-        let report = live_qa_report(reply_outcome(
+    fn test_final_reply_is_only_the_final_answer() {
+        let report = final_reply(reply_outcome(
             true,
             &narrated_report(),
             None,
@@ -2978,8 +3067,8 @@ mod tests {
     }
 
     #[test]
-    fn test_live_qa_report_falls_back_to_accumulated_output_without_a_final_answer() {
-        let report = live_qa_report(reply_outcome(
+    fn test_final_reply_falls_back_to_accumulated_output_without_a_final_answer() {
+        let report = final_reply(reply_outcome(
             true,
             &narrated_report(),
             None,
@@ -2991,8 +3080,8 @@ mod tests {
     }
 
     #[test]
-    fn test_live_qa_report_falls_back_to_accumulated_output_for_a_blank_final_answer() {
-        let report = live_qa_report(reply_outcome(
+    fn test_final_reply_falls_back_to_accumulated_output_for_a_blank_final_answer() {
+        let report = final_reply(reply_outcome(
             true,
             &narrated_report(),
             None,
@@ -3004,10 +3093,10 @@ mod tests {
     }
 
     #[test]
-    fn test_live_qa_report_failed_run_is_an_error_carrying_the_runner_error() {
+    fn test_final_reply_failed_run_is_an_error_carrying_the_runner_error() {
         let runner_error = r#"Claude rate limit hit: {"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":"2026-09-24T15:00:00Z"}}"#;
 
-        let error = live_qa_report(reply_outcome(
+        let error = final_reply(reply_outcome(
             false,
             &narrated_report(),
             Some(runner_error),
@@ -3025,10 +3114,10 @@ mod tests {
     }
 
     #[test]
-    fn test_live_qa_report_failed_run_does_not_repeat_the_cli_error_the_runner_error_carries() {
+    fn test_final_reply_failed_run_does_not_repeat_the_cli_error_the_runner_error_carries() {
         let runner_error = format!("Claude rate limit hit: {USAGE_LIMIT_MESSAGE}");
 
-        let error = live_qa_report(reply_outcome(
+        let error = final_reply(reply_outcome(
             false,
             &narrated_report(),
             Some(&runner_error),
@@ -3044,8 +3133,8 @@ mod tests {
     }
 
     #[test]
-    fn test_live_qa_report_failed_run_without_a_runner_error_uses_the_cli_error() {
-        let error = live_qa_report(reply_outcome(
+    fn test_final_reply_failed_run_without_a_runner_error_uses_the_cli_error() {
+        let error = final_reply(reply_outcome(
             false,
             &narrated_report(),
             Some(" \n"),
@@ -3060,8 +3149,8 @@ mod tests {
     }
 
     #[test]
-    fn test_live_qa_report_cli_error_fails_a_cleanly_exited_run() {
-        let error = live_qa_report(reply_outcome(
+    fn test_final_reply_cli_error_fails_a_cleanly_exited_run() {
+        let error = final_reply(reply_outcome(
             true,
             LIVE_QA_NARRATION,
             None,
@@ -3076,10 +3165,10 @@ mod tests {
     }
 
     #[test]
-    fn test_live_qa_report_failed_run_keeps_an_unflagged_final_answer_out_of_the_error() {
+    fn test_final_reply_failed_run_keeps_an_unflagged_final_answer_out_of_the_error() {
         let prose = "- #7 throttling returns 429 as designed LIVE PASS";
 
-        let error = live_qa_report(reply_outcome(
+        let error = final_reply(reply_outcome(
             false,
             prose,
             Some("Process exited with code 1"),
@@ -3096,21 +3185,21 @@ mod tests {
     }
 
     #[test]
-    fn test_live_qa_report_failed_run_without_any_message() {
-        let error = live_qa_report(reply_outcome(false, "", None, FinalResult::default()))
+    fn test_final_reply_failed_run_without_any_message() {
+        let error = final_reply(reply_outcome(false, "", None, FinalResult::default()))
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains(LIVE_QA_FAILURE_MESSAGE), "got: {error}");
+        assert!(error.contains(REPLY_FAILURE_MESSAGE), "got: {error}");
     }
 
     #[test]
-    fn test_live_qa_report_successful_run_without_report_text_is_an_error() {
-        let error = live_qa_report(reply_outcome(true, " \n", None, FinalResult::default()))
+    fn test_final_reply_successful_run_without_report_text_is_an_error() {
+        let error = final_reply(reply_outcome(true, " \n", None, FinalResult::default()))
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains(LIVE_QA_EMPTY_REPORT_MESSAGE), "got: {error}");
+        assert!(error.contains(EMPTY_REPLY_MESSAGE), "got: {error}");
     }
 
     #[test]
