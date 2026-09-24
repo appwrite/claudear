@@ -5227,13 +5227,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_json() {
-        let msg = r#"Claude rate limit hit: {"type":"rate_limit_event","resetsAt":"2026-02-23T06:00:00Z"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, Utc::now()).unwrap();
-        assert_eq!(parsed.to_rfc3339(), "2026-02-23T06:00:00+00:00");
-    }
-
-    #[test]
     fn test_extract_rate_limit_reset_from_banner_utc_same_day() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T04:11:25Z")
             .unwrap()
@@ -9376,10 +9369,13 @@ mod tests {
         format!("Claude AI usage limit reached|{}", reset.timestamp())
     }
 
-    fn rate_limit_event_failure(reset: DateTime<Utc>) -> String {
+    fn rate_limit_event_failure(resets_at: serde_json::Value) -> String {
         format!(
-            r#"Claude rate limit hit: {{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","resetsAt":{}}}}}"#,
-            reset.timestamp()
+            "Claude rate limit hit: {}",
+            json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": { "status": "rejected", "resetsAt": resets_at },
+            })
         )
     }
 
@@ -9392,7 +9388,45 @@ mod tests {
     #[tokio::test]
     async fn test_deploy_qa_rate_limit_event_with_epoch_reset_defers_qa_until_reset() {
         let reset = Utc::now() + chrono::Duration::hours(3);
-        assert_deploy_qa_deferred_until(rate_limit_event_failure(reset), reset).await;
+        assert_deploy_qa_deferred_until(rate_limit_event_failure(json!(reset.timestamp())), reset)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_rfc3339_reset_defers_qa_until_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_deferred_until(rate_limit_event_failure(json!(reset.to_rfc3339())), reset)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_falls_back_to_top_level_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        let failure = format!(
+            "Claude rate limit hit: {}",
+            json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": { "status": "rejected", "resetsAt": "invalid" },
+                "resetsAt": reset.to_rfc3339(),
+            })
+        );
+        assert_deploy_qa_deferred_until(failure, reset).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_invalid_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(json!("not-a-valid-date")))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_empty_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(json!(""))).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_without_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred("Claude rate limit hit: some error".to_string()).await;
     }
 
     #[tokio::test]
@@ -9404,7 +9438,7 @@ mod tests {
     #[tokio::test]
     async fn test_deploy_qa_rate_limit_event_with_elapsed_reset_still_defers_qa() {
         let reset = Utc::now() - chrono::Duration::hours(1);
-        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(reset)).await;
+        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(json!(reset.timestamp()))).await;
     }
 
     #[tokio::test]
@@ -13690,38 +13724,6 @@ mod tests {
         let msg = "Wait 120 seconds";
         let parsed = Watcher::extract_rate_limit_reset_from_retry_after(msg, now);
         assert!(parsed.is_none());
-    }
-
-    // --- Rate limit extraction: resets_at edge cases ---
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_no_key() {
-        let msg = "Claude rate limit hit: some error";
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, Utc::now());
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_invalid_timestamp() {
-        let msg = r#"{"resetsAt": "not-a-valid-date"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, Utc::now());
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_empty_key() {
-        let msg = r#"{"resetsAt": ""}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, Utc::now());
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_multiple_keys() {
-        // Multiple occurrences: first invalid, second valid
-        let msg = r#"{"resetsAt": "invalid"} and {"resetsAt": "2026-03-01T12:00:00Z"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, Utc::now());
-        assert!(parsed.is_some());
-        assert_eq!(parsed.unwrap().to_rfc3339(), "2026-03-01T12:00:00+00:00");
     }
 
     // --- extract_rate_limit_reset_time combined ---
