@@ -1816,6 +1816,24 @@ pub struct ReleaseTracking {
     pub created_at: DateTime<Utc>,
 }
 
+impl ReleaseTracking {
+    /// Create a new release tracking entry.
+    pub fn new(
+        regression_watch_id: i64,
+        release_version: impl Into<String>,
+        release_commit: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: 0,
+            regression_watch_id,
+            release_version: release_version.into(),
+            release_commit: release_commit.into(),
+            released_at: Some(Utc::now()),
+            created_at: Utc::now(),
+        }
+    }
+}
+
 /// Status of a `[deploy_qa]` release-tip attempt.
 ///
 /// Separate from [`RegressionWatchStatus`] — deploy QA tracks live verification
@@ -1830,7 +1848,10 @@ pub enum DeployQaTipStatus {
     Running,
     /// All LIVE-TESTABLE PRs verified (no live failures).
     Verified,
-    /// At least one LIVE-TESTABLE PR failed or was blocked as a fail.
+    /// Nothing failed, but at least one LIVE-TESTABLE PR was blocked or the
+    /// report lacked an all-verified verdict.
+    Unverified,
+    /// At least one LIVE-TESTABLE PR failed.
     Failed,
     /// The observe/report attempt ended without reaching a verdict.
     Errored,
@@ -1842,6 +1863,7 @@ impl std::fmt::Display for DeployQaTipStatus {
             Self::Pending => write!(f, "pending"),
             Self::Running => write!(f, "running"),
             Self::Verified => write!(f, "verified"),
+            Self::Unverified => write!(f, "unverified"),
             Self::Failed => write!(f, "failed"),
             Self::Errored => write!(f, "errored"),
         }
@@ -1851,11 +1873,12 @@ impl std::fmt::Display for DeployQaTipStatus {
 impl std::str::FromStr for DeployQaTipStatus {
     type Err = String;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
             "pending" => Ok(Self::Pending),
             "running" => Ok(Self::Running),
             "verified" => Ok(Self::Verified),
+            "unverified" => Ok(Self::Unverified),
             "failed" => Ok(Self::Failed),
             "errored" => Ok(Self::Errored),
             other => Err(format!("unknown deploy_qa tip status: {other}")),
@@ -1894,7 +1917,7 @@ pub struct DeployQaTip {
     /// Discord `#releases` message this tip replies under.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discord_message_id: Option<String>,
-    /// Discord thread created on FAIL.
+    /// Discord thread under the release message that the FAIL report was posted in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discord_thread_id: Option<String>,
     /// Cached release body for agent context.
@@ -1943,24 +1966,6 @@ impl DeployQaTip {
             release_body: None,
             created_at: String::new(),
             updated_at: String::new(),
-        }
-    }
-}
-
-impl ReleaseTracking {
-    /// Create a new release tracking entry.
-    pub fn new(
-        regression_watch_id: i64,
-        release_version: impl Into<String>,
-        release_commit: impl Into<String>,
-    ) -> Self {
-        Self {
-            id: 0,
-            regression_watch_id,
-            release_version: release_version.into(),
-            release_commit: release_commit.into(),
-            released_at: Some(Utc::now()),
-            created_at: Utc::now(),
         }
     }
 }
@@ -4319,6 +4324,7 @@ mod tests {
             DeployQaTipStatus::Pending,
             DeployQaTipStatus::Running,
             DeployQaTipStatus::Verified,
+            DeployQaTipStatus::Unverified,
             DeployQaTipStatus::Failed,
             DeployQaTipStatus::Errored,
         ];
