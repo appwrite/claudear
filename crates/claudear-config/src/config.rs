@@ -3383,6 +3383,18 @@ impl Config {
             self.deploy_qa.validate()?;
         }
 
+        let has_github_token = self
+            .github()
+            .token
+            .as_ref()
+            .is_some_and(|token| !token.is_empty());
+        if has_deploy_qa && !has_github_token {
+            return Err(Error::config(
+                "deploy_qa requires a GitHub token to poll release tips. \
+                 Set scm.github.token or CLAUDEAR_GITHUB_TOKEN, or disable deploy_qa.",
+            ));
+        }
+
         // Validate TLS config when enabled
         if self.tls.enabled && self.tls.domains.is_empty() {
             return Err(Error::config(
@@ -8152,12 +8164,26 @@ sms_number = "+1111111111"
         }
     }
 
+    fn scm_with_github_token(token: Option<&str>) -> ScmConfig {
+        ScmConfig {
+            github: GitHubConfig {
+                token: token.map(SecretValue::new),
+                ..GitHubConfig::default()
+            },
+            ..ScmConfig::default()
+        }
+    }
+
     #[test]
     fn test_validation_deploy_qa_checked_when_enabled() {
-        let mut config = config_with_linear();
-        config.deploy_qa = deploy_qa_with_tracks(true, &[("cloud", "appwrite")]);
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            deploy_qa: deploy_qa_with_tracks(true, &[("cloud", "appwrite")]),
+            ..config_with_linear()
+        };
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("deploy_qa"), "{error}");
+        assert!(error.contains("'appwrite'"), "{error}");
     }
 
     #[test]
@@ -8170,6 +8196,7 @@ sms_number = "+1111111111"
     #[test]
     fn test_validation_deploy_qa_counts_as_source() {
         let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
             deploy_qa: deploy_qa_with_tracks(true, &[("cloud", "appwrite-labs/cloud")]),
             ..Config::default()
         };
@@ -8179,11 +8206,63 @@ sms_number = "+1111111111"
     #[test]
     fn test_validation_deploy_qa_without_tracks_is_not_a_source() {
         let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
             deploy_qa: deploy_qa_with_tracks(true, &[]),
             ..Config::default()
         };
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("No sources configured"), "{error}");
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_requires_github_token() {
+        for base in [Config::default(), config_with_linear()] {
+            for token in [None, Some("")] {
+                let config = Config {
+                    scm: scm_with_github_token(token),
+                    deploy_qa: deploy_qa_with_tracks(true, &[("cloud", "appwrite-labs/cloud")]),
+                    ..base.clone()
+                };
+                let error = config.validate().unwrap_err().to_string();
+                assert!(error.contains("deploy_qa"), "{token:?}: {error}");
+                assert!(error.contains("GitHub token"), "{token:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_accepts_github_token_from_env() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[deploy_qa]
+enabled = true
+
+[[deploy_qa.tracks]]
+name = "cloud"
+repo = "appwrite-labs/cloud"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[], || {
+            let config = Config::load(file.path()).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("GitHub token"), "{error}");
+        });
+        with_env(&[("CLAUDEAR_GITHUB_TOKEN", "env_token")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(config.validate().is_ok());
+        });
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_without_tracks_needs_no_github_token() {
+        let config = Config {
+            scm: scm_with_github_token(None),
+            deploy_qa: deploy_qa_with_tracks(true, &[]),
+            ..config_with_linear()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

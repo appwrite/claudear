@@ -807,7 +807,9 @@ github_search_repos = []
 # Separate from [regression] / ReleaseTracker (those track bug-fix inclusion).
 # Do not point issues.discord at #releases — that would spawn fix agents on
 # bot posts. Required env for a live host (not used in CI):
-#   CLAUDEAR_GITHUB_TOKEN          - GitHub token for release/tag polling
+#   CLAUDEAR_GITHUB_TOKEN          - GitHub token for release/tag polling;
+#                                    required (or scm.github.token) whenever
+#                                    deploy_qa is enabled with tracks
 #   CLAUDEAR_DISCORD_BOT_TOKEN     - bot that can reply / create threads
 # Live host probes are performed by the agent; CI uses a no-op probe seam.
 
