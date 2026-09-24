@@ -3449,7 +3449,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("  Poll interval: {}ms", poll_interval);
         }
 
-        // Start regression monitoring background task
         let regression_handle = start_regression_monitoring(
             &config,
             tracker.clone(),
@@ -3507,13 +3506,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             tracker_for_shutdown.record_activity(&activity).ok();
         };
 
-        // Abort regression monitoring on shutdown
-        let regression_shutdown = {
-            let handle = regression_handle;
-            async move {
-                if let Some(h) = handle {
-                    h.abort();
-                }
+        let monitoring_shutdown = async move {
+            for handle in [regression_handle, deploy_qa_handle].into_iter().flatten() {
+                handle.abort();
             }
         };
 
@@ -3605,10 +3600,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     tracing::error!("Polling error: {}", e);
                 }
             }
-            _ = shutdown => {
-                // Stop regression monitoring
-                regression_shutdown.await;
-            }
+            _ = shutdown => monitoring_shutdown.await,
         }
 
         return Ok(());
@@ -4207,7 +4199,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             server.set_discord_search_service(deps.discord_search_service);
             server.set_review_watcher(deps.review_watcher);
 
-            // Start regression monitoring background task
             let regression_handle = start_regression_monitoring(
                 &config,
                 tracker.clone(),
@@ -4217,10 +4208,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             if regression_handle.is_some() {
                 tracing::info!("Regression monitoring: enabled");
             }
-            let _deploy_qa_handle =
+            let deploy_qa_handle =
                 start_deploy_qa_monitoring(&config, tracker.clone(), watcher.clone());
 
-            // Handle shutdown signals
             let watcher_for_shutdown = watcher.clone();
             let shutdown = async move {
                 tokio::signal::ctrl_c()
@@ -4234,8 +4224,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         std::process::exit(130);
                     }
                 }
-                if let Some(h) = regression_handle {
-                    h.abort();
+                for handle in [regression_handle, deploy_qa_handle].into_iter().flatten() {
+                    handle.abort();
                 }
             };
 
