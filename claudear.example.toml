@@ -822,6 +822,7 @@ github_discord_map_path = "github-discord-map.json"
 # Optional; bundled playbooks/deploy_qa.md is used when unset.
 instructions_path = "playbooks/deploy_qa.md"
 
+# Track names must be unique and must not contain ':'; repo is owner/name.
 [[deploy_qa.tracks]]
 name = "cloud"
 repo = "appwrite-labs/cloud"

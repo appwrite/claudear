@@ -160,7 +160,7 @@ mod tests {
         let sqlite = SqliteTracker::in_memory().unwrap();
         let mut pending = DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.0.0");
         pending.release_body = Some("Adds #1".into());
-        sqlite.upsert_deploy_qa_tip(&pending).unwrap();
+        let stored = sqlite.upsert_deploy_qa_tip(&pending).unwrap();
 
         let mut running = DeployQaTip::new("cloud", "appwrite-labs/cloud", "0.9.0");
         running.status = DeployQaTipStatus::Running;
@@ -170,7 +170,7 @@ mod tests {
         let source = DeployQaSource::new(DeployQaConfig::default(), store, None).unwrap();
         let issues = source.fetch_issues().await.unwrap();
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].id, "appwrite-labs/cloud:1.0.0");
+        assert_eq!(issues[0].id, stored.issue_id);
         assert_eq!(issues[0].source, DEPLOY_QA_SOURCE);
         assert!(source.matches_criteria(&issues[0]).matches);
         let ctx = source.build_issue_context(&issues[0]).await.unwrap();

@@ -1749,7 +1749,7 @@ pub trait DeployQaStore: Send + Sync {
         Ok(None)
     }
 
-    /// Fetch a tip by synthetic issue id (`repo:tag`).
+    /// Fetch a tip by its unique synthetic issue id (`track:repo:tag`).
     fn get_deploy_qa_tip_by_issue_id(&self, _issue_id: &str) -> Result<Option<DeployQaTip>> {
         Ok(None)
     }

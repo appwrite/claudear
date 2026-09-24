@@ -7828,7 +7828,7 @@ impl SqliteTracker {
             .optional()?)
     }
 
-    /// Fetch a deploy-QA tip by synthetic issue id.
+    /// Fetch a deploy-QA tip by its unique synthetic issue id (`track:repo:tag`).
     pub fn get_deploy_qa_tip_by_issue_id(
         &self,
         issue_id: &str,
@@ -7841,8 +7841,6 @@ impl SqliteTracker {
                    created_at, updated_at
             FROM deploy_qa_tips
             WHERE issue_id = ?1
-            ORDER BY created_at DESC
-            LIMIT 1
             "#,
         )?;
         Ok(stmt
@@ -11064,6 +11062,19 @@ mod tests {
         assert_eq!(stored.attempt_id, Some(9));
         assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
         assert_eq!(tracker.list_pending_deploy_qa_tips().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_deploy_qa_tip_issue_id_is_unique() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let first = DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.0.0");
+        tracker.upsert_deploy_qa_tip(&first).unwrap();
+
+        let mut colliding = DeployQaTip::new("cloud", "appwrite-labs/cloud", "2.0.0");
+        colliding.issue_id = first.issue_id.clone();
+        assert!(tracker.upsert_deploy_qa_tip(&colliding).is_err());
     }
 
     #[test]

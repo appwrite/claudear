@@ -32,11 +32,6 @@ pub struct ReleaseTip {
 }
 
 impl ReleaseTip {
-    /// Synthetic issue id (`repo:tag`).
-    pub fn issue_id(&self) -> String {
-        format!("{}:{}", self.repo, self.tag)
-    }
-
     fn from_release(repo: &str, release: GitHubRelease) -> Self {
         Self {
             repo: repo.to_string(),
@@ -241,7 +236,7 @@ pub fn build_deploy_qa_issue(
     playbook: &str,
     config: &DeployQaConfig,
 ) -> Issue {
-    let issue_id = tip.issue_id();
+    let issue_id = DeployQaTip::issue_id_for(&track.name, &tip.repo, &tip.tag);
     let title = format!(
         "[deploy_qa] {} {} — live QA (observe/report only)",
         track.name, tip.tag
@@ -424,34 +419,46 @@ mod tests {
         assert!(!net.matches("1.0.0-db"));
     }
 
+    fn release_tip(repo: &str, tag: &str, body: &str) -> ReleaseTip {
+        ReleaseTip {
+            repo: repo.into(),
+            tag: tag.into(),
+            name: Some(tag.into()),
+            body: Some(body.into()),
+            published_at: Some("2026-09-23T01:00:00Z".into()),
+            html_url: format!("https://github.com/{repo}/releases/tag/{tag}"),
+            author_login: Some("abnegate".into()),
+        }
+    }
+
     #[test]
     fn issue_is_observe_only_and_not_a_fix() {
-        let track = track(
-            "edge-db",
-            "appwrite-labs/edge",
-            DeployQaTagFilter::Suffix("-db".into()),
-        );
-        let tip = ReleaseTip {
-            repo: "appwrite-labs/edge".into(),
-            tag: "1.2.3-db".into(),
-            name: Some("1.2.3-db".into()),
-            body: Some("Adds #99".into()),
-            published_at: Some("2026-09-23T01:00:00Z".into()),
-            html_url: "https://github.com/appwrite-labs/edge/releases/tag/1.2.3-db".into(),
-            author_login: Some("abnegate".into()),
-        };
+        let repo = "appwrite-labs/edge";
+        let db = track("edge-db", repo, DeployQaTagFilter::Any);
+        let network = track("edge-network", repo, DeployQaTagFilter::Any);
+        let tip = release_tip(repo, "1.2.3", "Adds #99");
+
         let issue =
-            build_deploy_qa_issue(&track, &tip, bundled_playbook(), &DeployQaConfig::default());
+            build_deploy_qa_issue(&db, &tip, bundled_playbook(), &DeployQaConfig::default());
         assert_eq!(issue.source, DEPLOY_QA_SOURCE);
-        assert_eq!(issue.id, "appwrite-labs/edge:1.2.3-db");
-        assert_eq!(
-            issue.get_metadata::<String>("routing_intent").unwrap(),
-            "QA"
+        assert_eq!(issue.get_metadata::<bool>("observe_only"), Some(true));
+        assert!(issue
+            .description
+            .as_deref()
+            .unwrap()
+            .contains(tip.body.as_deref().unwrap()));
+
+        let again =
+            build_deploy_qa_issue(&db, &tip, bundled_playbook(), &DeployQaConfig::default());
+        assert_eq!(issue.id, again.id);
+
+        let other_track = build_deploy_qa_issue(
+            &network,
+            &tip,
+            bundled_playbook(),
+            &DeployQaConfig::default(),
         );
-        assert!(issue.get_metadata::<bool>("observe_only").unwrap());
-        let desc = issue.description.unwrap();
-        assert!(desc.contains("Do **not** open a fix PR"));
-        assert!(desc.contains("Adds #99"));
+        assert_ne!(issue.id, other_track.id);
     }
 
     #[tokio::test]
@@ -575,5 +582,39 @@ mod tests {
                 .tag,
             "v0.4.0"
         );
+    }
+
+    #[tokio::test]
+    async fn overlapping_tracks_on_same_repo_get_distinct_issue_ids() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let first = track("cloud-a", "appwrite-labs/cloud", DeployQaTagFilter::Any);
+        let second = track("cloud-b", "appwrite-labs/cloud", DeployQaTagFilter::Any);
+        let cfg = config(vec![first.clone(), second.clone()], true);
+        let body = format!("[{}]", release_json("1.0.0", ""));
+        let http = MapMockHttp::new().on(
+            "https://api.github.com/repos/appwrite-labs/cloud/releases",
+            200,
+            &body,
+        );
+        let tracker = poller(http, store.clone(), cfg);
+
+        let mut ids = Vec::new();
+        for track in [&first, &second] {
+            let result = tracker.poll_track(track).await.unwrap();
+            assert_eq!(
+                result.action,
+                DeployQaPollAction::Enqueued,
+                "{}",
+                track.name
+            );
+            let issue = result.issue.unwrap();
+            let stored = store
+                .get_deploy_qa_tip_by_issue_id(&issue.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.track, track.name);
+            ids.push(issue.id);
+        }
+        assert_ne!(ids[0], ids[1]);
     }
 }

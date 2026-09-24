@@ -1874,7 +1874,8 @@ pub struct DeployQaTip {
     pub repo: String,
     /// Release tag.
     pub tag: String,
-    /// Synthetic issue id (`repo:tag`) used when enqueueing the agent.
+    /// Synthetic issue id (`track:repo:tag`, see [`DeployQaTip::issue_id_for`])
+    /// used when enqueueing the agent. Unique per `(track, tag)`.
     pub issue_id: String,
     /// GitHub `published_at` (RFC3339) when known.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1906,12 +1907,26 @@ pub struct DeployQaTip {
 }
 
 impl DeployQaTip {
+    /// Separator between the parts of a synthetic issue id.
+    ///
+    /// Track names must never contain it, so a `track:repo:tag` id maps back to
+    /// exactly one `(track, tag)` row.
+    pub const ISSUE_ID_SEPARATOR: &str = ":";
+
+    /// Synthetic issue id for a tip: `track:repo:tag`.
+    ///
+    /// Scoped to the track so overlapping tracks on the same repo and tag each
+    /// get their own id, matching the `(track, tag)` uniqueness of stored tips.
+    pub fn issue_id_for(track: &str, repo: &str, tag: &str) -> String {
+        [track, repo, tag].join(Self::ISSUE_ID_SEPARATOR)
+    }
+
     /// Build a pending tip for `track` / `repo` / `tag`.
     pub fn new(track: impl Into<String>, repo: impl Into<String>, tag: impl Into<String>) -> Self {
         let track = track.into();
         let repo = repo.into();
         let tag = tag.into();
-        let issue_id = format!("{repo}:{tag}");
+        let issue_id = Self::issue_id_for(&track, &repo, &tag);
         Self {
             id: 0,
             track,

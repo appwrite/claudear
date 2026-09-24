@@ -1,5 +1,6 @@
 -- Live deploy-QA tips (distinct from regression_watches).
 -- One row per (track, tag). Last-seen is the newest row per track.
+-- issue_id is `track:repo:tag` (track names never contain ':'), so it is unique per (track, tag).
 
 CREATE TABLE IF NOT EXISTS deploy_qa_tips (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,7 +24,7 @@ CREATE TABLE IF NOT EXISTS deploy_qa_tips (
 CREATE INDEX IF NOT EXISTS idx_deploy_qa_tips_track_status
     ON deploy_qa_tips (track, status);
 
-CREATE INDEX IF NOT EXISTS idx_deploy_qa_tips_issue_id
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deploy_qa_tips_issue_id
     ON deploy_qa_tips (issue_id);
 
 CREATE INDEX IF NOT EXISTS idx_deploy_qa_tips_track_created

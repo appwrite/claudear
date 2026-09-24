@@ -5,6 +5,7 @@
 
 use claudear_core::error::{Error, Result};
 use claudear_core::secret::SecretValue;
+use claudear_core::types::DeployQaTip;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::env;
 use std::fs;
@@ -2189,6 +2190,44 @@ impl DeployQaConfig {
     pub fn effective_poll_interval_ms(&self) -> u64 {
         self.poll_interval_ms.max(1)
     }
+
+    /// Validate `[[deploy_qa.tracks]]`.
+    ///
+    /// Track names must be non-empty, unique, and free of
+    /// [`DeployQaTip::ISSUE_ID_SEPARATOR`] so every synthetic `track:repo:tag`
+    /// issue id maps back to exactly one `(track, tag)`. Repos must be in
+    /// `owner/name` form.
+    pub fn validate(&self) -> Result<()> {
+        let separator = DeployQaTip::ISSUE_ID_SEPARATOR;
+        let mut names = std::collections::HashSet::with_capacity(self.tracks.len());
+        for (index, track) in self.tracks.iter().enumerate() {
+            let name = track.name.as_str();
+            if name.trim().is_empty() {
+                return Err(Error::config(format!(
+                    "deploy_qa.tracks[{index}] (repo '{}') must have a non-empty name",
+                    track.repo
+                )));
+            }
+            if name.contains(separator) {
+                return Err(Error::config(format!(
+                    "deploy_qa track '{name}' must not contain '{separator}' in its name"
+                )));
+            }
+            if !names.insert(name) {
+                return Err(Error::config(format!(
+                    "deploy_qa track name '{name}' is used by more than one track"
+                )));
+            }
+            let (owner, repository) = track.repo.split_once('/').unwrap_or_default();
+            if owner.is_empty() || repository.is_empty() || repository.contains('/') {
+                return Err(Error::config(format!(
+                    "deploy_qa track '{name}' repo '{}' must be in owner/name form",
+                    track.repo
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for DeployQaConfig {
@@ -3290,10 +3329,18 @@ impl Config {
             .discord
             .as_ref()
             .is_some_and(|s| s.bot_token.is_some());
+        let has_deploy_qa = self.deploy_qa.enabled && !self.deploy_qa.tracks.is_empty();
 
-        if !has_linear && !has_sentry && !has_jira && !has_gitlab && !has_slack && !has_discord {
+        if !has_linear
+            && !has_sentry
+            && !has_jira
+            && !has_gitlab
+            && !has_slack
+            && !has_discord
+            && !has_deploy_qa
+        {
             return Err(Error::config(
-                "No sources configured. Configure linear, sentry, jira, gitlab, slack, or discord in config file with valid API credentials.",
+                "No sources configured. Configure linear, sentry, jira, gitlab, slack, discord, or deploy_qa tracks in config file with valid API credentials.",
             ));
         }
 
@@ -3333,6 +3380,10 @@ impl Config {
         // Validate prioritisation config only when engine is enabled
         if self.prioritisation.enabled {
             self.prioritisation.validate()?;
+        }
+
+        if self.deploy_qa.enabled {
+            self.deploy_qa.validate()?;
         }
 
         // Validate TLS config when enabled
@@ -8024,6 +8075,113 @@ sms_number = "+1111111111"
         config.prioritisation.enabled = true;
         config.prioritisation.severity_weight = -1.0;
         assert!(config.validate().is_err());
+    }
+
+    fn deploy_qa_with_tracks(enabled: bool, tracks: &[(&str, &str)]) -> DeployQaConfig {
+        DeployQaConfig {
+            enabled,
+            tracks: tracks
+                .iter()
+                .map(|(name, repo)| DeployQaTrackConfig {
+                    name: name.to_string(),
+                    repo: repo.to_string(),
+                    tag_filter: DeployQaTagFilter::Any,
+                })
+                .collect(),
+            ..DeployQaConfig::default()
+        }
+    }
+
+    fn config_with_linear() -> Config {
+        let mut config = Config::default();
+        config.issues.linear = Some(LinearConfig {
+            enabled: true,
+            api_key: SecretValue::new("key"),
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_accepts_distinct_tracks() {
+        let config = deploy_qa_with_tracks(
+            true,
+            &[
+                ("edge-db", "appwrite-labs/edge"),
+                ("edge-network", "appwrite-labs/edge"),
+                ("vibes", "appwrite/vibes"),
+            ],
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_duplicate_names() {
+        let config = deploy_qa_with_tracks(
+            true,
+            &[
+                ("cloud", "appwrite-labs/cloud"),
+                ("cloud", "appwrite/vibes"),
+            ],
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("'cloud'"), "{error}");
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_empty_names() {
+        for name in ["", "   "] {
+            let config = deploy_qa_with_tracks(true, &[(name, "appwrite-labs/cloud")]);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("appwrite-labs/cloud"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_separator_in_name() {
+        let name = format!("cloud{}prod", DeployQaTip::ISSUE_ID_SEPARATOR);
+        let config = deploy_qa_with_tracks(true, &[(&name, "appwrite-labs/cloud")]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains(&name), "{error}");
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_malformed_repos() {
+        for repo in ["appwrite", "a/", "/b", "a/b/c", ""] {
+            let config = deploy_qa_with_tracks(true, &[("cloud", repo)]);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("'cloud'"), "{repo}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_checked_when_enabled() {
+        let mut config = config_with_linear();
+        config.deploy_qa = deploy_qa_with_tracks(true, &[("cloud", "appwrite")]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("deploy_qa"), "{error}");
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_skipped_when_disabled() {
+        let mut config = config_with_linear();
+        config.deploy_qa = deploy_qa_with_tracks(false, &[("", "appwrite")]);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_counts_as_source() {
+        let mut config = Config::default();
+        config.deploy_qa = deploy_qa_with_tracks(true, &[("cloud", "appwrite-labs/cloud")]);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_without_tracks_is_not_a_source() {
+        let mut config = Config::default();
+        config.deploy_qa = deploy_qa_with_tracks(true, &[]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("No sources configured"), "{error}");
     }
 
     #[test]

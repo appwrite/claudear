@@ -744,7 +744,7 @@ On a new tip Claudear:
 
 1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates.
 2. Skips enqueue if a previous attempt on that track is still running.
-3. Enqueues a synthetic `deploy_qa` issue (`repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs.
+3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs.
 4. Posts to Discord `#releases`: all-verified reply (no @), or a FAIL thread that `@`s the releaser via `github-discord-map.json`.
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
