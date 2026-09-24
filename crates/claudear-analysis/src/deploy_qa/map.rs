@@ -56,13 +56,6 @@ impl GitHubDiscordMap {
             .get(github_login)
             .map(|user| format!("<@{}>", user.discord_user_id))
     }
-
-    /// Discord user id for a GitHub login, if mapped.
-    pub fn discord_user_id_for(&self, github_login: &str) -> Option<&str> {
-        self.by_github_login
-            .get(github_login)
-            .map(|user| user.discord_user_id.as_str())
-    }
 }
 
 #[cfg(test)]

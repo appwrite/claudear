@@ -25,8 +25,8 @@ use claudear::{
     runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
     source::{
-        DeployQaSource, DiscordSource, HelpScoutSource, IssueSource, JiraSource, LinearSource,
-        SentrySource, SlackSource, TelegramSource, WhatsAppSource,
+        DiscordSource, HelpScoutSource, IssueSource, JiraSource, LinearSource, SentrySource,
+        SlackSource, TelegramSource, WhatsAppSource,
     },
     storage::{
         ActivityStore, EmbeddingStore, FixAttemptTracker, RepoStore, SqliteTracker, UserStore,
@@ -1136,63 +1136,11 @@ fn create_sources(
         }
     }
 
-    if config.deploy_qa.enabled {
-        match attach_deploy_qa_source(config, tracker.clone()) {
-            Some(source) => {
-                sources.push(source);
-                tracing::info!("Deploy QA source initialized (observe/report only)");
-            }
-            None => {
-                tracing::warn!("[deploy_qa] enabled but source could not be initialized");
-            }
-        }
+    if let Some(source) = claudear::build_deploy_qa_source(config, tracker.clone()) {
+        sources.push(source);
     }
 
     sources.into_iter().map(InstrumentedSource::wrap).collect()
-}
-
-/// Build the synthetic `deploy_qa` issue source when config is valid.
-fn attach_deploy_qa_source(
-    config: &Config,
-    tracker: Arc<dyn FixAttemptTracker>,
-) -> Option<Arc<dyn IssueSource>> {
-    let map = config
-        .deploy_qa
-        .github_discord_map_path
-        .as_ref()
-        .and_then(|path| match claudear::deploy_qa::GitHubDiscordMap::load_from_path(path) {
-            Ok(map) => Some(map),
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to load github-discord map; FAIL @releaser disabled");
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    let bot_token = config
-        .discord_merged()
-        .bot_token
-        .as_ref()
-        .map(|t| t.expose().to_string());
-    let discord = match claudear::try_build_discord(
-        bot_token.as_deref(),
-        config.deploy_qa.discord_channel_id.as_deref(),
-        map,
-    ) {
-        Ok(client) => client,
-        Err(e) => {
-            tracing::warn!(error = %e, "deploy_qa Discord reporter unavailable");
-            None
-        }
-    };
-
-    match DeployQaSource::new(config.deploy_qa.clone(), tracker, discord) {
-        Ok(source) => Some(Arc::new(source)),
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to create deploy_qa source");
-            None
-        }
-    }
 }
 
 fn create_webhook_handlers(config: &Config) -> WebhookHandlerRegistry {

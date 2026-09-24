@@ -3,8 +3,10 @@
 //! All-verified: reply under the automated `#releases` message (no @).
 //! FAIL: create a thread from that message and `@` the mapped releaser.
 
-use claudear_analysis::deploy_qa::{classify_deploy_qa_verdict, DeployQaVerdict, GitHubDiscordMap};
-use claudear_core::error::{Error, Result};
+use claudear_analysis::deploy_qa::{
+    classify_deploy_qa_verdict, DeployQaVerdict, GitHubDiscordMap, DEPLOY_QA_SOURCE,
+};
+use claudear_core::error::Result;
 use claudear_core::types::DeployQaTipStatus;
 use claudear_storage::FixAttemptTracker;
 
@@ -84,7 +86,7 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
             .title("All PRs verified")
             .description(truncate_report(report, 1800))
             .color(COLOR_VERIFIED)
-            .footer(pin.unwrap_or("deploy_qa"))
+            .footer(pin.unwrap_or(DEPLOY_QA_SOURCE))
             .timestamp(chrono::Utc::now().to_rfc3339());
         let params = CreateMessageParams::with_embed("", embed).replying_to(release_message_id);
         let sent = self.client.send_message(&self.channel_id, params).await?;
@@ -120,7 +122,7 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
             .title(format!("FAIL {tag}"))
             .description(truncate_report(report, 1800))
             .color(COLOR_FAIL)
-            .footer("deploy_qa")
+            .footer(DEPLOY_QA_SOURCE)
             .timestamp(chrono::Utc::now().to_rfc3339());
         let sent = self
             .client
@@ -251,11 +253,6 @@ pub fn try_build_discord(
         (Some(token), Some(channel)) => Ok(Some(DeployQaDiscord::new(token, channel, map)?)),
         _ => Ok(None),
     }
-}
-
-/// Error helper so callers can surface a missing Discord path without panicking.
-pub fn discord_unconfigured() -> Error {
-    Error::config("deploy_qa Discord bot token / channel_id not configured")
 }
 
 #[cfg(test)]
