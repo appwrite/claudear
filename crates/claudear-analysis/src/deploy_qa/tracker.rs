@@ -12,6 +12,15 @@ use claudear_storage::FixAttemptTracker;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Issue metadata key holding the `[[deploy_qa.tracks]]` name.
+pub const TRACK_METADATA_KEY: &str = "deploy_qa_track";
+/// Issue metadata key holding the GitHub `owner/repo`.
+pub const REPO_METADATA_KEY: &str = "deploy_qa_repo";
+/// Issue metadata key holding the release tag.
+pub const TAG_METADATA_KEY: &str = "deploy_qa_tag";
+/// Issue metadata flag marking the issue as observe/report only (no fix PR).
+pub const OBSERVE_ONLY_METADATA_KEY: &str = "observe_only";
+
 /// A normalized tip the poller can persist and enqueue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseTip {
@@ -180,7 +189,7 @@ impl<C: HttpClient> DeployQaTracker<C> {
             });
         }
 
-        let issue = build_deploy_qa_issue(track, &tip, &self.playbook, &self.config);
+        let issue = build_deploy_qa_issue(track, &tip, &self.playbook);
         Ok(DeployQaPollResult {
             track: track.name.clone(),
             action: DeployQaPollAction::Enqueued,
@@ -230,11 +239,13 @@ fn load_configured_playbook(config: &DeployQaConfig) -> Result<String> {
 }
 
 /// Build the synthetic observe/report issue for a new tip.
+///
+/// Discord routing is deliberately absent from the metadata: the deploy_qa
+/// reporter posts to its configured `#releases` channel itself.
 pub fn build_deploy_qa_issue(
     track: &DeployQaTrackConfig,
     tip: &ReleaseTip,
     playbook: &str,
-    config: &DeployQaConfig,
 ) -> Issue {
     let issue_id = DeployQaTip::issue_id_for(&track.name, &tip.repo, &tip.tag);
     let title = format!(
@@ -276,18 +287,12 @@ pub fn build_deploy_qa_issue(
     issue.priority = IssuePriority::High;
     issue.status = IssueStatus::Open;
     issue.set_metadata("routing_intent", "QA");
-    issue.set_metadata("observe_only", true);
-    issue.set_metadata("deploy_qa_track", track.name.clone());
-    issue.set_metadata("deploy_qa_repo", tip.repo.clone());
-    issue.set_metadata("deploy_qa_tag", tip.tag.clone());
+    issue.set_metadata(OBSERVE_ONLY_METADATA_KEY, true);
+    issue.set_metadata(TRACK_METADATA_KEY, track.name.clone());
+    issue.set_metadata(REPO_METADATA_KEY, tip.repo.clone());
+    issue.set_metadata(TAG_METADATA_KEY, tip.tag.clone());
     if let Some(ref author) = tip.author_login {
         issue.set_metadata("github_login", author.clone());
-    }
-    if let Some(ref channel) = config.discord_channel_id {
-        issue.set_metadata("channel_id", channel.clone());
-    }
-    if let Some(ref guild) = config.discord_guild_id {
-        issue.set_metadata("guild_id", guild.clone());
     }
     issue
 }
@@ -438,26 +443,22 @@ mod tests {
         let network = track("edge-network", repo, DeployQaTagFilter::Any);
         let tip = release_tip(repo, "1.2.3", "Adds #99");
 
-        let issue =
-            build_deploy_qa_issue(&db, &tip, bundled_playbook(), &DeployQaConfig::default());
+        let issue = build_deploy_qa_issue(&db, &tip, bundled_playbook());
         assert_eq!(issue.source, DEPLOY_QA_SOURCE);
-        assert_eq!(issue.get_metadata::<bool>("observe_only"), Some(true));
+        assert_eq!(
+            issue.get_metadata::<bool>(OBSERVE_ONLY_METADATA_KEY),
+            Some(true)
+        );
         assert!(issue
             .description
             .as_deref()
             .unwrap()
             .contains(tip.body.as_deref().unwrap()));
 
-        let again =
-            build_deploy_qa_issue(&db, &tip, bundled_playbook(), &DeployQaConfig::default());
+        let again = build_deploy_qa_issue(&db, &tip, bundled_playbook());
         assert_eq!(issue.id, again.id);
 
-        let other_track = build_deploy_qa_issue(
-            &network,
-            &tip,
-            bundled_playbook(),
-            &DeployQaConfig::default(),
-        );
+        let other_track = build_deploy_qa_issue(&network, &tip, bundled_playbook());
         assert_ne!(issue.id, other_track.id);
     }
 

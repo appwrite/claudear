@@ -817,7 +817,6 @@ enabled = false
 poll_interval_ms = 300000
 skip_if_previous_running = true
 discord_channel_id = "990878183580651571"
-discord_guild_id = "938747207446839356"
 github_discord_map_path = "github-discord-map.json"
 # Optional; bundled playbooks/deploy_qa.md is used when unset.
 instructions_path = "playbooks/deploy_qa.md"

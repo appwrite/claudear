@@ -15,5 +15,6 @@ pub use playbook::{bundled_playbook, load_playbook, DEPLOY_QA_SOURCE};
 pub use probe::{classify_deploy_qa_verdict, DeployQaVerdict, LiveQaProbe, NoopLiveQaProbe};
 pub use tracker::{
     build_deploy_qa_issue, deploy_qa_match_result, DeployQaPollAction, DeployQaPollResult,
-    DeployQaTracker, ReleaseTip,
+    DeployQaTracker, ReleaseTip, OBSERVE_ONLY_METADATA_KEY, REPO_METADATA_KEY, TAG_METADATA_KEY,
+    TRACK_METADATA_KEY,
 };

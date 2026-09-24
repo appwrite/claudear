@@ -2174,8 +2174,6 @@ pub struct DeployQaConfig {
     pub skip_if_previous_running: bool,
     /// Discord `#releases` channel to reply under.
     pub discord_channel_id: Option<String>,
-    /// Discord guild for `#releases` (used when resolving releaser mentions).
-    pub discord_guild_id: Option<String>,
     /// Path to a GitHub login → Discord user id map (FAIL `@releaser`).
     pub github_discord_map_path: Option<String>,
     /// Optional path to the live-QA playbook. When unset, the bundled playbook
@@ -2237,7 +2235,6 @@ impl Default for DeployQaConfig {
             poll_interval_ms: 300_000,
             skip_if_previous_running: true,
             discord_channel_id: None,
-            discord_guild_id: None,
             github_discord_map_path: None,
             instructions_path: None,
             tracks: Vec::new(),
@@ -5235,7 +5232,6 @@ enabled = true
 poll_interval_ms = 120000
 skip_if_previous_running = false
 discord_channel_id = "990878183580651571"
-discord_guild_id = "938747207446839356"
 github_discord_map_path = "github-discord-map.json"
 instructions_path = "playbooks/deploy_qa.md"
 
