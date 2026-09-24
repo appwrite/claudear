@@ -197,6 +197,24 @@ impl Drop for DeployQaTipClaim {
     }
 }
 
+/// An issue's hold on its processing key and concurrency slot, released on
+/// drop so a run that panics or is aborted frees them instead of refusing the
+/// issue as in-flight and consuming the slot until restart.
+struct ProcessingClaim<'a> {
+    watcher: &'a Watcher,
+    key: String,
+}
+
+impl Drop for ProcessingClaim<'_> {
+    fn drop(&mut self) {
+        self.watcher.lock_processing().remove(&self.key);
+        self.watcher
+            .active_processing
+            .fetch_sub(1, Ordering::SeqCst);
+        self.watcher.slot_available.notify_waiters();
+    }
+}
+
 /// Options for creating a watcher.
 pub struct WatcherOptions {
     pub config: Config,
@@ -254,7 +272,9 @@ pub struct Watcher {
     qa_agent: Option<Arc<dyn AgentRunner>>,
     dry_run: bool,
     is_running: AtomicBool,
-    processing: RwLock<ProcessingState>,
+    /// Keys of the issues being processed. Each key is held by a
+    /// [`ProcessingClaim`], whose `Drop` needs a synchronous lock.
+    processing: Mutex<ProcessingState>,
     active_processing: AtomicUsize,
     /// Feedback analyzer for learning from past outcomes
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
@@ -358,7 +378,7 @@ impl Watcher {
             user_registry: options.user_registry,
             dry_run: options.dry_run,
             is_running: AtomicBool::new(false),
-            processing: RwLock::new(ProcessingState::new()),
+            processing: Mutex::new(ProcessingState::new()),
             active_processing: AtomicUsize::new(0),
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
             last_seen_releases: RwLock::new(HashMap::new()),
@@ -1552,10 +1572,7 @@ impl Watcher {
         let wait_started = std::time::Instant::now();
         let max_wait = std::time::Duration::from_secs(300);
         loop {
-            while {
-                let processing = self.processing.read().await;
-                processing.contains(&processing_key)
-            } {
+            while self.lock_processing().contains(&processing_key) {
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Err(claudear_core::error::Error::source(
                         &attempt.source,
@@ -1589,11 +1606,7 @@ impl Watcher {
             {
                 Ok(()) => break,
                 Err(e) => {
-                    let still_processing = {
-                        let processing = self.processing.read().await;
-                        processing.contains(&processing_key)
-                    };
-                    if still_processing {
+                    if self.lock_processing().contains(&processing_key) {
                         if !self.is_running.load(Ordering::SeqCst) {
                             return Err(claudear_core::error::Error::source(
                                 &attempt.source,
@@ -2569,27 +2582,24 @@ Create a PR with your changes.{custom_instructions}"#,
 
             // Check if this issue is already being processed
             let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
-            {
-                let processing = self.processing.read().await;
-                if processing.contains(&processing_key) {
-                    self.record_source_decision(
-                        &attempt.source,
-                        "ready_retry_skipped_inflight",
-                        format!(
-                            "Retry skipped because {} is already in-flight",
-                            attempt.short_id
-                        ),
-                        json!({
-                            "issue_id": attempt.issue_id.clone(),
-                            "short_id": attempt.short_id.clone(),
-                        }),
-                    );
-                    tracing::debug!(
-                        short_id = %attempt.short_id,
-                        "Issue already being processed, skipping retry"
-                    );
-                    continue;
-                }
+            if self.lock_processing().contains(&processing_key) {
+                self.record_source_decision(
+                    &attempt.source,
+                    "ready_retry_skipped_inflight",
+                    format!(
+                        "Retry skipped because {} is already in-flight",
+                        attempt.short_id
+                    ),
+                    json!({
+                        "issue_id": attempt.issue_id.clone(),
+                        "short_id": attempt.short_id.clone(),
+                    }),
+                );
+                tracing::debug!(
+                    short_id = %attempt.short_id,
+                    "Issue already being processed, skipping retry"
+                );
+                continue;
             }
 
             // Wait for concurrency slot (per-source limit, clamped to 1 to avoid deadlock).
@@ -2601,7 +2611,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     "max_concurrent_for source evaluated to 0, clamping to 1"
                 );
             }
-            while self.active_processing_for_source(&attempt.source).await >= retry_max_concurrent {
+            while self.active_processing_for_source(&attempt.source) >= retry_max_concurrent {
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -3112,7 +3122,6 @@ Create a PR with your changes.{custom_instructions}"#,
             &self.config.prioritisation.suppression_rules,
         );
 
-        let processing = self.processing.read().await;
         for issue in issues {
             if !seen_issue_ids.insert(issue.id.clone()) {
                 duplicate_skipped = duplicate_skipped.saturating_add(1);
@@ -3132,7 +3141,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
             // Skip if currently processing
             let processing_key = format!("{}:{}", source.name(), issue.id);
-            if processing.contains(&processing_key) {
+            if self.lock_processing().contains(&processing_key) {
                 inflight_skipped = inflight_skipped.saturating_add(1);
                 continue;
             }
@@ -3166,7 +3175,6 @@ Create a PR with your changes.{custom_instructions}"#,
                 unmatched_skipped = unmatched_skipped.saturating_add(1);
             }
         }
-        drop(processing);
 
         // Semantic dedup: filter out candidates that are duplicates of already-handled issues
         let mut semantic_duplicate_skipped = 0usize;
@@ -3509,12 +3517,42 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Number of active *fix-lane* processing items for a specific source.
     /// QA items are tracked separately; see [`Self::active_qa_for_source`].
-    async fn active_processing_for_source(&self, source_name: &str) -> usize {
-        self.processing.read().await.source_count(source_name)
+    fn active_processing_for_source(&self, source_name: &str) -> usize {
+        self.lock_processing().source_count(source_name)
     }
 
-    async fn active_qa_for_source(&self, source_name: &str) -> usize {
-        self.processing.read().await.qa_source_count(source_name)
+    fn active_qa_for_source(&self, source_name: &str) -> usize {
+        self.lock_processing().qa_source_count(source_name)
+    }
+
+    /// Lock the processing set, recovering it from a poisoned lock: its
+    /// methods keep keys and counts in step without panicking, so a holder
+    /// that panicked cannot leave it inconsistent.
+    fn lock_processing(&self) -> MutexGuard<'_, ProcessingState> {
+        self.processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take the processing slot for `key` in the QA or fix lane, or `None`
+    /// when the key is already being processed.
+    ///
+    /// The claim is built only after the lock is released, because dropping
+    /// it takes the same lock.
+    fn claim_processing(&self, key: String, is_qa: bool) -> Option<ProcessingClaim<'_>> {
+        let inserted = {
+            let mut processing = self.lock_processing();
+            if is_qa {
+                processing.insert_qa(key.clone())
+            } else {
+                processing.insert(key.clone())
+            }
+        };
+        if !inserted {
+            return None;
+        }
+        self.active_processing.fetch_add(1, Ordering::SeqCst);
+        Some(ProcessingClaim { watcher: self, key })
     }
 
     /// Dispatch one concurrency lane: spawn a processing task per item, gating on the
@@ -3545,9 +3583,9 @@ Create a PR with your changes.{custom_instructions}"#,
             // Wait for a concurrency slot in THIS lane.
             loop {
                 let in_flight = if is_qa {
-                    self.active_qa_for_source(source.name()).await
+                    self.active_qa_for_source(source.name())
                 } else {
-                    self.active_processing_for_source(source.name()).await
+                    self.active_processing_for_source(source.name())
                 };
                 if in_flight < max_concurrent {
                     break;
@@ -4033,27 +4071,16 @@ Create a PR with your changes.{custom_instructions}"#,
         // slow fixes for the same per-source concurrency budget.
         let is_qa = matches!(intent, Some(Intent::Question));
 
-        // Atomic check-and-insert to prevent race conditions.
-        {
-            let mut processing = self.processing.write().await;
-            if processing.contains(&processing_key) {
-                tracing::debug!(
-                    short_id = %issue.short_id,
-                    "Issue already being processed, skipping"
-                );
-                return false;
-            }
-            if is_qa {
-                processing.insert_qa(processing_key.clone());
-            } else {
-                processing.insert(processing_key.clone());
-            }
-        }
-        self.active_processing.fetch_add(1, Ordering::SeqCst);
+        let Some(_claim) = self.claim_processing(processing_key, is_qa) else {
+            tracing::debug!(
+                short_id = %issue.short_id,
+                "Issue already being processed, skipping"
+            );
+            return false;
+        };
 
         if let Some(ref tip) = deploy_qa_tip {
             if !self.claim_deploy_qa_tip(tip, &issue.short_id) {
-                self.release_processing_slot(&processing_key).await;
                 return false;
             }
         }
@@ -4199,14 +4226,10 @@ Create a PR with your changes.{custom_instructions}"#,
                             repo = %repo_name,
                             "Redirect repo not found, skipping issue"
                         );
-                        self.release_processing_slot(&processing_key).await;
                         return false;
                     }
                 }
-                ApprovalDecision::Denied | ApprovalDecision::Unrecognized => {
-                    self.release_processing_slot(&processing_key).await;
-                    return false;
-                }
+                ApprovalDecision::Denied | ApprovalDecision::Unrecognized => return false,
             }
         }
 
@@ -4264,20 +4287,10 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
-        self.release_processing_slot(&processing_key).await;
-
         // Return false for semantic duplicate skips (don't count as processed),
         // true for everything else
         !matches!(&outcome, ProcessingOutcome::Failed { error }
             if error.contains("Semantic duplicate of"))
-    }
-
-    /// Give back the processing slot [`Self::process_issue`] took for
-    /// `processing_key` and wake tasks waiting for a free slot.
-    async fn release_processing_slot(&self, processing_key: &str) {
-        self.processing.write().await.remove(processing_key);
-        self.active_processing.fetch_sub(1, Ordering::SeqCst);
-        self.slot_available.notify_waiters();
     }
 
     async fn clear_rate_limit_pause(&self) {
@@ -5181,6 +5194,7 @@ mod tests {
     use claudear_integrations::reports::Report;
     use claudear_integrations::source::{DeployQaSource, IssueSource};
     use claudear_storage::{ActivityStore, AttemptTracker, SqliteTracker};
+    use futures::FutureExt;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     // Mock notifier for testing
@@ -6417,10 +6431,9 @@ mod tests {
 
         // Simulate unrelated in-flight work from another source.
         watcher.active_processing.fetch_add(1, Ordering::SeqCst);
-        {
-            let mut processing = watcher.processing.write().await;
-            processing.insert("other:inflight".to_string());
-        }
+        watcher
+            .lock_processing()
+            .insert("other:inflight".to_string());
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -6438,10 +6451,7 @@ mod tests {
         );
 
         // Clean up simulated work so test state remains consistent.
-        {
-            let mut processing = watcher.processing.write().await;
-            processing.remove("other:inflight");
-        }
+        watcher.lock_processing().remove("other:inflight");
         watcher.active_processing.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -6796,16 +6806,12 @@ mod tests {
         ));
         watcher.is_running.store(true, Ordering::SeqCst);
 
-        {
-            let mut processing = watcher.processing.write().await;
-            processing.insert("mock:1".to_string());
-        }
+        watcher.lock_processing().insert("mock:1".to_string());
 
         let release = Arc::clone(&watcher);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let mut processing = release.processing.write().await;
-            processing.remove("mock:1");
+            release.lock_processing().remove("mock:1");
         });
 
         let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
@@ -6856,10 +6862,7 @@ mod tests {
             false,
         ));
 
-        {
-            let mut processing = watcher.processing.write().await;
-            processing.insert("mock:1".to_string());
-        }
+        watcher.lock_processing().insert("mock:1".to_string());
         watcher.is_running.store(false, Ordering::SeqCst);
 
         let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
@@ -6945,10 +6948,7 @@ mod tests {
         let sources = vec![source];
 
         let watcher = create_test_watcher(notifier, tracker, sources, true);
-        {
-            let mut processing = watcher.processing.write().await;
-            processing.insert("mock:123".to_string());
-        }
+        watcher.lock_processing().insert("mock:123".to_string());
 
         let result = watcher.trigger_issue("mock", "123").await;
         assert!(result.is_err());
@@ -6966,39 +6966,13 @@ mod tests {
 
         let watcher = create_test_watcher(notifier, tracker, sources, false);
 
-        // Use tokio runtime for the async lock
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            // Initially empty
-            {
-                let processing = watcher.processing.read().await;
-                assert!(processing.is_empty());
-            }
+        assert!(watcher.lock_processing().is_empty());
 
-            // Add item
-            {
-                let mut processing = watcher.processing.write().await;
-                processing.insert("test:123".to_string());
-            }
+        watcher.lock_processing().insert("test:123".to_string());
+        assert!(watcher.lock_processing().contains("test:123"));
 
-            // Verify added
-            {
-                let processing = watcher.processing.read().await;
-                assert!(processing.contains("test:123"));
-            }
-
-            // Remove item
-            {
-                let mut processing = watcher.processing.write().await;
-                processing.remove("test:123");
-            }
-
-            // Verify removed
-            {
-                let processing = watcher.processing.read().await;
-                assert!(!processing.contains("test:123"));
-            }
-        });
+        watcher.lock_processing().remove("test:123");
+        assert!(!watcher.lock_processing().contains("test:123"));
     }
 
     #[test]
@@ -7522,7 +7496,7 @@ mod tests {
 
         let watcher = create_test_watcher(notifier, tracker, sources, false);
 
-        assert_eq!(watcher.active_processing_for_source("test").await, 0);
+        assert_eq!(watcher.active_processing_for_source("test"), 0);
     }
 
     #[tokio::test]
@@ -7534,16 +7508,16 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, sources, false);
 
         {
-            let mut processing = watcher.processing.write().await;
+            let mut processing = watcher.lock_processing();
             processing.insert("source_a:issue-1".to_string());
             processing.insert("source_a:issue-2".to_string());
             processing.insert("source_b:issue-3".to_string());
             processing.insert("source_a:issue-4".to_string());
         }
 
-        assert_eq!(watcher.active_processing_for_source("source_a").await, 3);
-        assert_eq!(watcher.active_processing_for_source("source_b").await, 1);
-        assert_eq!(watcher.active_processing_for_source("source_c").await, 0);
+        assert_eq!(watcher.active_processing_for_source("source_a"), 3);
+        assert_eq!(watcher.active_processing_for_source("source_b"), 1);
+        assert_eq!(watcher.active_processing_for_source("source_c"), 0);
     }
 
     #[tokio::test]
@@ -7555,13 +7529,13 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, sources, false);
 
         {
-            let mut processing = watcher.processing.write().await;
+            let mut processing = watcher.lock_processing();
             // "test_source:" should NOT match "test:" prefix
             processing.insert("test_source:issue-1".to_string());
         }
 
-        assert_eq!(watcher.active_processing_for_source("test").await, 0);
-        assert_eq!(watcher.active_processing_for_source("test_source").await, 1);
+        assert_eq!(watcher.active_processing_for_source("test"), 0);
+        assert_eq!(watcher.active_processing_for_source("test_source"), 1);
     }
 
     #[tokio::test]
@@ -8098,16 +8072,14 @@ mod tests {
         for i in 0..100 {
             let w = Arc::clone(&watcher);
             handles.push(tokio::spawn(async move {
-                let mut processing = w.processing.write().await;
-                processing.insert(format!("test:{}", i));
+                w.lock_processing().insert(format!("test:{}", i));
             }));
         }
         for h in handles {
             h.await.unwrap();
         }
 
-        let processing = watcher.processing.read().await;
-        assert_eq!(processing.len(), 100);
+        assert_eq!(watcher.lock_processing().len(), 100);
     }
 
     #[tokio::test]
@@ -8119,7 +8091,7 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, sources, false);
 
         {
-            let mut processing = watcher.processing.write().await;
+            let mut processing = watcher.lock_processing();
             processing.insert("test:123".to_string());
             assert!(processing.contains("test:123"));
             processing.remove("test:123");
@@ -8127,13 +8099,9 @@ mod tests {
         }
 
         // Re-insert should work
-        {
-            let mut processing = watcher.processing.write().await;
-            processing.insert("test:123".to_string());
-        }
+        watcher.lock_processing().insert("test:123".to_string());
 
-        let processing = watcher.processing.read().await;
-        assert!(processing.contains("test:123"));
+        assert!(watcher.lock_processing().contains("test:123"));
     }
 
     #[test]
@@ -8617,10 +8585,9 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker.clone(), sources, true);
 
         // Mark one issue as in-flight
-        {
-            let mut processing = watcher.processing.write().await;
-            processing.insert("test:inflight-1".to_string());
-        }
+        watcher
+            .lock_processing()
+            .insert("test:inflight-1".to_string());
 
         watcher.poll_source(&source).await.unwrap();
 
@@ -8932,10 +8899,7 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, vec![source.clone()], false);
 
         // Mark as already processing
-        {
-            let mut processing = watcher.processing.write().await;
-            processing.insert("mock:1".to_string());
-        }
+        watcher.lock_processing().insert("mock:1".to_string());
 
         let issue = Issue::new("1", "T-1", "Test Issue", "http://example.com/1", "mock");
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
@@ -8957,6 +8921,8 @@ mod tests {
         Crash,
         Fail(String),
         Panic,
+        /// Panics on the first question, then answers with the report.
+        PanicOnce(String),
     }
 
     /// Agent that counts every invocation, answers QA as its [`QaAnswer`]
@@ -9014,6 +8980,12 @@ mod tests {
                 }
                 QaAnswer::Fail(message) => Err(claudear_core::error::Error::runner(message)),
                 QaAnswer::Panic => panic!("live QA probe panicked"),
+                QaAnswer::PanicOnce(report) => {
+                    if self.calls.load(AtomicOrdering::SeqCst) == 1 {
+                        panic!("first QA probe panicked");
+                    }
+                    Ok(report.clone())
+                }
             }
         }
         async fn verify_issue(
@@ -9060,7 +9032,7 @@ mod tests {
         lines.join("\n")
     }
 
-    fn deploy_qa_watcher(
+    fn watcher_with_agent(
         config: Config,
         source: Arc<dyn IssueSource>,
         tracker: Arc<SqliteTracker>,
@@ -9168,7 +9140,7 @@ mod tests {
                 .unwrap();
             let source = source(tracker.clone(), &tip);
             let agent_calls = Arc::new(AtomicUsize::new(0));
-            let watcher = deploy_qa_watcher(
+            let watcher = watcher_with_agent(
                 config,
                 source.clone(),
                 tracker.clone(),
@@ -9190,7 +9162,7 @@ mod tests {
         /// no in-memory state with [`Self::watcher`], standing in for a second
         /// daemon process.
         fn second_process(&self) -> Arc<Watcher> {
-            deploy_qa_watcher(
+            watcher_with_agent(
                 self.watcher.config.clone(),
                 self.source.clone(),
                 self.tracker.clone(),
@@ -9220,13 +9192,9 @@ mod tests {
                 .await
         }
 
-        async fn assert_processing_released(&self, watcher: &Watcher) {
+        fn assert_processing_released(&self, watcher: &Watcher) {
             assert!(
-                !watcher
-                    .processing
-                    .read()
-                    .await
-                    .contains(&self.processing_key()),
+                !watcher.lock_processing().contains(&self.processing_key()),
                 "the tip must not stay in the watcher's processing set"
             );
             assert_eq!(
@@ -9677,21 +9645,21 @@ mod tests {
             VERDICT_ALL_VERIFIED,
         ));
         let second = harness.second_process();
-        let processing = (
-            harness.watcher.processing.write().await,
-            second.processing.write().await,
+        let pauses = (
+            harness.watcher.rate_limit_pause_until.write().await,
+            second.rate_limit_pause_until.write().await,
         );
-        // Each run reads its tip before taking the processing set, so both
-        // have read it as pending once they have been polled.
-        let release_processing = async move {
+        // Each run reads its tip before checking for a rate-limit pause, so
+        // both have read it as pending once they have been polled.
+        let release_pauses = async move {
             tokio::task::yield_now().await;
-            drop(processing);
+            drop(pauses);
         };
 
         let (first_ran, second_ran, ()) = tokio::join!(
             harness.process_tip_on(&harness.watcher),
             harness.process_tip_on(&second),
-            release_processing,
+            release_pauses,
         );
 
         assert_eq!(
@@ -9708,8 +9676,8 @@ mod tests {
             DeployQaTipStatus::Verified,
             "the daemon that claimed the tip must record its verdict"
         );
-        harness.assert_processing_released(&harness.watcher).await;
-        harness.assert_processing_released(&second).await;
+        harness.assert_processing_released(&harness.watcher);
+        harness.assert_processing_released(&second);
     }
 
     #[tokio::test]
@@ -9719,14 +9687,14 @@ mod tests {
             VERDICT_ALL_VERIFIED,
         ));
         let harness = &harness;
-        let processing = harness.watcher.processing.write().await;
+        let pauses = harness.watcher.rate_limit_pause_until.write().await;
         let claim_elsewhere = async move {
             tokio::task::yield_now().await;
             harness
                 .tracker
                 .update_deploy_qa_tip_status(harness.tip.id, DeployQaTipStatus::Running, None)
                 .unwrap();
-            drop(processing);
+            drop(pauses);
         };
 
         let (ran, ()) = tokio::join!(harness.process_tip_on(&harness.watcher), claim_elsewhere);
@@ -9750,7 +9718,7 @@ mod tests {
                 .is_none(),
             "a lost claim must not record an attempt"
         );
-        harness.assert_processing_released(&harness.watcher).await;
+        harness.assert_processing_released(&harness.watcher);
     }
 
     #[tokio::test]
@@ -9906,6 +9874,83 @@ mod tests {
             harness.agent_calls(),
             2,
             "each pending tip should reach the QA agent once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_panicked_process_issue_releases_its_processing_slot() {
+        let issue = Issue::new(
+            "panic-1",
+            "PANIC-1",
+            "How do I rotate my API key?",
+            "http://example.com/panic/1",
+            "mock",
+        );
+        let source =
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>;
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            test_config(),
+            source.clone(),
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            Arc::new(ScriptedQaAgent {
+                calls: agent_calls.clone(),
+                answer: QaAnswer::PanicOnce(CUSTOMER_REPLY.to_string()),
+            }),
+        );
+        let process = |watcher: Arc<Watcher>| {
+            let source = source.clone();
+            let issue = issue.clone();
+            tokio::spawn(async move {
+                let match_result = source.matches_criteria(&issue);
+                watcher
+                    .process_issue(
+                        source,
+                        issue,
+                        match_result,
+                        None,
+                        None,
+                        Some(Intent::Question),
+                    )
+                    .await
+            })
+        };
+        let slot_freed = watcher.slot_available.notified();
+        tokio::pin!(slot_freed);
+        slot_freed.as_mut().enable();
+
+        let panicked = process(Arc::clone(&watcher)).await;
+
+        assert!(
+            panicked.is_err_and(|error| error.is_panic()),
+            "the run should panic with its QA agent"
+        );
+        assert!(
+            !watcher.lock_processing().contains("mock:panic-1"),
+            "a run that panicked must release its processing key"
+        );
+        assert_eq!(
+            watcher.active_count(),
+            0,
+            "a run that panicked must give back its processing slot"
+        );
+        assert!(
+            slot_freed.now_or_never().is_some(),
+            "a run that panicked must wake tasks waiting for a free slot"
+        );
+
+        let retried = process(Arc::clone(&watcher))
+            .await
+            .expect("the retried run should not panic");
+
+        assert!(
+            retried,
+            "the issue must not be refused as already being processed"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "the retried run should reach the QA agent"
         );
     }
 
@@ -11183,8 +11228,7 @@ mod tests {
         assert!(started); // true because it processed (even though it failed)
 
         // Verify processing set was cleaned up
-        let processing = watcher.processing.read().await;
-        assert!(!processing.contains("mock:cleanup-1"));
+        assert!(!watcher.lock_processing().contains("mock:cleanup-1"));
 
         // Verify active count is back to 0
         assert_eq!(watcher.active_count(), 0);
@@ -11438,10 +11482,9 @@ mod tests {
         watcher.is_running.store(true, Ordering::SeqCst);
 
         // Mark the issue as currently processing
-        {
-            let mut processing = watcher.processing.write().await;
-            processing.insert("mock:inflight-retry".to_string());
-        }
+        watcher
+            .lock_processing()
+            .insert("mock:inflight-retry".to_string());
 
         let result = watcher.process_ready_retries().await;
         assert!(result.is_ok());
@@ -12181,13 +12224,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let watcher = create_test_watcher(notifier, tracker, vec![], false);
 
-        {
-            let mut processing = watcher.processing.write().await;
-            processing.insert(":issue1".to_string());
-        }
+        watcher.lock_processing().insert(":issue1".to_string());
 
         // Empty source name prefix ":" should match ":issue1"
-        assert_eq!(watcher.active_processing_for_source("").await, 1);
+        assert_eq!(watcher.active_processing_for_source(""), 1);
     }
 
     #[tokio::test]
@@ -12414,15 +12454,15 @@ mod tests {
 
         // Manually populate the processing set
         {
-            let mut processing = watcher.processing.write().await;
+            let mut processing = watcher.lock_processing();
             processing.insert("source1:issue1".to_string());
             processing.insert("source1:issue2".to_string());
             processing.insert("source2:issue3".to_string());
         }
 
-        assert_eq!(watcher.active_processing_for_source("source1").await, 2);
-        assert_eq!(watcher.active_processing_for_source("source2").await, 1);
-        assert_eq!(watcher.active_processing_for_source("source3").await, 0);
+        assert_eq!(watcher.active_processing_for_source("source1"), 2);
+        assert_eq!(watcher.active_processing_for_source("source2"), 1);
+        assert_eq!(watcher.active_processing_for_source("source3"), 0);
     }
 
     #[test]
