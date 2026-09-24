@@ -819,7 +819,9 @@ enabled = false
 poll_interval_ms = 300000
 skip_if_previous_running = true
 discord_channel_id = "990878183580651571"
-github_discord_map_path = "github-discord-map.json"
+# GitHub login -> Discord user map for the FAIL @releaser mention. Use an
+# absolute path: a relative one breaks under systemd and drops the mention.
+github_discord_map_path = "/etc/claudear/github-discord-map.json"
 # Optional; defaults to the bundled playbooks/deploy_qa.md. When set, use an
 # absolute path: a relative one breaks under systemd and disables deploy_qa.
 # instructions_path = "/etc/claudear/deploy_qa.md"

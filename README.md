@@ -732,7 +732,7 @@ enabled = true
 poll_interval_ms = 300000
 skip_if_previous_running = true
 discord_channel_id = "990878183580651571"
-github_discord_map_path = "github-discord-map.json"
+github_discord_map_path = "/etc/claudear/github-discord-map.json"  # absolute: relative paths break under systemd
 
 [[deploy_qa.tracks]]
 name = "cloud"
