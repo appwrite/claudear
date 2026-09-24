@@ -1280,7 +1280,7 @@ The PR title should include the issue ID: {}
                 "timeout_secs": self.config.timeout_secs,
                 "working_dir": project_dir.display().to_string(),
                 "model": self.config.model.clone(),
-                "skip_permissions": self.config.skip_permissions,
+                "skip_permissions": self.skips_permissions(profile),
                 "permissions": self.config.permissions.clone(),
                 "cli_args_without_prompt": cli_args_without_prompt,
                 "prompt_hash": execution.prompt_hash.clone(),
@@ -2988,6 +2988,49 @@ mod tests {
                 .map(str::to_string)
                 .collect()
         }
+
+        /// The data of the `execution_initialized` event of the stub's run.
+        /// Runs in other tests may log to the same directory while it is set,
+        /// so the event is the one whose working directory is the stub's.
+        fn execution_initialized(&self) -> serde_json::Value {
+            let working_dir = self.directory().display().to_string();
+            events_logs(&self.directory().join("logs"))
+                .iter()
+                .flat_map(|log| {
+                    std::fs::read_to_string(log)
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .collect::<Vec<_>>()
+                })
+                .find(|entry| {
+                    entry["event"] == "execution_initialized"
+                        && entry["data"]["working_dir"] == working_dir.as_str()
+                })
+                .map(|entry| entry["data"].clone())
+                .expect("the stub's run never logged `execution_initialized`")
+        }
+    }
+
+    /// Every execution events log under `directory`, searched recursively.
+    #[cfg(unix)]
+    fn events_logs(directory: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .flat_map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    events_logs(&path)
+                } else if path.to_string_lossy().ends_with(".events.jsonl") {
+                    vec![path]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect()
     }
 
     #[cfg(unix)]
@@ -3054,6 +3097,26 @@ mod tests {
         );
         reply.expect("the stub reply run succeeds");
         args
+    }
+
+    /// The `execution_initialized` event data of a successful reply run for an
+    /// issue from `source` under `config`.
+    #[cfg(unix)]
+    fn reply_execution_initialized(source: &str, config: ClaudeRunnerConfig) -> serde_json::Value {
+        let cli = FakeCli::install(&fake_cli_script(
+            &[result_event(LIVE_QA_FINAL_REPORT, false)],
+            0,
+        ));
+        let runner = cli.runner(config);
+        block_on(runner.run_reply(
+            &deploy_qa_issue(source),
+            "ctx",
+            None,
+            ReplyKind::Answer,
+            cli.directory(),
+        ))
+        .expect("the stub reply run succeeds");
+        cli.execution_initialized()
     }
 
     /// A config that grants fix runs full access.
@@ -3349,6 +3412,19 @@ mod tests {
                 "mcp__helpdesk",
                 "--print",
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_execution_log_reports_the_effective_skip_permissions() {
+        let live_qa = reply_execution_initialized(DEPLOY_QA_SOURCE, full_access_config());
+        let customer_reply = reply_execution_initialized(HELPSCOUT_SOURCE, full_access_config());
+
+        assert_eq!(live_qa["skip_permissions"], true);
+        assert_eq!(
+            customer_reply["skip_permissions"], false,
+            "a read-only reply never skips permission prompts"
         );
     }
 
