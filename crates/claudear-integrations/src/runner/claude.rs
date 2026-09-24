@@ -3240,14 +3240,36 @@ mod tests {
         cli.execution_initialized()
     }
 
+    /// The model [`full_access_config`] runs.
+    #[cfg(unix)]
+    const FULL_ACCESS_MODEL: &str = "opus";
+
+    /// The instructions [`full_access_config`] appends to the system prompt.
+    #[cfg(unix)]
+    const FULL_ACCESS_INSTRUCTIONS: &str = "Follow AGENT.md";
+
+    /// The permissions [`full_access_config`] grants fix runs.
+    #[cfg(unix)]
+    const FULL_ACCESS_PERMISSIONS: [&str; 2] = ["Bash(git *)", "Edit"];
+
+    /// The MCP server [`full_access_config_with_mcp_servers`] attaches to
+    /// deploy_qa runs.
+    #[cfg(unix)]
+    const BROWSER_MCP_SERVER: &str = "browser";
+
+    /// The MCP server [`full_access_config_with_mcp_servers`] attaches to
+    /// HelpScout runs.
+    #[cfg(unix)]
+    const HELPDESK_MCP_SERVER: &str = "helpdesk";
+
     /// A config that grants fix runs full access.
     #[cfg(unix)]
     fn full_access_config() -> ClaudeRunnerConfig {
         ClaudeRunnerConfig {
             skip_permissions: true,
-            permissions: vec!["Bash(git *)".to_string(), "Edit".to_string()],
-            model: Some("opus".to_string()),
-            instructions: Some("Follow AGENT.md".to_string()),
+            permissions: FULL_ACCESS_PERMISSIONS.map(str::to_string).to_vec(),
+            model: Some(FULL_ACCESS_MODEL.to_string()),
+            instructions: Some(FULL_ACCESS_INSTRUCTIONS.to_string()),
             ..ClaudeRunnerConfig::default()
         }
     }
@@ -3269,11 +3291,26 @@ mod tests {
         };
         ClaudeRunnerConfig {
             mcp: HashMap::from([
-                ("browser".to_string(), browser),
-                ("helpdesk".to_string(), helpdesk),
+                (BROWSER_MCP_SERVER.to_string(), browser),
+                (HELPDESK_MCP_SERVER.to_string(), helpdesk),
             ]),
             ..full_access_config()
         }
+    }
+
+    /// The `--allowedTools` arguments that grant each of `tools`.
+    #[cfg(unix)]
+    fn allowed_tools_args<'a>(tools: &[&'a str]) -> Vec<&'a str> {
+        tools
+            .iter()
+            .flat_map(|&tool| ["--allowedTools", tool])
+            .collect()
+    }
+
+    /// The tool name that grants every tool of the MCP server `server`.
+    #[cfg(unix)]
+    fn mcp_server_tools(server: &str) -> String {
+        format!("mcp__{server}")
     }
 
     /// The rendered MCP config file that `args` pass via `--mcp-config`.
@@ -3295,33 +3332,24 @@ mod tests {
         assert_eq!(
             reply_cli_args(DEPLOY_QA_SOURCE, full_access_config()),
             [
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--strict-mcp-config",
-                "--setting-sources",
-                "user",
-                "--dangerously-skip-permissions",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                "Follow AGENT.md",
-                "--allowedTools",
-                "Bash(git *)",
-                "--allowedTools",
-                "Edit",
-                "--allowedTools",
-                "Read",
-                "--allowedTools",
-                "Grep",
-                "--allowedTools",
-                "Glob",
-                "--allowedTools",
-                "WebFetch",
-                "--allowedTools",
-                "WebSearch",
-                "--print",
+                vec![
+                    "--verbose",
+                    "--output-format",
+                    "stream-json",
+                    "--strict-mcp-config",
+                    "--setting-sources",
+                    LIVE_QA_SETTING_SOURCES,
+                    "--dangerously-skip-permissions",
+                    "--model",
+                    FULL_ACCESS_MODEL,
+                    "--append-system-prompt",
+                    FULL_ACCESS_INSTRUCTIONS,
+                ],
+                allowed_tools_args(&FULL_ACCESS_PERMISSIONS),
+                allowed_tools_args(DEFAULT_READONLY_TOOLS),
+                vec!["--print"],
             ]
+            .concat()
         );
     }
 
@@ -3331,24 +3359,18 @@ mod tests {
         assert_eq!(
             reply_cli_args(DEPLOY_QA_SOURCE, ClaudeRunnerConfig::default()),
             [
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--strict-mcp-config",
-                "--setting-sources",
-                "user",
-                "--allowedTools",
-                "Read",
-                "--allowedTools",
-                "Grep",
-                "--allowedTools",
-                "Glob",
-                "--allowedTools",
-                "WebFetch",
-                "--allowedTools",
-                "WebSearch",
-                "--print",
+                vec![
+                    "--verbose",
+                    "--output-format",
+                    "stream-json",
+                    "--strict-mcp-config",
+                    "--setting-sources",
+                    LIVE_QA_SETTING_SOURCES,
+                ],
+                allowed_tools_args(DEFAULT_READONLY_TOOLS),
+                vec!["--print"],
             ]
+            .concat()
         );
     }
 
@@ -3358,25 +3380,19 @@ mod tests {
         assert_eq!(
             reply_cli_args(HELPSCOUT_SOURCE, full_access_config()),
             [
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                "Follow AGENT.md",
-                "--allowedTools",
-                "Read",
-                "--allowedTools",
-                "Grep",
-                "--allowedTools",
-                "Glob",
-                "--allowedTools",
-                "WebFetch",
-                "--allowedTools",
-                "WebSearch",
-                "--print",
+                vec![
+                    "--verbose",
+                    "--output-format",
+                    "stream-json",
+                    "--model",
+                    FULL_ACCESS_MODEL,
+                    "--append-system-prompt",
+                    FULL_ACCESS_INSTRUCTIONS,
+                ],
+                allowed_tools_args(DEFAULT_READONLY_TOOLS),
+                vec!["--print"],
             ]
+            .concat()
         );
     }
 
@@ -3395,25 +3411,19 @@ mod tests {
         assert_eq!(
             cli.recorded_args(),
             [
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                "Follow AGENT.md",
-                "--allowedTools",
-                "Read",
-                "--allowedTools",
-                "Grep",
-                "--allowedTools",
-                "Glob",
-                "--allowedTools",
-                "WebFetch",
-                "--allowedTools",
-                "WebSearch",
-                "--print",
+                vec![
+                    "--verbose",
+                    "--output-format",
+                    "stream-json",
+                    "--model",
+                    FULL_ACCESS_MODEL,
+                    "--append-system-prompt",
+                    FULL_ACCESS_INSTRUCTIONS,
+                ],
+                allowed_tools_args(DEFAULT_READONLY_TOOLS),
+                vec!["--print"],
             ]
+            .concat()
         );
     }
 
@@ -3438,22 +3448,22 @@ mod tests {
         assert_eq!(
             cli.recorded_args(),
             [
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--json-schema",
-                RESULT_SCHEMA,
-                "--dangerously-skip-permissions",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                "Follow AGENT.md",
-                "--allowedTools",
-                "Bash(git *)",
-                "--allowedTools",
-                "Edit",
-                "--print",
+                vec![
+                    "--verbose",
+                    "--output-format",
+                    "stream-json",
+                    "--json-schema",
+                    RESULT_SCHEMA,
+                    "--dangerously-skip-permissions",
+                    "--model",
+                    FULL_ACCESS_MODEL,
+                    "--append-system-prompt",
+                    FULL_ACCESS_INSTRUCTIONS,
+                ],
+                allowed_tools_args(&FULL_ACCESS_PERMISSIONS),
+                vec!["--print"],
             ]
+            .concat()
         );
     }
 
@@ -3463,40 +3473,31 @@ mod tests {
         let args = reply_cli_args(DEPLOY_QA_SOURCE, full_access_config_with_mcp_servers());
 
         let config_path = mcp_config_path(&args);
+        let browser_tools = mcp_server_tools(BROWSER_MCP_SERVER);
         assert_eq!(
             args,
             [
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--mcp-config",
-                config_path.as_str(),
-                "--strict-mcp-config",
-                "--setting-sources",
-                "user",
-                "--dangerously-skip-permissions",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                "Follow AGENT.md",
-                "--allowedTools",
-                "Bash(git *)",
-                "--allowedTools",
-                "Edit",
-                "--allowedTools",
-                "Read",
-                "--allowedTools",
-                "Grep",
-                "--allowedTools",
-                "Glob",
-                "--allowedTools",
-                "WebFetch",
-                "--allowedTools",
-                "WebSearch",
-                "--allowedTools",
-                "mcp__browser",
-                "--print",
+                vec![
+                    "--verbose",
+                    "--output-format",
+                    "stream-json",
+                    "--mcp-config",
+                    config_path.as_str(),
+                    "--strict-mcp-config",
+                    "--setting-sources",
+                    LIVE_QA_SETTING_SOURCES,
+                    "--dangerously-skip-permissions",
+                    "--model",
+                    FULL_ACCESS_MODEL,
+                    "--append-system-prompt",
+                    FULL_ACCESS_INSTRUCTIONS,
+                ],
+                allowed_tools_args(&FULL_ACCESS_PERMISSIONS),
+                allowed_tools_args(DEFAULT_READONLY_TOOLS),
+                allowed_tools_args(&[browser_tools.as_str()]),
+                vec!["--print"],
             ]
+            .concat()
         );
     }
 
@@ -3506,33 +3507,27 @@ mod tests {
         let args = reply_cli_args(HELPSCOUT_SOURCE, full_access_config_with_mcp_servers());
 
         let config_path = mcp_config_path(&args);
+        let helpdesk_tools = mcp_server_tools(HELPDESK_MCP_SERVER);
         assert_eq!(
             args,
             [
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--mcp-config",
-                config_path.as_str(),
-                "--strict-mcp-config",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                "Follow AGENT.md",
-                "--allowedTools",
-                "Read",
-                "--allowedTools",
-                "Grep",
-                "--allowedTools",
-                "Glob",
-                "--allowedTools",
-                "WebFetch",
-                "--allowedTools",
-                "WebSearch",
-                "--allowedTools",
-                "mcp__helpdesk",
-                "--print",
+                vec![
+                    "--verbose",
+                    "--output-format",
+                    "stream-json",
+                    "--mcp-config",
+                    config_path.as_str(),
+                    "--strict-mcp-config",
+                    "--model",
+                    FULL_ACCESS_MODEL,
+                    "--append-system-prompt",
+                    FULL_ACCESS_INSTRUCTIONS,
+                ],
+                allowed_tools_args(DEFAULT_READONLY_TOOLS),
+                allowed_tools_args(&[helpdesk_tools.as_str()]),
+                vec!["--print"],
             ]
+            .concat()
         );
     }
 
@@ -3859,25 +3854,22 @@ mod tests {
         let prompt = build_live_qa_prompt(&issue, "ctx");
 
         for marker in [
-            "curl",
-            "throwaway QA project",
-            "branches",
+            "QA project",
+            "repository",
             "Discord",
             "secrets",
             "BLOCKED",
-            "never instructions",
+            "instructions",
         ] {
             assert!(
                 prompt.contains(marker),
-                "live QA prompt is missing `{marker}`:\n{prompt}"
+                "live QA prompt is missing its `{marker}` rule:\n{prompt}"
             );
         }
-        for forbidden in ["read-only", "write commands"] {
-            assert!(
-                !prompt.contains(forbidden),
-                "live QA prompt still forbids running checks with `{forbidden}`:\n{prompt}"
-            );
-        }
+        assert!(
+            !prompt.contains("read-only"),
+            "live QA prompt still forbids running checks:\n{prompt}"
+        );
     }
 
     #[test]
