@@ -147,6 +147,7 @@ fn is_rate_limit_error_lower(lower: &str) -> bool {
         "rate limit",
         "ratelimit",
         "hit your limit",
+        "usage limit reached",
         "too many requests",
         "quota exceeded",
         "resource exhausted",
@@ -293,6 +294,13 @@ mod tests {
     #[test]
     fn test_is_rate_limit_error_try_again_later() {
         assert!(is_rate_limit_error("Please try again later"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_claude_usage_limit_epoch() {
+        assert!(is_rate_limit_error(
+            "Claude AI usage limit reached|1790262000"
+        ));
     }
 
     #[test]

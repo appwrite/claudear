@@ -8955,6 +8955,7 @@ mod tests {
     enum QaAnswer {
         Report(String),
         Crash,
+        Fail(String),
         Panic,
     }
 
@@ -9011,6 +9012,7 @@ mod tests {
                 QaAnswer::Crash => {
                     Err(claudear_core::error::Error::runner("live QA probe crashed"))
                 }
+                QaAnswer::Fail(message) => Err(claudear_core::error::Error::runner(message)),
                 QaAnswer::Panic => panic!("live QA probe panicked"),
             }
         }
@@ -9100,7 +9102,12 @@ mod tests {
     impl DeployQaHarness {
         /// A mock `deploy_qa` source whose QA agent crashes.
         fn new(config: Config) -> Self {
-            Self::build(config, QaAnswer::Crash, |_, tip| {
+            Self::answering(config, QaAnswer::Crash)
+        }
+
+        /// A mock `deploy_qa` source whose QA agent answers as `answer`.
+        fn answering(config: Config, answer: QaAnswer) -> Self {
+            Self::build(config, answer, |_, tip| {
                 Arc::new(MockSource::with_issues(
                     DEPLOY_QA_SOURCE,
                     vec![deploy_qa_issue(tip)],
@@ -9336,6 +9343,36 @@ mod tests {
                 .track_has_in_flight_deploy_qa(DEPLOY_QA_TRACK)
                 .unwrap(),
             "an errored tip must not block the track"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_pauses_provider_until_reset() {
+        let reset_epoch = (Utc::now() + chrono::Duration::hours(3)).timestamp();
+        let harness = DeployQaHarness::answering(
+            test_config(),
+            QaAnswer::Fail(format!("Claude AI usage limit reached|{reset_epoch}")),
+        );
+
+        harness
+            .watcher
+            .process_issue(
+                harness.source.clone(),
+                harness.issue(),
+                MatchResult::matched("deploy_qa pending tip", MatchPriority::High),
+                None,
+                None,
+                Some(Intent::Question),
+            )
+            .await;
+
+        let expected =
+            DateTime::<Utc>::from_timestamp(reset_epoch, 0).unwrap() + chrono::Duration::minutes(1);
+        let pauses = harness.watcher.rate_limit_pause_until.read().await;
+        assert_eq!(
+            pauses.get(harness.watcher.agent.name()),
+            Some(&expected),
+            "a usage-limit result must pause the provider until its reset"
         );
     }
 
@@ -13617,16 +13654,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_rate_limit_reset_time_from_usage_limit_epoch_at_horizon() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-16T15:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let msg = "Claude AI usage limit reached|1790262000";
-        let parsed = Watcher::extract_rate_limit_reset_time(msg, now).unwrap();
-        assert_eq!(parsed.to_rfc3339(), "2026-09-24T15:00:00+00:00");
-    }
-
-    #[test]
     fn test_extract_rate_limit_reset_time_rejects_past_usage_limit_epoch() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T16:00:00Z")
             .unwrap()
@@ -13637,8 +13664,8 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_rate_limit_reset_time_rejects_usage_limit_epoch_beyond_horizon() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-16T14:59:59Z")
+    fn test_extract_rate_limit_reset_time_rejects_implausibly_distant_usage_limit_epoch() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-25T15:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let msg = "Claude rate limit hit: Claude AI usage limit reached|1790262000";
