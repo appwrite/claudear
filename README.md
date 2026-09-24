@@ -743,9 +743,9 @@ tag_filter = "any"                 # any | suffix:-db | not_suffix:-db
 On a new tip Claudear:
 
 1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates.
-2. Skips enqueue if a previous attempt on that track is still running.
+2. Skips enqueue if a previous attempt on that track is still running. An attempt that ends without a verdict is marked `errored` so it no longer blocks the track.
 3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs.
-4. Posts to Discord `#releases`: all-verified reply (no @), or a FAIL thread that `@`s the releaser via `github-discord-map.json`.
+4. Posts to Discord `#releases`: all-verified reply (no @), or a FAIL thread that `@`s the releaser via `github-discord-map.json`. Classification fails closed: only a report ending in `DEPLOY_QA_VERDICT: ALL_VERIFIED` with no `LIVE FAIL` / `LIVE BLOCKED` line counts as verified.
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
 
