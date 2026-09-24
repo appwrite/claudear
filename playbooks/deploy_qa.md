@@ -53,3 +53,5 @@ DEPLOY_QA_VERDICT: FAIL
 ```
 
 List each PR as `- #N title LIVE PASS|FAIL|BLOCKED` or `- #N title INFRA`.
+
+Any `LIVE FAIL` or `LIVE BLOCKED` line, or a missing footer, is treated as FAIL.

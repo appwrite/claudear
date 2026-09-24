@@ -7,12 +7,29 @@
 use async_trait::async_trait;
 use claudear_core::error::Result;
 
+/// Prefix of the machine-readable footer that ends every deploy-QA report.
+pub const VERDICT_PREFIX: &str = "DEPLOY_QA_VERDICT:";
+
+/// Footer value declaring every LIVE-TESTABLE PR passed.
+pub const VERDICT_ALL_VERIFIED: &str = "ALL_VERIFIED";
+
+/// Footer value declaring at least one live failure or blocked check.
+pub const VERDICT_FAIL: &str = "FAIL";
+
+const LIVE_FAIL: &str = "LIVE FAIL";
+
+const LIVE_BLOCKED: &str = "LIVE BLOCKED";
+
 /// Outcome of a deploy-QA attempt, used for Discord posting.
+///
+/// Classification is fail-closed: anything short of an explicit all-verified
+/// report is a [`DeployQaVerdict::Fail`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeployQaVerdict {
-    /// No LIVE-TESTABLE failures.
+    /// The report ends with an all-verified footer and no LIVE-TESTABLE PR
+    /// failed or was blocked.
     AllVerified,
-    /// At least one LIVE failure (or an explicit FAIL verdict).
+    /// A live failure, a blocked check, or no explicit all-verified verdict.
     Fail,
 }
 
@@ -53,61 +70,196 @@ impl LiveQaProbe for NoopLiveQaProbe {
     }
 }
 
-/// Classify an agent report into a Discord posting verdict.
+/// Classify an agent report into a Discord posting verdict, failing closed.
 ///
-/// Prefers an explicit `DEPLOY_QA_VERDICT:` footer. Falls back to scanning
-/// for a LIVE FAIL line so a slightly messy report still threads correctly.
+/// The footer is the last line starting with [`VERDICT_PREFIX`] (ignoring
+/// case, surrounding whitespace, backticks and `*`). The report is
+/// [`DeployQaVerdict::AllVerified`] only when that footer's value is
+/// [`VERDICT_ALL_VERIFIED`] (ignoring case) and no line reports a `LIVE FAIL`
+/// or `LIVE BLOCKED` result. Everything else, including a missing or
+/// unrecognised footer, is a [`DeployQaVerdict::Fail`].
 pub fn classify_deploy_qa_verdict(report: &str) -> DeployQaVerdict {
-    for line in report.lines().rev() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("DEPLOY_QA_VERDICT:") {
-            let value = rest.trim().to_ascii_uppercase();
-            if value.contains("FAIL") {
-                return DeployQaVerdict::Fail;
-            }
-            if value.contains("ALL_VERIFIED") || value.contains("VERIFIED") {
-                return DeployQaVerdict::AllVerified;
-            }
-        }
-    }
-
     let upper = report.to_ascii_uppercase();
-    if upper.contains("LIVE FAIL") || upper.contains("LIVE FAILED") {
+    if upper.contains(LIVE_FAIL) || upper.contains(LIVE_BLOCKED) {
         return DeployQaVerdict::Fail;
     }
-    DeployQaVerdict::AllVerified
+    match footer(report) {
+        Some(value) if value.eq_ignore_ascii_case(VERDICT_ALL_VERIFIED) => {
+            DeployQaVerdict::AllVerified
+        }
+        _ => DeployQaVerdict::Fail,
+    }
+}
+
+fn footer(report: &str) -> Option<&str> {
+    report
+        .lines()
+        .rev()
+        .find_map(|line| strip_prefix_ignore_case(trim_markup(line), VERDICT_PREFIX))
+        .map(trim_markup)
+}
+
+fn trim_markup(text: &str) -> &str {
+    text.trim_matches(|character: char| {
+        character.is_whitespace() || character == '`' || character == '*'
+    })
+}
+
+fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn verdict_prefers_footer() {
-        let report = "\
-- #1 foo LIVE PASS
-DEPLOY_QA_VERDICT: ALL_VERIFIED
-";
-        assert_eq!(
-            classify_deploy_qa_verdict(report),
-            DeployQaVerdict::AllVerified
-        );
+    fn verdict_line(value: &str) -> String {
+        format!("{VERDICT_PREFIX} {value}")
+    }
 
-        let fail = "\
-- #2 bar LIVE FAIL
-DEPLOY_QA_VERDICT: FAIL
-";
-        assert_eq!(classify_deploy_qa_verdict(fail), DeployQaVerdict::Fail);
+    fn report(lines: &[&str]) -> String {
+        lines.join("\n")
     }
 
     #[test]
-    fn verdict_fallback_scans_live_fail() {
+    fn all_verified_footer_passes() {
+        let text = report(&[
+            "- #1 foo LIVE PASS",
+            "- #2 ci INFRA",
+            &verdict_line(VERDICT_ALL_VERIFIED),
+        ]);
         assert_eq!(
-            classify_deploy_qa_verdict("- #9 x LIVE FAIL\nno footer"),
-            DeployQaVerdict::Fail
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::AllVerified
         );
+    }
+
+    #[test]
+    fn fail_footer_fails() {
+        let text = report(&["- #1 foo LIVE PASS", &verdict_line(VERDICT_FAIL)]);
+        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn missing_footer_fails() {
+        let text = report(&["- #1 ci INFRA", "- #2 docs INFRA", "all good"]);
+        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn live_fail_line_without_footer_fails() {
+        let text = report(&["- #1 foo LIVE FAIL", "no footer"]);
+        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn blocked_line_without_footer_fails() {
+        let text = report(&["- #1 foo LIVE BLOCKED", "- #2 ci INFRA"]);
+        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn blocked_line_overrides_all_verified_footer() {
+        let text = report(&[
+            "- #1 foo LIVE PASS",
+            "- #2 bar live blocked",
+            &verdict_line(VERDICT_ALL_VERIFIED),
+        ]);
+        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn live_fail_line_overrides_all_verified_footer() {
+        let text = report(&[
+            "- #1 foo LIVE PASS",
+            "- #2 bar LIVE FAIL",
+            &verdict_line(VERDICT_ALL_VERIFIED),
+        ]);
+        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn unverified_footer_fails() {
+        let text = report(&["- #1 foo LIVE PASS", &verdict_line("UNVERIFIED")]);
+        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn lowercase_all_verified_value_passes() {
+        let text = report(&[
+            "- #1 foo LIVE PASS",
+            &verdict_line(&VERDICT_ALL_VERIFIED.to_ascii_lowercase()),
+        ]);
         assert_eq!(
-            classify_deploy_qa_verdict("- #9 x INFRA\nall good"),
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::AllVerified
+        );
+    }
+
+    #[test]
+    fn lowercase_prefix_is_recognised() {
+        let line = format!(
+            "{} {VERDICT_ALL_VERIFIED}",
+            VERDICT_PREFIX.to_ascii_lowercase()
+        );
+        let text = report(&["- #1 foo LIVE PASS", &line]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::AllVerified
+        );
+    }
+
+    #[test]
+    fn last_all_verified_footer_overrides_earlier_fail() {
+        let text = report(&[
+            &verdict_line(VERDICT_FAIL),
+            "- #1 foo LIVE PASS (retried after flaky host)",
+            &verdict_line(VERDICT_ALL_VERIFIED),
+        ]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::AllVerified
+        );
+    }
+
+    #[test]
+    fn last_fail_footer_overrides_earlier_all_verified() {
+        let text = report(&[
+            &verdict_line(VERDICT_ALL_VERIFIED),
+            "- #1 foo LIVE PASS",
+            &verdict_line(VERDICT_FAIL),
+        ]);
+        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn backticked_fail_footer_fails() {
+        let text = report(&[
+            "- #1 foo LIVE PASS",
+            &format!("`{}`", verdict_line(VERDICT_FAIL)),
+        ]);
+        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn bold_fail_footer_fails() {
+        let text = report(&[
+            "- #1 foo LIVE PASS",
+            &format!("**{}**", verdict_line(VERDICT_FAIL)),
+        ]);
+        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn backticked_all_verified_footer_passes() {
+        let text = report(&[
+            "- #1 foo LIVE PASS",
+            &format!("`{}`", verdict_line(VERDICT_ALL_VERIFIED)),
+        ]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
             DeployQaVerdict::AllVerified
         );
     }

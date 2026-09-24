@@ -12,7 +12,10 @@ mod tracker;
 
 pub use map::{GitHubDiscordMap, MappedDiscordUser};
 pub use playbook::{bundled_playbook, load_playbook, DEPLOY_QA_SOURCE};
-pub use probe::{classify_deploy_qa_verdict, DeployQaVerdict, LiveQaProbe, NoopLiveQaProbe};
+pub use probe::{
+    classify_deploy_qa_verdict, DeployQaVerdict, LiveQaProbe, NoopLiveQaProbe,
+    VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX,
+};
 pub use tracker::{
     build_deploy_qa_issue, deploy_qa_match_result, DeployQaPollAction, DeployQaPollResult,
     DeployQaTracker, ReleaseTip, OBSERVE_ONLY_METADATA_KEY, REPO_METADATA_KEY, TAG_METADATA_KEY,
