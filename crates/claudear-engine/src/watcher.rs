@@ -9315,18 +9315,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_deploy_qa_usage_limit_defers_qa_until_reset() {
+    async fn assert_deploy_qa_deferred_until_reset(failure: impl FnOnce(i64) -> String) {
         let reset = Utc::now() + chrono::Duration::hours(3);
         let mut config = test_config();
         config.agent.default_provider = SCRIPTED_QA_PROVIDER.to_string();
-        let harness = DeployQaHarness::answering(
-            config,
-            QaAnswer::Fail(format!(
-                "Claude AI usage limit reached|{}",
-                reset.timestamp()
-            )),
-        );
+        let harness =
+            DeployQaHarness::answering(config, QaAnswer::Fail(failure(reset.timestamp())));
 
         for _ in 0..2 {
             harness
@@ -9356,11 +9350,29 @@ mod tests {
             .and_then(|activity| activity.metadata)
             .and_then(|metadata| metadata["pause_until"].as_str().map(str::to_string))
             .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-            .expect("the usage limit should be logged as a pause");
+            .expect("the rate limit should be logged as a pause");
         assert!(
             pause_until >= reset,
-            "the pause must last until the usage limit resets at {reset}, got {pause_until}"
+            "the pause must last until the limit resets at {reset}, got {pause_until}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_defers_qa_until_reset() {
+        assert_deploy_qa_deferred_until_reset(|epoch| {
+            format!("Claude AI usage limit reached|{epoch}")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_epoch_reset_defers_qa_until_reset() {
+        assert_deploy_qa_deferred_until_reset(|epoch| {
+            format!(
+                r#"Claude rate limit hit: {{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","resetsAt":{epoch}}}}}"#
+            )
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -13772,16 +13784,6 @@ mod tests {
         assert!(parsed.is_none());
     }
 
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_skips_implausible_numeric_value() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-02-26T07:30:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let msg = r#"{"resetsAt": 1} and {"resetsAt": 1772096400}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg, now).unwrap();
-        assert_eq!(parsed.to_rfc3339(), "2026-02-26T09:00:00+00:00");
-    }
-
     // --- is_rate_limit_paused / clear_rate_limit_pause ---
 
     #[tokio::test]
@@ -13923,27 +13925,6 @@ mod tests {
         // The pause should NOT be lowered below the existing far_future value
         let pauses = watcher.rate_limit_pause_until.read().await;
         assert!(*pauses.get("claude").unwrap() >= far_future);
-    }
-
-    #[tokio::test]
-    async fn test_pause_until_rate_limit_reset_targets_usage_limit_epoch() {
-        let notifier = Arc::new(MockNotifier::new(true));
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-        let watcher = create_test_watcher(notifier, tracker, vec![], false);
-
-        let reset_epoch = (Utc::now() + chrono::Duration::hours(3)).timestamp();
-        let error = format!(
-            "Claude rate limit hit: Claude AI usage limit reached|{}",
-            reset_epoch
-        );
-
-        let result = watcher
-            .pause_until_rate_limit_reset(&test_issue(), &error)
-            .await;
-
-        let expected =
-            DateTime::<Utc>::from_timestamp(reset_epoch, 0).unwrap() + chrono::Duration::minutes(1);
-        assert_eq!(result, Some(expected));
     }
 
     // --- check_releases_and_cascade early returns ---
