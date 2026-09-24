@@ -32,6 +32,10 @@ const DEFAULT_READONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebFetch", "W
 /// Tool whose permission lets a run execute shell commands.
 const SHELL_TOOL: &str = "Bash";
 
+/// The only `--setting-sources` a live-QA run loads, so project and local
+/// settings in its working directory never apply to it.
+const LIVE_QA_SETTING_SOURCES: &str = "user";
+
 /// Timeout for read-only structured queries (classification-scale, not the long
 /// fix-run timeout).
 const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
@@ -55,7 +59,8 @@ enum RunProfile {
     /// read-only tools, and never skipping permission prompts.
     Reply,
     /// A [`DEPLOY_QA_SOURCE`] live-QA run: plain text with the fix-run access
-    /// plus the read-only tools, so it can probe live hosts.
+    /// plus the read-only tools, so it can probe live hosts. It loads no MCP
+    /// servers or settings from its working directory.
     LiveQa,
 }
 
@@ -1029,6 +1034,12 @@ The PR title should include the issue ID: {}
     /// The CLI arguments for a run under `profile`, attaching the rendered
     /// `mcp_config` and allowlisting `mcp_tool_globs` when servers matched.
     ///
+    /// `--strict-mcp-config` loads only the rendered config's servers and
+    /// ignores any other MCP configuration, such as a repo's `.mcp.json`. A
+    /// live-QA run gets it even when no server matched, and loads only user
+    /// settings, so no MCP server or project or local setting from its working
+    /// directory applies to it.
+    ///
     /// The prompt is not among them: it is piped via stdin to stay clear of the
     /// OS argv size limit (E2BIG), and `--print` with no positional prompt
     /// reads it from there.
@@ -1043,11 +1054,17 @@ The PR title should include the issue ID: {}
             "--output-format".to_string(),
             "stream-json".to_string(),
         ];
-        // --strict ignores any repo .mcp.json, so only the rendered config loads.
+        let live_qa = profile == RunProfile::LiveQa;
         if let Some(path) = mcp_config {
             args.push("--mcp-config".to_string());
             args.push(path.display().to_string());
+        }
+        if mcp_config.is_some() || live_qa {
             args.push("--strict-mcp-config".to_string());
+        }
+        if live_qa {
+            args.push("--setting-sources".to_string());
+            args.push(LIVE_QA_SETTING_SOURCES.to_string());
         }
         if profile == RunProfile::Fix {
             args.push("--json-schema".to_string());
@@ -3097,6 +3114,9 @@ mod tests {
                 "--verbose",
                 "--output-format",
                 "stream-json",
+                "--strict-mcp-config",
+                "--setting-sources",
+                "user",
                 "--dangerously-skip-permissions",
                 "--model",
                 "opus",
@@ -3130,6 +3150,9 @@ mod tests {
                 "--verbose",
                 "--output-format",
                 "stream-json",
+                "--strict-mcp-config",
+                "--setting-sources",
+                "user",
                 "--allowedTools",
                 "Read",
                 "--allowedTools",
@@ -3265,6 +3288,8 @@ mod tests {
                 "--mcp-config",
                 config_path.as_str(),
                 "--strict-mcp-config",
+                "--setting-sources",
+                "user",
                 "--dangerously-skip-permissions",
                 "--model",
                 "opus",
