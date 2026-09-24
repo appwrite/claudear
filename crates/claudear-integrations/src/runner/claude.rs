@@ -3360,6 +3360,22 @@ mod tests {
             .expect("the stub CLI never recorded its PID")
     }
 
+    /// Wait up to [`FAKE_CLI_DEADLINE`] for the process `pid` to exit, killing
+    /// it and failing with `failure` when it outlives the deadline.
+    #[cfg(unix)]
+    fn assert_exits(pid: u32, failure: &str) {
+        let deadline = std::time::Instant::now() + FAKE_CLI_DEADLINE;
+        while process_is_running(pid) {
+            if std::time::Instant::now() >= deadline {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+                panic!("{failure} (pid {pid})");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_dropping_a_run_kills_the_cli() {
@@ -3375,16 +3391,24 @@ mod tests {
             }
         });
 
-        let deadline = std::time::Instant::now() + FAKE_CLI_DEADLINE;
-        while process_is_running(pid) {
-            if std::time::Instant::now() >= deadline {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .status();
-                panic!("the agent CLI (pid {pid}) outlived its dropped run");
+        assert_exits(pid, "the agent CLI outlived its dropped run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dropping_a_structured_query_kills_the_cli() {
+        let cli = FakeCli::install(&hanging_cli_script());
+        let runner = cli.runner(ClaudeRunnerConfig::default());
+
+        let pid = block_on(async {
+            let query = runner.run_structured_query("Classify this issue", "{}", cli.directory());
+            tokio::select! {
+                result = query => panic!("the stub CLI finished before the query was dropped: {result:?}"),
+                pid = recorded_pid(cli.directory()) => pid,
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        });
+
+        assert_exits(pid, "the agent CLI outlived its dropped structured query");
     }
 
     #[test]
