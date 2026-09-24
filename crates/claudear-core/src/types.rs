@@ -1832,8 +1832,8 @@ pub enum DeployQaTipStatus {
     Verified,
     /// At least one LIVE-TESTABLE PR failed or was blocked as a fail.
     Failed,
-    /// Intentionally not enqueued (duplicate / skip-if-running).
-    Skipped,
+    /// The observe/report attempt ended without reaching a verdict.
+    Errored,
 }
 
 impl std::fmt::Display for DeployQaTipStatus {
@@ -1843,7 +1843,7 @@ impl std::fmt::Display for DeployQaTipStatus {
             Self::Running => write!(f, "running"),
             Self::Verified => write!(f, "verified"),
             Self::Failed => write!(f, "failed"),
-            Self::Skipped => write!(f, "skipped"),
+            Self::Errored => write!(f, "errored"),
         }
     }
 }
@@ -1857,7 +1857,7 @@ impl std::str::FromStr for DeployQaTipStatus {
             "running" => Ok(Self::Running),
             "verified" => Ok(Self::Verified),
             "failed" => Ok(Self::Failed),
-            "skipped" => Ok(Self::Skipped),
+            "errored" => Ok(Self::Errored),
             other => Err(format!("unknown deploy_qa tip status: {other}")),
         }
     }
@@ -4311,6 +4311,28 @@ mod tests {
             let parsed: RegressionWatchStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, status);
         }
+    }
+
+    #[test]
+    fn test_deploy_qa_tip_status_round_trips() {
+        let statuses = [
+            DeployQaTipStatus::Pending,
+            DeployQaTipStatus::Running,
+            DeployQaTipStatus::Verified,
+            DeployQaTipStatus::Failed,
+            DeployQaTipStatus::Errored,
+        ];
+
+        for status in statuses {
+            let stored = status.to_string();
+            assert_eq!(stored.parse::<DeployQaTipStatus>(), Ok(status));
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{stored}\""),
+                "Display (persisted) and serde (API) spellings must not drift"
+            );
+        }
+        assert!("skipped".parse::<DeployQaTipStatus>().is_err());
     }
 
     #[test]

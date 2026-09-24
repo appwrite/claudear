@@ -5,6 +5,7 @@ use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
 use chrono::{DateTime, Utc};
+use claudear_analysis::deploy_qa::DEPLOY_QA_SOURCE;
 use claudear_analysis::feedback::{FeedbackAnalyzer, IssueEmbeddingService, Outcome};
 use claudear_analysis::inference::{
     resolve_repo_for_cascade, resolve_repo_for_issue, Confidence, RepoInferrer, RepoResolution,
@@ -15,9 +16,9 @@ use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActivityLogEntry, AskRequest, BlockingQuestion, FixAttempt, FixAttemptStats, FixAttemptStatus,
-    Issue, IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric,
-    RegressionWatch, ReplyKind, TimelineEventStatus,
+    ActivityLogEntry, AskRequest, BlockingQuestion, DeployQaTip, DeployQaTipStatus, FixAttempt,
+    FixAttemptStats, FixAttemptStatus, Issue, IssueEmbedding, IssueType, MatchPriority,
+    MatchResult, ProcessingMetric, RegressionWatch, ReplyKind, TimelineEventStatus,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
@@ -3238,8 +3239,8 @@ Create a PR with your changes.{custom_instructions}"#,
             && crate::processing::qa_eligible_source(source.name())
             && self.intent_classifier.is_some();
 
-        let to_process: Vec<(Issue, MatchResult, Option<Intent>)> = if source.name() == "deploy_qa"
-        {
+        let is_deploy_qa = source.name() == DEPLOY_QA_SOURCE;
+        let to_process: Vec<(Issue, MatchResult, Option<Intent>)> = if is_deploy_qa {
             // Release announcements are observe/report only — never open a fix PR.
             ordered
                 .into_iter()
@@ -3727,6 +3728,56 @@ Create a PR with your changes.{custom_instructions}"#,
         self.tracker.record_activity(&activity).ok();
     }
 
+    /// Look up the tip behind a deploy_qa issue, warning when it cannot be found:
+    /// a missed status transition leaves the track blocked.
+    fn find_deploy_qa_tip(&self, issue_id: &str) -> Option<DeployQaTip> {
+        match self.tracker.get_deploy_qa_tip_by_issue_id(issue_id) {
+            Ok(Some(tip)) => Some(tip),
+            Ok(None) => {
+                tracing::warn!(issue_id, "deploy_qa tip not found; status left unchanged");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(issue_id, error = %e, "Failed to load deploy_qa tip");
+                None
+            }
+        }
+    }
+
+    fn mark_deploy_qa_tip(
+        &self,
+        tip: &DeployQaTip,
+        status: DeployQaTipStatus,
+        attempt_id: Option<i64>,
+    ) {
+        if let Err(e) = self
+            .tracker
+            .update_deploy_qa_tip_status(tip.id, status, attempt_id)
+        {
+            tracing::warn!(
+                issue_id = %tip.issue_id,
+                %status,
+                error = %e,
+                "Failed to update deploy_qa tip status"
+            );
+        }
+    }
+
+    /// Mark a tip `Errored` when its attempt ended without the source recording
+    /// a verdict, so `skip_if_previous_running` does not block the track forever.
+    fn release_unfinished_deploy_qa_tip(&self, tip: &DeployQaTip) {
+        let Some(current) = self.find_deploy_qa_tip(&tip.issue_id) else {
+            return;
+        };
+        if current.status == DeployQaTipStatus::Running {
+            tracing::warn!(
+                issue_id = %current.issue_id,
+                "deploy_qa attempt ended without a verdict; marking tip errored"
+            );
+            self.mark_deploy_qa_tip(&current, DeployQaTipStatus::Errored, None);
+        }
+    }
+
     /// Process a single issue.
     ///
     /// Uses the RepoInferrer engine to determine which repository to use
@@ -3741,6 +3792,8 @@ Create a PR with your changes.{custom_instructions}"#,
         intent: Option<Intent>,
     ) -> bool {
         use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
+
+        let is_deploy_qa = source.name() == DEPLOY_QA_SOURCE;
 
         if self.is_rate_limit_paused().await {
             tracing::info!(
@@ -3811,24 +3864,6 @@ Create a PR with your changes.{custom_instructions}"#,
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
 
-        if source.name() == "deploy_qa" {
-            if let Ok(Some(tip)) = self.tracker.get_deploy_qa_tip_by_issue_id(&issue.id) {
-                let attempt_id = self
-                    .tracker
-                    .get_attempt(source.name(), &issue.id)
-                    .ok()
-                    .flatten()
-                    .map(|a| a.id);
-                if let Err(e) = self.tracker.update_deploy_qa_tip_status(
-                    tip.id,
-                    claudear_core::types::DeployQaTipStatus::Running,
-                    attempt_id,
-                ) {
-                    tracing::debug!(error = %e, "Failed to mark deploy_qa tip running");
-                }
-            }
-        }
-
         // Timeline: attempt created (pending).
         self.tracker
             .record_activity(
@@ -3871,6 +3906,15 @@ Create a PR with your changes.{custom_instructions}"#,
             .ok()
             .flatten()
             .map(|a| a.id);
+
+        let deploy_qa_tip = if is_deploy_qa {
+            self.find_deploy_qa_tip(&issue.id)
+        } else {
+            None
+        };
+        if let Some(ref tip) = deploy_qa_tip {
+            self.mark_deploy_qa_tip(tip, DeployQaTipStatus::Running, attempt_id);
+        }
 
         // Infer the target repository using the shared resolution function
         let mut resolution =
@@ -3984,6 +4028,10 @@ Create a PR with your changes.{custom_instructions}"#,
 
         let context_provider = crate::processing::SourceContext(source.as_ref());
         let outcome = processor.run(input, &context_provider).await;
+
+        if let Some(ref tip) = deploy_qa_tip {
+            self.release_unfinished_deploy_qa_tip(tip);
+        }
 
         // Watcher-specific: check for rate limit errors and pause if needed
         if let ProcessingOutcome::Failed { ref error } = outcome {
@@ -8624,6 +8672,159 @@ mod tests {
         assert!(
             !result,
             "process_issue should return false when issue already in-flight"
+        );
+    }
+
+    struct FailingQaAgent {
+        answer_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for FailingQaAgent {
+        fn name(&self) -> &str {
+            "failing-qa-agent"
+        }
+        fn capabilities(&self) -> claudear_integrations::runner::ProviderCapabilities {
+            claudear_integrations::runner::ProviderCapabilities::default()
+        }
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> String {
+            String::new()
+        }
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &std::path::Path,
+        ) -> Result<claudear_core::types::AgentResult> {
+            Err(claudear_core::error::Error::runner(
+                "fix pipeline must never run for this agent",
+            ))
+        }
+        async fn answer_question(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> Result<String> {
+            self.answer_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(claudear_core::error::Error::runner("live QA probe crashed"))
+        }
+    }
+
+    fn deploy_qa_issue(tip: &DeployQaTip) -> Issue {
+        Issue::new(
+            tip.issue_id.clone(),
+            tip.tag.clone(),
+            format!("Deploy QA {}", tip.tag),
+            format!("https://github.com/{}/releases/tag/{}", tip.repo, tip.tag),
+            DEPLOY_QA_SOURCE,
+        )
+    }
+
+    struct DeployQaHarness {
+        watcher: Arc<Watcher>,
+        source: Arc<dyn IssueSource>,
+        tracker: Arc<SqliteTracker>,
+        tip: DeployQaTip,
+        answer_calls: Arc<AtomicUsize>,
+    }
+
+    impl DeployQaHarness {
+        fn new(config: Config) -> Self {
+            let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+            let tip = tracker
+                .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.2.3"))
+                .unwrap();
+            let source = Arc::new(MockSource::with_issues(
+                DEPLOY_QA_SOURCE,
+                vec![deploy_qa_issue(&tip)],
+            )) as Arc<dyn IssueSource>;
+            let answer_calls = Arc::new(AtomicUsize::new(0));
+            let watcher = Arc::new(Watcher::new(WatcherOptions {
+                config,
+                sources: vec![source.clone()],
+                notifier: Arc::new(MockNotifier::new(true)),
+                tracker: tracker.clone(),
+                inferrer: None,
+                embedding_client: None,
+                review_watcher: None,
+                issue_embedding_service: None,
+                code_search_service: None,
+                discord_search_service: None,
+                discord_index_orchestrator: None,
+                relationships: None,
+                github_client: None,
+                scm_provider: None,
+                user_registry: UserRegistry::new(std::collections::HashMap::new()),
+                classification_agent: None,
+                repo_classification_agent: None,
+                qa_agent: None,
+                dry_run: false,
+                llm_engine: None,
+                agent: Arc::new(FailingQaAgent {
+                    answer_calls: answer_calls.clone(),
+                }),
+            }));
+            Self {
+                watcher,
+                source,
+                tracker,
+                tip,
+                answer_calls,
+            }
+        }
+
+        fn issue(&self) -> Issue {
+            deploy_qa_issue(&self.tip)
+        }
+
+        fn stored_status(&self) -> DeployQaTipStatus {
+            self.tracker
+                .get_deploy_qa_tip_by_issue_id(&self.tip.issue_id)
+                .unwrap()
+                .expect("deploy_qa tip should still be stored")
+                .status
+        }
+
+        fn answer_calls(&self) -> usize {
+            self.answer_calls.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failed_deploy_qa_attempt_marks_tip_errored() {
+        let harness = DeployQaHarness::new(test_config());
+
+        harness
+            .watcher
+            .process_issue(
+                harness.source.clone(),
+                harness.issue(),
+                MatchResult::matched("deploy_qa pending tip", MatchPriority::High),
+                None,
+                None,
+                Some(Intent::Question),
+            )
+            .await;
+
+        assert_eq!(harness.answer_calls(), 1, "QA agent should be asked once");
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Errored,
+            "an attempt that ends without a verdict must release the tip from running"
+        );
+        assert!(
+            !harness
+                .tracker
+                .track_has_in_flight_deploy_qa("cloud")
+                .unwrap(),
+            "an errored tip must not block the track"
         );
     }
 

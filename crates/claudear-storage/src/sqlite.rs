@@ -11113,6 +11113,32 @@ mod tests {
     }
 
     #[test]
+    fn test_errored_deploy_qa_tip_round_trips_and_unblocks_track() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let tip = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.2.3"))
+            .unwrap();
+
+        tracker
+            .update_deploy_qa_tip_status(tip.id, DeployQaTipStatus::Running, Some(7))
+            .unwrap();
+        assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
+
+        tracker
+            .update_deploy_qa_tip_status(tip.id, DeployQaTipStatus::Errored, None)
+            .unwrap();
+        let stored = tracker
+            .get_deploy_qa_tip_by_issue_id(&tip.issue_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, DeployQaTipStatus::Errored);
+        assert_eq!(stored.attempt_id, Some(7));
+        assert!(!tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
+    }
+
+    #[test]
     fn test_create_regression_watch_with_linear_bug() {
         use claudear_core::types::{IssueType, RegressionWatch};
 
