@@ -21,7 +21,8 @@ pub const TRACK_METADATA_KEY: &str = "deploy_qa_track";
 pub const REPO_METADATA_KEY: &str = "deploy_qa_repo";
 /// Issue metadata key holding the release tag.
 pub const TAG_METADATA_KEY: &str = "deploy_qa_tag";
-/// Issue metadata flag marking the issue as observe/report only (no fix PR).
+/// Issue metadata flag marking the issue as report-only: no fix PR, branch or
+/// commit.
 pub const OBSERVE_ONLY_METADATA_KEY: &str = "observe_only";
 
 /// A normalized tip the poller can persist and enqueue.
@@ -253,7 +254,7 @@ fn load_configured_playbook(config: &DeployQaConfig) -> Result<String> {
     load_playbook(path)
 }
 
-/// Build the synthetic observe/report issue for a new tip.
+/// Build the synthetic live-QA issue for a new tip.
 ///
 /// Discord routing is deliberately absent from the metadata: the deploy_qa
 /// reporter posts to its configured `#releases` channel itself.
@@ -264,7 +265,7 @@ pub fn build_deploy_qa_issue(
 ) -> Issue {
     let issue_id = DeployQaTip::issue_id_for(&track.name, &tip.repo, &tip.tag);
     let title = format!(
-        "[deploy_qa] {} {} — live QA (observe/report only)",
+        "[deploy_qa] {} {} — live QA (report only, no fixes)",
         track.name, tip.tag
     );
     let body = tip.body.as_deref().unwrap_or("(no release body)");
@@ -278,7 +279,10 @@ pub fn build_deploy_qa_issue(
          - Author: {author}\n\n\
          ## Release body\n\n{body}\n\n\
          ## Agent constraints\n\n\
-         - Source is `{source}` — observe, probe, and report only.\n\
+         - Source is `{source}` — live QA: actually run the playbook's checks \
+         against the shipped release and report what you observed.\n\
+         - Make state-changing requests (create, update, delete) only in the \
+         playbook's throwaway QA project, never in any other project or production data.\n\
          - Do **not** open a fix PR, branch, or commit for this announcement.\n\
          - Do **not** post to Discord; Claudear posts the outcome from this report.\n\
          - End with `{prefix} {all_verified}` (every LIVE-TESTABLE PR passed), \

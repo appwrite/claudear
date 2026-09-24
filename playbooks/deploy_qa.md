@@ -38,7 +38,7 @@ Your report becomes the post, so keep it short: one bullet per PR, no curl dumps
 
 - Not regression / fix-inclusion tracking (`[regression]` / `ReleaseTracker`). That stays separate.
 - Do not ingest `#releases` via Discord issue source (would spawn code-fix agents on bot posts).
-- Do **not** open fix PRs for a release announcement. Observe, probe, and report only.
+- Do **not** open fix PRs, branches, or commits for a release announcement. Run the checks above and report; do not fix what they find.
 
 ## Required report format (machine-readable footer)
 
