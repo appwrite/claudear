@@ -24,6 +24,7 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 const DEFAULT_LOG_DIR: &str = "./logs";
 const AUDIT_LOG_SUBDIR: &str = "audit";
@@ -4399,8 +4400,8 @@ impl DeployQaStore for SqliteTracker {
         SqliteTracker::update_deploy_qa_tip_status_if(self, id, expected, status, attempt_id)
     }
 
-    fn release_running_deploy_qa_tips(&self) -> Result<usize> {
-        SqliteTracker::release_running_deploy_qa_tips(self)
+    fn release_stale_running_deploy_qa_tips(&self, stale_after: Duration) -> Result<usize> {
+        SqliteTracker::release_stale_running_deploy_qa_tips(self, stale_after)
     }
 
     fn update_deploy_qa_discord_ids(
@@ -7981,8 +7982,9 @@ impl SqliteTracker {
         Ok(changed > 0)
     }
 
-    /// Mark every `running` tip `errored`; returns how many were released.
-    pub fn release_running_deploy_qa_tips(&self) -> Result<usize> {
+    /// Mark every tip left `running` for longer than `stale_after` as
+    /// `errored`; returns how many were released.
+    pub fn release_stale_running_deploy_qa_tips(&self, stale_after: Duration) -> Result<usize> {
         use claudear_core::types::DeployQaTipStatus;
 
         let conn = self.acquire_lock()?;
@@ -7991,11 +7993,12 @@ impl SqliteTracker {
             UPDATE deploy_qa_tips
             SET status = ?1,
                 updated_at = datetime('now')
-            WHERE status = ?2
+            WHERE status = ?2 AND updated_at < datetime('now', ?3)
             "#,
             params![
                 DeployQaTipStatus::Errored.to_string(),
-                DeployQaTipStatus::Running.to_string()
+                DeployQaTipStatus::Running.to_string(),
+                format!("-{} seconds", stale_after.as_secs())
             ],
         )?;
         Ok(released)
@@ -11336,27 +11339,47 @@ mod tests {
         );
     }
 
+    fn age_deploy_qa_tip(tracker: &SqliteTracker, id: i64, seconds: u64) {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE deploy_qa_tips SET updated_at = datetime('now', ?1) WHERE id = ?2",
+                params![format!("-{seconds} seconds"), id],
+            )
+            .unwrap();
+    }
+
     #[test]
-    fn test_release_running_deploy_qa_tips_errors_only_running_tips() {
+    fn test_release_stale_running_deploy_qa_tips_errors_only_stale_running_tips() {
         use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
 
         let tracker = SqliteTracker::in_memory().unwrap();
+        let stale_after = Duration::from_secs(1800);
         let seeded = [
             ("cloud", "1.0.0", DeployQaTipStatus::Pending),
             ("cloud", "1.1.0", DeployQaTipStatus::Running),
             ("cloud", "1.2.0", DeployQaTipStatus::Verified),
-            ("cloud", "1.3.0", DeployQaTipStatus::Failed),
-            ("cloud", "1.4.0", DeployQaTipStatus::Errored),
+            ("cloud", "1.3.0", DeployQaTipStatus::Unverified),
+            ("cloud", "1.4.0", DeployQaTipStatus::Failed),
+            ("cloud", "1.5.0", DeployQaTipStatus::Errored),
             ("edge", "2.0.0", DeployQaTipStatus::Running),
         ];
         for (track, tag, status) in seeded {
             let mut tip = DeployQaTip::new(track, "appwrite-labs/cloud", tag);
             tip.status = status;
             tip.attempt_id = Some(3);
-            tracker.upsert_deploy_qa_tip(&tip).unwrap();
+            let stored = tracker.upsert_deploy_qa_tip(&tip).unwrap();
+            age_deploy_qa_tip(&tracker, stored.id, 3600);
         }
 
-        assert_eq!(tracker.release_running_deploy_qa_tips().unwrap(), 2);
+        assert_eq!(
+            tracker
+                .release_stale_running_deploy_qa_tips(stale_after)
+                .unwrap(),
+            2,
+            "only running tips past the threshold should be released"
+        );
 
         for (track, tag, status) in seeded {
             let expected = match status {
@@ -11371,7 +11394,55 @@ mod tests {
             !tracker.track_has_in_flight_deploy_qa("edge").unwrap(),
             "a released tip must no longer block its track"
         );
-        assert_eq!(tracker.release_running_deploy_qa_tips().unwrap(), 0);
+        assert_eq!(
+            tracker
+                .release_stale_running_deploy_qa_tips(stale_after)
+                .unwrap(),
+            0,
+            "a second sweep must find nothing left to release"
+        );
+    }
+
+    #[test]
+    fn test_release_stale_running_deploy_qa_tips_leaves_live_runs_alone() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let stale_after = Duration::from_secs(1800);
+        let claim = |tag: &str| {
+            let tip = tracker
+                .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", tag))
+                .unwrap();
+            assert!(tracker
+                .update_deploy_qa_tip_status_if(
+                    tip.id,
+                    DeployQaTipStatus::Pending,
+                    DeployQaTipStatus::Running,
+                    Some(5),
+                )
+                .unwrap());
+            tip
+        };
+        let just_claimed = claim("1.0.0");
+        let within_threshold = claim("1.1.0");
+        age_deploy_qa_tip(&tracker, within_threshold.id, 1700);
+
+        assert_eq!(
+            tracker
+                .release_stale_running_deploy_qa_tips(stale_after)
+                .unwrap(),
+            0,
+            "a run younger than the threshold may still be live in another process"
+        );
+        for tip in [&just_claimed, &within_threshold] {
+            let stored = tracker
+                .get_deploy_qa_tip_by_issue_id(&tip.issue_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.status, DeployQaTipStatus::Running, "{}", tip.tag);
+            assert_eq!(stored.attempt_id, Some(5), "{}", tip.tag);
+        }
+        assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
     }
 
     #[test]

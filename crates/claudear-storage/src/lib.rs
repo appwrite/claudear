@@ -34,6 +34,7 @@ use claudear_core::types::{
 use claudear_core::types::{CrossRepoCorrelation, FixOutcome};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 /// Maximum allowed length for PR URLs to prevent ReDoS and excessive memory usage.
 const MAX_PR_URL_LENGTH: usize = 2048;
@@ -1793,12 +1794,15 @@ pub trait DeployQaStore: Send + Sync {
         Ok(false)
     }
 
-    /// Mark every `running` tip `errored`, returning how many were released.
+    /// Mark every tip left `running` for longer than `stale_after` as
+    /// `errored`, returning how many were released.
     ///
-    /// A tip is only `running` inside a live process, so at startup any such
-    /// tip was orphaned by a restart, crash, or shutdown mid-attempt and would
-    /// otherwise block its track under `skip_if_previous_running`.
-    fn release_running_deploy_qa_tips(&self) -> Result<usize> {
+    /// A live run cannot outlast its agent timeout, so a tip `running` past a
+    /// `stale_after` above that timeout was orphaned by a crash, restart or
+    /// shutdown mid-attempt and would otherwise block its track under
+    /// `skip_if_previous_running`. Fresher tips may still be running in
+    /// another process sharing the database, so they are left alone.
+    fn release_stale_running_deploy_qa_tips(&self, _stale_after: Duration) -> Result<usize> {
         Ok(0)
     }
 

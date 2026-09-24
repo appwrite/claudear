@@ -1555,6 +1555,11 @@ fn start_regression_monitoring(
     Some(handle)
 }
 
+/// How many QA answer timeouts a `[deploy_qa]` tip may stay `running` before
+/// it is treated as orphaned: a live run cannot outlast its answer timeout,
+/// and the margin covers setup and delivery around the agent call.
+const DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER: u32 = 2;
+
 /// Start the `[deploy_qa]` background poller.
 ///
 /// Distinct from [`start_regression_monitoring`]: this watches **new GitHub
@@ -1567,13 +1572,12 @@ fn start_regression_monitoring(
 /// `deploy_qa`. Dispatch waits for the watcher to finish warm start, so tips
 /// seen before then run after the next poll.
 ///
-/// Before polling starts, every tip still `running` is marked `errored` to
-/// unblock its track. That is usually a run orphaned by a previous process,
-/// but a `claudear trigger`, `claudear retries process` or second
-/// `claudear poll` process sharing the database can legitimately be mid-run.
-/// Its tip is then errored early, which only relaxes
-/// `skip_if_previous_running` for that track until the run finishes and
-/// records its verdict.
+/// Every tick, starting with the first, begins by marking tips left `running`
+/// longer than [`DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER`] QA answer timeouts
+/// as `errored`, so a run orphaned by a crash, restart or shutdown stops
+/// blocking its track under `skip_if_previous_running` without waiting for a
+/// restart. A run still live in this or another process sharing the database
+/// is younger than that and is left alone.
 fn start_deploy_qa_monitoring(
     config: &Config,
     tracker: Arc<dyn FixAttemptTracker>,
@@ -1582,19 +1586,6 @@ fn start_deploy_qa_monitoring(
     if !config.deploy_qa.enabled {
         tracing::info!("Deploy QA disabled in configuration");
         return None;
-    }
-    match tracker.release_running_deploy_qa_tips() {
-        Ok(0) => {}
-        Ok(released) => tracing::info!(
-            component = "deploy_qa",
-            released,
-            "Marked deploy QA tips left running by a previous process as errored"
-        ),
-        Err(error) => tracing::warn!(
-            component = "deploy_qa",
-            error = %error,
-            "Failed to release deploy QA tips left running by a previous process"
-        ),
     }
     if config.deploy_qa.tracks.is_empty() {
         tracing::warn!("[deploy_qa] enabled but no [[deploy_qa.tracks]] configured");
@@ -1615,24 +1606,29 @@ fn start_deploy_qa_monitoring(
         }
     };
 
-    let poller = match DeployQaTracker::new(github_token, tracker, config.deploy_qa.clone()) {
-        Ok(poller) => poller,
-        Err(error) => {
-            tracing::error!(error = %error, "Failed to start deploy QA poller");
-            return None;
-        }
-    };
+    let poller =
+        match DeployQaTracker::new(github_token, Arc::clone(&tracker), config.deploy_qa.clone()) {
+            Ok(poller) => poller,
+            Err(error) => {
+                tracing::error!(error = %error, "Failed to start deploy QA poller");
+                return None;
+            }
+        };
 
+    let stale_after = Duration::from_secs(config.qa.answer_timeout_secs.max(1))
+        .saturating_mul(DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER);
     let interval_ms = config.deploy_qa.effective_poll_interval_ms();
     let handle = tokio::spawn(async move {
         let mut tick = interval(Duration::from_millis(interval_ms));
         tracing::info!(
             component = "deploy_qa",
             poll_interval_ms = interval_ms,
+            stale_after_secs = stale_after.as_secs(),
             "Deploy QA poller started"
         );
         loop {
             tick.tick().await;
+            release_stale_deploy_qa_tips(tracker.as_ref(), stale_after);
             for result in poller.poll_once().await {
                 match result.action {
                     DeployQaPollAction::Enqueued => {
@@ -1684,6 +1680,25 @@ fn start_deploy_qa_monitoring(
         }
     });
     Some(handle)
+}
+
+/// Mark `[deploy_qa]` tips left `running` longer than `stale_after` as
+/// `errored`, so the tracks their orphaned runs held can take new tips.
+fn release_stale_deploy_qa_tips(tracker: &dyn FixAttemptTracker, stale_after: Duration) {
+    match tracker.release_stale_running_deploy_qa_tips(stale_after) {
+        Ok(0) => {}
+        Ok(released) => tracing::info!(
+            component = "deploy_qa",
+            released,
+            stale_after_secs = stale_after.as_secs(),
+            "Marked stale running deploy QA tips as errored"
+        ),
+        Err(error) => tracing::warn!(
+            component = "deploy_qa",
+            error = %error,
+            "Failed to release stale running deploy QA tips"
+        ),
+    }
 }
 
 /// Enrich the process PATH with entries from the user's login shell.
