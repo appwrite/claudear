@@ -13,7 +13,8 @@ use claudear_storage::FixAttemptTracker;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -35,6 +36,14 @@ const SHELL_TOOL: &str = "Bash";
 /// The only `--setting-sources` a live-QA run loads, so project and local
 /// settings in its working directory never apply to it.
 const LIVE_QA_SETTING_SOURCES: &str = "user";
+
+/// Prefix of Claudear's own environment variables, such as
+/// `CLAUDEAR_MASTER_KEY`, which a live-QA run never inherits.
+const CLAUDEAR_VARIABLE_PREFIX: &str = "CLAUDEAR_";
+
+/// Marks a process as running inside a Claude Code session; agent runs drop
+/// it so the CLI never takes itself for a nested session.
+const NESTED_SESSION_VARIABLE: &str = "CLAUDECODE";
 
 /// Timeout for read-only structured queries (classification-scale, not the long
 /// fix-run timeout).
@@ -70,7 +79,8 @@ enum RunProfile {
     Reply,
     /// A [`DEPLOY_QA_SOURCE`] live-QA run: plain text with the fix-run access
     /// plus the read-only tools, so it can probe live hosts. It loads no MCP
-    /// servers or settings from its working directory, and is bounded by
+    /// servers or settings from its working directory, inherits none of
+    /// Claudear's own `CLAUDEAR_*` variables, and is bounded by
     /// [`ClaudeRunnerConfig::live_qa_timeout_secs`].
     LiveQa,
 }
@@ -84,6 +94,23 @@ impl RunProfile {
             Self::Reply
         }
     }
+
+    /// Whether a run under this profile may see Claudear's own `CLAUDEAR_*`
+    /// variables. A live-QA run may not: they hold Claudear's credentials,
+    /// such as `CLAUDEAR_MASTER_KEY`, and live QA needs none of them.
+    fn inherits_claudear_variables(self) -> bool {
+        self != Self::LiveQa
+    }
+}
+
+/// Claudear's own `CLAUDEAR_*` variables among `env` and the daemon's
+/// environment, which a spawned CLI inherits unless they are removed.
+fn claudear_variables(env: &HashMap<String, String>) -> BTreeSet<OsString> {
+    env.keys()
+        .map(OsString::from)
+        .chain(std::env::vars_os().map(|(name, _)| name))
+        .filter(|name| name.to_string_lossy().starts_with(CLAUDEAR_VARIABLE_PREFIX))
+        .collect()
 }
 
 /// Which shell commands `--allowedTools` permissions let a run execute,
@@ -398,6 +425,7 @@ pub struct ClaudeRunnerConfig {
     /// CLI binary name or absolute path (default: "claude").
     pub binary: String,
     /// Extra environment variables to set when spawning the agent process.
+    /// Live-QA runs drop those named `CLAUDEAR_*`, as they do Claudear's own.
     pub env: HashMap<String, String>,
     /// MCP servers to attach, keyed by server name. Attachment is gated per-run
     /// by each server's `sources` list against the issue source.
@@ -440,7 +468,7 @@ impl ClaudeAgentRunner {
     pub fn new(config: ClaudeRunnerConfig, tracker: Arc<dyn FixAttemptTracker>) -> Self {
         let template_renderer = TemplateRenderer::new();
         let mut base_env: HashMap<String, String> = std::env::vars()
-            .filter(|(k, _)| k != "CLAUDECODE")
+            .filter(|(k, _)| k != NESTED_SESSION_VARIABLE)
             .collect();
         // Merge config-level env vars (overrides process env).
         for (k, v) in &config.env {
@@ -808,7 +836,7 @@ The PR title should include the issue ID: {}
             .args(&args)
             .current_dir(project_dir)
             .envs(env)
-            .env_remove("CLAUDECODE")
+            .env_remove(NESTED_SESSION_VARIABLE)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Discard stderr: this lean path never reads it, and leaving it piped
@@ -906,9 +934,9 @@ The PR title should include the issue ID: {}
     /// Release tips from [`DEPLOY_QA_SOURCE`] are the exception: they run live
     /// QA with the fix-run tool access (`permissions`, `skip_permissions`) plus
     /// the read-only tools, so the agent can probe live hosts, within
-    /// `live_qa_timeout_secs`, and return a live-QA report. Either way the
-    /// result is the run's [`final_reply`], and a run that times out is an
-    /// error.
+    /// `live_qa_timeout_secs` and without Claudear's own `CLAUDEAR_*`
+    /// variables, and return a live-QA report. Either way the result is the
+    /// run's [`final_reply`], and a run that times out is an error.
     pub async fn run_reply(
         &self,
         issue: &Issue,
@@ -936,7 +964,8 @@ The PR title should include the issue ID: {}
 
     /// Render matched MCP servers into a private temp file (claudear-mcp-*.json,
     /// 0600 on Unix) passed to the CLI via --mcp-config and deleted when the handle
-    /// drops. `${VAR}` in env is expanded by the CLI.
+    /// drops. `${VAR}` in env is expanded by the CLI from the run's environment,
+    /// so a live-QA run cannot expand `${CLAUDEAR_*}`.
     fn render_mcp_config(
         servers: &[(&String, &McpServerConfig)],
     ) -> std::io::Result<tempfile::NamedTempFile> {
@@ -1341,11 +1370,29 @@ The PR title should include the issue ID: {}
         )
         .await;
 
-        let mut child = match Command::new(&self.config.binary)
+        let withheld = if profile.inherits_claudear_variables() {
+            BTreeSet::new()
+        } else {
+            claudear_variables(&env)
+        };
+        if !withheld.is_empty() {
+            tracing::debug!(
+                component = "claude",
+                label = label,
+                variables = ?withheld,
+                "Withholding Claudear's own variables from the run"
+            );
+        }
+        let mut command = Command::new(&self.config.binary);
+        command
             .args(&args)
             .current_dir(project_dir)
             .envs(env)
-            .env_remove("CLAUDECODE")
+            .env_remove(NESTED_SESSION_VARIABLE);
+        for name in &withheld {
+            command.env_remove(name);
+        }
+        let mut child = match command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2935,6 +2982,11 @@ mod tests {
     #[cfg(unix)]
     const FAKE_CLI_ARGS_FILE: &str = "args";
 
+    /// File, beside the stub CLI, that it records its environment to, one
+    /// `NAME=value` per line.
+    #[cfg(unix)]
+    const FAKE_CLI_ENVIRONMENT_FILE: &str = "environment";
+
     /// File, beside the hanging stub CLI, that it records its PID to.
     #[cfg(unix)]
     const FAKE_CLI_PID_FILE: &str = "pid";
@@ -2944,9 +2996,9 @@ mod tests {
     #[cfg(unix)]
     const FAKE_CLI_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-    /// A stub `claude` binary that records its arguments, drains the prompt
-    /// from stdin, prints `events` as stream-json lines and exits with
-    /// `exit_code`.
+    /// A stub `claude` binary that records its arguments and environment,
+    /// drains the prompt from stdin, prints `events` as stream-json lines and
+    /// exits with `exit_code`.
     #[cfg(unix)]
     fn fake_cli_script(events: &[serde_json::Value], exit_code: i32) -> String {
         delayed_cli_script(0, events, exit_code)
@@ -2957,7 +3009,7 @@ mod tests {
     fn delayed_cli_script(delay_secs: u64, events: &[serde_json::Value], exit_code: i32) -> String {
         let lines: Vec<String> = events.iter().map(|event| event.to_string()).collect();
         format!(
-            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$(dirname \"$0\")/{FAKE_CLI_ARGS_FILE}\"\ncat > /dev/null\nsleep {delay_secs}\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
+            "#!/bin/sh\ndirectory=\"$(dirname \"$0\")\"\nprintf '%s\\0' \"$@\" > \"$directory/{FAKE_CLI_ARGS_FILE}\"\nenv > \"$directory/{FAKE_CLI_ENVIRONMENT_FILE}\"\ncat > /dev/null\nsleep {delay_secs}\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
             lines.join("\n")
         )
     }
@@ -2986,11 +3038,13 @@ mod tests {
 
     /// A stub `claude` binary installed in a temp dir that also holds the
     /// execution logs. Holds [`ENV_MUTEX`] for its lifetime and restores
-    /// `CLAUDEAR_LOG_DIR` when dropped.
+    /// every process variable it set, `CLAUDEAR_LOG_DIR` among them, when
+    /// dropped.
     #[cfg(unix)]
     struct FakeCli {
         directory: tempfile::TempDir,
-        previous_log_dir: Option<String>,
+        /// Each process variable this stub set, with the value it replaced.
+        replaced_variables: Vec<(&'static str, Option<OsString>)>,
         _env_guard: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -3004,13 +3058,20 @@ mod tests {
             let binary = directory.path().join(FAKE_CLI_BINARY);
             std::fs::write(&binary, script).unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let previous_log_dir = std::env::var("CLAUDEAR_LOG_DIR").ok();
-            std::env::set_var("CLAUDEAR_LOG_DIR", directory.path().join("logs"));
-            Self {
+            let logs = directory.path().join("logs");
+            let mut cli = Self {
                 directory,
-                previous_log_dir,
+                replaced_variables: Vec::new(),
                 _env_guard: env_guard,
-            }
+            };
+            cli.set_variable("CLAUDEAR_LOG_DIR", logs);
+            cli
+        }
+
+        /// Set the process variable `name` to `value` until this stub drops.
+        fn set_variable(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            self.replaced_variables.push((name, std::env::var_os(name)));
+            std::env::set_var(name, value);
         }
 
         /// A runner with `config` that spawns this stub.
@@ -3034,6 +3095,16 @@ mod tests {
                 .unwrap_or(&recorded)
                 .split('\0')
                 .map(str::to_string)
+                .collect()
+        }
+
+        /// The environment the stub was last spawned with.
+        fn recorded_environment(&self) -> HashMap<String, String> {
+            std::fs::read_to_string(self.directory().join(FAKE_CLI_ENVIRONMENT_FILE))
+                .expect("the stub CLI was never spawned")
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(name, value)| (name.to_string(), value.to_string()))
                 .collect()
         }
 
@@ -3084,9 +3155,11 @@ mod tests {
     #[cfg(unix)]
     impl Drop for FakeCli {
         fn drop(&mut self) {
-            match self.previous_log_dir.take() {
-                Some(value) => std::env::set_var("CLAUDEAR_LOG_DIR", value),
-                None => std::env::remove_var("CLAUDEAR_LOG_DIR"),
+            for (name, previous) in self.replaced_variables.drain(..).rev() {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
             }
         }
     }
@@ -3655,6 +3728,128 @@ mod tests {
         .expect("a customer reply runs until `timeout_secs`, not the live-QA timeout");
 
         assert_eq!(reply, "Thanks for reaching out!");
+    }
+
+    /// A fake credential held in Claudear's own variables.
+    #[cfg(unix)]
+    const FAKE_CLAUDEAR_CREDENTIAL: &str = "fake-claudear-credential-0001";
+
+    /// Claudear's variable for the key that decrypts its config's secrets,
+    /// set through the provider `env`.
+    #[cfg(unix)]
+    const MASTER_KEY_VARIABLE: &str = "CLAUDEAR_MASTER_KEY";
+
+    /// Claudear's variable for its Discord bot token, set in the daemon's own
+    /// environment.
+    #[cfg(unix)]
+    const DISCORD_BOT_TOKEN_VARIABLE: &str = "CLAUDEAR_DISCORD_BOT_TOKEN";
+
+    /// A provider `env` variable the operator chose for the agent, and its
+    /// value.
+    #[cfg(unix)]
+    const QA_PROJECT_VARIABLE: (&str, &str) = ("APPWRITE_QA_PROJECT_ID", "qa-1044");
+
+    /// The environment a run under `profile` spawns the stub CLI with, while
+    /// the provider `env` holds a fake [`MASTER_KEY_VARIABLE`] beside
+    /// [`QA_PROJECT_VARIABLE`], and the daemon's environment a fake
+    /// [`DISCORD_BOT_TOKEN_VARIABLE`] set only after the runner captured it,
+    /// so the CLI can only inherit that one.
+    #[cfg(unix)]
+    fn stub_run_environment(profile: RunProfile) -> HashMap<String, String> {
+        let mut cli = FakeCli::install(&fake_cli_script(
+            &[result_event(LIVE_QA_FINAL_REPORT, false)],
+            0,
+        ));
+        let (qa_project_name, qa_project) = QA_PROJECT_VARIABLE;
+        let runner = cli.runner(ClaudeRunnerConfig {
+            env: HashMap::from([
+                (
+                    MASTER_KEY_VARIABLE.to_string(),
+                    FAKE_CLAUDEAR_CREDENTIAL.to_string(),
+                ),
+                (qa_project_name.to_string(), qa_project.to_string()),
+            ]),
+            ..ClaudeRunnerConfig::default()
+        });
+        cli.set_variable(DISCORD_BOT_TOKEN_VARIABLE, FAKE_CLAUDEAR_CREDENTIAL);
+        let source = match profile {
+            RunProfile::LiveQa => DEPLOY_QA_SOURCE,
+            RunProfile::Reply => HELPSCOUT_SOURCE,
+            RunProfile::Fix => "sentry",
+        };
+        let issue = deploy_qa_issue(source);
+
+        block_on(async {
+            match profile {
+                RunProfile::Fix => runner
+                    .execute_with_attempt("Fix it", Some(&issue), None, cli.directory())
+                    .await
+                    .map(drop),
+                RunProfile::Reply | RunProfile::LiveQa => runner
+                    .run_reply(&issue, "ctx", None, ReplyKind::Answer, cli.directory())
+                    .await
+                    .map(drop),
+            }
+        })
+        .expect("the stub run succeeds");
+        cli.recorded_environment()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_live_qa_run_inherits_none_of_claudears_own_variables() {
+        let environment = stub_run_environment(RunProfile::LiveQa);
+
+        let inherited: Vec<&String> = environment
+            .keys()
+            .filter(|name| name.starts_with(CLAUDEAR_VARIABLE_PREFIX))
+            .collect();
+        assert!(
+            inherited.is_empty(),
+            "the live-QA agent inherited Claudear's own variables: {inherited:?}"
+        );
+        assert!(
+            !environment
+                .values()
+                .any(|value| value.contains(FAKE_CLAUDEAR_CREDENTIAL)),
+            "a Claudear credential reached the live-QA agent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_live_qa_run_keeps_the_rest_of_its_environment() {
+        let environment = stub_run_environment(RunProfile::LiveQa);
+
+        let (qa_project_name, qa_project) = QA_PROJECT_VARIABLE;
+        assert_eq!(
+            environment.get(qa_project_name).map(String::as_str),
+            Some(qa_project),
+            "the live-QA agent lost the provider's own variable"
+        );
+        for name in ["PATH", "HOME"] {
+            assert_eq!(
+                environment.get(name),
+                std::env::var(name).ok().as_ref(),
+                "the live-QA agent lost {name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fix_and_reply_runs_still_inherit_claudears_own_variables() {
+        for profile in [RunProfile::Fix, RunProfile::Reply] {
+            let environment = stub_run_environment(profile);
+
+            for name in [MASTER_KEY_VARIABLE, DISCORD_BOT_TOKEN_VARIABLE] {
+                assert_eq!(
+                    environment.get(name).map(String::as_str),
+                    Some(FAKE_CLAUDEAR_CREDENTIAL),
+                    "a {profile:?} run lost {name}"
+                );
+            }
+        }
     }
 
     #[test]

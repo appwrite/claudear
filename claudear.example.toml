@@ -139,6 +139,7 @@ binary = "claude"
 # Useful when the daemon runs as a service and the CLI needs PATH or other vars.
 # Passed verbatim (no ${VAR} expansion) to every agent run of every source,
 # fix runs and [deploy_qa] live QA alike, so a secret here reaches all of them.
+# Live QA drops any named CLAUDEAR_*, as it does Claudear's own variables.
 # [agent.providers.claude.env]
 # PATH = "/home/user/.local/bin:/home/user/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin"
 
@@ -155,6 +156,7 @@ sandbox = ""
 # Gated per-run by `sources` against the issue source. Default here: HelpScout only.
 # Add "discord" to enable there; set sources = [] to enable for all sources.
 # Keep secrets out of this file: reference them via ${VAR} from the daemon/provider env.
+# [deploy_qa] runs have no CLAUDEAR_* variables, so ${CLAUDEAR_*} never resolves there.
 # [agent.providers.claude.mcp.appwrite]
 # command = "uvx"
 # args    = ["mcp-server-appwrite", "--databases", "--users", "--functions"]
@@ -835,10 +837,11 @@ github_search_repos = []
 # the MCP servers attached for deploy_qa and your user-level Claude Code
 # settings, never a .mcp.json or project/local settings. Its "no fix PRs, no
 # posting, QA-project-only writes" rules are prompt rules, not a sandbox: the
-# agent has the same environment and access as fix runs. Claudear redacts the
-# credentials it recognizes from the report before posting it to #releases and
-# never sends it to other notifier channels, but don't rely on redaction to
-# keep a secret out of #releases.
+# agent has the same access as fix runs, and their environment minus
+# Claudear's own CLAUDEAR_* variables (its master key and tokens). Claudear
+# redacts the credentials it recognizes from the report before posting it to
+# #releases and never sends it to other notifier channels, but don't rely on
+# redaction to keep a secret out of #releases.
 # Separate from [regression] / ReleaseTracker (those track bug-fix inclusion).
 # Do not point issues.discord at #releases — that would spawn fix agents on
 # bot posts. Required env for a live host (not used in CI):
@@ -848,8 +851,9 @@ github_search_repos = []
 #   CLAUDEAR_DISCORD_BOT_TOKEN     - bot that can reply / create threads
 #   QA credentials the playbook's checks need (e.g. a throwaway QA project's
 #   API key) - set in the daemon or provider env, which every agent run
-#   inherits, so scope them to the QA project; an MCP server env references
-#   them as ${VAR}, and the browser logs in via --storage-state or --secrets
+#   inherits, so scope them to the QA project, and don't name them CLAUDEAR_*,
+#   which live QA never gets; an MCP server env references them as ${VAR},
+#   and the browser logs in via --storage-state or --secrets
 # Live host probes are performed by the agent; CI uses a no-op probe seam.
 
 [deploy_qa]
