@@ -9315,12 +9315,10 @@ mod tests {
         );
     }
 
-    async fn assert_deploy_qa_deferred_until_reset(failure: impl FnOnce(i64) -> String) {
-        let reset = Utc::now() + chrono::Duration::hours(3);
+    async fn run_rate_limited_deploy_qa(failure: String) -> (usize, DateTime<Utc>) {
         let mut config = test_config();
         config.agent.default_provider = SCRIPTED_QA_PROVIDER.to_string();
-        let harness =
-            DeployQaHarness::answering(config, QaAnswer::Fail(failure(reset.timestamp())));
+        let harness = DeployQaHarness::answering(config, QaAnswer::Fail(failure));
 
         for _ in 0..2 {
             harness
@@ -9336,11 +9334,6 @@ mod tests {
                 .await;
         }
 
-        assert_eq!(
-            harness.agent_calls(),
-            1,
-            "a usage-limited provider must not be asked again before its reset"
-        );
         let pause_until = harness
             .tracker
             .get_recent_activities(50, None)
@@ -9350,29 +9343,89 @@ mod tests {
             .and_then(|activity| activity.metadata)
             .and_then(|metadata| metadata["pause_until"].as_str().map(str::to_string))
             .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-            .expect("the rate limit should be logged as a pause");
+            .expect("the rate limit should be logged as a pause")
+            .with_timezone(&Utc);
+        (harness.agent_calls(), pause_until)
+    }
+
+    async fn assert_deploy_qa_deferred_until(failure: String, reset: DateTime<Utc>) {
+        let (agent_calls, pause_until) = run_rate_limited_deploy_qa(failure).await;
+        assert_eq!(
+            agent_calls, 1,
+            "a rate-limited provider must not be asked again before its reset"
+        );
         assert!(
             pause_until >= reset,
             "the pause must last until the limit resets at {reset}, got {pause_until}"
         );
     }
 
+    async fn assert_deploy_qa_briefly_deferred(failure: String) {
+        let (agent_calls, pause_until) = run_rate_limited_deploy_qa(failure).await;
+        assert_eq!(
+            agent_calls, 1,
+            "a rate-limited provider must stay paused when its reset cannot be trusted"
+        );
+        assert!(
+            pause_until < Utc::now() + chrono::Duration::hours(1),
+            "an untrusted reset must not hold the provider past a short pause, got {pause_until}"
+        );
+    }
+
+    fn usage_limit_failure(reset: DateTime<Utc>) -> String {
+        format!("Claude AI usage limit reached|{}", reset.timestamp())
+    }
+
+    fn rate_limit_event_failure(reset: DateTime<Utc>) -> String {
+        format!(
+            r#"Claude rate limit hit: {{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","resetsAt":{}}}}}"#,
+            reset.timestamp()
+        )
+    }
+
     #[tokio::test]
     async fn test_deploy_qa_usage_limit_defers_qa_until_reset() {
-        assert_deploy_qa_deferred_until_reset(|epoch| {
-            format!("Claude AI usage limit reached|{epoch}")
-        })
-        .await;
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_deferred_until(usage_limit_failure(reset), reset).await;
     }
 
     #[tokio::test]
     async fn test_deploy_qa_rate_limit_event_with_epoch_reset_defers_qa_until_reset() {
-        assert_deploy_qa_deferred_until_reset(|epoch| {
-            format!(
-                r#"Claude rate limit hit: {{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","resetsAt":{epoch}}}}}"#
-            )
-        })
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_deferred_until(rate_limit_event_failure(reset), reset).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_with_elapsed_reset_still_defers_qa() {
+        let reset = Utc::now() - chrono::Duration::hours(1);
+        assert_deploy_qa_briefly_deferred(usage_limit_failure(reset)).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_elapsed_reset_still_defers_qa() {
+        let reset = Utc::now() - chrono::Duration::hours(1);
+        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(reset)).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_with_implausibly_distant_reset_defers_qa_briefly() {
+        let reset = Utc::now() + chrono::Duration::days(30);
+        assert_deploy_qa_briefly_deferred(usage_limit_failure(reset)).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_with_millisecond_reset_defers_qa_briefly() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_briefly_deferred(format!(
+            "Claude AI usage limit reached|{}",
+            reset.timestamp_millis()
+        ))
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_without_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred("Claude AI usage limit reached|".to_string()).await;
     }
 
     #[tokio::test]
@@ -13710,76 +13763,6 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let msg = "Some random error with no rate limit info";
-        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_time_from_usage_limit_epoch() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let msg = "Claude rate limit hit: Claude AI usage limit reached|1790262000";
-        let parsed = Watcher::extract_rate_limit_reset_time(msg, now).unwrap();
-        assert_eq!(parsed.to_rfc3339(), "2026-09-24T15:00:00+00:00");
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_time_rejects_past_usage_limit_epoch() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T16:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let msg = "Claude rate limit hit: Claude AI usage limit reached|1790262000";
-        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_time_rejects_implausibly_distant_usage_limit_epoch() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-08-25T15:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let msg = "Claude rate limit hit: Claude AI usage limit reached|1790262000";
-        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_time_rejects_usage_limit_epoch_in_milliseconds() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let msg = "Claude rate limit hit: Claude AI usage limit reached|1790262000000";
-        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_time_rejects_usage_limit_without_epoch() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let msg = "Claude rate limit hit: Claude AI usage limit reached|";
-        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_time_from_numeric_resets_at() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-02-26T07:30:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let msg = r#"Claude rate limit hit: {"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1772096400}}"#;
-        let parsed = Watcher::extract_rate_limit_reset_time(msg, now).unwrap();
-        assert_eq!(parsed.to_rfc3339(), "2026-02-26T09:00:00+00:00");
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_time_rejects_past_numeric_resets_at() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-02-26T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let msg = r#"Claude rate limit hit: {"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1772096400}}"#;
         let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
         assert!(parsed.is_none());
     }
