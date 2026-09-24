@@ -2318,6 +2318,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         let result = release_tracker
@@ -2357,6 +2358,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         let result = release_tracker
@@ -2396,6 +2398,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         let result = release_tracker
@@ -2434,6 +2437,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         let result = release_tracker
@@ -2480,6 +2484,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         let result = release_tracker
@@ -3120,6 +3125,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         // The release has null published_at, so get_first_release_after will filter it out
@@ -3946,6 +3952,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         let result = release_tracker
@@ -3988,6 +3995,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         let result = release_tracker
@@ -4028,6 +4036,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         // Invalid merged_at should cause an error
@@ -4068,6 +4077,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         let result = release_tracker
@@ -4772,6 +4782,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         let result = release_tracker
@@ -5371,6 +5382,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         let result = release_tracker
@@ -5632,6 +5644,7 @@ mod tests {
             target_commitish: "main".to_string(),
             body: None,
             html_url: "url".to_string(),
+            author: None,
         };
 
         // Source release has null published_at -> get_first_release_after will filter it out

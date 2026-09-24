@@ -28,6 +28,16 @@ pub struct GitHubRelease {
     pub body: Option<String>,
     /// HTML URL to the release.
     pub html_url: String,
+    /// Account that published the release.
+    #[serde(default)]
+    pub author: Option<ReleaseAuthor>,
+}
+
+/// The GitHub account that published a release.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReleaseAuthor {
+    /// GitHub login.
+    pub login: String,
 }
 
 /// A repository tag (used when a repo has tags but no GitHub Releases).

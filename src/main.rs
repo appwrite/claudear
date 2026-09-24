@@ -1616,6 +1616,8 @@ fn start_deploy_qa_monitoring(
     config: &Config,
     tracker: Arc<dyn FixAttemptTracker>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    use claudear::deploy_qa::DeployQaPollAction;
+
     if !config.deploy_qa.enabled {
         tracing::info!("Deploy QA disabled in configuration");
         return None;
@@ -1629,8 +1631,8 @@ fn start_deploy_qa_monitoring(
         .github()
         .token
         .as_ref()
-        .map(|t| t.expose().to_string())
-        .filter(|t| !t.is_empty());
+        .map(|token| token.expose().to_string())
+        .filter(|token| !token.is_empty());
     let github_token = match github_token {
         Some(token) => token,
         None => {
@@ -1640,9 +1642,9 @@ fn start_deploy_qa_monitoring(
     };
 
     let poller = match DeployQaTracker::new(github_token, tracker, config.deploy_qa.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to start deploy QA poller");
+        Ok(poller) => poller,
+        Err(error) => {
+            tracing::error!(error = %error, "Failed to start deploy QA poller");
             return None;
         }
     };
@@ -1657,38 +1659,39 @@ fn start_deploy_qa_monitoring(
         );
         loop {
             tick.tick().await;
-            match poller.poll_once().await {
-                Ok(results) => {
-                    for result in results {
-                        match result.action {
-                            claudear::deploy_qa::DeployQaPollAction::Enqueued => {
-                                tracing::info!(
-                                    component = "deploy_qa",
-                                    track = %result.track,
-                                    tag = result.tip.as_ref().map(|t| t.tag.as_str()).unwrap_or("?"),
-                                    "Enqueued observe/report attempt for new release tip"
-                                );
-                            }
-                            claudear::deploy_qa::DeployQaPollAction::SkippedDuplicate => {
-                                tracing::debug!(
-                                    component = "deploy_qa",
-                                    track = %result.track,
-                                    "Tip unchanged; not re-fired"
-                                );
-                            }
-                            claudear::deploy_qa::DeployQaPollAction::SkippedPreviousRunning => {
-                                tracing::info!(
-                                    component = "deploy_qa",
-                                    track = %result.track,
-                                    "Skipping new tip; previous attempt still running"
-                                );
-                            }
-                            claudear::deploy_qa::DeployQaPollAction::NoMatchingTip => {}
-                        }
+            for result in poller.poll_once().await {
+                match result.action {
+                    DeployQaPollAction::Enqueued => {
+                        tracing::info!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            tag = result.tip.as_ref().map(|tip| tip.tag.as_str()).unwrap_or("?"),
+                            "Enqueued observe/report attempt for new release tip"
+                        );
                     }
-                }
-                Err(e) => {
-                    tracing::error!(component = "deploy_qa", error = %e, "Error polling release tips");
+                    DeployQaPollAction::SkippedDuplicate => {
+                        tracing::debug!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            "Tip unchanged; not re-fired"
+                        );
+                    }
+                    DeployQaPollAction::SkippedPreviousRunning => {
+                        tracing::info!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            "Skipping new tip; previous attempt still running"
+                        );
+                    }
+                    DeployQaPollAction::NoMatchingTip => {}
+                    DeployQaPollAction::Errored(ref error) => {
+                        tracing::warn!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            error = %error,
+                            "Failed to poll release tips for track"
+                        );
+                    }
                 }
             }
         }

@@ -1,7 +1,7 @@
 //! Poll GitHub for new release tips and persist last-seen / attempt state.
 
 use crate::deploy_qa::playbook::{load_playbook, DEPLOY_QA_SOURCE};
-use crate::release::{GitHubRelease, ReleaseClient};
+use crate::release::{GitHubRelease, GitHubTag, ReleaseClient};
 use claudear_config::config::{DeployQaConfig, DeployQaTagFilter, DeployQaTrackConfig};
 use claudear_core::error::Result;
 use claudear_core::http::{HttpClient, ReqwestHttpClient};
@@ -49,8 +49,18 @@ impl ReleaseTip {
             body: release.body,
             published_at: release.published_at,
             html_url: release.html_url,
-            // GitHubRelease stays schema-stable for regression tests; login is
-            // optional context filled when the poller can parse it later.
+            author_login: release.author.map(|author| author.login),
+        }
+    }
+
+    fn from_tag(repo: &str, tag: GitHubTag) -> Self {
+        Self {
+            repo: repo.to_string(),
+            html_url: format!("https://github.com/{repo}/releases/tag/{}", tag.name),
+            name: Some(tag.name.clone()),
+            tag: tag.name,
+            body: None,
+            published_at: None,
             author_login: None,
         }
     }
@@ -67,6 +77,8 @@ pub enum DeployQaPollAction {
     SkippedPreviousRunning,
     /// No matching published tip on this track.
     NoMatchingTip,
+    /// Polling this track failed; carries the error.
+    Errored(String),
 }
 
 /// Per-track poll result.
@@ -124,12 +136,23 @@ impl<C: HttpClient> DeployQaTracker<C> {
     }
 
     /// Poll every configured track once.
-    pub async fn poll_once(&self) -> Result<Vec<DeployQaPollResult>> {
-        let mut results = Vec::new();
+    ///
+    /// A failing track yields [`DeployQaPollAction::Errored`] without aborting the others.
+    pub async fn poll_once(&self) -> Vec<DeployQaPollResult> {
+        let mut results = Vec::with_capacity(self.config.tracks.len());
         for track in &self.config.tracks {
-            results.push(self.poll_track(track).await?);
+            let result = match self.poll_track(track).await {
+                Ok(result) => result,
+                Err(error) => DeployQaPollResult {
+                    track: track.name.clone(),
+                    action: DeployQaPollAction::Errored(error.to_string()),
+                    tip: None,
+                    issue: None,
+                },
+            };
+            results.push(result);
         }
-        Ok(results)
+        results
     }
 
     /// Poll a single track: detect tip, persist last-seen, skip duplicates / in-flight.
@@ -198,38 +221,39 @@ impl<C: HttpClient> DeployQaTracker<C> {
         })
     }
 
+    /// Newest non-draft release matching `filter`.
+    ///
+    /// Tags are consulted only when the repo has no published releases at all;
+    /// otherwise a matching tag may belong to an unpublished draft.
     async fn latest_matching_tip(
         &self,
         repo: &str,
         filter: &DeployQaTagFilter,
     ) -> Result<Option<ReleaseTip>> {
-        let releases = self.client.get_releases(repo, 30).await.unwrap_or_default();
-        if let Some(release) = releases
+        const PAGE_SIZE: u32 = 30;
+
+        let published: Vec<GitHubRelease> = self
+            .client
+            .get_releases(repo, PAGE_SIZE)
+            .await?
             .into_iter()
-            .filter(|r| !r.draft)
-            .find(|r| filter.matches(&r.tag_name))
-        {
-            return Ok(Some(ReleaseTip::from_release(repo, release)));
+            .filter(|release| !release.draft)
+            .collect();
+
+        if !published.is_empty() {
+            return Ok(published
+                .into_iter()
+                .find(|release| filter.matches(&release.tag_name))
+                .map(|release| ReleaseTip::from_release(repo, release)));
         }
 
-        // Fallback: latest tag when the repo has no GitHub Releases.
-        let tags = self.client.get_tags(repo, 30).await.unwrap_or_default();
-        for tag in tags {
-            if !filter.matches(&tag.name) {
-                continue;
-            }
-            return Ok(Some(ReleaseTip {
-                repo: repo.to_string(),
-                tag: tag.name.clone(),
-                name: Some(tag.name.clone()),
-                body: None,
-                published_at: None,
-                html_url: format!("https://github.com/{repo}/releases/tag/{}", tag.name),
-                author_login: None,
-            }));
-        }
-
-        Ok(None)
+        Ok(self
+            .client
+            .get_tags(repo, PAGE_SIZE)
+            .await?
+            .into_iter()
+            .find(|tag| filter.matches(&tag.name))
+            .map(|tag| ReleaseTip::from_tag(repo, tag)))
     }
 }
 
@@ -481,7 +505,7 @@ mod tests {
         );
         let tracker = poller(http, store.clone(), cfg);
 
-        let first = tracker.poll_once().await.unwrap();
+        let first = tracker.poll_once().await;
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].action, DeployQaPollAction::Enqueued);
         assert!(first[0].issue.is_some());
@@ -493,7 +517,7 @@ mod tests {
         assert_eq!(last.tag, "1.2.3-db");
         assert_eq!(last.status, DeployQaTipStatus::Pending);
 
-        let second = tracker.poll_once().await.unwrap();
+        let second = tracker.poll_once().await;
         assert_eq!(second[0].action, DeployQaPollAction::SkippedDuplicate);
         assert!(second[0].issue.is_none());
     }
@@ -520,7 +544,7 @@ mod tests {
             &body,
         );
         let tracker = poller(http, store, cfg);
-        let result = tracker.poll_once().await.unwrap();
+        let result = tracker.poll_once().await;
         assert_eq!(result[0].action, DeployQaPollAction::Enqueued);
         assert_eq!(result[0].tip.as_ref().unwrap().tag, "1.9.0-db");
     }
@@ -548,7 +572,7 @@ mod tests {
             &body,
         );
         let tracker = poller(http, store.clone(), cfg);
-        let result = tracker.poll_once().await.unwrap();
+        let result = tracker.poll_once().await;
         assert_eq!(result[0].action, DeployQaPollAction::SkippedPreviousRunning);
         assert!(store.get_deploy_qa_tip("cloud", "1.1.0").unwrap().is_none());
     }
@@ -572,7 +596,7 @@ mod tests {
                 r#"[{"name":"v0.4.0","commit":{"sha":"abc"}}]"#,
             );
         let tracker = poller(http, store.clone(), cfg);
-        let result = tracker.poll_once().await.unwrap();
+        let result = tracker.poll_once().await;
         assert_eq!(result[0].action, DeployQaPollAction::Enqueued);
         assert_eq!(result[0].tip.as_ref().unwrap().tag, "v0.4.0");
         assert_eq!(
@@ -617,5 +641,106 @@ mod tests {
             ids.push(issue.id);
         }
         assert_ne!(ids[0], ids[1]);
+    }
+
+    #[tokio::test]
+    async fn release_author_flows_to_tip_and_issue() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let cfg = config(
+            vec![track(
+                "edge-db",
+                "appwrite-labs/edge",
+                DeployQaTagFilter::Suffix("-db".into()),
+            )],
+            true,
+        );
+        let body = format!("[{}]", release_json("1.2.3-db", ""));
+        let http = MapMockHttp::new().on(
+            "https://api.github.com/repos/appwrite-labs/edge/releases",
+            200,
+            &body,
+        );
+        let tracker = poller(http, store.clone(), cfg);
+
+        let results = tracker.poll_once().await;
+
+        let stored = store
+            .get_deploy_qa_tip("edge-db", "1.2.3-db")
+            .unwrap()
+            .expect("tip should be persisted");
+        assert_eq!(stored.author_login.as_deref(), Some("abnegate"));
+        let issue = results[0].issue.as_ref().expect("issue should be built");
+        assert_eq!(
+            issue.get_metadata::<String>("github_login").as_deref(),
+            Some("abnegate")
+        );
+    }
+
+    #[tokio::test]
+    async fn track_error_is_isolated_and_reported() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let cfg = config(
+            vec![
+                track("a", "org/a", DeployQaTagFilter::Any),
+                track("b", "org/b", DeployQaTagFilter::Any),
+            ],
+            true,
+        );
+        let body = format!("[{}]", release_json("1.0.0", ""));
+        let http = MapMockHttp::new()
+            .on(
+                "https://api.github.com/repos/org/a/releases",
+                401,
+                r#"{"message":"Bad credentials"}"#,
+            )
+            .on("https://api.github.com/repos/org/b/releases", 200, &body);
+        let tracker = poller(http, store.clone(), cfg);
+
+        let results = tracker.poll_once().await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].track, "a");
+        assert!(
+            matches!(results[0].action, DeployQaPollAction::Errored(_)),
+            "expected Errored, got {:?}",
+            results[0].action
+        );
+        assert_eq!(results[1].track, "b");
+        assert_eq!(results[1].action, DeployQaPollAction::Enqueued);
+        assert!(store.get_deploy_qa_tip("b", "1.0.0").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn no_tag_fallback_when_releases_exist_but_none_match() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let cfg = config(
+            vec![track(
+                "edge-db",
+                "appwrite-labs/edge",
+                DeployQaTagFilter::Suffix("-db".into()),
+            )],
+            true,
+        );
+        let body = format!("[{}]", release_json("2.0.0", ""));
+        let http = MapMockHttp::new()
+            .on(
+                "https://api.github.com/repos/appwrite-labs/edge/releases",
+                200,
+                &body,
+            )
+            .on(
+                "https://api.github.com/repos/appwrite-labs/edge/tags",
+                200,
+                r#"[{"name":"1.0.0-db","commit":{"sha":"abc"}}]"#,
+            );
+        let tracker = poller(http, store.clone(), cfg);
+
+        let results = tracker.poll_once().await;
+
+        assert_eq!(results[0].action, DeployQaPollAction::NoMatchingTip);
+        assert!(store
+            .get_deploy_qa_tip("edge-db", "1.0.0-db")
+            .unwrap()
+            .is_none());
     }
 }
