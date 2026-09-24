@@ -33,7 +33,7 @@ use futures::future::join_all;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{interval, Duration};
 
@@ -179,6 +179,22 @@ impl ProcessingState {
     }
 }
 
+/// A dispatched `deploy_qa` tip's hold on its `qa.max_concurrent` slot,
+/// released on drop so a run that panics or is aborted frees the slot instead
+/// of holding it until restart.
+struct DeployQaTipClaim {
+    watcher: Arc<Watcher>,
+    issue_id: String,
+}
+
+impl Drop for DeployQaTipClaim {
+    fn drop(&mut self) {
+        self.watcher
+            .lock_dispatched_deploy_qa_tips()
+            .remove(&self.issue_id);
+    }
+}
+
 /// Options for creating a watcher.
 pub struct WatcherOptions {
     pub config: Config,
@@ -255,8 +271,9 @@ pub struct Watcher {
     /// Join handles for spawned issue-processing tasks (used by tests to drain).
     spawn_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Issue ids of `deploy_qa` tips whose dispatched runs have not finished,
-    /// so overlapping dispatches never start the same tip twice.
-    dispatched_deploy_qa_tips: tokio::sync::Mutex<HashSet<String>>,
+    /// so overlapping dispatches never start the same tip twice. Each id is
+    /// held by a [`DeployQaTipClaim`], whose `Drop` needs a synchronous lock.
+    dispatched_deploy_qa_tips: Mutex<HashSet<String>>,
 }
 
 /// A ledger comment carried by a review batch: `(scm_comment_id, comment_kind)`.
@@ -348,7 +365,7 @@ impl Watcher {
             llm_analyzer,
             intent_classifier,
             spawn_handles: tokio::sync::Mutex::new(Vec::new()),
-            dispatched_deploy_qa_tips: tokio::sync::Mutex::new(HashSet::new()),
+            dispatched_deploy_qa_tips: Mutex::new(HashSet::new()),
         }
     }
 
@@ -3740,10 +3757,11 @@ Create a PR with your changes.{custom_instructions}"#,
     /// mode. It is the only in-process path that runs tips: source polls skip
     /// the `deploy_qa` source. Oldest tips go first, at most
     /// `qa.max_concurrent` dispatched runs are in flight, a tip is never
-    /// dispatched twice at once, and a tip that left pending before its run
-    /// starts is skipped. Nothing starts while the watcher is not running
-    /// (before warm start or during shutdown) or is rate limited; tips left
-    /// out stay pending for a later call.
+    /// dispatched twice at once, a run that panics or is aborted frees its
+    /// slot, and a tip that left pending before its run starts is skipped.
+    /// Nothing starts while the watcher is not running (before warm start or
+    /// during shutdown) or is rate limited; tips left out stay pending for a
+    /// later call.
     pub async fn dispatch_pending_deploy_qa_tips(
         self: &Arc<Self>,
     ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
@@ -3758,36 +3776,62 @@ Create a PR with your changes.{custom_instructions}"#,
             return Ok(Vec::new());
         }
 
-        let mut dispatched = self.dispatched_deploy_qa_tips.lock().await;
-        let capacity = self
-            .config
-            .qa
-            .max_concurrent
-            .max(1)
-            .saturating_sub(dispatched.len());
-        let tips: Vec<DeployQaTip> = self
-            .tracker
-            .list_pending_deploy_qa_tips()?
+        Ok(self
+            .claim_pending_deploy_qa_tips()?
             .into_iter()
-            .filter(|tip| !dispatched.contains(&tip.issue_id))
-            .take(capacity)
-            .collect();
+            .map(|claim| {
+                let source = Arc::clone(source);
+                tokio::spawn(async move {
+                    claim
+                        .watcher
+                        .process_deploy_qa_tip(source, &claim.issue_id)
+                        .await;
+                })
+            })
+            .collect())
+    }
 
-        let mut runs = Vec::with_capacity(tips.len());
-        for tip in tips {
-            dispatched.insert(tip.issue_id.clone());
-            let watcher = Arc::clone(self);
-            let source = Arc::clone(source);
-            runs.push(tokio::spawn(async move {
-                watcher.process_deploy_qa_tip(source, &tip.issue_id).await;
-                watcher
-                    .dispatched_deploy_qa_tips
-                    .lock()
-                    .await
-                    .remove(&tip.issue_id);
-            }));
-        }
-        Ok(runs)
+    /// Claim the oldest pending tips that fit in the free `qa.max_concurrent`
+    /// slots, skipping tips an unfinished dispatched run already holds.
+    ///
+    /// The claims are built only after the lock is released, because dropping
+    /// one takes the same lock.
+    fn claim_pending_deploy_qa_tips(self: &Arc<Self>) -> Result<Vec<DeployQaTipClaim>> {
+        let issue_ids: Vec<String> = {
+            let mut dispatched = self.lock_dispatched_deploy_qa_tips();
+            let capacity = self
+                .config
+                .qa
+                .max_concurrent
+                .max(1)
+                .saturating_sub(dispatched.len());
+            let issue_ids: Vec<String> = self
+                .tracker
+                .list_pending_deploy_qa_tips()?
+                .into_iter()
+                .map(|tip| tip.issue_id)
+                .filter(|issue_id| !dispatched.contains(issue_id))
+                .take(capacity)
+                .collect();
+            dispatched.extend(issue_ids.iter().cloned());
+            issue_ids
+        };
+        Ok(issue_ids
+            .into_iter()
+            .map(|issue_id| DeployQaTipClaim {
+                watcher: Arc::clone(self),
+                issue_id,
+            })
+            .collect())
+    }
+
+    /// Lock the dispatched tip set, recovering it from a poisoned lock: the set
+    /// only gains or loses whole ids, so a holder that panicked cannot leave it
+    /// inconsistent.
+    fn lock_dispatched_deploy_qa_tips(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.dispatched_deploy_qa_tips
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Run QA for one dispatched tip unless it is no longer pending: another
@@ -8830,11 +8874,18 @@ mod tests {
 
     const CUSTOMER_REPLY: &str = "Thanks for reaching out, we are looking into this for you.";
 
-    /// Agent that counts every invocation, answers QA with `report` (crashing
-    /// when there is none), and never supports the fix pipeline.
+    /// How [`ScriptedQaAgent`] answers a QA question.
+    enum QaAnswer {
+        Report(String),
+        Crash,
+        Panic,
+    }
+
+    /// Agent that counts every invocation, answers QA as its [`QaAnswer`]
+    /// scripts, and never supports the fix pipeline.
     struct ScriptedQaAgent {
         calls: Arc<AtomicUsize>,
-        report: Option<String>,
+        answer: QaAnswer,
     }
 
     impl ScriptedQaAgent {
@@ -8878,9 +8929,13 @@ mod tests {
             _project_dir: &std::path::Path,
         ) -> Result<String> {
             self.record_call();
-            self.report
-                .clone()
-                .ok_or_else(|| claudear_core::error::Error::runner("live QA probe crashed"))
+            match &self.answer {
+                QaAnswer::Report(report) => Ok(report.clone()),
+                QaAnswer::Crash => {
+                    Err(claudear_core::error::Error::runner("live QA probe crashed"))
+                }
+                QaAnswer::Panic => panic!("live QA probe panicked"),
+            }
         }
         async fn verify_issue(
             &self,
@@ -8937,7 +8992,7 @@ mod tests {
     impl DeployQaHarness {
         /// A mock `deploy_qa` source whose QA agent crashes.
         fn new(config: Config) -> Self {
-            Self::build(config, None, |_, tip| {
+            Self::build(config, QaAnswer::Crash, |_, tip| {
                 Arc::new(MockSource::with_issues(
                     DEPLOY_QA_SOURCE,
                     vec![deploy_qa_issue(tip)],
@@ -8947,22 +9002,31 @@ mod tests {
 
         /// The real [`DeployQaSource`], whose QA agent answers with `report`.
         fn with_deploy_qa_source(report: String) -> Self {
-            Self::with_deploy_qa_config(test_config(), report)
+            Self::with_deploy_qa_config(test_config(), QaAnswer::Report(report))
         }
 
         /// A running watcher over the real [`DeployQaSource`] whose QA agent
         /// verifies every tip, ready for the `[deploy_qa]` poller to dispatch.
         fn dispatching(config: Config) -> Self {
-            let harness = Self::with_deploy_qa_config(
+            Self::dispatching_with(
                 config,
-                deploy_qa_report(&["- #1 x LIVE PASS"], VERDICT_ALL_VERIFIED),
-            );
+                QaAnswer::Report(deploy_qa_report(
+                    &["- #1 x LIVE PASS"],
+                    VERDICT_ALL_VERIFIED,
+                )),
+            )
+        }
+
+        /// A running watcher over the real [`DeployQaSource`] whose QA agent
+        /// answers as `answer`, ready for the `[deploy_qa]` poller to dispatch.
+        fn dispatching_with(config: Config, answer: QaAnswer) -> Self {
+            let harness = Self::with_deploy_qa_config(config, answer);
             harness.watcher.set_running(true);
             harness
         }
 
-        fn with_deploy_qa_config(config: Config, report: String) -> Self {
-            Self::build(config, Some(report), |tracker, _| {
+        fn with_deploy_qa_config(config: Config, answer: QaAnswer) -> Self {
+            Self::build(config, answer, |tracker, _| {
                 let config = DeployQaConfig {
                     tracks: vec![DeployQaTrackConfig {
                         name: DEPLOY_QA_TRACK.to_string(),
@@ -8980,7 +9044,7 @@ mod tests {
 
         fn build(
             config: Config,
-            report: Option<String>,
+            answer: QaAnswer,
             source: impl FnOnce(Arc<dyn FixAttemptTracker>, &DeployQaTip) -> Arc<dyn IssueSource>,
         ) -> Self {
             let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -9012,7 +9076,7 @@ mod tests {
                 llm_engine: None,
                 agent: Arc::new(ScriptedQaAgent {
                     calls: agent_calls.clone(),
-                    report,
+                    answer,
                 }),
             }));
             Self {
@@ -9251,6 +9315,15 @@ mod tests {
     async fn finish_deploy_qa_runs(runs: Vec<tokio::task::JoinHandle<()>>) {
         for run in join_all(runs).await {
             run.expect("a dispatched deploy_qa run should not panic");
+        }
+    }
+
+    async fn finish_panicking_deploy_qa_runs(runs: Vec<tokio::task::JoinHandle<()>>) {
+        for run in join_all(runs).await {
+            assert!(
+                run.is_err_and(|error| error.is_panic()),
+                "a dispatched deploy_qa run should panic with its QA agent"
+            );
         }
     }
 
@@ -9547,6 +9620,36 @@ mod tests {
             [DeployQaTipStatus::Verified, DeployQaTipStatus::Verified]
         );
         assert_eq!(harness.agent_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_panicked_deploy_qa_run_frees_its_dispatch_slot() {
+        let mut config = test_config();
+        config.qa.max_concurrent = 1;
+        let harness = DeployQaHarness::dispatching_with(config, QaAnswer::Panic);
+        harness
+            .tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new(DEPLOY_QA_TRACK, DEPLOY_QA_REPO, "1.2.4"))
+            .unwrap();
+
+        let first = harness.dispatch_pending_tips().await;
+        assert_eq!(first.len(), 1, "one tip should take the only QA slot");
+        finish_panicking_deploy_qa_runs(first).await;
+
+        let after_panic = harness.dispatch_pending_tips().await;
+
+        assert_eq!(
+            after_panic.len(),
+            1,
+            "a dispatched run that panicked must release its claim so the other pending tip \
+             can take the QA slot"
+        );
+        finish_panicking_deploy_qa_runs(after_panic).await;
+        assert_eq!(
+            harness.agent_calls(),
+            2,
+            "each pending tip should reach the QA agent once"
+        );
     }
 
     #[tokio::test]
