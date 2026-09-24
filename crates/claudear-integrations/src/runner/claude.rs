@@ -2,6 +2,7 @@
 
 use super::{AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
+use claudear_analysis::deploy_qa::{DEPLOY_QA_SOURCE, VERDICT_PREFIX};
 use claudear_config::McpServerConfig;
 use claudear_core::error::{Error, Result};
 use claudear_core::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
@@ -31,6 +32,9 @@ const DEFAULT_READONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebFetch", "W
 /// Timeout for read-only structured queries (classification-scale, not the long
 /// fix-run timeout).
 const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
+
+/// Issue source whose ticket system renders reply bodies as HTML, not Markdown.
+const HELPSCOUT_SOURCE: &str = "helpscout";
 
 /// Resolve the root directory for execution logs.
 /// Used by both the runner and the API to validate log file paths.
@@ -753,7 +757,8 @@ The PR title should include the issue ID: {}
     }
 
     /// Generate a grounded, human-sounding reply, read-only. `guideline` is an
-    /// optional per-inbox style guideline; `kind` selects the framing.
+    /// optional per-inbox style guideline; `kind` selects the framing. Release
+    /// tips from [`DEPLOY_QA_SOURCE`] get a live-QA report instead.
     pub async fn run_reply(
         &self,
         issue: &Issue,
@@ -2300,13 +2305,19 @@ Respond with ONLY a single JSON object on its own, no prose:
 /// Build the prompt for a read-only, RAG-grounded, human-sounding reply.
 ///
 /// `guideline` is an optional per-inbox template treated as a soft style
-/// guideline; `kind` selects the framing of the reply.
+/// guideline; `kind` selects the framing of the reply. Release tips from
+/// [`DEPLOY_QA_SOURCE`] are not customer tickets, so they get
+/// [`build_live_qa_prompt`] whatever the guideline or kind.
 fn build_reply_prompt(
     issue: &Issue,
     context: &str,
     guideline: Option<&str>,
     kind: ReplyKind,
 ) -> String {
+    if issue.source == DEPLOY_QA_SOURCE {
+        return build_live_qa_prompt(issue, context);
+    }
+
     let task = match kind {
         ReplyKind::Answer => {
             "Write a helpful reply that answers the customer's question or addresses \
@@ -2335,7 +2346,7 @@ tone and spirit, but vary the wording naturally; do NOT copy it verbatim):\n{g}\
     // HelpScout renders the reply body as HTML, not Markdown, so Markdown syntax
     // shows up as raw characters. Other sources (Discord, Slack, GitHub, Linear)
     // render Markdown, so only constrain formatting for HelpScout.
-    let format_rule = if issue.source == "helpscout" {
+    let format_rule = if issue.source == HELPSCOUT_SOURCE {
         "\n- Write in PLAIN PROSE. This ticket system does NOT render Markdown, so do \
 NOT use Markdown syntax: no `**bold**`, `_italics_`, backticks/code fences, `#` \
 headers, `-`/`*` bullet lists, or `[text](url)` links. Write URLs as bare URLs and \
@@ -2369,6 +2380,55 @@ Write only the reply message."#,
         task = task,
         format_rule = format_rule,
         guideline_block = guideline_block,
+        context = context,
+        title = issue.title,
+        body = issue_body(issue),
+    )
+}
+
+/// Build the prompt for a read-only, observe/report live QA run of a release tip.
+///
+/// The output is an internal report, not a customer reply: its per-PR lines and
+/// verdict footer are machine-classified, so the exact line format and allowed
+/// footer values come from the ticket's own Agent constraints.
+fn build_live_qa_prompt(issue: &Issue, context: &str) -> String {
+    format!(
+        r#"You are a release QA engineer running live QA on a new release tip ({source}).
+
+Follow the playbook and release details in the ticket below exactly: verify the
+PRs the release claims, classify each one, and run a live check for every PR the
+playbook treats as live-testable.
+
+Your output is an internal QA report that a machine parses. It is NOT a message
+to a customer: no greeting, sign-off, first-person pleasantries, or support tone.
+
+STRICT RULES:
+- Observe and report only. Do NOT modify files, run write commands, or create
+  branches, commits, or PRs.
+- Do NOT post to Discord, Slack, or any other external channel. Claudear posts
+  your report itself, so skip any posting steps in the playbook.
+- Report any check you cannot actually run with the tools available to you as
+  BLOCKED. Never guess or assume PASS.
+- Ground every result in what you actually observed; do not invent behavior.
+
+REPORT FORMAT:
+- One line per PR the release claims, in the exact per-PR format the ticket
+  specifies. Use the result keywords only on those lines.
+- Keep it short: no raw command output or walls of URLs.
+- End with exactly one `{prefix} <value>` footer line, using only a value the
+  ticket's Agent constraints allow. A missing or malformed footer is treated as
+  not verified.
+
+Retrieved code context:
+{context}
+
+Ticket:
+Title: {title}
+{body}
+
+Write only the QA report."#,
+        source = issue.source,
+        prefix = VERDICT_PREFIX,
         context = context,
         title = issue.title,
         body = issue_body(issue),
@@ -2502,6 +2562,77 @@ mod tests {
             assert!(
                 !prompt.contains("PLAIN PROSE"),
                 "plain-prose rule should not apply for source {source}"
+            );
+        }
+    }
+
+    const DEPLOY_QA_BODY: &str = "Follow the playbook.\n\n# Release tip\n\n- Tag: 1.2.3\n\n## Agent constraints\n\n- Observe and report only.";
+
+    fn deploy_qa_issue(source: &str) -> Issue {
+        let mut issue = Issue::new(
+            "deploy-qa-1",
+            "cloud-1.2.3",
+            "cloud 1.2.3 live QA",
+            "url",
+            source,
+        );
+        issue.description = Some(DEPLOY_QA_BODY.to_string());
+        issue
+    }
+
+    #[test]
+    fn test_build_reply_prompt_deploy_qa_is_not_a_customer_reply() {
+        let deploy_qa = deploy_qa_issue(DEPLOY_QA_SOURCE);
+        let prompt = build_reply_prompt(&deploy_qa, "retrieved ctx", None, ReplyKind::Answer);
+        let customer_reply = build_reply_prompt(
+            &deploy_qa_issue("linear"),
+            "retrieved ctx",
+            None,
+            ReplyKind::Answer,
+        );
+
+        assert_ne!(
+            prompt.replace(DEPLOY_QA_SOURCE, "linear"),
+            customer_reply,
+            "deploy_qa must not get the customer-reply prompt"
+        );
+        assert!(
+            prompt.contains(DEPLOY_QA_BODY),
+            "prompt must carry the ticket body"
+        );
+        assert!(
+            prompt.contains("cloud 1.2.3 live QA"),
+            "prompt must carry the ticket title"
+        );
+        assert!(
+            prompt.contains("retrieved ctx"),
+            "prompt must carry the retrieved context"
+        );
+        assert!(
+            prompt.contains(VERDICT_PREFIX),
+            "prompt must require the machine-read verdict footer"
+        );
+    }
+
+    #[test]
+    fn test_build_reply_prompt_deploy_qa_ignores_inbox_guideline() {
+        let guideline = "Warm and apologetic; sign off as Support.";
+        let deploy_qa = deploy_qa_issue(DEPLOY_QA_SOURCE);
+
+        for kind in [
+            ReplyKind::Answer,
+            ReplyKind::NeedRepro,
+            ReplyKind::FixShipped,
+        ] {
+            let prompt = build_reply_prompt(&deploy_qa, "ctx", Some(guideline), kind);
+            assert!(
+                !prompt.contains(guideline),
+                "inbox guideline leaked into the deploy_qa prompt for {kind:?}"
+            );
+            assert_eq!(
+                prompt,
+                build_reply_prompt(&deploy_qa, "ctx", None, ReplyKind::Answer),
+                "deploy_qa prompt must not vary with the reply kind ({kind:?})"
             );
         }
     }
