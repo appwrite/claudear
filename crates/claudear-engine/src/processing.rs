@@ -1,6 +1,7 @@
 //! Shared issue-processing pipeline used by both the polling watcher and the webhook server.
 
 use async_trait::async_trait;
+use claudear_analysis::deploy_qa::DEPLOY_QA_SOURCE;
 use claudear_analysis::feedback::{
     format_similar_issues_context, EmbeddingClient, FeedbackAnalyzer, FixOutcome,
     IssueEmbeddingService, Outcome,
@@ -304,6 +305,25 @@ impl IssueProcessor {
         input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
+        // Release QA is observe-only: it must never enter the action, fix, or
+        // customer-reply pipelines, whatever `[reply]` says.
+        if input.source_name == DEPLOY_QA_SOURCE {
+            tracing::info!(
+                short_id = %input.issue.short_id,
+                source = %input.source_name,
+                "Routing release QA to read-only answer path"
+            );
+            return self
+                .answer_question_issue(
+                    &input.issue,
+                    &input.resolution,
+                    &input.source_name,
+                    input.attempt_id,
+                    context_provider,
+                )
+                .await;
+        }
+
         // Action pipeline (opt-in via [reply]): classify the payload, then chain
         //   bug/security -> verify -> resolve -> reply
         //   otherwise     -> reply
@@ -330,6 +350,7 @@ impl IssueProcessor {
                     &input.resolution,
                     &input.source_name,
                     input.attempt_id,
+                    context_provider,
                 )
                 .await;
         }
@@ -2147,13 +2168,51 @@ impl IssueProcessor {
         }
     }
 
+    /// Deliver an answer back to where the issue came from. Conversational
+    /// sources receive `notify_body` via the notifier; tracker-style sources
+    /// receive `body` as a comment on the ticket, falling back to the notifier
+    /// when posting fails. Any notifier message ids are recorded so a later
+    /// reply maps back to this issue.
+    async fn deliver_answer(
+        &self,
+        issue: &Issue,
+        source_name: &str,
+        body: &str,
+        notify_body: &str,
+        context_provider: &dyn ContextProvider,
+    ) -> Result<()> {
+        let sent_ids = if qa_eligible_source(source_name) {
+            self.notifier.notify_answer(issue, notify_body).await?
+        } else {
+            match context_provider.post_reply(&issue.id, body).await {
+                Ok(()) => Vec::new(),
+                Err(e) => {
+                    tracing::warn!(short_id = %issue.short_id, error = %e, "post_reply failed; falling back to notifier");
+                    self.notifier.notify_answer(issue, notify_body).await?
+                }
+            }
+        };
+        if !sent_ids.is_empty() {
+            if let Err(e) =
+                self.tracker
+                    .record_answer_message_ids(source_name, &issue.id, &sent_ids)
+            {
+                tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to record answer message ids");
+            }
+        }
+        Ok(())
+    }
+
     /// Answer a pure question with RAG-grounded context, read-only (no PR).
+    /// Delivery follows [`Self::deliver_answer`]: conversational sources get the
+    /// answer via the notifier, tracker-style sources as a comment on the ticket.
     async fn answer_question_issue(
         &self,
         issue: &Issue,
         resolution: &RepoResolution,
         source_name: &str,
         attempt_id: Option<i64>,
+        context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
         // Timeline: QA run started.
         self.record_timeline_event(
@@ -2268,21 +2327,17 @@ impl IssueProcessor {
                 } else {
                     format!("{}{}", answer, discord_refs)
                 };
-                match self.notifier.notify_answer(issue, &answer_to_send).await {
-                    Ok(sent_ids) => {
-                        if !sent_ids.is_empty() {
-                            if let Err(e) = self.tracker.record_answer_message_ids(
-                                source_name,
-                                &issue.id,
-                                &sent_ids,
-                            ) {
-                                tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to record answer message ids");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to deliver answer");
-                    }
+                if let Err(e) = self
+                    .deliver_answer(
+                        issue,
+                        source_name,
+                        &answer,
+                        &answer_to_send,
+                        context_provider,
+                    )
+                    .await
+                {
+                    tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to deliver answer");
                 }
                 // Store the FULL answer so it can ground a later reply-chain
                 // continuation; truncation is a display/send concern only.
@@ -2398,8 +2453,6 @@ impl IssueProcessor {
             },
         }
     }
-
-    // ---- Action pipeline (classify -> verify -> resolve -> reply) ----
 
     /// Run the action pipeline for a payload: classify it, then chain the
     /// appropriate actions. Bug/security reports are verified (reproduced) and,
@@ -2722,9 +2775,6 @@ impl IssueProcessor {
 
         match result {
             Ok(Ok(reply)) => {
-                // Deliver: conversational sources go via the notifier; tracker
-                // sources post a comment on the ticket (falling back to notifier).
-                // Capture any sent message ids so a later reply maps back here.
                 // Referenced-discussion jump links are appended to notifier
                 // deliveries only; ticket comments keep the plain reply.
                 let reply_notify = if discord_refs.is_empty() {
@@ -2732,40 +2782,11 @@ impl IssueProcessor {
                 } else {
                     format!("{}{}", reply, discord_refs)
                 };
-                let mut answer_ids: Vec<String> = Vec::new();
-                let delivered: Result<()> = if qa_eligible_source(source_name) {
-                    match self.notifier.notify_answer(issue, &reply_notify).await {
-                        Ok(ids) => {
-                            answer_ids = ids;
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    match context_provider.post_reply(&issue.id, &reply).await {
-                        Ok(()) => Ok(()),
-                        Err(e) => {
-                            tracing::warn!(short_id = %issue.short_id, error = %e, "post_reply failed; falling back to notifier");
-                            match self.notifier.notify_answer(issue, &reply_notify).await {
-                                Ok(ids) => {
-                                    answer_ids = ids;
-                                    Ok(())
-                                }
-                                Err(e) => Err(e),
-                            }
-                        }
-                    }
-                };
-                if let Err(e) = delivered {
+                if let Err(e) = self
+                    .deliver_answer(issue, source_name, &reply, &reply_notify, context_provider)
+                    .await
+                {
                     tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to deliver reply");
-                }
-                if !answer_ids.is_empty() {
-                    if let Err(e) =
-                        self.tracker
-                            .record_answer_message_ids(source_name, &issue.id, &answer_ids)
-                    {
-                        tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to record answer message ids");
-                    }
                 }
 
                 // Store the FULL reply for reply-chain grounding; the truncated
@@ -5966,7 +5987,96 @@ mod tests {
         );
     }
 
-    // --- Dummy test helpers ---
+    const QA_REPORT: &str = "QA report";
+
+    fn answering_processor() -> IssueProcessor {
+        let tracker: Arc<dyn FixAttemptTracker> =
+            Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
+        let mut processor = make_reply_chain_processor(tracker);
+        processor.agent = Arc::new(AnsweringAgent);
+        processor
+    }
+
+    fn question_input(source: &str) -> ProcessingInput {
+        let mut issue = make_test_issue();
+        issue.source = source.to_string();
+        ProcessingInput {
+            issue,
+            source_name: source.to_string(),
+            match_result: claudear_core::types::MatchResult::matched(
+                source,
+                claudear_core::types::MatchPriority::Normal,
+            ),
+            resolution: RepoResolution::Skip {
+                reason: "no repo configured".to_string(),
+            },
+            attempt_id: None,
+            review_feedback: None,
+            existing_pr_branch: None,
+            intent: Some(Intent::Question),
+            diagnosis: None,
+        }
+    }
+
+    fn assert_completed_no_pr(outcome: ProcessingOutcome) {
+        match outcome {
+            ProcessingOutcome::CompletedNoPr { .. } => {}
+            ProcessingOutcome::Failed { error } => {
+                panic!("expected CompletedNoPr, got Failed: {error}")
+            }
+            ProcessingOutcome::Success { pr_url } => {
+                panic!("expected CompletedNoPr, got Success: {pr_url}")
+            }
+            ProcessingOutcome::WrongRepo { .. } => panic!("expected CompletedNoPr, got WrongRepo"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_question_answer_posts_reply_for_non_conversational_source() {
+        let processor = answering_processor();
+        let input = question_input(DEPLOY_QA_SOURCE);
+        let issue_id = input.issue.id.clone();
+        let context = RecordingContextProvider::default();
+
+        assert_completed_no_pr(processor.run(input, &context).await);
+
+        assert_eq!(
+            context.replies(),
+            vec![(issue_id, QA_REPORT.to_string())],
+            "tracker-style sources must receive the answer via post_reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_question_answer_uses_notifier_for_conversational_source() {
+        let processor = answering_processor();
+        let context = RecordingContextProvider::default();
+
+        assert_completed_no_pr(processor.run(question_input("discord"), &context).await);
+
+        assert!(
+            context.replies().is_empty(),
+            "conversational sources are answered via the notifier, not post_reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_uses_answer_path_when_reply_pipeline_enabled() {
+        let mut processor = answering_processor();
+        processor.config.notifiers.helpscout.enabled = true;
+        assert!(processor.config.reply().enabled);
+        let input = question_input(DEPLOY_QA_SOURCE);
+        let issue_id = input.issue.id.clone();
+        let context = RecordingContextProvider::default();
+
+        assert_completed_no_pr(processor.run(input, &context).await);
+
+        assert_eq!(
+            context.replies(),
+            vec![(issue_id, QA_REPORT.to_string())],
+            "release QA must bypass the reply pipeline and deliver the QA answer"
+        );
+    }
 
     /// Intent classifier stub returning a fixed verdict (for routing tests).
     struct StubIntentClassifier(Option<Intent>);
@@ -6036,6 +6146,80 @@ mod tests {
             _issue: &Issue,
         ) -> claudear_core::error::Result<String> {
             Ok("dummy context".to_string())
+        }
+    }
+
+    /// Agent runner whose `answer_question` always returns [`QA_REPORT`].
+    struct AnsweringAgent;
+
+    #[async_trait]
+    impl claudear_integrations::runner::AgentRunner for AnsweringAgent {
+        fn name(&self) -> &str {
+            "answering"
+        }
+
+        fn capabilities(&self) -> claudear_integrations::runner::ProviderCapabilities {
+            claudear_integrations::runner::ProviderCapabilities::default()
+        }
+
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> String {
+            String::new()
+        }
+
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &std::path::Path,
+        ) -> claudear_core::error::Result<claudear_core::types::AgentResult> {
+            Err(claudear_core::error::Error::runner(
+                "execute is not supported by the answering agent",
+            ))
+        }
+
+        async fn answer_question(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> claudear_core::error::Result<String> {
+            Ok(QA_REPORT.to_string())
+        }
+    }
+
+    /// Context provider that records every `post_reply` as `(issue_id, body)`.
+    #[derive(Default)]
+    struct RecordingContextProvider {
+        replies: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingContextProvider {
+        fn replies(&self) -> Vec<(String, String)> {
+            self.replies.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ContextProvider for RecordingContextProvider {
+        async fn build_issue_context(
+            &self,
+            _issue: &Issue,
+        ) -> claudear_core::error::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn post_reply(&self, issue_id: &str, body: &str) -> claudear_core::error::Result<()> {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((issue_id.to_string(), body.to_string()));
+            Ok(())
         }
     }
 }
