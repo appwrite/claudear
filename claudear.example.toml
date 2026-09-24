@@ -122,7 +122,9 @@ instructions_file = "./claude-instructions.md"
 # permissions and skip_permissions govern fix runs and [deploy_qa] live QA,
 # which gets them on top of readonly_tools. A scoped Bash(...) rule allows only
 # the commands it matches: Bash(git *) does not allow curl, so live-QA HTTP
-# checks need e.g. "Bash(curl:*)" here or skip_permissions = true.
+# checks need e.g. "Bash(curl:*)" here or skip_permissions = true. Without
+# skip_permissions, live QA logs a warning when these plus readonly_tools grant
+# no Bash at all, or only scoped Bash(...) rules.
 permissions = ["Bash(git *)", "Read", "Edit"]
 
 readonly_tools = ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]
@@ -829,9 +831,14 @@ github_search_repos = []
 # Durable-watches new GitHub release tips and runs live QA against them: the
 # agent runs real checks and reports, and is told never to open fix PRs. Each
 # run works in a fresh owner-only directory under
-# <workspace>/.claudear-deploy-qa that is deleted afterwards. Its "no fix PRs,
-# no posting, QA-project-only writes" rules are prompt rules, not a sandbox:
-# the agent has the same environment and access as fix runs.
+# <workspace>/.claudear-deploy-qa that is deleted afterwards, and loads only
+# the MCP servers attached for deploy_qa and your user-level Claude Code
+# settings, never a .mcp.json or project/local settings. Its "no fix PRs, no
+# posting, QA-project-only writes" rules are prompt rules, not a sandbox: the
+# agent has the same environment and access as fix runs. Claudear redacts the
+# credentials it recognizes from the report before posting it to #releases and
+# never sends it to other notifier channels, but don't rely on redaction to
+# keep a secret out of #releases.
 # Separate from [regression] / ReleaseTracker (those track bug-fix inclusion).
 # Do not point issues.discord at #releases — that would spawn fix agents on
 # bot posts. Required env for a live host (not used in CI):
