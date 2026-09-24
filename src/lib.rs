@@ -389,8 +389,10 @@ pub fn build_deploy_qa_source(
 
 /// Redactor for live-QA reports. Masks every credential in `config` and the
 /// value of every secret-named variable the agent can read: `environment`
-/// (the daemon's, which the agent inherits), each provider's `env`, and each
-/// MCP server's `env` and `headers`.
+/// (the daemon's, which the agent inherits minus Claudear's own `CLAUDEAR_*`
+/// variables), each provider's `env`, and each MCP server's `env` and
+/// `headers`. Those `CLAUDEAR_*` values are masked too: the agent runs as the
+/// daemon's user, so it can still find them outside its own environment.
 fn deploy_qa_redactor(
     config: &Config,
     environment: impl IntoIterator<Item = (String, String)>,
@@ -843,6 +845,10 @@ mod tests {
                 "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
                 "inherited-oauth-token".to_string(),
             ),
+            (
+                "CLAUDEAR_MASTER_KEY".to_string(),
+                "withheld-master-key".to_string(),
+            ),
             ("HOME".to_string(), "/home/claudear".to_string()),
         ];
         let secrets = [
@@ -855,6 +861,7 @@ mod tests {
             "provider-env-api-key",
             "mcp-authorization-value",
             "inherited-oauth-token",
+            "withheld-master-key",
         ];
         let kept = "https://cloud.appwrite.io/v1 /home/claudear";
 
