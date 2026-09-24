@@ -4689,8 +4689,9 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
     /// issue, bypassing classification. Backs the `claudear action ...` CLI.
     ///
-    /// `resolve` is refused for observe-only `deploy_qa` issues, which must never
-    /// reach the fix pipeline.
+    /// Every action is refused for observe-only `deploy_qa` issues: `resolve`
+    /// would enter the fix pipeline, and `reply` / `verify` would post through
+    /// the source, which records any comment as the release's QA verdict.
     pub async fn run_action(
         &self,
         action: ActionKind,
@@ -4705,12 +4706,13 @@ Create a PR with your changes.{custom_instructions}"#,
             .find(|s| s.name() == source_name)
             .ok_or_else(|| claudear_core::error::Error::source(source_name, "Unknown source"))?;
 
-        if action == ActionKind::Resolve && source.name() == DEPLOY_QA_SOURCE {
+        if source.name() == DEPLOY_QA_SOURCE {
             tracing::warn!(
                 component = "watcher",
                 source = source_name,
                 issue_id = issue_id,
-                "Refusing resolve for observe-only deploy_qa issue"
+                %action,
+                "Refusing manual action for observe-only deploy_qa issue"
             );
             return Ok(ProcessingOutcome::Failed {
                 error: format!(
@@ -4936,10 +4938,12 @@ pub struct SeedResult {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use claudear_analysis::deploy_qa::{VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX};
+    use claudear_config::config::{DeployQaConfig, DeployQaTrackConfig};
     use claudear_core::types::IssuePriority;
     use claudear_integrations::notifier::Notifier;
     use claudear_integrations::reports::Report;
-    use claudear_integrations::source::IssueSource;
+    use claudear_integrations::source::{DeployQaSource, IssueSource};
     use claudear_storage::{ActivityStore, AttemptTracker, SqliteTracker};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -8709,14 +8713,25 @@ mod tests {
         );
     }
 
-    struct FailingQaAgent {
-        answer_calls: Arc<AtomicUsize>,
+    const CUSTOMER_REPLY: &str = "Thanks for reaching out, we are looking into this for you.";
+
+    /// Agent that counts every invocation, answers QA with `report` (crashing
+    /// when there is none), and never supports the fix pipeline.
+    struct ScriptedQaAgent {
+        calls: Arc<AtomicUsize>,
+        report: Option<String>,
+    }
+
+    impl ScriptedQaAgent {
+        fn record_call(&self) {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        }
     }
 
     #[async_trait]
-    impl AgentRunner for FailingQaAgent {
+    impl AgentRunner for ScriptedQaAgent {
         fn name(&self) -> &str {
-            "failing-qa-agent"
+            "scripted-qa-agent"
         }
         fn capabilities(&self) -> claudear_integrations::runner::ProviderCapabilities {
             claudear_integrations::runner::ProviderCapabilities::default()
@@ -8736,6 +8751,7 @@ mod tests {
             _attempt_id: Option<i64>,
             _project_dir: &std::path::Path,
         ) -> Result<claudear_core::types::AgentResult> {
+            self.record_call();
             Err(claudear_core::error::Error::runner(
                 "fix pipeline must never run for this agent",
             ))
@@ -8746,10 +8762,37 @@ mod tests {
             _context: &str,
             _project_dir: &std::path::Path,
         ) -> Result<String> {
-            self.answer_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            Err(claudear_core::error::Error::runner("live QA probe crashed"))
+            self.record_call();
+            self.report
+                .clone()
+                .ok_or_else(|| claudear_core::error::Error::runner("live QA probe crashed"))
+        }
+        async fn verify_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> Result<claudear_core::types::VerifyResult> {
+            self.record_call();
+            Err(claudear_core::error::Error::runner(
+                "verify must never run for this agent",
+            ))
+        }
+        async fn generate_reply(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _guideline: Option<&str>,
+            _kind: ReplyKind,
+            _project_dir: &std::path::Path,
+        ) -> Result<String> {
+            self.record_call();
+            Ok(CUSTOMER_REPLY.to_string())
         }
     }
+
+    const DEPLOY_QA_TRACK: &str = "cloud";
+    const DEPLOY_QA_REPO: &str = "appwrite-labs/cloud";
 
     fn deploy_qa_issue(tip: &DeployQaTip) -> Issue {
         Issue::new(
@@ -8761,25 +8804,61 @@ mod tests {
         )
     }
 
+    fn deploy_qa_report(results: &[&str], verdict: &str) -> String {
+        let mut lines = results.to_vec();
+        let footer = format!("{VERDICT_PREFIX} {verdict}");
+        lines.push(&footer);
+        lines.join("\n")
+    }
+
     struct DeployQaHarness {
         watcher: Arc<Watcher>,
         source: Arc<dyn IssueSource>,
         tracker: Arc<SqliteTracker>,
         tip: DeployQaTip,
-        answer_calls: Arc<AtomicUsize>,
+        agent_calls: Arc<AtomicUsize>,
     }
 
     impl DeployQaHarness {
+        /// A mock `deploy_qa` source whose QA agent crashes.
         fn new(config: Config) -> Self {
+            Self::build(config, None, |_, tip| {
+                Arc::new(MockSource::with_issues(
+                    DEPLOY_QA_SOURCE,
+                    vec![deploy_qa_issue(tip)],
+                ))
+            })
+        }
+
+        /// The real [`DeployQaSource`], whose QA agent answers with `report`.
+        fn with_deploy_qa_source(report: String) -> Self {
+            Self::build(test_config(), Some(report), |tracker, _| {
+                let config = DeployQaConfig {
+                    tracks: vec![DeployQaTrackConfig {
+                        name: DEPLOY_QA_TRACK.to_string(),
+                        repo: DEPLOY_QA_REPO.to_string(),
+                        tag_filter: Default::default(),
+                    }],
+                    ..DeployQaConfig::default()
+                };
+                Arc::new(
+                    DeployQaSource::new(config, tracker, None)
+                        .expect("the bundled playbook should load"),
+                )
+            })
+        }
+
+        fn build(
+            config: Config,
+            report: Option<String>,
+            source: impl FnOnce(Arc<dyn FixAttemptTracker>, &DeployQaTip) -> Arc<dyn IssueSource>,
+        ) -> Self {
             let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
             let tip = tracker
-                .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.2.3"))
+                .upsert_deploy_qa_tip(&DeployQaTip::new(DEPLOY_QA_TRACK, DEPLOY_QA_REPO, "1.2.3"))
                 .unwrap();
-            let source = Arc::new(MockSource::with_issues(
-                DEPLOY_QA_SOURCE,
-                vec![deploy_qa_issue(&tip)],
-            )) as Arc<dyn IssueSource>;
-            let answer_calls = Arc::new(AtomicUsize::new(0));
+            let source = source(tracker.clone(), &tip);
+            let agent_calls = Arc::new(AtomicUsize::new(0));
             let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config,
                 sources: vec![source.clone()],
@@ -8801,8 +8880,9 @@ mod tests {
                 qa_agent: None,
                 dry_run: false,
                 llm_engine: None,
-                agent: Arc::new(FailingQaAgent {
-                    answer_calls: answer_calls.clone(),
+                agent: Arc::new(ScriptedQaAgent {
+                    calls: agent_calls.clone(),
+                    report,
                 }),
             }));
             Self {
@@ -8810,7 +8890,7 @@ mod tests {
                 source,
                 tracker,
                 tip,
-                answer_calls,
+                agent_calls,
             }
         }
 
@@ -8826,8 +8906,63 @@ mod tests {
                 .status
         }
 
-        fn answer_calls(&self) -> usize {
-            self.answer_calls.load(AtomicOrdering::SeqCst)
+        fn agent_calls(&self) -> usize {
+            self.agent_calls.load(AtomicOrdering::SeqCst)
+        }
+
+        /// Drive the seeded tip through the watcher the way a poll would:
+        /// fetch it from the source, then process it.
+        async fn process_pending_tip(&self) {
+            let mut pending = self.source.fetch_issues().await.unwrap();
+            assert_eq!(pending.len(), 1, "the seeded tip should be pending");
+            let issue = pending.remove(0);
+            let match_result = self.source.matches_criteria(&issue);
+            self.watcher
+                .process_issue(self.source.clone(), issue, match_result, None, None, None)
+                .await;
+        }
+
+        async fn assert_manual_action_refused(&self, action: ActionKind) {
+            use crate::processing::ProcessingOutcome;
+
+            let issue = self.issue();
+            self.tracker
+                .record_attempt(DEPLOY_QA_SOURCE, &issue.id, &issue.short_id)
+                .unwrap();
+
+            let outcome = self
+                .watcher
+                .run_action(action, DEPLOY_QA_SOURCE, &issue.id)
+                .await
+                .unwrap();
+
+            match outcome {
+                ProcessingOutcome::Failed { error } => assert!(
+                    error.contains(&action.to_string()),
+                    "the refusal should name the {action} action: {error}"
+                ),
+                _ => panic!("{action} on an observe-only deploy_qa issue must be refused"),
+            }
+            assert_eq!(
+                self.agent_calls(),
+                0,
+                "a refused {action} must not run the agent"
+            );
+            assert_eq!(
+                self.stored_status(),
+                DeployQaTipStatus::Pending,
+                "a refused {action} must not post a comment that is read as a QA verdict"
+            );
+            let attempt = self
+                .tracker
+                .get_attempt(DEPLOY_QA_SOURCE, &issue.id)
+                .unwrap()
+                .expect("attempt should still be recorded");
+            assert_eq!(
+                attempt.status,
+                FixAttemptStatus::Pending,
+                "a refused {action} must leave the attempt untouched"
+            );
         }
     }
 
@@ -8847,7 +8982,7 @@ mod tests {
             )
             .await;
 
-        assert_eq!(harness.answer_calls(), 1, "QA agent should be asked once");
+        assert_eq!(harness.agent_calls(), 1, "QA agent should be asked once");
         assert_eq!(
             harness.stored_status(),
             DeployQaTipStatus::Errored,
@@ -8856,7 +8991,7 @@ mod tests {
         assert!(
             !harness
                 .tracker
-                .track_has_in_flight_deploy_qa("cloud")
+                .track_has_in_flight_deploy_qa(DEPLOY_QA_TRACK)
                 .unwrap(),
             "an errored tip must not block the track"
         );
@@ -8873,7 +9008,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            harness.answer_calls(),
+            harness.agent_calls(),
             1,
             "a triggered deploy_qa attempt must take the read-only QA path, not the fix pipeline"
         );
@@ -8898,7 +9033,7 @@ mod tests {
             .await;
 
         assert_eq!(
-            harness.answer_calls(),
+            harness.agent_calls(),
             1,
             "observe-only deploy_qa attempts must not wait on human approval"
         );
@@ -8911,40 +9046,65 @@ mod tests {
 
     #[tokio::test]
     async fn test_deploy_qa_refuses_manual_resolve() {
-        use crate::processing::ProcessingOutcome;
+        DeployQaHarness::with_deploy_qa_source(String::new())
+            .assert_manual_action_refused(ActionKind::Resolve)
+            .await;
+    }
 
-        let harness = DeployQaHarness::new(test_config());
-        let issue = harness.issue();
-        harness
-            .tracker
-            .record_attempt(DEPLOY_QA_SOURCE, &issue.id, &issue.short_id)
-            .unwrap();
+    #[tokio::test]
+    async fn test_deploy_qa_refuses_manual_reply() {
+        DeployQaHarness::with_deploy_qa_source(String::new())
+            .assert_manual_action_refused(ActionKind::Reply)
+            .await;
+    }
 
-        let outcome = harness
-            .watcher
-            .run_action(ActionKind::Resolve, DEPLOY_QA_SOURCE, &issue.id)
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn test_deploy_qa_refuses_manual_verify() {
+        DeployQaHarness::with_deploy_qa_source(String::new())
+            .assert_manual_action_refused(ActionKind::Verify)
+            .await;
+    }
 
-        assert!(
-            matches!(outcome, ProcessingOutcome::Failed { .. }),
-            "resolve on an observe-only deploy_qa issue must be refused"
-        );
-        let attempt = harness
-            .tracker
-            .get_attempt(DEPLOY_QA_SOURCE, &issue.id)
-            .unwrap()
-            .expect("attempt should still be recorded");
+    #[tokio::test]
+    async fn test_deploy_qa_all_verified_report_marks_tip_verified() {
+        let harness = DeployQaHarness::with_deploy_qa_source(deploy_qa_report(
+            &["- #1 x LIVE PASS", "- #2 y LIVE PASS"],
+            VERDICT_ALL_VERIFIED,
+        ));
+
+        harness.process_pending_tip().await;
+
+        assert_eq!(harness.agent_calls(), 1, "QA agent should be asked once");
         assert_eq!(
-            attempt.status,
-            FixAttemptStatus::Pending,
-            "a refused resolve must not enter the fix pipeline"
+            harness.stored_status(),
+            DeployQaTipStatus::Verified,
+            "the source must persist the all-verified verdict and the watcher must not clobber it"
         );
+        assert!(!harness
+            .tracker
+            .track_has_in_flight_deploy_qa(DEPLOY_QA_TRACK)
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_live_fail_report_marks_tip_failed() {
+        let harness = DeployQaHarness::with_deploy_qa_source(deploy_qa_report(
+            &["- #1 x LIVE FAIL", "- #2 y LIVE PASS"],
+            VERDICT_FAIL,
+        ));
+
+        harness.process_pending_tip().await;
+
+        assert_eq!(harness.agent_calls(), 1, "QA agent should be asked once");
         assert_eq!(
-            harness.answer_calls(),
-            0,
-            "a refused resolve must not run the agent"
+            harness.stored_status(),
+            DeployQaTipStatus::Failed,
+            "the source must persist the fail verdict and the watcher must not clobber it"
         );
+        assert!(!harness
+            .tracker
+            .track_has_in_flight_deploy_qa(DEPLOY_QA_TRACK)
+            .unwrap());
     }
 
     #[tokio::test]
