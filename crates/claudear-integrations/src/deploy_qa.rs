@@ -69,19 +69,30 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
 
     /// Find the automated `#releases` announcement for `tip`.
     ///
-    /// Searches the most recent messages, newest first, skipping Claudear's own
-    /// deploy-QA posts. A message announces the tip when it links the release's
-    /// `html_url`, or names both its `owner/repo` and its tag as whole tokens,
-    /// so `1.2.3` never matches `1.2.3-db`, `1.2.30` or `1.2.3-rc.1`.
+    /// Only webhook or bot posts are candidates, never Claudear's own deploy-QA
+    /// posts. The newest candidate with an embed linking the release's
+    /// `html_url` wins across the whole page; failing that, the newest whose
+    /// content or embed title names both the `owner/repo` and the tag as whole
+    /// tokens, so `1.2.3` never matches `1.2.3-db`, `1.2.30`, `1.2.3-rc.1` or
+    /// a later release's `1.2.3...1.2.4` changelog link.
     pub async fn find_release_message(&self, tip: &DeployQaTip) -> Result<Option<String>> {
         let messages = self
             .client
             .list_channel_messages(&self.channel_id, RELEASE_SEARCH_PAGE_SIZE)
             .await?;
-        Ok(messages
+        let candidates: Vec<DiscordMessage> = messages
             .into_iter()
-            .find(|message| !is_deploy_qa_post(message) && announces(message, tip))
-            .map(|message| message.id))
+            .filter(|message| is_automated(message) && !is_deploy_qa_post(message))
+            .collect();
+        Ok(candidates
+            .iter()
+            .find(|message| links_release(message, tip))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|message| names_release(message, tip))
+            })
+            .map(|message| message.id.clone()))
     }
 
     /// Reply under the release announcement, without an @, when every
@@ -323,30 +334,50 @@ fn is_deploy_qa_post(message: &DiscordMessage) -> bool {
     })
 }
 
-fn announces(message: &DiscordMessage, tip: &DeployQaTip) -> bool {
-    let texts: Vec<&str> = std::iter::once(message.content.as_str())
-        .chain(message.embeds.iter().flat_map(|embed| {
-            [
-                embed.title.as_deref(),
-                embed.description.as_deref(),
-                embed.url.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-        }))
+/// Whether a webhook (GitHub's release feed) or a bot sent `message`, rather
+/// than a person chatting about the release.
+fn is_automated(message: &DiscordMessage) -> bool {
+    message.webhook_id.is_some() || message.author.as_ref().is_some_and(|author| author.bot)
+}
+
+fn links_release(message: &DiscordMessage, tip: &DeployQaTip) -> bool {
+    let Some(release_url) = tip.html_url.as_deref() else {
+        return false;
+    };
+    message
+        .embeds
+        .iter()
+        .filter_map(|embed| embed.url.as_deref())
+        .any(|url| same_url(url, release_url))
+}
+
+fn same_url(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/')
+        .eq_ignore_ascii_case(right.trim_end_matches('/'))
+}
+
+/// Whether the message content or an embed title names the tip's repo and tag.
+/// Embed descriptions are skipped: they carry release notes and changelog
+/// links that name earlier tags.
+fn names_release(message: &DiscordMessage, tip: &DeployQaTip) -> bool {
+    let headlines: Vec<&str> = std::iter::once(message.content.as_str())
+        .chain(
+            message
+                .embeds
+                .iter()
+                .filter_map(|embed| embed.title.as_deref()),
+        )
         .collect();
-    let mentions = |token: &str| texts.iter().any(|text| contains_token(text, token));
     let repo = tip.repo.to_ascii_lowercase();
-    tip.html_url.as_deref().is_some_and(mentions)
-        || (texts
-            .iter()
-            .any(|text| contains_token(&text.to_ascii_lowercase(), &repo))
-            && mentions(&tip.tag))
+    headlines
+        .iter()
+        .any(|text| contains_token(&text.to_ascii_lowercase(), &repo))
+        && headlines.iter().any(|text| contains_token(text, &tip.tag))
 }
 
 /// Whether `token` occurs in `text` without running into a neighbouring name
 /// or version character, so `1.2.3` does not match inside `1.2.3-db`,
-/// `1.2.30`, `v1.2.3` or `1.2.3.4`.
+/// `1.2.30`, `v1.2.3`, `1.2.3.4` or the `1.2.3...1.2.4` compare range.
 fn contains_token(text: &str, token: &str) -> bool {
     !token.is_empty()
         && text.match_indices(token).any(|(start, _)| {
@@ -366,7 +397,9 @@ fn bounded_after(after: &str) -> bool {
     let mut characters = after.chars();
     match characters.next() {
         None => true,
-        Some('.') => !characters.next().is_some_and(char::is_alphanumeric),
+        Some('.') => !characters
+            .next()
+            .is_some_and(|next| next == '.' || next.is_alphanumeric()),
         Some(neighbour) => !extends_token(neighbour),
     }
 }
@@ -563,12 +596,30 @@ mod tests {
         })
     }
 
+    fn human_message(id: &str, content: &str) -> Value {
+        json!({
+            "id": id,
+            "channel_id": CHANNEL,
+            "content": content,
+            "timestamp": "2026-09-23T02:00:00Z",
+            "author": { "id": "700", "username": "releaser", "bot": false }
+        })
+    }
+
     fn tip() -> DeployQaTip {
         let mut tip = DeployQaTip::new("cloud", REPO, TAG);
         tip.id = 7;
         tip.html_url = Some(release_url(REPO, TAG));
         tip.author_login = Some(RELEASER.to_string());
         tip
+    }
+
+    /// The tip as stored, and without a release URL so only the repo + tag
+    /// fallback can find its announcement.
+    fn tips_with_and_without_release_url() -> [DeployQaTip; 2] {
+        let mut without_url = tip();
+        without_url.html_url = None;
+        [tip(), without_url]
     }
 
     fn verdict_report(result: &str, verdict: &str) -> String {
@@ -852,9 +903,126 @@ mod tests {
             false,
         );
 
+        for tip in tips_with_and_without_release_url() {
+            let found = discord.find_release_message(&tip).await.unwrap();
+
+            assert_eq!(
+                found.as_deref(),
+                Some(RELEASE_MESSAGE),
+                "{:?}",
+                tip.html_url
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn find_release_message_ignores_newer_announcement_comparing_against_the_tag() {
+        let mut next_release = announcement("3000", REPO, "1.2.4");
+        next_release["embeds"][0]["description"] = json!(format!(
+            "## What's Changed\n* Fix routing\n\n**Full Changelog**: https://github.com/{REPO}/compare/{TAG}...1.2.4"
+        ));
+        let (discord, _) = reporter(
+            vec![next_release, announcement(RELEASE_MESSAGE, REPO, TAG)],
+            false,
+        );
+
+        for tip in tips_with_and_without_release_url() {
+            let found = discord.find_release_message(&tip).await.unwrap();
+
+            assert_eq!(
+                found.as_deref(),
+                Some(RELEASE_MESSAGE),
+                "{:?}",
+                tip.html_url
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn find_release_message_ignores_newer_human_message_naming_the_release() {
+        let (discord, _) = reporter(
+            vec![
+                human_message("3000", &format!("rolling {REPO} {TAG} now")),
+                announcement(RELEASE_MESSAGE, REPO, TAG),
+            ],
+            false,
+        );
+
+        for tip in tips_with_and_without_release_url() {
+            let found = discord.find_release_message(&tip).await.unwrap();
+
+            assert_eq!(
+                found.as_deref(),
+                Some(RELEASE_MESSAGE),
+                "{:?}",
+                tip.html_url
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn find_release_message_ignores_newer_human_link_to_the_release() {
+        let mut shared_link =
+            human_message("3000", &format!("rolling {} now", release_url(REPO, TAG)));
+        shared_link["embeds"] = json!([{
+            "title": format!("Release {TAG} · {REPO}"),
+            "url": release_url(REPO, TAG)
+        }]);
+        let (discord, _) = reporter(
+            vec![shared_link, announcement(RELEASE_MESSAGE, REPO, TAG)],
+            false,
+        );
+
         let found = discord.find_release_message(&tip()).await.unwrap();
 
         assert_eq!(found.as_deref(), Some(RELEASE_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn find_release_message_prefers_release_url_over_newer_repo_and_tag_match() {
+        let mut deploy_notice = announcement("3000", REPO, TAG);
+        deploy_notice["embeds"] = json!([{ "title": format!("[{REPO}] Deploying {TAG}") }]);
+        let (discord, _) = reporter(
+            vec![deploy_notice, announcement(RELEASE_MESSAGE, REPO, TAG)],
+            false,
+        );
+
+        let found = discord.find_release_message(&tip()).await.unwrap();
+
+        assert_eq!(found.as_deref(), Some(RELEASE_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn find_release_message_falls_back_to_automated_posts_naming_repo_and_tag() {
+        let bot_post = json!({
+            "id": RELEASE_MESSAGE,
+            "channel_id": CHANNEL,
+            "content": format!("{REPO} {TAG} released"),
+            "timestamp": "2026-09-23T01:00:00Z",
+            "author": { "id": "600", "username": "Release Bot", "bot": true }
+        });
+        let webhook_post = json!({
+            "id": RELEASE_MESSAGE,
+            "channel_id": CHANNEL,
+            "content": "",
+            "timestamp": "2026-09-23T01:00:00Z",
+            "author": { "id": "901", "username": "Releases" },
+            "webhook_id": "901",
+            "embeds": [{ "title": format!("[{REPO}] New release published: {TAG}") }]
+        });
+        for automated_post in [bot_post, webhook_post] {
+            let (discord, _) = reporter(
+                vec![
+                    human_message("3000", &format!("rolling {REPO} {TAG} now")),
+                    automated_post.clone(),
+                ],
+                false,
+            );
+
+            let found = discord.find_release_message(&tip()).await.unwrap();
+
+            assert_eq!(found.as_deref(), Some(RELEASE_MESSAGE), "{automated_post}");
+        }
     }
 
     #[tokio::test]
@@ -873,6 +1041,7 @@ mod tests {
             "channel_id": CHANNEL,
             "content": posted["content"],
             "timestamp": "2026-09-24T00:00:00Z",
+            "author": { "id": "800", "username": "Claudear", "bot": true },
             "embeds": posted["embeds"]
         });
         let (discord, _) = reporter(
@@ -894,7 +1063,8 @@ mod tests {
             "channel_id": CHANNEL,
             "content": "",
             "timestamp": "2026-09-23T01:00:00Z",
-            "embeds": [{ "title": "Cloud shipped", "url": release_url(REPO, TAG) }]
+            "webhook_id": "901",
+            "embeds": [{ "title": "Cloud shipped", "url": format!("{}/", release_url(REPO, TAG)) }]
         });
         let (discord, _) = reporter(vec![message], false);
 
@@ -934,6 +1104,9 @@ mod tests {
             ("Released v1.2.3", "1.2.3", false),
             ("Released 0.1.2.3", "1.2.3", false),
             ("Released 1.2.3-db then 1.2.3", "1.2.3", true),
+            ("compare/1.2.3...1.2.4", "1.2.3", false),
+            ("compare/1.2.3..1.2.4", "1.2.3", false),
+            ("compare/1.2.2...1.2.3", "1.2.3", false),
             ("[appwrite-labs/cloud]", "appwrite-labs/cloud", true),
             ("appwrite-labs/cloud-sdk", "appwrite-labs/cloud", false),
             ("anything", "", false),
