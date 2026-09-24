@@ -16,8 +16,8 @@ use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActivityLogEntry, AskRequest, BlockingQuestion, DeployQaTip, DeployQaTipStatus, FixAttempt,
-    FixAttemptStats, FixAttemptStatus, Issue, IssueEmbedding, IssueType, MatchPriority,
+    ActionKind, ActivityLogEntry, AskRequest, BlockingQuestion, DeployQaTip, DeployQaTipStatus,
+    FixAttempt, FixAttemptStats, FixAttemptStatus, Issue, IssueEmbedding, IssueType, MatchPriority,
     MatchResult, ProcessingMetric, RegressionWatch, ReplyKind, TimelineEventStatus,
 };
 use claudear_integrations::github::GitHubClient;
@@ -4678,19 +4678,36 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
     /// issue, bypassing classification. Backs the `claudear action ...` CLI.
+    ///
+    /// `resolve` is refused for observe-only `deploy_qa` issues, which must never
+    /// reach the fix pipeline.
     pub async fn run_action(
         &self,
-        action: claudear_core::types::ActionKind,
+        action: ActionKind,
         source_name: &str,
         issue_id: &str,
     ) -> Result<crate::processing::ProcessingOutcome> {
-        use crate::processing::{IssueProcessor, ProcessingInput};
+        use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
 
         let source = self
             .sources
             .iter()
             .find(|s| s.name() == source_name)
             .ok_or_else(|| claudear_core::error::Error::source(source_name, "Unknown source"))?;
+
+        if action == ActionKind::Resolve && source.name() == DEPLOY_QA_SOURCE {
+            tracing::warn!(
+                component = "watcher",
+                source = source_name,
+                issue_id = issue_id,
+                "Refusing resolve for observe-only deploy_qa issue"
+            );
+            return Ok(ProcessingOutcome::Failed {
+                error: format!(
+                    "{DEPLOY_QA_SOURCE} issues are observe-only; {action} is not permitted"
+                ),
+            });
+        }
 
         let issue = source.get_issue(issue_id).await?;
         let match_result = MatchResult::matched("Manual action", MatchPriority::Urgent);
@@ -8879,6 +8896,44 @@ mod tests {
             harness.stored_status(),
             DeployQaTipStatus::Running,
             "the tip must not be left running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_refuses_manual_resolve() {
+        use crate::processing::ProcessingOutcome;
+
+        let harness = DeployQaHarness::new(test_config());
+        let issue = harness.issue();
+        harness
+            .tracker
+            .record_attempt(DEPLOY_QA_SOURCE, &issue.id, &issue.short_id)
+            .unwrap();
+
+        let outcome = harness
+            .watcher
+            .run_action(ActionKind::Resolve, DEPLOY_QA_SOURCE, &issue.id)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, ProcessingOutcome::Failed { .. }),
+            "resolve on an observe-only deploy_qa issue must be refused"
+        );
+        let attempt = harness
+            .tracker
+            .get_attempt(DEPLOY_QA_SOURCE, &issue.id)
+            .unwrap()
+            .expect("attempt should still be recorded");
+        assert_eq!(
+            attempt.status,
+            FixAttemptStatus::Pending,
+            "a refused resolve must not enter the fix pipeline"
+        );
+        assert_eq!(
+            harness.answer_calls(),
+            0,
+            "a refused resolve must not run the agent"
         );
     }
 
