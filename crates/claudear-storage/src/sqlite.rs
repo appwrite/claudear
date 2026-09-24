@@ -7894,6 +7894,8 @@ impl SqliteTracker {
 
     /// Tips waiting to be picked up by the `deploy_qa` source.
     pub fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        use claudear_core::types::DeployQaTipStatus;
+
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
@@ -7901,25 +7903,34 @@ impl SqliteTracker {
                    status, attempt_id, discord_message_id, discord_thread_id, release_body,
                    created_at, updated_at
             FROM deploy_qa_tips
-            WHERE status = 'pending'
+            WHERE status = ?1
             ORDER BY created_at ASC
             "#,
         )?;
         let tips = stmt
-            .query_map([], Self::row_to_deploy_qa_tip)?
+            .query_map(
+                params![DeployQaTipStatus::Pending.to_string()],
+                Self::row_to_deploy_qa_tip,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(tips)
     }
 
     /// Whether the track has a pending or running attempt.
     pub fn track_has_in_flight_deploy_qa(&self, track: &str) -> Result<bool> {
+        use claudear_core::types::DeployQaTipStatus;
+
         let conn = self.acquire_lock()?;
         let count: i64 = conn.query_row(
             r#"
             SELECT COUNT(*) FROM deploy_qa_tips
-            WHERE track = ?1 AND status IN ('pending', 'running')
+            WHERE track = ?1 AND status IN (?2, ?3)
             "#,
-            params![track],
+            params![
+                track,
+                DeployQaTipStatus::Pending.to_string(),
+                DeployQaTipStatus::Running.to_string()
+            ],
             |row| row.get(0),
         )?;
         Ok(count > 0)
