@@ -2431,7 +2431,7 @@ mod tests {
         use claudear_core::error::{Error, Result};
         use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, IssueType};
         use claudear_storage::{
-            ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore,
+            ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
             EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
             SimilarityStore, UserStore, WebhookStore,
         };
@@ -2668,6 +2668,7 @@ mod tests {
         impl WebhookStore for MockFixAttemptTracker {}
         impl SimilarityStore for MockFixAttemptTracker {}
         impl DiscordStore for MockFixAttemptTracker {}
+        impl DeployQaStore for MockFixAttemptTracker {}
 
         fn make_fix_attempt(
             source: &str,
@@ -4424,7 +4425,7 @@ mod tests {
         use claudear_core::error::Result;
         use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
         use claudear_storage::{
-            ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore,
+            ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
             EvaluationStore, ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore,
             RepoStore, SimilarityStore, UserStore, WebhookStore,
         };
@@ -4603,6 +4604,7 @@ mod tests {
         impl WebhookStore for MockTracker {}
         impl SimilarityStore for MockTracker {}
         impl DiscordStore for MockTracker {}
+        impl DeployQaStore for MockTracker {}
 
         fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
             CodeReview {
@@ -5114,7 +5116,7 @@ mod tests {
         use claudear_core::error::Result;
         use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
         use claudear_storage::{
-            ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore,
+            ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
             EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
             SimilarityStore, UserStore, WebhookStore,
         };
@@ -5318,6 +5320,7 @@ mod tests {
         impl WebhookStore for MockFixAttemptTracker {}
         impl SimilarityStore for MockFixAttemptTracker {}
         impl DiscordStore for MockFixAttemptTracker {}
+        impl DeployQaStore for MockFixAttemptTracker {}
 
         fn make_fix_attempt(
             source: &str,
@@ -5735,7 +5738,7 @@ mod tests {
             ActivityLogEntry, FixAttempt, FixAttemptStats, FixAttemptStatus, PrReviewRecord,
         };
         use claudear_storage::{
-            ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore,
+            ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
             EvaluationStore, ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore,
             RepoStore, SimilarityStore, SqliteTracker, UserStore, WebhookStore,
         };
@@ -5977,6 +5980,7 @@ mod tests {
         impl WebhookStore for MockTrackerWithRecording {}
         impl SimilarityStore for MockTrackerWithRecording {}
         impl DiscordStore for MockTrackerWithRecording {}
+        impl DeployQaStore for MockTrackerWithRecording {}
 
         fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
             CodeReview {

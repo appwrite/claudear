@@ -5,6 +5,7 @@ use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
 use chrono::{DateTime, Utc};
+use claudear_analysis::deploy_qa::DEPLOY_QA_SOURCE;
 use claudear_analysis::feedback::{FeedbackAnalyzer, IssueEmbeddingService, Outcome};
 use claudear_analysis::inference::{
     resolve_repo_for_cascade, resolve_repo_for_issue, Confidence, RepoInferrer, RepoResolution,
@@ -15,9 +16,9 @@ use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActivityLogEntry, AskRequest, BlockingQuestion, FixAttempt, FixAttemptStats, FixAttemptStatus,
-    Issue, IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric,
-    RegressionWatch, ReplyKind, TimelineEventStatus,
+    ActionKind, ActivityLogEntry, AskRequest, BlockingQuestion, DeployQaTip, DeployQaTipStatus,
+    FixAttempt, FixAttemptStats, FixAttemptStatus, Issue, IssueEmbedding, IssueType, MatchPriority,
+    MatchResult, ProcessingMetric, RegressionWatch, ReplyKind, TimelineEventStatus,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
@@ -32,7 +33,7 @@ use futures::future::join_all;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{interval, Duration};
 
@@ -178,6 +179,22 @@ impl ProcessingState {
     }
 }
 
+/// A dispatched `deploy_qa` tip's hold on its `qa.max_concurrent` slot,
+/// released on drop so a run that panics or is aborted frees the slot instead
+/// of holding it until restart.
+struct DeployQaTipClaim {
+    watcher: Arc<Watcher>,
+    issue_id: String,
+}
+
+impl Drop for DeployQaTipClaim {
+    fn drop(&mut self) {
+        self.watcher
+            .lock_dispatched_deploy_qa_tips()
+            .remove(&self.issue_id);
+    }
+}
+
 /// Options for creating a watcher.
 pub struct WatcherOptions {
     pub config: Config,
@@ -253,6 +270,10 @@ pub struct Watcher {
     intent_classifier: Option<Arc<dyn crate::intent::IntentClassifier>>,
     /// Join handles for spawned issue-processing tasks (used by tests to drain).
     spawn_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Issue ids of `deploy_qa` tips whose dispatched runs have not finished,
+    /// so overlapping dispatches never start the same tip twice. Each id is
+    /// held by a [`DeployQaTipClaim`], whose `Drop` needs a synchronous lock.
+    dispatched_deploy_qa_tips: Mutex<HashSet<String>>,
 }
 
 /// A ledger comment carried by a review batch: `(scm_comment_id, comment_kind)`.
@@ -344,6 +365,7 @@ impl Watcher {
             llm_analyzer,
             intent_classifier,
             spawn_handles: tokio::sync::Mutex::new(Vec::new()),
+            dispatched_deploy_qa_tips: Mutex::new(HashSet::new()),
         }
     }
 
@@ -2227,6 +2249,10 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Seed the tracker with existing issues.
+    ///
+    /// The `deploy_qa` source is skipped: its tips are dispatched only by
+    /// [`Self::dispatch_pending_deploy_qa_tips`], and a seeded failed attempt
+    /// would hand a pending tip to the retry manager as well.
     pub async fn seed(&self) -> Result<SeedResult> {
         tracing::info!("");
         tracing::info!("Seeding tracker with existing issues...");
@@ -2234,12 +2260,14 @@ Create a PR with your changes.{custom_instructions}"#,
         let mut results = SeedResult::default();
 
         for source in &self.sources {
+            if source.name() == DEPLOY_QA_SOURCE {
+                continue;
+            }
             match source.fetch_issues().await {
                 Ok(issues) => {
                     let mut seeded = 0;
                     for issue in issues {
                         if !self.tracker.has_attempted(source.name(), &issue.id)? {
-                            // Extract labels from issue metadata for bug detection
                             let labels: Vec<String> =
                                 issue.get_metadata("labels").unwrap_or_default();
                             self.tracker.record_attempt_with_labels(
@@ -3045,8 +3073,11 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Poll a single source.
+    ///
+    /// The `deploy_qa` source is skipped: its tips are dispatched only by
+    /// [`Self::dispatch_pending_deploy_qa_tips`], so a tip never runs twice.
     async fn poll_source(self: &Arc<Self>, source: &Arc<dyn IssueSource>) -> Result<()> {
-        if self.is_rate_limit_paused().await {
+        if source.name() == DEPLOY_QA_SOURCE || self.is_rate_limit_paused().await {
             return Ok(());
         }
 
@@ -3719,10 +3750,237 @@ Create a PR with your changes.{custom_instructions}"#,
         self.tracker.record_activity(&activity).ok();
     }
 
+    /// Start QA for pending `deploy_qa` release tips without waiting for it to
+    /// finish, returning a handle per started run.
+    ///
+    /// The `[deploy_qa]` poller calls this after every poll, in every daemon
+    /// mode. It is the only in-process path that runs tips: source polls skip
+    /// the `deploy_qa` source. Oldest tips go first, at most
+    /// `qa.max_concurrent` dispatched runs are in flight, a tip is never
+    /// dispatched twice at once, a run that panics or is aborted frees its
+    /// slot, and a tip that left pending before its run starts is skipped.
+    /// Nothing starts while the watcher is not running (before warm start or
+    /// during shutdown) or is rate limited; tips left out stay pending for a
+    /// later call.
+    pub async fn dispatch_pending_deploy_qa_tips(
+        self: &Arc<Self>,
+    ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+        let source = self
+            .sources
+            .iter()
+            .find(|source| source.name() == DEPLOY_QA_SOURCE)
+            .ok_or_else(|| {
+                claudear_core::error::Error::source(DEPLOY_QA_SOURCE, "Unknown source")
+            })?;
+        if !self.is_running() || self.is_rate_limit_paused().await {
+            return Ok(Vec::new());
+        }
+
+        Ok(self
+            .claim_pending_deploy_qa_tips()?
+            .into_iter()
+            .map(|claim| {
+                let source = Arc::clone(source);
+                tokio::spawn(async move {
+                    claim
+                        .watcher
+                        .process_deploy_qa_tip(source, &claim.issue_id)
+                        .await;
+                })
+            })
+            .collect())
+    }
+
+    /// Claim the oldest pending tips that fit in the free `qa.max_concurrent`
+    /// slots, skipping tips an unfinished dispatched run already holds.
+    ///
+    /// The claims are built only after the lock is released, because dropping
+    /// one takes the same lock.
+    fn claim_pending_deploy_qa_tips(self: &Arc<Self>) -> Result<Vec<DeployQaTipClaim>> {
+        let issue_ids: Vec<String> = {
+            let mut dispatched = self.lock_dispatched_deploy_qa_tips();
+            let capacity = self
+                .config
+                .qa
+                .max_concurrent
+                .max(1)
+                .saturating_sub(dispatched.len());
+            let issue_ids: Vec<String> = self
+                .tracker
+                .list_pending_deploy_qa_tips()?
+                .into_iter()
+                .map(|tip| tip.issue_id)
+                .filter(|issue_id| !dispatched.contains(issue_id))
+                .take(capacity)
+                .collect();
+            dispatched.extend(issue_ids.iter().cloned());
+            issue_ids
+        };
+        Ok(issue_ids
+            .into_iter()
+            .map(|issue_id| DeployQaTipClaim {
+                watcher: Arc::clone(self),
+                issue_id,
+            })
+            .collect())
+    }
+
+    /// Lock the dispatched tip set, recovering it from a poisoned lock: the set
+    /// only gains or loses whole ids, so a holder that panicked cannot leave it
+    /// inconsistent.
+    fn lock_dispatched_deploy_qa_tips(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.dispatched_deploy_qa_tips
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Run QA for one dispatched tip unless it is no longer pending: another
+    /// process or path may have started, finished or errored it since it was
+    /// listed, and dispatch leaves an errored tip to the retry manager.
+    async fn process_deploy_qa_tip(&self, source: Arc<dyn IssueSource>, issue_id: &str) {
+        let still_pending = self
+            .find_deploy_qa_tip(issue_id)
+            .is_some_and(|tip| tip.status == DeployQaTipStatus::Pending);
+        if !still_pending {
+            tracing::info!(
+                component = "deploy_qa",
+                issue_id,
+                "Skipping dispatched deploy_qa tip that is no longer pending"
+            );
+            return;
+        }
+        match source.get_issue(issue_id).await {
+            Ok(issue) => {
+                let match_result = source.matches_criteria(&issue);
+                self.process_issue(
+                    source,
+                    issue,
+                    match_result,
+                    None,
+                    None,
+                    Some(Intent::Question),
+                )
+                .await;
+            }
+            Err(error) => tracing::warn!(
+                component = "deploy_qa",
+                issue_id,
+                error = %error,
+                "Failed to load dispatched deploy_qa tip"
+            ),
+        }
+    }
+
+    /// Look up the tip behind a deploy_qa issue, warning when it cannot be found:
+    /// QA never runs without a tip to record its status on.
+    fn find_deploy_qa_tip(&self, issue_id: &str) -> Option<DeployQaTip> {
+        match self.tracker.get_deploy_qa_tip_by_issue_id(issue_id) {
+            Ok(Some(tip)) => Some(tip),
+            Ok(None) => {
+                tracing::warn!(issue_id, "deploy_qa tip not found; skipping QA run");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(issue_id, error = %e, "Failed to load deploy_qa tip");
+                None
+            }
+        }
+    }
+
+    /// Claim `tip` for this process by moving it from the status it was read
+    /// with to `Running` in a single conditional update, returning whether
+    /// the claim succeeded.
+    ///
+    /// Daemons sharing the database each keep their own processing set, so
+    /// only the database can decide which of them runs a tip that all of them
+    /// read as runnable. A tip another process claimed, or whose status
+    /// changed since it was read, is left to its owner, and a failed claim
+    /// never runs QA unclaimed.
+    fn claim_deploy_qa_tip(&self, tip: &DeployQaTip, short_id: &str) -> bool {
+        match self.tracker.update_deploy_qa_tip_status_if(
+            tip.id,
+            tip.status,
+            DeployQaTipStatus::Running,
+            None,
+        ) {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::info!(
+                    component = "deploy_qa",
+                    short_id,
+                    "Skipping deploy_qa tip claimed elsewhere"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    component = "deploy_qa",
+                    short_id,
+                    error = %e,
+                    "Failed to claim deploy_qa tip; skipping QA run"
+                );
+                false
+            }
+        }
+    }
+
+    /// Link the attempt recording this run to the tip it claimed, leaving a
+    /// tip that has already left `Running` (a verdict recorded by another
+    /// process) untouched.
+    fn link_deploy_qa_tip_attempt(&self, tip: &DeployQaTip, attempt_id: Option<i64>) {
+        let Some(attempt_id) = attempt_id else {
+            return;
+        };
+        if let Err(e) = self.tracker.update_deploy_qa_tip_status_if(
+            tip.id,
+            DeployQaTipStatus::Running,
+            DeployQaTipStatus::Running,
+            Some(attempt_id),
+        ) {
+            tracing::warn!(
+                issue_id = %tip.issue_id,
+                attempt_id,
+                error = %e,
+                "Failed to link attempt to deploy_qa tip"
+            );
+        }
+    }
+
+    /// Mark a tip `Errored` when its attempt ended without the source recording
+    /// a verdict, so `skip_if_previous_running` does not block the track forever.
+    ///
+    /// The transition is a single conditional update because `claudear trigger`
+    /// and `claudear action` run in separate processes that can record a
+    /// verdict for the same tip at any moment.
+    fn release_unfinished_deploy_qa_tip(&self, tip: &DeployQaTip) {
+        match self.tracker.update_deploy_qa_tip_status_if(
+            tip.id,
+            DeployQaTipStatus::Running,
+            DeployQaTipStatus::Errored,
+            None,
+        ) {
+            Ok(true) => tracing::warn!(
+                issue_id = %tip.issue_id,
+                "deploy_qa attempt ended without a verdict; marked tip errored"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                issue_id = %tip.issue_id,
+                error = %e,
+                "Failed to release unfinished deploy_qa tip"
+            ),
+        }
+    }
+
     /// Process a single issue.
     ///
     /// Uses the RepoInferrer engine to determine which repository to use
     /// for fixing the issue. Delegates to the shared `IssueProcessor` pipeline.
+    ///
+    /// A `deploy_qa` issue is skipped unless its tip
+    /// [is runnable](DeployQaTipStatus::is_runnable) and this process
+    /// [claims](Self::claim_deploy_qa_tip) it, so no retry, trigger or other
+    /// daemon re-runs a tip that is running or already has a verdict.
     async fn process_issue(
         &self,
         source: Arc<dyn IssueSource>,
@@ -3733,6 +3991,32 @@ Create a PR with your changes.{custom_instructions}"#,
         intent: Option<Intent>,
     ) -> bool {
         use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
+
+        // Retries, IPC and review-feedback triggers pass no intent, and a
+        // deploy_qa attempt must never reach the fix pipeline.
+        let is_deploy_qa = source.name() == DEPLOY_QA_SOURCE;
+        let intent = if is_deploy_qa {
+            Some(Intent::Question)
+        } else {
+            intent
+        };
+        let deploy_qa_tip = if is_deploy_qa {
+            match self.find_deploy_qa_tip(&issue.id) {
+                Some(tip) if tip.status.is_runnable() => Some(tip),
+                Some(tip) => {
+                    tracing::info!(
+                        component = "deploy_qa",
+                        short_id = %issue.short_id,
+                        status = %tip.status,
+                        "Skipping deploy_qa tip that is running or has a verdict"
+                    );
+                    return false;
+                }
+                None => return false,
+            }
+        } else {
+            None
+        };
 
         if self.is_rate_limit_paused().await {
             tracing::info!(
@@ -3764,6 +4048,13 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
         self.active_processing.fetch_add(1, Ordering::SeqCst);
+
+        if let Some(ref tip) = deploy_qa_tip {
+            if !self.claim_deploy_qa_tip(tip, &issue.short_id) {
+                self.release_processing_slot(&processing_key).await;
+                return false;
+            }
+        }
 
         let intent_label = match intent {
             Some(Intent::Question) => "question",
@@ -3846,6 +4137,10 @@ Create a PR with your changes.{custom_instructions}"#,
             .flatten()
             .map(|a| a.id);
 
+        if let Some(ref tip) = deploy_qa_tip {
+            self.link_deploy_qa_tip_attempt(tip, attempt_id);
+        }
+
         // Infer the target repository using the shared resolution function
         let mut resolution =
             resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
@@ -3881,7 +4176,7 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         // Confidence-aware approval gate
-        if self.should_request_approval(&resolution) {
+        if !is_deploy_qa && self.should_request_approval(&resolution) {
             match self
                 .request_approval(source.name(), &issue, &resolution)
                 .await
@@ -3902,16 +4197,12 @@ Create a PR with your changes.{custom_instructions}"#,
                             repo = %repo_name,
                             "Redirect repo not found, skipping issue"
                         );
-                        let mut processing = self.processing.write().await;
-                        processing.remove(&processing_key);
-                        self.active_processing.fetch_sub(1, Ordering::SeqCst);
+                        self.release_processing_slot(&processing_key).await;
                         return false;
                     }
                 }
                 ApprovalDecision::Denied | ApprovalDecision::Unrecognized => {
-                    let mut processing = self.processing.write().await;
-                    processing.remove(&processing_key);
-                    self.active_processing.fetch_sub(1, Ordering::SeqCst);
+                    self.release_processing_slot(&processing_key).await;
                     return false;
                 }
             }
@@ -3959,6 +4250,10 @@ Create a PR with your changes.{custom_instructions}"#,
         let context_provider = crate::processing::SourceContext(source.as_ref());
         let outcome = processor.run(input, &context_provider).await;
 
+        if let Some(ref tip) = deploy_qa_tip {
+            self.release_unfinished_deploy_qa_tip(tip);
+        }
+
         // Watcher-specific: check for rate limit errors and pause if needed
         if let ProcessingOutcome::Failed { ref error } = outcome {
             if runner::is_rate_limit_error(error) {
@@ -3967,18 +4262,20 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
-        // Cleanup processing state
-        {
-            let mut processing = self.processing.write().await;
-            processing.remove(&processing_key);
-        }
-        self.active_processing.fetch_sub(1, Ordering::SeqCst);
-        self.slot_available.notify_waiters();
+        self.release_processing_slot(&processing_key).await;
 
         // Return false for semantic duplicate skips (don't count as processed),
         // true for everything else
         !matches!(&outcome, ProcessingOutcome::Failed { error }
             if error.contains("Semantic duplicate of"))
+    }
+
+    /// Give back the processing slot [`Self::process_issue`] took for
+    /// `processing_key` and wake tasks waiting for a free slot.
+    async fn release_processing_slot(&self, processing_key: &str) {
+        self.processing.write().await.remove(processing_key);
+        self.active_processing.fetch_sub(1, Ordering::SeqCst);
+        self.slot_available.notify_waiters();
     }
 
     async fn clear_rate_limit_pause(&self) {
@@ -4597,19 +4894,38 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
     /// issue, bypassing classification. Backs the `claudear action ...` CLI.
+    ///
+    /// Every action is refused for observe-only `deploy_qa` issues: `resolve`
+    /// would enter the fix pipeline, and `reply` / `verify` would post through
+    /// the source, which records any comment as the release's QA verdict.
     pub async fn run_action(
         &self,
-        action: claudear_core::types::ActionKind,
+        action: ActionKind,
         source_name: &str,
         issue_id: &str,
     ) -> Result<crate::processing::ProcessingOutcome> {
-        use crate::processing::{IssueProcessor, ProcessingInput};
+        use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
 
         let source = self
             .sources
             .iter()
             .find(|s| s.name() == source_name)
             .ok_or_else(|| claudear_core::error::Error::source(source_name, "Unknown source"))?;
+
+        if source.name() == DEPLOY_QA_SOURCE {
+            tracing::warn!(
+                component = "watcher",
+                source = source_name,
+                issue_id = issue_id,
+                %action,
+                "Refusing manual action for observe-only deploy_qa issue"
+            );
+            return Ok(ProcessingOutcome::Failed {
+                error: format!(
+                    "{DEPLOY_QA_SOURCE} issues are observe-only; {action} is not permitted"
+                ),
+            });
+        }
 
         let issue = source.get_issue(issue_id).await?;
         let match_result = MatchResult::matched("Manual action", MatchPriority::Urgent);
@@ -4828,10 +5144,12 @@ pub struct SeedResult {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use claudear_analysis::deploy_qa::{VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX};
+    use claudear_config::config::{DeployQaConfig, DeployQaTrackConfig};
     use claudear_core::types::IssuePriority;
     use claudear_integrations::notifier::Notifier;
     use claudear_integrations::reports::Report;
-    use claudear_integrations::source::IssueSource;
+    use claudear_integrations::source::{DeployQaSource, IssueSource};
     use claudear_storage::{ActivityStore, AttemptTracker, SqliteTracker};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -5055,6 +5373,7 @@ mod tests {
             ask: claudear_config::config::AskConfig::default(),
             retry: claudear_config::config::RetryConfig::default(),
             regression: claudear_config::config::RegressionConfig::default(),
+            deploy_qa: claudear_config::config::DeployQaConfig::default(),
             cascade: claudear_config::config::CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: claudear_config::config::LearningConfig::default(),
@@ -8597,6 +8916,970 @@ mod tests {
         assert!(
             !result,
             "process_issue should return false when issue already in-flight"
+        );
+    }
+
+    const CUSTOMER_REPLY: &str = "Thanks for reaching out, we are looking into this for you.";
+
+    /// How [`ScriptedQaAgent`] answers a QA question.
+    enum QaAnswer {
+        Report(String),
+        Crash,
+        Panic,
+    }
+
+    /// Agent that counts every invocation, answers QA as its [`QaAnswer`]
+    /// scripts, and never supports the fix pipeline.
+    struct ScriptedQaAgent {
+        calls: Arc<AtomicUsize>,
+        answer: QaAnswer,
+    }
+
+    impl ScriptedQaAgent {
+        fn record_call(&self) {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl AgentRunner for ScriptedQaAgent {
+        fn name(&self) -> &str {
+            "scripted-qa-agent"
+        }
+        fn capabilities(&self) -> claudear_integrations::runner::ProviderCapabilities {
+            claudear_integrations::runner::ProviderCapabilities::default()
+        }
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> String {
+            String::new()
+        }
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &std::path::Path,
+        ) -> Result<claudear_core::types::AgentResult> {
+            self.record_call();
+            Err(claudear_core::error::Error::runner(
+                "fix pipeline must never run for this agent",
+            ))
+        }
+        async fn answer_question(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> Result<String> {
+            self.record_call();
+            match &self.answer {
+                QaAnswer::Report(report) => Ok(report.clone()),
+                QaAnswer::Crash => {
+                    Err(claudear_core::error::Error::runner("live QA probe crashed"))
+                }
+                QaAnswer::Panic => panic!("live QA probe panicked"),
+            }
+        }
+        async fn verify_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> Result<claudear_core::types::VerifyResult> {
+            self.record_call();
+            Err(claudear_core::error::Error::runner(
+                "verify must never run for this agent",
+            ))
+        }
+        async fn generate_reply(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _guideline: Option<&str>,
+            _kind: ReplyKind,
+            _project_dir: &std::path::Path,
+        ) -> Result<String> {
+            self.record_call();
+            Ok(CUSTOMER_REPLY.to_string())
+        }
+    }
+
+    const DEPLOY_QA_TRACK: &str = "cloud";
+    const DEPLOY_QA_REPO: &str = "appwrite-labs/cloud";
+
+    fn deploy_qa_issue(tip: &DeployQaTip) -> Issue {
+        Issue::new(
+            tip.issue_id.clone(),
+            tip.tag.clone(),
+            format!("Deploy QA {}", tip.tag),
+            format!("https://github.com/{}/releases/tag/{}", tip.repo, tip.tag),
+            DEPLOY_QA_SOURCE,
+        )
+    }
+
+    fn deploy_qa_report(results: &[&str], verdict: &str) -> String {
+        let mut lines = results.to_vec();
+        let footer = format!("{VERDICT_PREFIX} {verdict}");
+        lines.push(&footer);
+        lines.join("\n")
+    }
+
+    fn deploy_qa_watcher(
+        config: Config,
+        source: Arc<dyn IssueSource>,
+        tracker: Arc<SqliteTracker>,
+        agent: Arc<dyn AgentRunner>,
+    ) -> Arc<Watcher> {
+        Arc::new(Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source],
+            notifier: Arc::new(MockNotifier::new(true)),
+            tracker,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: false,
+            llm_engine: None,
+            agent,
+        }))
+    }
+
+    struct DeployQaHarness {
+        watcher: Arc<Watcher>,
+        source: Arc<dyn IssueSource>,
+        tracker: Arc<SqliteTracker>,
+        tip: DeployQaTip,
+        agent_calls: Arc<AtomicUsize>,
+    }
+
+    impl DeployQaHarness {
+        /// A mock `deploy_qa` source whose QA agent crashes.
+        fn new(config: Config) -> Self {
+            Self::build(config, QaAnswer::Crash, |_, tip| {
+                Arc::new(MockSource::with_issues(
+                    DEPLOY_QA_SOURCE,
+                    vec![deploy_qa_issue(tip)],
+                ))
+            })
+        }
+
+        /// The real [`DeployQaSource`], whose QA agent answers with `report`.
+        fn with_deploy_qa_source(report: String) -> Self {
+            Self::with_deploy_qa_config(test_config(), QaAnswer::Report(report))
+        }
+
+        /// A running watcher over the real [`DeployQaSource`] whose QA agent
+        /// verifies every tip, ready for the `[deploy_qa]` poller to dispatch.
+        fn dispatching(config: Config) -> Self {
+            Self::dispatching_with(
+                config,
+                QaAnswer::Report(deploy_qa_report(
+                    &["- #1 x LIVE PASS"],
+                    VERDICT_ALL_VERIFIED,
+                )),
+            )
+        }
+
+        /// A running watcher over the real [`DeployQaSource`] whose QA agent
+        /// answers as `answer`, ready for the `[deploy_qa]` poller to dispatch.
+        fn dispatching_with(config: Config, answer: QaAnswer) -> Self {
+            let harness = Self::with_deploy_qa_config(config, answer);
+            harness.watcher.set_running(true);
+            harness
+        }
+
+        fn with_deploy_qa_config(config: Config, answer: QaAnswer) -> Self {
+            Self::build(config, answer, |tracker, _| {
+                let config = DeployQaConfig {
+                    tracks: vec![DeployQaTrackConfig {
+                        name: DEPLOY_QA_TRACK.to_string(),
+                        repo: DEPLOY_QA_REPO.to_string(),
+                        tag_filter: Default::default(),
+                    }],
+                    ..DeployQaConfig::default()
+                };
+                Arc::new(
+                    DeployQaSource::new(config, tracker, None)
+                        .expect("the bundled playbook should load"),
+                )
+            })
+        }
+
+        fn build(
+            config: Config,
+            answer: QaAnswer,
+            source: impl FnOnce(Arc<dyn FixAttemptTracker>, &DeployQaTip) -> Arc<dyn IssueSource>,
+        ) -> Self {
+            let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+            let tip = tracker
+                .upsert_deploy_qa_tip(&DeployQaTip::new(DEPLOY_QA_TRACK, DEPLOY_QA_REPO, "1.2.3"))
+                .unwrap();
+            let source = source(tracker.clone(), &tip);
+            let agent_calls = Arc::new(AtomicUsize::new(0));
+            let watcher = deploy_qa_watcher(
+                config,
+                source.clone(),
+                tracker.clone(),
+                Arc::new(ScriptedQaAgent {
+                    calls: agent_calls.clone(),
+                    answer,
+                }),
+            );
+            Self {
+                watcher,
+                source,
+                tracker,
+                tip,
+                agent_calls,
+            }
+        }
+
+        /// A watcher over the same database, source and QA agent that shares
+        /// no in-memory state with [`Self::watcher`], standing in for a second
+        /// daemon process.
+        fn second_process(&self) -> Arc<Watcher> {
+            deploy_qa_watcher(
+                self.watcher.config.clone(),
+                self.source.clone(),
+                self.tracker.clone(),
+                Arc::clone(&self.watcher.agent),
+            )
+        }
+
+        fn issue(&self) -> Issue {
+            deploy_qa_issue(&self.tip)
+        }
+
+        fn processing_key(&self) -> String {
+            format!("{DEPLOY_QA_SOURCE}:{}", self.tip.issue_id)
+        }
+
+        /// Load the seeded tip's issue from the source and process it on
+        /// `watcher`, returning whether the watcher processed it.
+        async fn process_tip_on(&self, watcher: &Watcher) -> bool {
+            let issue = self
+                .source
+                .get_issue(&self.tip.issue_id)
+                .await
+                .expect("the seeded tip's issue should load");
+            let match_result = self.source.matches_criteria(&issue);
+            watcher
+                .process_issue(self.source.clone(), issue, match_result, None, None, None)
+                .await
+        }
+
+        async fn assert_processing_released(&self, watcher: &Watcher) {
+            assert!(
+                !watcher
+                    .processing
+                    .read()
+                    .await
+                    .contains(&self.processing_key()),
+                "the tip must not stay in the watcher's processing set"
+            );
+            assert_eq!(
+                watcher.active_processing.load(Ordering::SeqCst),
+                0,
+                "the watcher must give back its processing slot"
+            );
+        }
+
+        fn stored_status(&self) -> DeployQaTipStatus {
+            self.status_of(&self.tip)
+        }
+
+        fn status_of(&self, tip: &DeployQaTip) -> DeployQaTipStatus {
+            self.tracker
+                .get_deploy_qa_tip_by_issue_id(&tip.issue_id)
+                .unwrap()
+                .expect("deploy_qa tip should still be stored")
+                .status
+        }
+
+        async fn dispatch_pending_tips(&self) -> Vec<tokio::task::JoinHandle<()>> {
+            self.watcher
+                .dispatch_pending_deploy_qa_tips()
+                .await
+                .expect("dispatching pending deploy_qa tips should succeed")
+        }
+
+        fn agent_calls(&self) -> usize {
+            self.agent_calls.load(AtomicOrdering::SeqCst)
+        }
+
+        /// Drive the seeded tip through the watcher: list it from the source,
+        /// then process it without a routing intent.
+        async fn process_pending_tip(&self) {
+            let mut pending = self.source.fetch_issues().await.unwrap();
+            assert_eq!(pending.len(), 1, "the seeded tip should be pending");
+            let issue = pending.remove(0);
+            let match_result = self.source.matches_criteria(&issue);
+            self.watcher
+                .process_issue(self.source.clone(), issue, match_result, None, None, None)
+                .await;
+        }
+
+        async fn assert_manual_action_refused(&self, action: ActionKind) {
+            use crate::processing::ProcessingOutcome;
+
+            let issue = self.issue();
+            self.tracker
+                .record_attempt(DEPLOY_QA_SOURCE, &issue.id, &issue.short_id)
+                .unwrap();
+
+            let outcome = self
+                .watcher
+                .run_action(action, DEPLOY_QA_SOURCE, &issue.id)
+                .await
+                .unwrap();
+
+            match outcome {
+                ProcessingOutcome::Failed { error } => assert!(
+                    error.contains(&action.to_string()),
+                    "the refusal should name the {action} action: {error}"
+                ),
+                _ => panic!("{action} on an observe-only deploy_qa issue must be refused"),
+            }
+            assert_eq!(
+                self.agent_calls(),
+                0,
+                "a refused {action} must not run the agent"
+            );
+            assert_eq!(
+                self.stored_status(),
+                DeployQaTipStatus::Pending,
+                "a refused {action} must not post a comment that is read as a QA verdict"
+            );
+            let attempt = self
+                .tracker
+                .get_attempt(DEPLOY_QA_SOURCE, &issue.id)
+                .unwrap()
+                .expect("attempt should still be recorded");
+            assert_eq!(
+                attempt.status,
+                FixAttemptStatus::Pending,
+                "a refused {action} must leave the attempt untouched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failed_deploy_qa_attempt_marks_tip_errored() {
+        let harness = DeployQaHarness::new(test_config());
+
+        harness
+            .watcher
+            .process_issue(
+                harness.source.clone(),
+                harness.issue(),
+                MatchResult::matched("deploy_qa pending tip", MatchPriority::High),
+                None,
+                None,
+                Some(Intent::Question),
+            )
+            .await;
+
+        assert_eq!(harness.agent_calls(), 1, "QA agent should be asked once");
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Errored,
+            "an attempt that ends without a verdict must release the tip from running"
+        );
+        assert!(
+            !harness
+                .tracker
+                .track_has_in_flight_deploy_qa(DEPLOY_QA_TRACK)
+                .unwrap(),
+            "an errored tip must not block the track"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_trigger_forces_question_path() {
+        let harness = DeployQaHarness::new(test_config());
+
+        harness
+            .watcher
+            .trigger_issue(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness.agent_calls(),
+            1,
+            "a triggered deploy_qa attempt must take the read-only QA path, not the fix pipeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_skips_approval_gate() {
+        let mut config = test_config();
+        config.ask.approval_confidence_threshold = Some("high".to_string());
+        let harness = DeployQaHarness::new(config);
+
+        harness
+            .watcher
+            .process_issue(
+                harness.source.clone(),
+                harness.issue(),
+                MatchResult::matched("deploy_qa pending tip", MatchPriority::High),
+                None,
+                None,
+                Some(Intent::Question),
+            )
+            .await;
+
+        assert_eq!(
+            harness.agent_calls(),
+            1,
+            "observe-only deploy_qa attempts must not wait on human approval"
+        );
+        assert_ne!(
+            harness.stored_status(),
+            DeployQaTipStatus::Running,
+            "the tip must not be left running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_refuses_manual_resolve() {
+        DeployQaHarness::with_deploy_qa_source(String::new())
+            .assert_manual_action_refused(ActionKind::Resolve)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_refuses_manual_reply() {
+        DeployQaHarness::with_deploy_qa_source(String::new())
+            .assert_manual_action_refused(ActionKind::Reply)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_refuses_manual_verify() {
+        DeployQaHarness::with_deploy_qa_source(String::new())
+            .assert_manual_action_refused(ActionKind::Verify)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_all_verified_report_marks_tip_verified() {
+        let harness = DeployQaHarness::with_deploy_qa_source(deploy_qa_report(
+            &["- #1 x LIVE PASS", "- #2 y LIVE PASS"],
+            VERDICT_ALL_VERIFIED,
+        ));
+
+        harness.process_pending_tip().await;
+
+        assert_eq!(harness.agent_calls(), 1, "QA agent should be asked once");
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Verified,
+            "the source must persist the all-verified verdict and the watcher must not clobber it"
+        );
+        assert!(!harness
+            .tracker
+            .track_has_in_flight_deploy_qa(DEPLOY_QA_TRACK)
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_live_fail_report_marks_tip_failed() {
+        let harness = DeployQaHarness::with_deploy_qa_source(deploy_qa_report(
+            &["- #1 x LIVE FAIL", "- #2 y LIVE PASS"],
+            VERDICT_FAIL,
+        ));
+
+        harness.process_pending_tip().await;
+
+        assert_eq!(harness.agent_calls(), 1, "QA agent should be asked once");
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Failed,
+            "the source must persist the fail verdict and the watcher must not clobber it"
+        );
+        assert!(!harness
+            .tracker
+            .track_has_in_flight_deploy_qa(DEPLOY_QA_TRACK)
+            .unwrap());
+    }
+
+    async fn finish_deploy_qa_runs(runs: Vec<tokio::task::JoinHandle<()>>) {
+        for run in join_all(runs).await {
+            run.expect("a dispatched deploy_qa run should not panic");
+        }
+    }
+
+    async fn finish_panicking_deploy_qa_runs(runs: Vec<tokio::task::JoinHandle<()>>) {
+        for run in join_all(runs).await {
+            assert!(
+                run.is_err_and(|error| error.is_panic()),
+                "a dispatched deploy_qa run should panic with its QA agent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatched_pending_deploy_qa_tip_is_verified() {
+        let harness = DeployQaHarness::dispatching(test_config());
+
+        let runs = harness.dispatch_pending_tips().await;
+
+        assert_eq!(runs.len(), 1, "the pending tip should be dispatched");
+        finish_deploy_qa_runs(runs).await;
+        assert_eq!(harness.agent_calls(), 1, "QA agent should be asked once");
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Verified,
+            "a dispatched tip must run QA without the watcher polling sources"
+        );
+        assert!(
+            !harness
+                .tracker
+                .track_has_in_flight_deploy_qa(DEPLOY_QA_TRACK)
+                .unwrap(),
+            "a verified tip must not block its track"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poll_leaves_deploy_qa_tips_to_dispatch() {
+        let harness = DeployQaHarness::dispatching(test_config());
+
+        harness.watcher.poll().await.unwrap();
+        harness.watcher.drain_spawned_tasks().await;
+
+        assert_eq!(
+            harness.agent_calls(),
+            0,
+            "a poll cycle must leave deploy_qa tips to the dispatcher so a tip never runs twice"
+        );
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Pending);
+
+        finish_deploy_qa_runs(harness.dispatch_pending_tips().await).await;
+
+        assert_eq!(harness.agent_calls(), 1, "dispatch should run the tip once");
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn test_finished_deploy_qa_tip_is_not_dispatched() {
+        let harness = DeployQaHarness::dispatching(test_config());
+        harness
+            .tracker
+            .update_deploy_qa_tip_status(harness.tip.id, DeployQaTipStatus::Verified, None)
+            .unwrap();
+
+        let runs = harness.dispatch_pending_tips().await;
+
+        assert!(runs.is_empty(), "only pending tips may be dispatched");
+        assert_eq!(
+            harness.agent_calls(),
+            0,
+            "a finished tip must not run QA again"
+        );
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn test_dispatched_deploy_qa_tip_finished_elsewhere_is_not_rerun() {
+        let harness = DeployQaHarness::dispatching(test_config());
+        for status in [
+            DeployQaTipStatus::Running,
+            DeployQaTipStatus::Verified,
+            DeployQaTipStatus::Errored,
+        ] {
+            harness
+                .tracker
+                .update_deploy_qa_tip_status(harness.tip.id, status, None)
+                .unwrap();
+
+            harness
+                .watcher
+                .process_deploy_qa_tip(harness.source.clone(), &harness.tip.issue_id)
+                .await;
+
+            assert_eq!(
+                harness.agent_calls(),
+                0,
+                "a tip that left pending after dispatch listed it must not run QA again"
+            );
+            assert_eq!(
+                harness.stored_status(),
+                status,
+                "a skipped {status} tip must keep its status"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_trigger_skips_tip_that_is_running_or_has_verdict() {
+        let harness = DeployQaHarness::with_deploy_qa_source(deploy_qa_report(
+            &["- #1 x LIVE FAIL"],
+            VERDICT_FAIL,
+        ));
+        for status in [
+            DeployQaTipStatus::Verified,
+            DeployQaTipStatus::Unverified,
+            DeployQaTipStatus::Failed,
+            DeployQaTipStatus::Running,
+        ] {
+            harness
+                .tracker
+                .update_deploy_qa_tip_status(harness.tip.id, status, None)
+                .unwrap();
+
+            let triggered = harness
+                .watcher
+                .trigger_issue(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+                .await;
+
+            assert!(
+                triggered.is_err(),
+                "a trigger for a {status} tip must report that QA did not start"
+            );
+            assert_eq!(
+                harness.agent_calls(),
+                0,
+                "a {status} tip must not run QA again or post a second report"
+            );
+            assert_eq!(
+                harness.stored_status(),
+                status,
+                "a skipped {status} tip must keep its status"
+            );
+            assert!(
+                harness
+                    .tracker
+                    .get_attempt(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+                    .unwrap()
+                    .is_none(),
+                "a skipped {status} tip must not record an attempt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_trigger_reruns_errored_tip() {
+        let harness = DeployQaHarness::with_deploy_qa_source(deploy_qa_report(
+            &["- #1 x LIVE FAIL"],
+            VERDICT_FAIL,
+        ));
+        harness
+            .tracker
+            .update_deploy_qa_tip_status(harness.tip.id, DeployQaTipStatus::Errored, None)
+            .unwrap();
+
+        harness
+            .watcher
+            .trigger_issue(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness.agent_calls(),
+            1,
+            "an errored tip has no verdict, so a retry must run QA once"
+        );
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Failed,
+            "the retried run must record its verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_tip_runs_once_across_daemon_processes() {
+        let harness = DeployQaHarness::with_deploy_qa_source(deploy_qa_report(
+            &["- #1 x LIVE PASS"],
+            VERDICT_ALL_VERIFIED,
+        ));
+        let second = harness.second_process();
+        let processing = (
+            harness.watcher.processing.write().await,
+            second.processing.write().await,
+        );
+        // Each run reads its tip before taking the processing set, so both
+        // have read it as pending once they have been polled.
+        let release_processing = async move {
+            tokio::task::yield_now().await;
+            drop(processing);
+        };
+
+        let (first_ran, second_ran, ()) = tokio::join!(
+            harness.process_tip_on(&harness.watcher),
+            harness.process_tip_on(&second),
+            release_processing,
+        );
+
+        assert_eq!(
+            harness.agent_calls(),
+            1,
+            "daemons that both read the tip as pending must run QA for it once"
+        );
+        assert_ne!(
+            first_ran, second_ran,
+            "exactly one daemon may process the tip"
+        );
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Verified,
+            "the daemon that claimed the tip must record its verdict"
+        );
+        harness.assert_processing_released(&harness.watcher).await;
+        harness.assert_processing_released(&second).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_tip_claimed_by_another_process_is_left_to_it() {
+        let harness = DeployQaHarness::with_deploy_qa_source(deploy_qa_report(
+            &["- #1 x LIVE PASS"],
+            VERDICT_ALL_VERIFIED,
+        ));
+        let harness = &harness;
+        let processing = harness.watcher.processing.write().await;
+        let claim_elsewhere = async move {
+            tokio::task::yield_now().await;
+            harness
+                .tracker
+                .update_deploy_qa_tip_status(harness.tip.id, DeployQaTipStatus::Running, None)
+                .unwrap();
+            drop(processing);
+        };
+
+        let (ran, ()) = tokio::join!(harness.process_tip_on(&harness.watcher), claim_elsewhere);
+
+        assert!(!ran, "a tip another process claimed must not be processed");
+        assert_eq!(
+            harness.agent_calls(),
+            0,
+            "a tip another process claimed must not run QA again"
+        );
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Running,
+            "the tip must stay running for the process that claimed it"
+        );
+        assert!(
+            harness
+                .tracker
+                .get_attempt(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+                .unwrap()
+                .is_none(),
+            "a lost claim must not record an attempt"
+        );
+        harness.assert_processing_released(&harness.watcher).await;
+    }
+
+    #[tokio::test]
+    async fn test_retry_of_failed_deploy_qa_attempt_skips_tip_with_verdict() {
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        config.processing_delay_ms = 0;
+        let harness = DeployQaHarness::dispatching(config);
+        let issue = harness.issue();
+        harness
+            .tracker
+            .record_attempt(DEPLOY_QA_SOURCE, &issue.id, &issue.short_id)
+            .unwrap();
+        harness
+            .tracker
+            .mark_failed(DEPLOY_QA_SOURCE, &issue.id, "answer delivery failed")
+            .unwrap();
+        harness
+            .tracker
+            .update_deploy_qa_tip_status(harness.tip.id, DeployQaTipStatus::Verified, None)
+            .unwrap();
+
+        harness.watcher.process_ready_retries().await.unwrap();
+
+        assert_eq!(
+            harness.agent_calls(),
+            0,
+            "retrying a failed attempt must not re-run QA for a tip that already has a verdict"
+        );
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn test_seed_leaves_deploy_qa_tips_to_dispatch() {
+        let harness = DeployQaHarness::dispatching(test_config());
+
+        let seeded = harness.watcher.seed().await.unwrap();
+
+        assert_eq!(
+            seeded.total, 0,
+            "a pending deploy_qa tip must not be seeded"
+        );
+        assert!(!seeded.by_source.contains_key(DEPLOY_QA_SOURCE));
+        assert!(
+            harness
+                .tracker
+                .get_attempt(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+                .unwrap()
+                .is_none(),
+            "seeding must not record a failed attempt that the retry manager would re-run"
+        );
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Pending);
+
+        finish_deploy_qa_runs(harness.dispatch_pending_tips().await).await;
+
+        assert_eq!(
+            harness.agent_calls(),
+            1,
+            "dispatch should still run the tip once"
+        );
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_deploy_qa_dispatches_run_tip_once() {
+        let mut config = test_config();
+        config.qa.max_concurrent = 2;
+        let harness = DeployQaHarness::dispatching(config);
+
+        let (first, second) = tokio::join!(
+            harness.dispatch_pending_tips(),
+            harness.dispatch_pending_tips()
+        );
+        finish_deploy_qa_runs(first.into_iter().chain(second).collect()).await;
+        let after_verdict = harness.dispatch_pending_tips().await;
+
+        assert!(
+            after_verdict.is_empty(),
+            "a verified tip must not be dispatched again"
+        );
+        assert_eq!(
+            harness.agent_calls(),
+            1,
+            "concurrent dispatches must run the QA agent once per tip"
+        );
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_dispatch_respects_qa_concurrency() {
+        let mut config = test_config();
+        config.qa.max_concurrent = 1;
+        let harness = DeployQaHarness::dispatching(config);
+        let next = harness
+            .tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new(DEPLOY_QA_TRACK, DEPLOY_QA_REPO, "1.2.4"))
+            .unwrap();
+        let statuses = || [harness.stored_status(), harness.status_of(&next)];
+
+        let first = harness.dispatch_pending_tips().await;
+        let while_busy = harness.dispatch_pending_tips().await;
+
+        assert_eq!(first.len(), 1, "one tip should take the only QA slot");
+        assert!(
+            while_busy.is_empty(),
+            "no tip may start while qa.max_concurrent dispatched runs are in flight"
+        );
+        finish_deploy_qa_runs(first).await;
+        let mut after_first = statuses();
+        after_first.sort_by_key(|status| status.to_string());
+        assert_eq!(
+            after_first,
+            [DeployQaTipStatus::Pending, DeployQaTipStatus::Verified],
+            "the tip left out must stay pending for a later dispatch"
+        );
+
+        let second = harness.dispatch_pending_tips().await;
+
+        assert_eq!(second.len(), 1, "the freed slot should take the other tip");
+        finish_deploy_qa_runs(second).await;
+        assert_eq!(
+            statuses(),
+            [DeployQaTipStatus::Verified, DeployQaTipStatus::Verified]
+        );
+        assert_eq!(harness.agent_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_panicked_deploy_qa_run_frees_its_dispatch_slot() {
+        let mut config = test_config();
+        config.qa.max_concurrent = 1;
+        let harness = DeployQaHarness::dispatching_with(config, QaAnswer::Panic);
+        harness
+            .tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new(DEPLOY_QA_TRACK, DEPLOY_QA_REPO, "1.2.4"))
+            .unwrap();
+
+        let first = harness.dispatch_pending_tips().await;
+        assert_eq!(first.len(), 1, "one tip should take the only QA slot");
+        finish_panicking_deploy_qa_runs(first).await;
+
+        let after_panic = harness.dispatch_pending_tips().await;
+
+        assert_eq!(
+            after_panic.len(),
+            1,
+            "a dispatched run that panicked must release its claim so the other pending tip \
+             can take the QA slot"
+        );
+        finish_panicking_deploy_qa_runs(after_panic).await;
+        assert_eq!(
+            harness.agent_calls(),
+            2,
+            "each pending tip should reach the QA agent once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_tips_stay_pending_while_watcher_cannot_process() {
+        let harness = DeployQaHarness::dispatching(test_config());
+
+        harness.watcher.set_running(false);
+        assert!(
+            harness.dispatch_pending_tips().await.is_empty(),
+            "a watcher that is not running must not start QA runs"
+        );
+
+        harness.watcher.set_running(true);
+        harness.watcher.rate_limit_pause_until.write().await.insert(
+            harness.watcher.config.agent.default_provider.clone(),
+            Utc::now() + chrono::Duration::hours(1),
+        );
+        assert!(
+            harness.dispatch_pending_tips().await.is_empty(),
+            "a rate-limited watcher must not start QA runs"
+        );
+
+        assert_eq!(harness.agent_calls(), 0);
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Pending,
+            "an undispatched tip must stay pending for a later dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_dispatch_requires_deploy_qa_source() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher =
+            create_test_watcher(Arc::new(MockNotifier::new(true)), tracker, vec![], false);
+        watcher.set_running(true);
+
+        assert!(
+            watcher.dispatch_pending_deploy_qa_tips().await.is_err(),
+            "dispatching without a deploy_qa source must be reported"
         );
     }
 

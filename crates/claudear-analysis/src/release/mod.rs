@@ -8,5 +8,5 @@
 mod github;
 mod tracker;
 
-pub use github::{PrDetails, ReleaseClient};
+pub use github::{GitHubRelease, GitHubTag, PrDetails, ReleaseAuthor, ReleaseClient};
 pub use tracker::{ReleaseTracker, ReleaseTrackerConfig};

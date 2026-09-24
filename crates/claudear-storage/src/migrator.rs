@@ -71,6 +71,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "fix_attempt_routing_intent",
         sql: include_str!("../../../migrations/V11__fix_attempt_routing_intent.sql"),
     },
+    Migration {
+        version: 12,
+        name: "deploy_qa_tips",
+        sql: include_str!("../../../migrations/V12__deploy_qa_tips.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -120,20 +125,39 @@ pub fn run(conn: &Connection) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn latest_version() -> u32 {
+        MIGRATIONS
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .unwrap()
+    }
+
+    fn applied_version(connection: &Connection) -> u32 {
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn applied_count(connection: &Connection) -> usize {
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        usize::try_from(count).unwrap()
+    }
+
     #[test]
     fn test_migrations_apply_to_fresh_db() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
-        // Verify tracking table
-        let version: u32 = conn
-            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(applied_version(&conn), latest_version());
+        assert_eq!(applied_count(&conn), MIGRATIONS.len());
 
-        // Verify a table from V1 exists
         let count: u32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fix_attempts'",
@@ -201,21 +225,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_routing_intent, 1);
+
+        let has_deploy_qa: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='deploy_qa_tips'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_deploy_qa, 1);
     }
 
     #[test]
     fn test_migrations_are_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
-        // Running again should be a no-op
         run(&conn).unwrap();
 
-        let version: u32 = conn
-            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(applied_version(&conn), latest_version());
+        assert_eq!(applied_count(&conn), MIGRATIONS.len());
     }
 
     #[test]

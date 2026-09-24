@@ -155,6 +155,12 @@ pub struct DiscordEmbed {
     /// Embed description.
     #[serde(default)]
     pub description: Option<String>,
+    /// Embed URL (the link on the title).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Embed footer.
+    #[serde(default)]
+    pub footer: Option<EmbedFooter>,
 }
 
 /// A Discord message reference (used for replies).

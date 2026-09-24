@@ -1,5 +1,6 @@
 //! Issue source implementations.
 
+mod deploy_qa;
 mod discord;
 mod github;
 mod gitlab;
@@ -11,6 +12,7 @@ mod slack;
 mod telegram;
 mod whatsapp;
 
+pub use deploy_qa::DeployQaSource;
 pub use discord::DiscordSource;
 pub use github::GitHubSource;
 pub use gitlab::GitLabSource;

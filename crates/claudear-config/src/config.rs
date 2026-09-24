@@ -5,6 +5,7 @@
 
 use claudear_core::error::{Error, Result};
 use claudear_core::secret::SecretValue;
+use claudear_core::types::DeployQaTip;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::env;
 use std::fs;
@@ -461,6 +462,9 @@ pub struct Config {
     /// Regression monitoring configuration.
     #[serde(default)]
     pub regression: RegressionConfig,
+    /// Live deploy QA for GitHub release tips (separate from `[regression]`).
+    #[serde(default)]
+    pub deploy_qa: DeployQaConfig,
     /// Cascade configuration for multi-repo chaining.
     #[serde(default)]
     pub cascade: CascadeConfig,
@@ -687,6 +691,7 @@ impl Default for Config {
             ask: AskConfig::default(),
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
+            deploy_qa: DeployQaConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
@@ -2066,6 +2071,177 @@ impl Default for RegressionConfig {
     }
 }
 
+/// Tag filter for a `[deploy_qa]` track.
+///
+/// TOML values: `"any"`, `"suffix:-db"`, `"not_suffix:-db"`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DeployQaTagFilter {
+    /// Match every release tag.
+    #[default]
+    Any,
+    /// Match tags that end with the given suffix (e.g. `-db`).
+    Suffix(String),
+    /// Match tags that do **not** end with the given suffix.
+    NotSuffix(String),
+}
+
+impl DeployQaTagFilter {
+    /// Parse a tag filter from its TOML string form.
+    pub fn parse(raw: &str) -> std::result::Result<Self, String> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("any") {
+            return Ok(Self::Any);
+        }
+        if let Some(suffix) = raw.strip_prefix("suffix:") {
+            let suffix = suffix.trim();
+            if suffix.is_empty() {
+                return Err("tag_filter 'suffix:' requires a non-empty suffix".to_string());
+            }
+            return Ok(Self::Suffix(suffix.to_string()));
+        }
+        if let Some(suffix) = raw.strip_prefix("not_suffix:") {
+            let suffix = suffix.trim();
+            if suffix.is_empty() {
+                return Err("tag_filter 'not_suffix:' requires a non-empty suffix".to_string());
+            }
+            return Ok(Self::NotSuffix(suffix.to_string()));
+        }
+        Err(format!(
+            "unknown tag_filter '{raw}' (expected any | suffix:<text> | not_suffix:<text>)"
+        ))
+    }
+
+    /// Whether `tag` matches this filter.
+    pub fn matches(&self, tag: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Suffix(suffix) => tag.ends_with(suffix),
+            Self::NotSuffix(suffix) => !tag.ends_with(suffix),
+        }
+    }
+
+    /// Canonical TOML string for this filter.
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::Any => "any".to_string(),
+            Self::Suffix(suffix) => format!("suffix:{suffix}"),
+            Self::NotSuffix(suffix) => format!("not_suffix:{suffix}"),
+        }
+    }
+}
+
+impl Serialize for DeployQaTagFilter {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeployQaTagFilter {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One GitHub repo + tag-filter track watched by `[deploy_qa]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployQaTrackConfig {
+    /// Stable track name (e.g. `cloud`, `edge-db`).
+    pub name: String,
+    /// GitHub `owner/repo`.
+    pub repo: String,
+    /// Which release tags this track consumes.
+    #[serde(default)]
+    pub tag_filter: DeployQaTagFilter,
+}
+
+/// Live deploy QA for new GitHub release tips.
+///
+/// Distinct from `[regression]`, which watches **bug-fix inclusion** after a
+/// merge. `[deploy_qa]` durable-watches **new tips** and runs observe/report
+/// live QA against them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeployQaConfig {
+    /// Whether the deploy-QA poller is enabled (default: false).
+    pub enabled: bool,
+    /// How often to poll GitHub for new tips (milliseconds, default: 300000).
+    pub poll_interval_ms: u64,
+    /// Skip enqueueing a new tip on a track while a previous attempt is running.
+    pub skip_if_previous_running: bool,
+    /// Discord `#releases` channel to reply under.
+    pub discord_channel_id: Option<String>,
+    /// Path to a GitHub login → Discord user id map (FAIL `@releaser`).
+    pub github_discord_map_path: Option<String>,
+    /// Optional path to the live-QA playbook. When unset, the bundled playbook
+    /// shipped with Claudear is used.
+    pub instructions_path: Option<String>,
+    /// Tracks to poll. Each track is a repo + tag filter.
+    pub tracks: Vec<DeployQaTrackConfig>,
+}
+
+impl DeployQaConfig {
+    /// Poll interval, clamped to at least 1 ms so timers never panic.
+    pub fn effective_poll_interval_ms(&self) -> u64 {
+        self.poll_interval_ms.max(1)
+    }
+
+    /// Validate `[[deploy_qa.tracks]]`.
+    ///
+    /// Track names must be non-empty, unique, and free of
+    /// [`DeployQaTip::ISSUE_ID_SEPARATOR`] so every synthetic `track:repo:tag`
+    /// issue id maps back to exactly one `(track, tag)`. Repos must be in
+    /// `owner/name` form.
+    pub fn validate(&self) -> Result<()> {
+        let separator = DeployQaTip::ISSUE_ID_SEPARATOR;
+        let mut names = std::collections::HashSet::with_capacity(self.tracks.len());
+        for (index, track) in self.tracks.iter().enumerate() {
+            let name = track.name.as_str();
+            if name.trim().is_empty() {
+                return Err(Error::config(format!(
+                    "deploy_qa.tracks[{index}] (repo '{}') must have a non-empty name",
+                    track.repo
+                )));
+            }
+            if name.contains(separator) {
+                return Err(Error::config(format!(
+                    "deploy_qa track '{name}' must not contain '{separator}' in its name"
+                )));
+            }
+            if !names.insert(name) {
+                return Err(Error::config(format!(
+                    "deploy_qa track name '{name}' is used by more than one track"
+                )));
+            }
+            let (owner, repository) = track.repo.split_once('/').unwrap_or_default();
+            if owner.is_empty() || repository.is_empty() || repository.contains('/') {
+                return Err(Error::config(format!(
+                    "deploy_qa track '{name}' repo '{}' must be in owner/name form",
+                    track.repo
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for DeployQaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: 300_000,
+            skip_if_previous_running: true,
+            discord_channel_id: None,
+            github_discord_map_path: None,
+            instructions_path: None,
+            tracks: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KnowledgebasesConfig {
@@ -3150,10 +3326,18 @@ impl Config {
             .discord
             .as_ref()
             .is_some_and(|s| s.bot_token.is_some());
+        let has_deploy_qa = self.deploy_qa.enabled && !self.deploy_qa.tracks.is_empty();
 
-        if !has_linear && !has_sentry && !has_jira && !has_gitlab && !has_slack && !has_discord {
+        if !has_linear
+            && !has_sentry
+            && !has_jira
+            && !has_gitlab
+            && !has_slack
+            && !has_discord
+            && !has_deploy_qa
+        {
             return Err(Error::config(
-                "No sources configured. Configure linear, sentry, jira, gitlab, slack, or discord in config file with valid API credentials.",
+                "No sources configured. Configure linear, sentry, jira, gitlab, slack, discord, or deploy_qa tracks in config file with valid API credentials.",
             ));
         }
 
@@ -3193,6 +3377,22 @@ impl Config {
         // Validate prioritisation config only when engine is enabled
         if self.prioritisation.enabled {
             self.prioritisation.validate()?;
+        }
+
+        if self.deploy_qa.enabled {
+            self.deploy_qa.validate()?;
+        }
+
+        let has_github_token = self
+            .github()
+            .token
+            .as_ref()
+            .is_some_and(|token| !token.is_empty());
+        if has_deploy_qa && !has_github_token {
+            return Err(Error::config(
+                "deploy_qa requires a GitHub token to poll release tips. \
+                 Set scm.github.token or CLAUDEAR_GITHUB_TOKEN, or disable deploy_qa.",
+            ));
         }
 
         // Validate TLS config when enabled
@@ -4988,6 +5188,112 @@ monitoring_duration_hours = 12
             assert_eq!(config.regression.monitoring_duration_hours, 12);
             // Defaults should apply for unspecified fields
             assert_eq!(config.regression.sentry_event_threshold, 1);
+        });
+    }
+
+    #[test]
+    fn test_deploy_qa_config_default() {
+        let config = DeployQaConfig::default();
+        assert!(!config.enabled);
+        assert!(config.tracks.is_empty());
+        assert!(config.effective_poll_interval_ms() > 0);
+
+        let zero_interval = DeployQaConfig {
+            poll_interval_ms: 0,
+            ..Default::default()
+        };
+        assert!(zero_interval.effective_poll_interval_ms() >= 1);
+
+        let root = Config::default();
+        assert!(!root.deploy_qa.enabled);
+        assert!(root.deploy_qa.tracks.is_empty());
+    }
+
+    #[test]
+    fn test_deploy_qa_tag_filter_parse_and_match() {
+        assert_eq!(
+            DeployQaTagFilter::parse("any").unwrap(),
+            DeployQaTagFilter::Any
+        );
+        assert_eq!(
+            DeployQaTagFilter::parse("suffix:-db").unwrap(),
+            DeployQaTagFilter::Suffix("-db".into())
+        );
+        assert_eq!(
+            DeployQaTagFilter::parse("not_suffix:-db").unwrap(),
+            DeployQaTagFilter::NotSuffix("-db".into())
+        );
+        assert!(DeployQaTagFilter::parse("suffix:").is_err());
+        assert!(DeployQaTagFilter::parse("glob:*").is_err());
+
+        assert!(DeployQaTagFilter::Any.matches("v1.0.0"));
+        assert!(DeployQaTagFilter::Suffix("-db".into()).matches("1.2.3-db"));
+        assert!(!DeployQaTagFilter::Suffix("-db".into()).matches("1.2.3"));
+        assert!(DeployQaTagFilter::NotSuffix("-db".into()).matches("1.2.3"));
+        assert!(!DeployQaTagFilter::NotSuffix("-db".into()).matches("1.2.3-db"));
+    }
+
+    #[test]
+    fn test_config_deploy_qa_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+workspace = "/tmp/test"
+
+[deploy_qa]
+enabled = true
+poll_interval_ms = 120000
+skip_if_previous_running = false
+discord_channel_id = "990878183580651571"
+github_discord_map_path = "github-discord-map.json"
+instructions_path = "playbooks/deploy_qa.md"
+
+[[deploy_qa.tracks]]
+name = "cloud"
+repo = "appwrite-labs/cloud"
+tag_filter = "any"
+
+[[deploy_qa.tracks]]
+name = "edge-db"
+repo = "appwrite-labs/edge"
+tag_filter = "suffix:-db"
+
+[[deploy_qa.tracks]]
+name = "edge-network"
+repo = "appwrite-labs/edge"
+tag_filter = "not_suffix:-db"
+
+[[deploy_qa.tracks]]
+name = "vibes"
+repo = "appwrite/vibes"
+tag_filter = "any"
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert!(config.deploy_qa.enabled);
+            assert_eq!(config.deploy_qa.poll_interval_ms, 120_000);
+            assert!(!config.deploy_qa.skip_if_previous_running);
+            assert_eq!(
+                config.deploy_qa.discord_channel_id.as_deref(),
+                Some("990878183580651571")
+            );
+            assert_eq!(config.deploy_qa.tracks.len(), 4);
+            assert_eq!(config.deploy_qa.tracks[0].name, "cloud");
+            assert_eq!(
+                config.deploy_qa.tracks[0].tag_filter,
+                DeployQaTagFilter::Any
+            );
+            assert_eq!(
+                config.deploy_qa.tracks[1].tag_filter,
+                DeployQaTagFilter::Suffix("-db".into())
+            );
+            assert_eq!(
+                config.deploy_qa.tracks[2].tag_filter,
+                DeployQaTagFilter::NotSuffix("-db".into())
+            );
+            assert_eq!(config.deploy_qa.tracks[3].repo, "appwrite/vibes");
+            assert_eq!(
+                config.regression.enabled,
+                RegressionConfig::default().enabled
+            );
         });
     }
 
@@ -7779,6 +8085,184 @@ sms_number = "+1111111111"
         config.prioritisation.enabled = true;
         config.prioritisation.severity_weight = -1.0;
         assert!(config.validate().is_err());
+    }
+
+    fn deploy_qa_with_tracks(enabled: bool, tracks: &[(&str, &str)]) -> DeployQaConfig {
+        DeployQaConfig {
+            enabled,
+            tracks: tracks
+                .iter()
+                .map(|(name, repo)| DeployQaTrackConfig {
+                    name: name.to_string(),
+                    repo: repo.to_string(),
+                    tag_filter: DeployQaTagFilter::Any,
+                })
+                .collect(),
+            ..DeployQaConfig::default()
+        }
+    }
+
+    fn config_with_linear() -> Config {
+        let mut config = Config::default();
+        config.issues.linear = Some(LinearConfig {
+            enabled: true,
+            api_key: SecretValue::new("key"),
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_accepts_distinct_tracks() {
+        let config = deploy_qa_with_tracks(
+            true,
+            &[
+                ("edge-db", "appwrite-labs/edge"),
+                ("edge-network", "appwrite-labs/edge"),
+                ("vibes", "appwrite/vibes"),
+            ],
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_duplicate_names() {
+        let config = deploy_qa_with_tracks(
+            true,
+            &[
+                ("cloud", "appwrite-labs/cloud"),
+                ("cloud", "appwrite/vibes"),
+            ],
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("'cloud'"), "{error}");
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_empty_names() {
+        for name in ["", "   "] {
+            let config = deploy_qa_with_tracks(true, &[(name, "appwrite-labs/cloud")]);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("appwrite-labs/cloud"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_separator_in_name() {
+        let name = format!("cloud{}prod", DeployQaTip::ISSUE_ID_SEPARATOR);
+        let config = deploy_qa_with_tracks(true, &[(&name, "appwrite-labs/cloud")]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains(&name), "{error}");
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_malformed_repos() {
+        for repo in ["appwrite", "a/", "/b", "a/b/c", ""] {
+            let config = deploy_qa_with_tracks(true, &[("cloud", repo)]);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("'cloud'"), "{repo}: {error}");
+        }
+    }
+
+    fn scm_with_github_token(token: Option<&str>) -> ScmConfig {
+        ScmConfig {
+            github: GitHubConfig {
+                token: token.map(SecretValue::new),
+                ..GitHubConfig::default()
+            },
+            ..ScmConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_checked_when_enabled() {
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            deploy_qa: deploy_qa_with_tracks(true, &[("cloud", "appwrite")]),
+            ..config_with_linear()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("deploy_qa"), "{error}");
+        assert!(error.contains("'appwrite'"), "{error}");
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_skipped_when_disabled() {
+        let mut config = config_with_linear();
+        config.deploy_qa = deploy_qa_with_tracks(false, &[("", "appwrite")]);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_counts_as_source() {
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            deploy_qa: deploy_qa_with_tracks(true, &[("cloud", "appwrite-labs/cloud")]),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_without_tracks_is_not_a_source() {
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            deploy_qa: deploy_qa_with_tracks(true, &[]),
+            ..Config::default()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("No sources configured"), "{error}");
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_requires_github_token() {
+        for base in [Config::default(), config_with_linear()] {
+            for token in [None, Some("")] {
+                let config = Config {
+                    scm: scm_with_github_token(token),
+                    deploy_qa: deploy_qa_with_tracks(true, &[("cloud", "appwrite-labs/cloud")]),
+                    ..base.clone()
+                };
+                let error = config.validate().unwrap_err().to_string();
+                assert!(error.contains("deploy_qa"), "{token:?}: {error}");
+                assert!(error.contains("GitHub token"), "{token:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_accepts_github_token_from_env() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[deploy_qa]
+enabled = true
+
+[[deploy_qa.tracks]]
+name = "cloud"
+repo = "appwrite-labs/cloud"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[], || {
+            let config = Config::load(file.path()).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("GitHub token"), "{error}");
+        });
+        with_env(&[("CLAUDEAR_GITHUB_TOKEN", "env_token")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(config.validate().is_ok());
+        });
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_without_tracks_needs_no_github_token() {
+        let config = Config {
+            scm: scm_with_github_token(None),
+            deploy_qa: deploy_qa_with_tracks(true, &[]),
+            ..config_with_linear()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

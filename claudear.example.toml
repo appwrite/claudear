@@ -800,6 +800,53 @@ github_search_repos = []
 [regression.package_names]
 "utopia-php/database" = ["utopia-php/database"]
 
+# ============================================
+# Deploy QA (live release-tip watches)
+# ============================================
+# Durable-watches new GitHub release tips and runs observe/report live QA.
+# Separate from [regression] / ReleaseTracker (those track bug-fix inclusion).
+# Do not point issues.discord at #releases — that would spawn fix agents on
+# bot posts. Required env for a live host (not used in CI):
+#   CLAUDEAR_GITHUB_TOKEN          - GitHub token for release/tag polling;
+#                                    required (or scm.github.token) whenever
+#                                    deploy_qa is enabled with tracks
+#   CLAUDEAR_DISCORD_BOT_TOKEN     - bot that can reply / create threads
+# Live host probes are performed by the agent; CI uses a no-op probe seam.
+
+[deploy_qa]
+# Off by default so existing deployments are unchanged.
+enabled = false
+poll_interval_ms = 300000
+skip_if_previous_running = true
+discord_channel_id = "990878183580651571"
+# GitHub login -> Discord user map for the FAIL @releaser mention. Use an
+# absolute path: a relative one breaks under systemd and drops the mention.
+github_discord_map_path = "/etc/claudear/github-discord-map.json"
+# Optional; defaults to the bundled playbooks/deploy_qa.md. When set, use an
+# absolute path: a relative one breaks under systemd and disables deploy_qa.
+# instructions_path = "/etc/claudear/deploy_qa.md"
+
+# Track names must be unique and must not contain ':'; repo is owner/name.
+[[deploy_qa.tracks]]
+name = "cloud"
+repo = "appwrite-labs/cloud"
+tag_filter = "any"
+
+[[deploy_qa.tracks]]
+name = "edge-db"
+repo = "appwrite-labs/edge"
+tag_filter = "suffix:-db"
+
+[[deploy_qa.tracks]]
+name = "edge-network"
+repo = "appwrite-labs/edge"
+tag_filter = "not_suffix:-db"
+
+[[deploy_qa.tracks]]
+name = "vibes"
+repo = "appwrite/vibes"
+tag_filter = "any"
+
 # Enables chained follow-up fixes across repositories.
 
 [cascade]

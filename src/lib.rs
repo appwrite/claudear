@@ -41,6 +41,7 @@ pub use claudear_config::users;
 pub use claudear_storage as storage;
 
 // Re-exported from claudear-analysis
+pub use claudear_analysis::deploy_qa;
 pub use claudear_analysis::evaluation;
 pub use claudear_analysis::feedback;
 pub use claudear_analysis::inference;
@@ -220,8 +221,10 @@ pub async fn build_app(
     // Notifier
     let notifier = build_notifier(&config, user_registry.clone());
 
-    // Sources
-    let sources = build_sources(&config);
+    let mut sources = build_sources(&config);
+    if let Some(source) = build_deploy_qa_source(&config, tracker.clone()) {
+        sources.push(telemetry::InstrumentedSource::wrap(source));
+    }
 
     // GitHub client for inferrer
     let github_client = github::GitHubClient::new(config.github().clone());
@@ -279,8 +282,6 @@ pub async fn build_app(
     })
 }
 
-// --- internal helpers used by both build_app and main.rs ---
-
 fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notifier::Notifier> {
     use notifier::*;
     use telemetry::InstrumentedNotifier;
@@ -326,6 +327,59 @@ fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notif
     }
 
     Arc::new(composite)
+}
+
+/// Build the synthetic observe/report `deploy_qa` issue source.
+///
+/// Returns `None` when `[deploy_qa]` is disabled or the source cannot be built
+/// (e.g. an unreadable playbook). An unreadable GitHub↔Discord map or a Discord
+/// reporter that fails to build only degrades reporting, so the source is still
+/// returned. Every failure is logged. The source is returned unwrapped; callers
+/// add telemetry instrumentation.
+pub fn build_deploy_qa_source(
+    config: &Config,
+    tracker: Arc<dyn storage::FixAttemptTracker>,
+) -> Option<Arc<dyn source::IssueSource>> {
+    if !config.deploy_qa.enabled {
+        return None;
+    }
+
+    let map = match config.deploy_qa.github_discord_map_path.as_deref() {
+        Some(path) => deploy_qa::GitHubDiscordMap::load_from_path(path).unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                path,
+                "Failed to load deploy_qa GitHub↔Discord map; FAIL @releaser disabled"
+            );
+            deploy_qa::GitHubDiscordMap::default()
+        }),
+        None => deploy_qa::GitHubDiscordMap::default(),
+    };
+
+    let bot_token = config
+        .discord_merged()
+        .bot_token
+        .map(|token| token.expose().to_string());
+    let discord = claudear_integrations::deploy_qa::try_build_discord(
+        bot_token.as_deref(),
+        config.deploy_qa.discord_channel_id.as_deref(),
+        map,
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "deploy_qa Discord reporter unavailable; reporting disabled");
+        None
+    });
+
+    match source::DeployQaSource::new(config.deploy_qa.clone(), tracker, discord) {
+        Ok(source) => {
+            tracing::info!("Deploy QA source initialized (observe/report only)");
+            Some(Arc::new(source))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create deploy_qa source; [deploy_qa] disabled");
+            None
+        }
+    }
 }
 
 fn build_sources(config: &Config) -> Vec<Arc<dyn source::IssueSource>> {
@@ -429,8 +483,6 @@ fn build_embedding_service(
 mod tests {
     use super::*;
 
-    // --- build_sources with default config ---
-
     #[test]
     fn build_sources_default_config_returns_empty() {
         let config = Config::default();
@@ -441,8 +493,6 @@ mod tests {
         );
     }
 
-    // --- build_notifier with default config ---
-
     #[test]
     fn build_notifier_default_config_has_console() {
         let config = Config::default();
@@ -450,8 +500,6 @@ mod tests {
         let _notifier = build_notifier(&config, user_registry);
         // Should not panic -- console notifier is always added
     }
-
-    // --- build_embedding_service ---
 
     #[test]
     fn build_embedding_service_none_when_no_client() {
@@ -461,8 +509,6 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // --- build_review_watcher ---
-
     #[test]
     fn build_review_watcher_returns_none_when_github_disabled() {
         let config = Config::default();
@@ -471,8 +517,6 @@ mod tests {
         let result = build_review_watcher(&config, tracker);
         assert!(result.is_none());
     }
-
-    // --- build_sources with linear enabled ---
 
     #[test]
     fn build_sources_with_linear_enabled() {
@@ -502,8 +546,6 @@ mod tests {
         assert!(sources.is_empty());
     }
 
-    // --- build_sources with jira enabled ---
-
     #[test]
     fn build_sources_with_jira_enabled() {
         let mut config = Config::default();
@@ -518,8 +560,6 @@ mod tests {
         let sources = build_sources(&config);
         assert_eq!(sources.len(), 1);
     }
-
-    // --- build_sources with sentry enabled ---
 
     #[test]
     fn build_sources_with_sentry_enabled() {
@@ -554,5 +594,51 @@ mod tests {
         });
         let sources = build_sources(&config);
         assert_eq!(sources.len(), 2);
+    }
+
+    fn deploy_qa_config() -> Config {
+        let mut config = Config::default();
+        config.deploy_qa.enabled = true;
+        config
+    }
+
+    fn in_memory_tracker() -> Arc<dyn storage::FixAttemptTracker> {
+        Arc::new(storage::SqliteTracker::in_memory().unwrap())
+    }
+
+    #[test]
+    fn build_deploy_qa_source_none_when_disabled() {
+        let source = build_deploy_qa_source(&Config::default(), in_memory_tracker());
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn build_deploy_qa_source_without_discord() {
+        let source = build_deploy_qa_source(&deploy_qa_config(), in_memory_tracker())
+            .expect("enabled deploy_qa should build without Discord");
+        assert_eq!(source.name(), deploy_qa::DEPLOY_QA_SOURCE);
+    }
+
+    #[test]
+    fn build_deploy_qa_source_none_when_playbook_missing() {
+        let mut config = deploy_qa_config();
+        config.deploy_qa.instructions_path = Some("/nonexistent/deploy_qa_playbook.md".to_string());
+        let source = build_deploy_qa_source(&config, in_memory_tracker());
+        assert!(
+            source.is_none(),
+            "an unreadable playbook must disable the source"
+        );
+    }
+
+    #[test]
+    fn build_deploy_qa_source_survives_missing_discord_map() {
+        let mut config = deploy_qa_config();
+        config.deploy_qa.github_discord_map_path =
+            Some("/nonexistent/github-discord-map.json".to_string());
+        let source = build_deploy_qa_source(&config, in_memory_tracker());
+        assert!(
+            source.is_some(),
+            "a missing GitHub↔Discord map only disables FAIL @releaser mentions"
+        );
     }
 }

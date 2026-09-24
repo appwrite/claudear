@@ -4,6 +4,7 @@
 //! prioritisation, repository indexing, inference, regression detection,
 //! and release tracking.
 
+pub mod deploy_qa;
 pub mod evaluation;
 pub mod feedback;
 pub mod inference;

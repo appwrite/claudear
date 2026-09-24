@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use claudear::{
     api::ApiServer,
     config::Config,
+    deploy_qa::{DeployQaPollAction, DeployQaTracker},
     feedback::{EmbeddingClient, IssueEmbeddingService},
     github::GitHubClient,
     housekeeping::HousekeepingWorker,
@@ -718,7 +719,7 @@ async fn build_watcher_deps(
     config: &Config,
     tracker: &Arc<dyn FixAttemptTracker>,
 ) -> anyhow::Result<WatcherDeps> {
-    let sources = create_sources(config);
+    let sources = create_sources(config, tracker);
 
     // GitHub client for API-based repo discovery
     let github_client = GitHubClient::new(config.github().clone());
@@ -1042,7 +1043,10 @@ fn create_review_watcher(
     Some(Arc::new(review_watcher))
 }
 
-fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
+fn create_sources(
+    config: &Config,
+    tracker: &Arc<dyn FixAttemptTracker>,
+) -> Vec<Arc<dyn IssueSource>> {
     let mut sources: Vec<Arc<dyn IssueSource>> = Vec::new();
 
     if let Some(linear_config) = config.linear() {
@@ -1130,6 +1134,10 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
         } else {
             tracing::warn!("Telegram source_enabled but missing bot_token; skipping");
         }
+    }
+
+    if let Some(source) = claudear::build_deploy_qa_source(config, tracker.clone()) {
+        sources.push(source);
     }
 
     sources.into_iter().map(InstrumentedSource::wrap).collect()
@@ -1545,6 +1553,152 @@ fn start_regression_monitoring(
     });
 
     Some(handle)
+}
+
+/// How many QA answer timeouts a `[deploy_qa]` tip may stay `running` before
+/// it is treated as orphaned: a live run cannot outlast its answer timeout,
+/// and the margin covers setup and delivery around the agent call.
+const DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER: u32 = 2;
+
+/// Start the `[deploy_qa]` background poller.
+///
+/// Distinct from [`start_regression_monitoring`]: this watches **new GitHub
+/// release tips** and enqueues observe/report live QA. It does not use
+/// `ReleaseTracker` or `[regression]` watches.
+///
+/// After every poll it dispatches pending tips through `watcher`, including
+/// tips a previous process left pending. That dispatch is the only path that
+/// runs tips in every daemon mode, since the watcher's source polls skip
+/// `deploy_qa`. Dispatch waits for the watcher to finish warm start, so tips
+/// seen before then run after the next poll.
+///
+/// Every tick, starting with the first, begins by marking tips left `running`
+/// longer than [`DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER`] QA answer timeouts
+/// as `errored`, so a run orphaned by a crash, restart or shutdown stops
+/// blocking its track under `skip_if_previous_running` without waiting for a
+/// restart. A run still live in this or another process sharing the database
+/// is younger than that and is left alone.
+fn start_deploy_qa_monitoring(
+    config: &Config,
+    tracker: Arc<dyn FixAttemptTracker>,
+    watcher: Arc<Watcher>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.deploy_qa.enabled {
+        tracing::info!("Deploy QA disabled in configuration");
+        return None;
+    }
+    if config.deploy_qa.tracks.is_empty() {
+        tracing::warn!("[deploy_qa] enabled but no [[deploy_qa.tracks]] configured");
+        return None;
+    }
+
+    let github_token = config
+        .github()
+        .token
+        .as_ref()
+        .map(|token| token.expose().to_string())
+        .filter(|token| !token.is_empty());
+    let github_token = match github_token {
+        Some(token) => token,
+        None => {
+            tracing::warn!("No GitHub token configured, deploy QA disabled");
+            return None;
+        }
+    };
+
+    let poller =
+        match DeployQaTracker::new(github_token, Arc::clone(&tracker), config.deploy_qa.clone()) {
+            Ok(poller) => poller,
+            Err(error) => {
+                tracing::error!(error = %error, "Failed to start deploy QA poller");
+                return None;
+            }
+        };
+
+    let stale_after = Duration::from_secs(config.qa.answer_timeout_secs.max(1))
+        .saturating_mul(DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER);
+    let interval_ms = config.deploy_qa.effective_poll_interval_ms();
+    let handle = tokio::spawn(async move {
+        let mut tick = interval(Duration::from_millis(interval_ms));
+        tracing::info!(
+            component = "deploy_qa",
+            poll_interval_ms = interval_ms,
+            stale_after_secs = stale_after.as_secs(),
+            "Deploy QA poller started"
+        );
+        loop {
+            tick.tick().await;
+            release_stale_deploy_qa_tips(tracker.as_ref(), stale_after);
+            for result in poller.poll_once().await {
+                match result.action {
+                    DeployQaPollAction::Enqueued => {
+                        tracing::info!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            tag = result.tip.as_ref().map(|tip| tip.tag.as_str()).unwrap_or("?"),
+                            "Enqueued observe/report attempt for new release tip"
+                        );
+                    }
+                    DeployQaPollAction::SkippedDuplicate => {
+                        tracing::debug!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            "Tip unchanged; not re-fired"
+                        );
+                    }
+                    DeployQaPollAction::SkippedPreviousRunning => {
+                        tracing::info!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            "Skipping new tip; previous attempt still running"
+                        );
+                    }
+                    DeployQaPollAction::NoMatchingTip => {}
+                    DeployQaPollAction::Errored(ref error) => {
+                        tracing::warn!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            error = %error,
+                            "Failed to poll release tips for track"
+                        );
+                    }
+                }
+            }
+            match watcher.dispatch_pending_deploy_qa_tips().await {
+                Ok(runs) if runs.is_empty() => {}
+                Ok(runs) => tracing::info!(
+                    component = "deploy_qa",
+                    dispatched = runs.len(),
+                    "Dispatched pending release tips for observe/report QA"
+                ),
+                Err(error) => tracing::warn!(
+                    component = "deploy_qa",
+                    error = %error,
+                    "Failed to dispatch pending release tips"
+                ),
+            }
+        }
+    });
+    Some(handle)
+}
+
+/// Mark `[deploy_qa]` tips left `running` longer than `stale_after` as
+/// `errored`, so the tracks their orphaned runs held can take new tips.
+fn release_stale_deploy_qa_tips(tracker: &dyn FixAttemptTracker, stale_after: Duration) {
+    match tracker.release_stale_running_deploy_qa_tips(stale_after) {
+        Ok(0) => {}
+        Ok(released) => tracing::info!(
+            component = "deploy_qa",
+            released,
+            stale_after_secs = stale_after.as_secs(),
+            "Marked stale running deploy QA tips as errored"
+        ),
+        Err(error) => tracing::warn!(
+            component = "deploy_qa",
+            error = %error,
+            "Failed to release stale running deploy QA tips"
+        ),
+    }
 }
 
 /// Enrich the process PATH with entries from the user's login shell.
@@ -3310,7 +3464,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("  Poll interval: {}ms", poll_interval);
         }
 
-        // Start regression monitoring background task
         let regression_handle = start_regression_monitoring(
             &config,
             tracker.clone(),
@@ -3319,6 +3472,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         );
         if regression_handle.is_some() {
             tracing::info!("  Regression monitoring: enabled");
+        }
+
+        let deploy_qa_handle =
+            start_deploy_qa_monitoring(&config, tracker.clone(), watcher.clone());
+        if deploy_qa_handle.is_some() {
+            tracing::info!("  Deploy QA: enabled");
         }
 
         print_startup_banner_and_status(
@@ -3362,13 +3521,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             tracker_for_shutdown.record_activity(&activity).ok();
         };
 
-        // Abort regression monitoring on shutdown
-        let regression_shutdown = {
-            let handle = regression_handle;
-            async move {
-                if let Some(h) = handle {
-                    h.abort();
-                }
+        let monitoring_shutdown = async move {
+            for handle in [regression_handle, deploy_qa_handle].into_iter().flatten() {
+                handle.abort();
             }
         };
 
@@ -3460,10 +3615,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     tracing::error!("Polling error: {}", e);
                 }
             }
-            _ = shutdown => {
-                // Stop regression monitoring
-                regression_shutdown.await;
-            }
+            _ = shutdown => monitoring_shutdown.await,
         }
 
         return Ok(());
@@ -3477,7 +3629,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         let github_client = GitHubClient::new(config.github().clone());
         let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
-        let sources = create_sources(&config);
+        let sources = create_sources(&config, &tracker);
         let pr_monitor = if config.regression.enabled {
             PrMonitor::with_regression_tracking(
                 provider,
@@ -3730,7 +3882,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         println!("\nProcessing {} retries...", ready.len());
 
         // Need sources and watcher for processing
-        let sources = create_sources(&config);
+        let sources = create_sources(&config, &tracker);
         if sources.is_empty() {
             anyhow::bail!("No sources were initialized");
         }
@@ -4062,18 +4214,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             server.set_discord_search_service(deps.discord_search_service);
             server.set_review_watcher(deps.review_watcher);
 
-            // Start regression monitoring background task
             let regression_handle = start_regression_monitoring(
                 &config,
                 tracker.clone(),
-                create_sources(&config),
+                create_sources(&config, &tracker),
                 notifier.clone(),
             );
             if regression_handle.is_some() {
                 tracing::info!("Regression monitoring: enabled");
             }
+            let deploy_qa_handle =
+                start_deploy_qa_monitoring(&config, tracker.clone(), watcher.clone());
 
-            // Handle shutdown signals
             let watcher_for_shutdown = watcher.clone();
             let shutdown = async move {
                 tokio::signal::ctrl_c()
@@ -4087,8 +4239,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         std::process::exit(130);
                     }
                 }
-                if let Some(h) = regression_handle {
-                    h.abort();
+                for handle in [regression_handle, deploy_qa_handle].into_iter().flatten() {
+                    handle.abort();
                 }
             };
 
@@ -4124,7 +4276,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         _ => {
             // Initialize sources for polling/seed/dry-run modes
             tracing::info!("Initializing sources...");
-            let sources = create_sources(&config);
+            let sources = create_sources(&config, &tracker);
 
             if sources.is_empty() {
                 anyhow::bail!("No sources were initialized");
@@ -4331,6 +4483,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         tracker_for_api.clone(),
                         sources_for_regression.clone(),
                         notifier_for_regression.clone(),
+                    );
+                    let _deploy_qa_handle = start_deploy_qa_monitoring(
+                        &config,
+                        tracker_for_api.clone(),
+                        watcher.clone(),
                     );
 
                     let shutdown = async {

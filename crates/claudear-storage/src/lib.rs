@@ -26,14 +26,15 @@ pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActivityLogEntry, AgentExecution, AnalyticsSummary, ErrorPattern, FixAttempt, FixAttemptStats,
-    FixAttemptStatus, IssueEmbedding, IssueTimeline, PrAnalytics, PrRecord, PrReviewRecord,
-    ProcessingMetric, PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck,
-    RegressionWatch, RegressionWatchStatus, SimilarIssue,
+    ActivityLogEntry, AgentExecution, AnalyticsSummary, DeployQaTip, DeployQaTipStatus,
+    ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, IssueTimeline,
+    PrAnalytics, PrRecord, PrReviewRecord, ProcessingMetric, PromptExperiment, QaKnowledgeEntry,
+    QaMatch, RegressionCheck, RegressionWatch, RegressionWatchStatus, SimilarIssue,
 };
 use claudear_core::types::{CrossRepoCorrelation, FixOutcome};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 /// Maximum allowed length for PR URLs to prevent ReDoS and excessive memory usage.
 const MAX_PR_URL_LENGTH: usize = 2048;
@@ -1730,6 +1731,92 @@ pub trait UserStore: Send + Sync {
     }
 }
 
+/// Persist last-seen `[deploy_qa]` tips and attempt status (all defaulted).
+///
+/// Separate from [`RegressionStore`] — deploy QA does not share regression
+/// watch rows or status machines.
+pub trait DeployQaStore: Send + Sync {
+    /// Insert or return the existing tip for `(track, tag)`.
+    fn upsert_deploy_qa_tip(&self, _tip: &DeployQaTip) -> Result<DeployQaTip> {
+        Ok(DeployQaTip::new(
+            _tip.track.clone(),
+            _tip.repo.clone(),
+            _tip.tag.clone(),
+        ))
+    }
+
+    /// Fetch a tip by track + tag.
+    fn get_deploy_qa_tip(&self, _track: &str, _tag: &str) -> Result<Option<DeployQaTip>> {
+        Ok(None)
+    }
+
+    /// Fetch a tip by its unique synthetic issue id (`track:repo:tag`).
+    fn get_deploy_qa_tip_by_issue_id(&self, _issue_id: &str) -> Result<Option<DeployQaTip>> {
+        Ok(None)
+    }
+
+    /// Most recently recorded tip for a track (last-seen).
+    fn get_last_seen_deploy_qa_tip(&self, _track: &str) -> Result<Option<DeployQaTip>> {
+        Ok(None)
+    }
+
+    /// Pending tips waiting to be enqueued / picked up by the `deploy_qa` source.
+    fn list_pending_deploy_qa_tips(&self) -> Result<Vec<DeployQaTip>> {
+        Ok(Vec::new())
+    }
+
+    /// Whether the track has a pending or running attempt.
+    fn track_has_in_flight_deploy_qa(&self, _track: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Update tip status (and optional attempt id).
+    fn update_deploy_qa_tip_status(
+        &self,
+        _id: i64,
+        _status: DeployQaTipStatus,
+        _attempt_id: Option<i64>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Set tip status (and optional attempt id) only while it is still
+    /// `expected`, returning whether it changed, so a verdict another process
+    /// wrote concurrently is never overwritten and only one process can claim
+    /// a tip.
+    fn update_deploy_qa_tip_status_if(
+        &self,
+        _id: i64,
+        _expected: DeployQaTipStatus,
+        _status: DeployQaTipStatus,
+        _attempt_id: Option<i64>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Mark every tip left `running` for longer than `stale_after` as
+    /// `errored`, returning how many were released.
+    ///
+    /// A live run cannot outlast its agent timeout, so a tip `running` past a
+    /// `stale_after` above that timeout was orphaned by a crash, restart or
+    /// shutdown mid-attempt and would otherwise block its track under
+    /// `skip_if_previous_running`. Fresher tips may still be running in
+    /// another process sharing the database, so they are left alone.
+    fn release_stale_running_deploy_qa_tips(&self, _stale_after: Duration) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Store the Discord release-message / FAIL-thread ids for a tip.
+    fn update_deploy_qa_discord_ids(
+        &self,
+        _id: i64,
+        _message_id: Option<&str>,
+        _thread_id: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Regression watches and checks (all defaulted).
 pub trait RegressionStore: Send + Sync {
     /// Get regression watches by status.
@@ -1837,6 +1924,7 @@ pub trait FixAttemptTracker:
     + RepoStore
     + UserStore
     + RegressionStore
+    + DeployQaStore
     + ChatStore
     + DiscordStore
 {
@@ -1854,6 +1942,7 @@ impl<T> FixAttemptTracker for T where
         + RepoStore
         + UserStore
         + RegressionStore
+        + DeployQaStore
         + ChatStore
         + DiscordStore
 {
@@ -1944,6 +2033,7 @@ impl SimilarityStore for NoopTracker {}
 impl RepoStore for NoopTracker {}
 impl UserStore for NoopTracker {}
 impl RegressionStore for NoopTracker {}
+impl DeployQaStore for NoopTracker {}
 impl ChatStore for NoopTracker {}
 impl DiscordStore for NoopTracker {}
 
@@ -2128,6 +2218,7 @@ mod tests {
         impl RepoStore for FullTracker {}
         impl UserStore for FullTracker {}
         impl RegressionStore for FullTracker {}
+        impl DeployQaStore for FullTracker {}
         impl ChatStore for FullTracker {}
         impl DiscordStore for FullTracker {}
 

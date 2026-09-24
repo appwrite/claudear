@@ -1089,8 +1089,9 @@ async fn process_issue(
 mod tests {
     use super::*;
     use crate::config::{
-        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, IssuesConfig, LearningConfig,
-        NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig, ScmConfig,
+        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, DeployQaConfig, IssuesConfig,
+        LearningConfig, NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig,
+        ScmConfig,
     };
     use crate::notifier::Notifier;
     use crate::processing::{
@@ -1222,6 +1223,7 @@ mod tests {
             ask: AskConfig::default(),
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
+            deploy_qa: DeployQaConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
