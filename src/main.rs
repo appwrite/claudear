@@ -22,7 +22,7 @@ use claudear::{
     repo::{build_repo_index, DependencyType, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
-    runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
+    runner::{process_group, AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
     source::{
         DiscordSource, HelpScoutSource, IssueSource, JiraSource, LinearSource, SentrySource,
@@ -1699,6 +1699,87 @@ fn release_stale_deploy_qa_tips(tracker: &dyn FixAttemptTracker, stale_after: Du
             "Failed to release stale running deploy QA tips"
         ),
     }
+}
+
+/// How long interrupted agent CLIs get to clean up before they are killed.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+
+/// Resolves on Ctrl-C or a terminal hangup. Agent CLIs lead their own process
+/// groups, so neither signal reaches them unless claudear passes it on.
+async fn interrupted() {
+    #[cfg(unix)]
+    {
+        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("Failed to install signal handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.expect("Failed to install signal handler"),
+            _ = hangup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to install signal handler");
+}
+
+/// Stop the watcher starting runs and pass the interrupt on to the agent CLIs,
+/// including any a run spawns from now on.
+fn interrupt(watcher: &Watcher) {
+    watcher.stop();
+    process_group::Registry::global().interrupt_all();
+}
+
+/// Let the watcher's runs finish, then interrupt the agent CLIs still running
+/// and kill whatever is left after [`INTERRUPT_GRACE`], force-quitting if
+/// interrupted again meanwhile.
+async fn shut_down(watcher: &Watcher) {
+    tokio::select! {
+        () = async {
+            watcher.stop_and_drain().await;
+            process_group::Registry::global().shutdown(INTERRUPT_GRACE).await;
+        } => {}
+        () = interrupted() => {
+            tracing::warn!("\nForce shutdown requested, exiting immediately");
+            force_quit();
+        }
+    }
+}
+
+/// Kill every agent CLI, then die of SIGINT as if it had not been caught, so a
+/// calling shell stops too rather than running its next command.
+fn force_quit() -> ! {
+    process_group::Registry::global().kill_all();
+    #[cfg(unix)]
+    // SAFETY: neither call takes pointers.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::raise(libc::SIGINT);
+    }
+    std::process::exit(130);
+}
+
+/// Run a one-shot command that may start agent runs. On interrupt, pass it on
+/// to the agent CLIs, keep driving their runs until the CLIs exit or
+/// [`INTERRUPT_GRACE`] passes, then force-quit before the command starts
+/// anything new.
+async fn interruptible<F: std::future::Future>(command: F) -> F::Output {
+    tokio::pin!(command);
+    tokio::select! {
+        output = &mut command => return output,
+        () = interrupted() => {}
+    }
+    tracing::warn!("\nInterrupted, stopping agent runs");
+    let registry = process_group::Registry::global();
+    registry.interrupt_all();
+    let _ = tokio::time::timeout(INTERRUPT_GRACE, async {
+        tokio::select! {
+            _ = &mut command => {}
+            () = registry.emptied() => {}
+            () = interrupted() => {}
+        }
+    })
+    .await;
+    force_quit();
 }
 
 /// Enrich the process PATH with entries from the user's login shell.
@@ -3492,33 +3573,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             &user_registry,
         );
 
-        // Shutdown signal handler with graceful drain
         let watcher_for_shutdown = watcher.clone();
         let tracker_for_shutdown = tracker.clone();
         let mut shutdown_rx = ipc_server.shutdown_receiver();
-        let shutdown = async move {
+        let shutdown_requested = async move {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+                () = interrupted() => {
                     tracing::info!("\nReceived shutdown signal, press Ctrl+C again to force quit...");
+                    interrupt(&watcher_for_shutdown);
                 }
                 _ = shutdown_rx.recv() => {
                     tracing::info!("\nReceived IPC shutdown command, initiating graceful shutdown...");
                 }
             }
-
-            // Race graceful drain against a second Ctrl+C for force quit
-            tokio::select! {
-                _ = watcher_for_shutdown.stop_and_drain() => {}
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::warn!("\nForce shutdown requested, exiting immediately");
-                    std::process::exit(130);
-                }
-            }
-
-            // Log watcher_stopped activity
-            let activity = ActivityLogEntry::new("watcher_stopped", "Watcher daemon stopped")
-                .with_source("system".to_string());
-            tracker_for_shutdown.record_activity(&activity).ok();
         };
 
         let monitoring_shutdown = async move {
@@ -3615,9 +3682,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     tracing::error!("Polling error: {}", e);
                 }
             }
-            _ = shutdown => monitoring_shutdown.await,
+            () = shutdown_requested => {}
         }
 
+        shut_down(&watcher).await;
+        let activity = ActivityLogEntry::new("watcher_stopped", "Watcher daemon stopped")
+            .with_source("system".to_string());
+        tracker_for_shutdown.record_activity(&activity).ok();
+        monitoring_shutdown.await;
         return Ok(());
     }
 
@@ -3986,20 +4058,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             llm_engine: None,
         });
 
-        for attempt in ready {
-            println!("\n  Retrying [{}] {}...", attempt.source, attempt.short_id);
-
-            // Prepare for retry
-            retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
-
-            // Trigger the fix
-            if let Err(e) = watcher
-                .trigger_issue(&attempt.source, &attempt.issue_id)
-                .await
-            {
-                tracing::error!("Failed to retry {}: {}", attempt.short_id, e);
+        interruptible(async {
+            for attempt in ready {
+                println!("\n  Retrying [{}] {}...", attempt.source, attempt.short_id);
+                retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
+                if let Err(error) = watcher
+                    .trigger_issue(&attempt.source, &attempt.issue_id)
+                    .await
+                {
+                    tracing::error!("Failed to retry {}: {}", attempt.short_id, error);
+                }
             }
-        }
+            anyhow::Ok(())
+        })
+        .await?;
 
         println!("\nRetry processing complete.");
         return Ok(());
@@ -4227,21 +4299,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 start_deploy_qa_monitoring(&config, tracker.clone(), watcher.clone());
 
             let watcher_for_shutdown = watcher.clone();
-            let shutdown = async move {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("Failed to install signal handler");
+            let shutdown_requested = async move {
+                interrupted().await;
                 tracing::info!("\nReceived shutdown signal, press Ctrl+C again to force quit...");
-                tokio::select! {
-                    _ = watcher_for_shutdown.stop_and_drain() => {}
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::warn!("\nForce shutdown requested, exiting immediately");
-                        std::process::exit(130);
-                    }
-                }
-                for handle in [regression_handle, deploy_qa_handle].into_iter().flatten() {
-                    handle.abort();
-                }
+                interrupt(&watcher_for_shutdown);
             };
 
             if self_test {
@@ -4269,7 +4330,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         tracing::error!("Housekeeping worker error: {}", e);
                     }
                 }
-                _ = shutdown => {}
+                () = shutdown_requested => {}
+            }
+
+            shut_down(&watcher).await;
+            for handle in [regression_handle, deploy_qa_handle].into_iter().flatten() {
+                handle.abort();
             }
         }
 
@@ -4490,18 +4556,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         watcher.clone(),
                     );
 
-                    let shutdown = async {
-                        tokio::signal::ctrl_c()
-                            .await
-                            .expect("Failed to install signal handler");
+                    let shutdown_requested = async {
+                        interrupted().await;
                         tracing::info!("\nReceived shutdown signal...");
-                        watcher_ref.stop();
+                        interrupt(watcher_ref);
                     };
 
                     if no_dashboard {
                         tokio::select! {
                             result = watcher.start(Some(interval)) => result?,
-                            _ = shutdown => {}
+                            () = shutdown_requested => {}
                         }
                     } else {
                         let api_server = ApiServer::with_port(
@@ -4513,13 +4577,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         tokio::select! {
                             result = watcher.start(Some(interval)) => result?,
                             result = api_server.start() => result?,
-                            _ = shutdown => {}
+                            () = shutdown_requested => {}
                         }
                     }
+                    shut_down(watcher_ref).await;
                 }
 
                 Commands::Trigger { source, issue_id } => {
-                    watcher.trigger_issue(&source, &issue_id).await?;
+                    interruptible(watcher.trigger_issue(&source, &issue_id)).await?;
                 }
 
                 Commands::Action {
@@ -4527,9 +4592,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     source,
                     issue_id,
                 } => {
-                    let kind: ActionKind =
-                        action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-                    let outcome = watcher.run_action(kind, &source, &issue_id).await?;
+                    let kind: ActionKind = action
+                        .parse()
+                        .map_err(|error: String| anyhow::anyhow!(error))?;
+                    let outcome =
+                        interruptible(watcher.run_action(kind, &source, &issue_id)).await?;
                     use claudear::processing::ProcessingOutcome;
                     match outcome {
                         ProcessingOutcome::Success { pr_url } => {
