@@ -3765,16 +3765,26 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Mark a tip `Errored` when its attempt ended without the source recording
     /// a verdict, so `skip_if_previous_running` does not block the track forever.
+    ///
+    /// The transition is a single conditional update because `claudear trigger`
+    /// and `claudear action` run in separate processes that can record a
+    /// verdict for the same tip at any moment.
     fn release_unfinished_deploy_qa_tip(&self, tip: &DeployQaTip) {
-        let Some(current) = self.find_deploy_qa_tip(&tip.issue_id) else {
-            return;
-        };
-        if current.status == DeployQaTipStatus::Running {
-            tracing::warn!(
-                issue_id = %current.issue_id,
-                "deploy_qa attempt ended without a verdict; marking tip errored"
-            );
-            self.mark_deploy_qa_tip(&current, DeployQaTipStatus::Errored, None);
+        match self.tracker.update_deploy_qa_tip_status_if(
+            tip.id,
+            DeployQaTipStatus::Running,
+            DeployQaTipStatus::Errored,
+        ) {
+            Ok(true) => tracing::warn!(
+                issue_id = %tip.issue_id,
+                "deploy_qa attempt ended without a verdict; marked tip errored"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                issue_id = %tip.issue_id,
+                error = %e,
+                "Failed to release unfinished deploy_qa tip"
+            ),
         }
     }
 

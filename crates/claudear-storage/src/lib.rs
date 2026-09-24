@@ -1779,6 +1779,27 @@ pub trait DeployQaStore: Send + Sync {
         Ok(())
     }
 
+    /// Set tip status only while it is still `expected`, returning whether it
+    /// changed, so a verdict another process wrote concurrently is never
+    /// overwritten.
+    fn update_deploy_qa_tip_status_if(
+        &self,
+        _id: i64,
+        _expected: DeployQaTipStatus,
+        _status: DeployQaTipStatus,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Mark every `running` tip `errored`, returning how many were released.
+    ///
+    /// A tip is only `running` inside a live process, so at startup any such
+    /// tip was orphaned by a restart, crash, or shutdown mid-attempt and would
+    /// otherwise block its track under `skip_if_previous_running`.
+    fn release_running_deploy_qa_tips(&self) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Store the Discord release-message / FAIL-thread ids for a tip.
     fn update_deploy_qa_discord_ids(
         &self,

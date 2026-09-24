@@ -1560,6 +1560,9 @@ fn start_regression_monitoring(
 /// Distinct from [`start_regression_monitoring`]: this watches **new GitHub
 /// release tips** and enqueues observe/report live QA. It does not use
 /// `ReleaseTracker` or `[regression]` watches.
+///
+/// Runs before the watcher starts, so any tip still `running` was orphaned by
+/// a previous process and is marked `errored` to unblock its track.
 fn start_deploy_qa_monitoring(
     config: &Config,
     tracker: Arc<dyn FixAttemptTracker>,
@@ -1567,6 +1570,19 @@ fn start_deploy_qa_monitoring(
     if !config.deploy_qa.enabled {
         tracing::info!("Deploy QA disabled in configuration");
         return None;
+    }
+    match tracker.release_running_deploy_qa_tips() {
+        Ok(0) => {}
+        Ok(released) => tracing::info!(
+            component = "deploy_qa",
+            released,
+            "Marked deploy QA tips left running by a previous process as errored"
+        ),
+        Err(error) => tracing::warn!(
+            component = "deploy_qa",
+            error = %error,
+            "Failed to release deploy QA tips left running by a previous process"
+        ),
     }
     if config.deploy_qa.tracks.is_empty() {
         tracing::warn!("[deploy_qa] enabled but no [[deploy_qa.tracks]] configured");

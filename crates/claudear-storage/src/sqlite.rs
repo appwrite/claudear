@@ -4389,6 +4389,19 @@ impl DeployQaStore for SqliteTracker {
         SqliteTracker::update_deploy_qa_tip_status(self, id, status, attempt_id)
     }
 
+    fn update_deploy_qa_tip_status_if(
+        &self,
+        id: i64,
+        expected: claudear_core::types::DeployQaTipStatus,
+        status: claudear_core::types::DeployQaTipStatus,
+    ) -> Result<bool> {
+        SqliteTracker::update_deploy_qa_tip_status_if(self, id, expected, status)
+    }
+
+    fn release_running_deploy_qa_tips(&self) -> Result<usize> {
+        SqliteTracker::release_running_deploy_qa_tips(self)
+    }
+
     fn update_deploy_qa_discord_ids(
         &self,
         id: i64,
@@ -7933,6 +7946,46 @@ impl SqliteTracker {
         Ok(())
     }
 
+    /// Set tip status only while it is still `expected`; returns whether a row changed.
+    pub fn update_deploy_qa_tip_status_if(
+        &self,
+        id: i64,
+        expected: claudear_core::types::DeployQaTipStatus,
+        status: claudear_core::types::DeployQaTipStatus,
+    ) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let changed = conn.execute(
+            r#"
+            UPDATE deploy_qa_tips
+            SET status = ?1,
+                updated_at = datetime('now')
+            WHERE id = ?2 AND status = ?3
+            "#,
+            params![status.to_string(), id, expected.to_string()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Mark every `running` tip `errored`; returns how many were released.
+    pub fn release_running_deploy_qa_tips(&self) -> Result<usize> {
+        use claudear_core::types::DeployQaTipStatus;
+
+        let conn = self.acquire_lock()?;
+        let released = conn.execute(
+            r#"
+            UPDATE deploy_qa_tips
+            SET status = ?1,
+                updated_at = datetime('now')
+            WHERE status = ?2
+            "#,
+            params![
+                DeployQaTipStatus::Errored.to_string(),
+                DeployQaTipStatus::Running.to_string()
+            ],
+        )?;
+        Ok(released)
+    }
+
     /// Store Discord release-message / FAIL-thread ids.
     pub fn update_deploy_qa_discord_ids(
         &self,
@@ -11136,6 +11189,111 @@ mod tests {
         assert_eq!(stored.status, DeployQaTipStatus::Errored);
         assert_eq!(stored.attempt_id, Some(7));
         assert!(!tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
+    }
+
+    #[test]
+    fn test_update_deploy_qa_tip_status_if_only_applies_to_expected_status() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let stored = |tip: &DeployQaTip| {
+            tracker
+                .get_deploy_qa_tip_by_issue_id(&tip.issue_id)
+                .unwrap()
+                .unwrap()
+        };
+        let concluded = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.2.3"))
+            .unwrap();
+        tracker
+            .update_deploy_qa_tip_status(concluded.id, DeployQaTipStatus::Running, Some(7))
+            .unwrap();
+        tracker
+            .update_deploy_qa_tip_status(concluded.id, DeployQaTipStatus::Verified, None)
+            .unwrap();
+
+        let changed = tracker
+            .update_deploy_qa_tip_status_if(
+                concluded.id,
+                DeployQaTipStatus::Running,
+                DeployQaTipStatus::Errored,
+            )
+            .unwrap();
+
+        assert!(!changed, "a tip no longer running must be left alone");
+        assert_eq!(
+            stored(&concluded).status,
+            DeployQaTipStatus::Verified,
+            "a verdict recorded concurrently must not be overwritten"
+        );
+
+        let unfinished = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.2.4"))
+            .unwrap();
+        tracker
+            .update_deploy_qa_tip_status(unfinished.id, DeployQaTipStatus::Running, Some(8))
+            .unwrap();
+
+        let changed = tracker
+            .update_deploy_qa_tip_status_if(
+                unfinished.id,
+                DeployQaTipStatus::Running,
+                DeployQaTipStatus::Errored,
+            )
+            .unwrap();
+
+        assert!(
+            changed,
+            "a tip still in the expected status must transition"
+        );
+        let released = stored(&unfinished);
+        assert_eq!(released.status, DeployQaTipStatus::Errored);
+        assert_eq!(released.attempt_id, Some(8));
+        assert!(!tracker
+            .update_deploy_qa_tip_status_if(
+                i64::MAX,
+                DeployQaTipStatus::Running,
+                DeployQaTipStatus::Errored,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn test_release_running_deploy_qa_tips_errors_only_running_tips() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let seeded = [
+            ("cloud", "1.0.0", DeployQaTipStatus::Pending),
+            ("cloud", "1.1.0", DeployQaTipStatus::Running),
+            ("cloud", "1.2.0", DeployQaTipStatus::Verified),
+            ("cloud", "1.3.0", DeployQaTipStatus::Failed),
+            ("cloud", "1.4.0", DeployQaTipStatus::Errored),
+            ("edge", "2.0.0", DeployQaTipStatus::Running),
+        ];
+        for (track, tag, status) in seeded {
+            let mut tip = DeployQaTip::new(track, "appwrite-labs/cloud", tag);
+            tip.status = status;
+            tip.attempt_id = Some(3);
+            tracker.upsert_deploy_qa_tip(&tip).unwrap();
+        }
+
+        assert_eq!(tracker.release_running_deploy_qa_tips().unwrap(), 2);
+
+        for (track, tag, status) in seeded {
+            let expected = match status {
+                DeployQaTipStatus::Running => DeployQaTipStatus::Errored,
+                other => other,
+            };
+            let stored = tracker.get_deploy_qa_tip(track, tag).unwrap().unwrap();
+            assert_eq!(stored.status, expected, "{track} {tag}");
+            assert_eq!(stored.attempt_id, Some(3), "{track} {tag}");
+        }
+        assert!(
+            !tracker.track_has_in_flight_deploy_qa("edge").unwrap(),
+            "a released tip must no longer block its track"
+        );
+        assert_eq!(tracker.release_running_deploy_qa_tips().unwrap(), 0);
     }
 
     #[test]
