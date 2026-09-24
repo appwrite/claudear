@@ -4212,15 +4212,15 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_rate_limit_in_stderr() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "rate limit exceeded");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", "rate limit exceeded");
+        assert!(message.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_rate_limit_in_cli_error() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, LEGACY_USAGE_LIMIT_MESSAGE, "");
+        let message = ClaudeAgentRunner::compose_failure_message(1, LEGACY_USAGE_LIMIT_MESSAGE, "");
         assert_eq!(
-            msg,
+            message,
             format!("Claude rate limit hit: {LEGACY_USAGE_LIMIT_MESSAGE}")
         );
     }
@@ -4228,15 +4228,15 @@ mod tests {
     #[test]
     fn test_compose_failure_message_rate_limit_past_the_preview_limit() {
         let stderr = format!("{}\nrate limit exceeded", "e".repeat(5000));
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", &stderr);
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", &stderr);
+        assert!(message.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_very_long_stderr_truncated() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", &"e".repeat(5000));
-        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 3);
-        assert!(msg.ends_with("..."));
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", &"e".repeat(5000));
+        assert!(message.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 3);
+        assert!(message.ends_with("..."));
     }
 
     #[test]
@@ -5265,41 +5265,41 @@ mod tests {
     fn test_compose_failure_message_rate_limit_combined_empty_gives_default() {
         // When both are empty but still trigger rate limit through combined being empty,
         // this should not happen, but let's verify the fallback.
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "");
-        assert!(!msg.starts_with("Claude rate limit hit:"));
-        assert_eq!(msg, "Process exited with code 1");
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", "");
+        assert!(!message.starts_with("Claude rate limit hit:"));
+        assert_eq!(message, "Process exited with code 1");
     }
 
     #[test]
     fn test_compose_failure_message_whitespace_stderr_ignored() {
-        let msg = ClaudeAgentRunner::compose_failure_message(2, "API Error: overloaded", "   ");
-        assert_eq!(msg, "API Error: overloaded");
+        let message = ClaudeAgentRunner::compose_failure_message(2, "API Error: overloaded", "   ");
+        assert_eq!(message, "API Error: overloaded");
     }
 
     #[test]
     fn test_compose_failure_message_very_long_cli_error_truncated() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, &"o".repeat(5000), "");
-        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT);
-        assert!(msg.ends_with("..."));
+        let message = ClaudeAgentRunner::compose_failure_message(1, &"o".repeat(5000), "");
+        assert!(message.len() <= EXECUTION_LOG_PREVIEW_LIMIT);
+        assert!(message.ends_with("..."));
     }
 
     #[test]
     fn test_compose_failure_message_rate_limit_429_in_stderr() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "HTTP 429");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", "HTTP 429");
+        assert!(message.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_exit_code_zero_with_stderr() {
         // Even exit code 0 can produce a failure message if called
-        let msg = ClaudeAgentRunner::compose_failure_message(0, "", "some stderr");
-        assert_eq!(msg, "some stderr");
+        let message = ClaudeAgentRunner::compose_failure_message(0, "", "some stderr");
+        assert_eq!(message, "some stderr");
     }
 
     #[test]
     fn test_compose_failure_message_negative_exit_code() {
-        let msg = ClaudeAgentRunner::compose_failure_message(-1, "", "");
-        assert_eq!(msg, "Process exited with code -1");
+        let message = ClaudeAgentRunner::compose_failure_message(-1, "", "");
+        assert_eq!(message, "Process exited with code -1");
     }
 
     #[test]
@@ -5927,32 +5927,33 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_rate_limit_only_in_combined_not_individual() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "check rate", "limit issues");
+        let message = ClaudeAgentRunner::compose_failure_message(1, "check rate", "limit issues");
         assert!(
-            !msg.starts_with("Claude rate limit hit:"),
+            !message.starts_with("Claude rate limit hit:"),
             "Should not detect rate limit in separate words across lines"
         );
     }
 
     #[test]
     fn test_compose_failure_message_try_again_later_in_stderr() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "please try again later");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", "please try again later");
+        assert!(message.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_resource_exhausted_in_combined() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "cli error", "resource exhausted");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        let message =
+            ClaudeAgentRunner::compose_failure_message(1, "cli error", "resource exhausted");
+        assert!(message.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_very_long_rate_limit_in_stderr_truncated() {
         let long_rate_limit = format!("rate limit: {}", "x".repeat(5000));
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", &long_rate_limit);
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", &long_rate_limit);
+        assert!(message.starts_with("Claude rate limit hit:"));
         // The inner message should be truncated
-        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 30);
+        assert!(message.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 30);
     }
 
     #[test]
@@ -6317,14 +6318,14 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_max_exit_code() {
-        let msg = ClaudeAgentRunner::compose_failure_message(255, "", "");
-        assert_eq!(msg, "Process exited with code 255");
+        let message = ClaudeAgentRunner::compose_failure_message(255, "", "");
+        assert_eq!(message, "Process exited with code 255");
     }
 
     #[test]
     fn test_compose_failure_message_signal_exit_code() {
-        let msg = ClaudeAgentRunner::compose_failure_message(137, "", "");
-        assert_eq!(msg, "Process exited with code 137");
+        let message = ClaudeAgentRunner::compose_failure_message(137, "", "");
+        assert_eq!(message, "Process exited with code 137");
     }
 
     #[test]
@@ -6497,8 +6498,8 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_tabs_and_newlines_only() {
-        let msg = ClaudeAgentRunner::compose_failure_message(3, "\t\n", "\n\t\n");
-        assert_eq!(msg, "Process exited with code 3");
+        let message = ClaudeAgentRunner::compose_failure_message(3, "\t\n", "\n\t\n");
+        assert_eq!(message, "Process exited with code 3");
     }
 
     #[test]
@@ -6594,27 +6595,27 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_npm_test_failure() {
-        let msg = ClaudeAgentRunner::compose_failure_message(
+        let message = ClaudeAgentRunner::compose_failure_message(
             1,
             "",
             "npm ERR! Test failed. See above for more details.",
         );
-        assert_eq!(msg, "npm ERR! Test failed. See above for more details.");
-        assert!(!msg.starts_with("Claude rate limit hit:"));
+        assert_eq!(message, "npm ERR! Test failed. See above for more details.");
+        assert!(!message.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_cargo_test_failure() {
         let stderr = "error[E0308]: mismatched types\n  --> src/main.rs:10:5";
-        let msg = ClaudeAgentRunner::compose_failure_message(101, "", stderr);
-        assert!(msg.contains("mismatched types"));
+        let message = ClaudeAgentRunner::compose_failure_message(101, "", stderr);
+        assert!(message.contains("mismatched types"));
     }
 
     #[test]
     fn test_compose_failure_message_git_push_failure() {
         let stderr = "remote: Permission to org/repo.git denied.\nfatal: unable to access";
-        let msg = ClaudeAgentRunner::compose_failure_message(128, "", stderr);
-        assert!(msg.contains("Permission"));
+        let message = ClaudeAgentRunner::compose_failure_message(128, "", stderr);
+        assert!(message.contains("Permission"));
     }
 
     #[test]
@@ -6772,40 +6773,40 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_empty_both() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "");
-        assert_eq!(msg, "Process exited with code 1");
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", "");
+        assert_eq!(message, "Process exited with code 1");
     }
 
     #[test]
     fn test_compose_failure_message_rate_limit_429_in_cli_error() {
-        let msg =
+        let message =
             ClaudeAgentRunner::compose_failure_message(1, "API Error: 429 Too Many Requests", "");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        assert!(message.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_rate_limit_quota_exceeded() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "Quota exceeded for model");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", "Quota exceeded for model");
+        assert!(message.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_long_stderr_truncated() {
         let long_stderr = "e".repeat(3000);
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", &long_stderr);
-        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 3); // +3 for "..."
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", &long_stderr);
+        assert!(message.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 3); // +3 for "..."
     }
 
     #[test]
     fn test_compose_failure_message_long_cli_error_truncated() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, &"o".repeat(3000), "");
-        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT);
+        let message = ClaudeAgentRunner::compose_failure_message(1, &"o".repeat(3000), "");
+        assert!(message.len() <= EXECUTION_LOG_PREVIEW_LIMIT);
     }
 
     #[test]
     fn test_compose_failure_message_whitespace_only_stderr() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "API Error: 500", "   \n  ");
-        assert_eq!(msg, "API Error: 500");
+        let message = ClaudeAgentRunner::compose_failure_message(1, "API Error: 500", "   \n  ");
+        assert_eq!(message, "API Error: 500");
     }
 
     #[test]
@@ -7416,22 +7417,23 @@ more output"#;
 
     #[test]
     fn test_compose_failure_message_rate_limit_in_stderr_alongside_a_cli_error() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "cli error", "rate limit exceeded");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        let message =
+            ClaudeAgentRunner::compose_failure_message(1, "cli error", "rate limit exceeded");
+        assert!(message.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_exit_code_signal_killed() {
         // SIGKILL exit code is 137
-        let msg = ClaudeAgentRunner::compose_failure_message(137, "", "Killed");
-        assert_eq!(msg, "Killed");
+        let message = ClaudeAgentRunner::compose_failure_message(137, "", "Killed");
+        assert_eq!(message, "Killed");
     }
 
     #[test]
     fn test_compose_failure_message_exit_code_segfault() {
         // SIGSEGV exit code is 139
-        let msg = ClaudeAgentRunner::compose_failure_message(139, "", "Segmentation fault");
-        assert_eq!(msg, "Segmentation fault");
+        let message = ClaudeAgentRunner::compose_failure_message(139, "", "Segmentation fault");
+        assert_eq!(message, "Segmentation fault");
     }
 
     #[test]
@@ -7637,15 +7639,15 @@ more output"#;
 
     #[test]
     fn test_compose_failure_message_exit_code_large_positive() {
-        let msg = ClaudeAgentRunner::compose_failure_message(32767, "", "");
-        assert_eq!(msg, "Process exited with code 32767");
+        let message = ClaudeAgentRunner::compose_failure_message(32767, "", "");
+        assert_eq!(message, "Process exited with code 32767");
     }
 
     #[test]
     fn test_compose_failure_message_newlines_only_stderr() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "\n\n\n");
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", "\n\n\n");
         // Trimmed stderr is empty, so falls through to exit code format
-        assert_eq!(msg, "Process exited with code 1");
+        assert_eq!(message, "Process exited with code 1");
     }
 
     #[test]
@@ -7852,8 +7854,8 @@ more output"#;
 
     #[test]
     fn test_compose_failure_message_rate_limit_retry_after_in_stderr() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "retry-after: 120 seconds");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        let message = ClaudeAgentRunner::compose_failure_message(1, "", "retry-after: 120 seconds");
+        assert!(message.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
