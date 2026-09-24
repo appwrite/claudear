@@ -1,7 +1,9 @@
 //! Poll GitHub for new release tips and persist last-seen / attempt state.
 
 use crate::deploy_qa::playbook::{load_playbook, DEPLOY_QA_SOURCE};
-use crate::deploy_qa::probe::{VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX};
+use crate::deploy_qa::probe::{
+    VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX, VERDICT_UNVERIFIED,
+};
 use crate::release::{GitHubRelease, GitHubTag, ReleaseClient};
 use claudear_config::config::{DeployQaConfig, DeployQaTagFilter, DeployQaTrackConfig};
 use claudear_core::error::Result;
@@ -202,8 +204,6 @@ impl<C: HttpClient> DeployQaTracker<C> {
         row.status = DeployQaTipStatus::Pending;
         let stored = self.store.upsert_deploy_qa_tip(&row)?;
 
-        // upsert is insert-or-keep. If a concurrent poll already stored this
-        // tag, treat it as a duplicate rather than re-enqueueing.
         if stored.status != DeployQaTipStatus::Pending || stored.id == 0 {
             return Ok(DeployQaPollResult {
                 track: track.name.clone(),
@@ -290,7 +290,10 @@ pub fn build_deploy_qa_issue(
          ## Agent constraints\n\n\
          - Source is `{source}` — observe, probe, and report only.\n\
          - Do **not** open a fix PR, branch, or commit for this announcement.\n\
-         - End with `{prefix} {all_verified}` or `{prefix} {fail}`.\n",
+         - Do **not** post to Discord; Claudear posts the outcome from this report.\n\
+         - End with `{prefix} {all_verified}` (every LIVE-TESTABLE PR passed), \
+         `{prefix} {unverified}` (nothing failed but a check was blocked), \
+         or `{prefix} {fail}` (a LIVE-TESTABLE PR failed).\n",
         playbook = playbook.trim(),
         track = track.name,
         repo = tip.repo,
@@ -301,6 +304,7 @@ pub fn build_deploy_qa_issue(
         source = DEPLOY_QA_SOURCE,
         prefix = VERDICT_PREFIX,
         all_verified = VERDICT_ALL_VERIFIED,
+        unverified = VERDICT_UNVERIFIED,
         fail = VERDICT_FAIL,
     );
 
@@ -319,9 +323,6 @@ pub fn build_deploy_qa_issue(
     issue.set_metadata(TRACK_METADATA_KEY, track.name.clone());
     issue.set_metadata(REPO_METADATA_KEY, tip.repo.clone());
     issue.set_metadata(TAG_METADATA_KEY, tip.tag.clone());
-    if let Some(ref author) = tip.author_login {
-        issue.set_metadata("github_login", author.clone());
-    }
     issue
 }
 
@@ -376,18 +377,17 @@ mod tests {
     impl HttpClient for MapMockHttp {
         async fn get(&self, url: &str, _headers: Vec<(&str, String)>) -> Result<HttpResponse> {
             let map = self.by_url.lock().unwrap();
-            if let Some(resp) = map.get(url) {
+            if let Some(response) = map.get(url) {
                 return Ok(HttpResponse {
-                    status: resp.status,
-                    body: resp.body.clone(),
+                    status: response.status,
+                    body: response.body.clone(),
                 });
             }
-            // Prefix match so query strings still hit the stub.
-            for (key, resp) in map.iter() {
+            for (key, response) in map.iter() {
                 if url.starts_with(key) {
                     return Ok(HttpResponse {
-                        status: resp.status,
-                        body: resp.body.clone(),
+                        status: response.status,
+                        body: response.body.clone(),
                     });
                 }
             }
@@ -437,20 +437,20 @@ mod tests {
     fn poller(
         http: MapMockHttp,
         store: Arc<dyn FixAttemptTracker>,
-        cfg: DeployQaConfig,
+        config: DeployQaConfig,
     ) -> DeployQaTracker<MapMockHttp> {
         let client = ReleaseClient::with_http_client("test-token", http);
-        DeployQaTracker::with_http_client(client, store, cfg, bundled_playbook())
+        DeployQaTracker::with_http_client(client, store, config, bundled_playbook())
     }
 
     #[test]
     fn tag_filters_select_edge_tracks() {
-        let db = DeployQaTagFilter::Suffix("-db".into());
-        let net = DeployQaTagFilter::NotSuffix("-db".into());
-        assert!(db.matches("1.0.0-db"));
-        assert!(!db.matches("1.0.0"));
-        assert!(net.matches("1.0.0"));
-        assert!(!net.matches("1.0.0-db"));
+        let database = DeployQaTagFilter::Suffix("-db".into());
+        let network = DeployQaTagFilter::NotSuffix("-db".into());
+        assert!(database.matches("1.0.0-db"));
+        assert!(!database.matches("1.0.0"));
+        assert!(network.matches("1.0.0"));
+        assert!(!network.matches("1.0.0-db"));
     }
 
     fn release_tip(repo: &str, tag: &str, body: &str) -> ReleaseTip {
@@ -468,11 +468,11 @@ mod tests {
     #[test]
     fn issue_is_observe_only_and_not_a_fix() {
         let repo = "appwrite-labs/edge";
-        let db = track("edge-db", repo, DeployQaTagFilter::Any);
+        let database = track("edge-db", repo, DeployQaTagFilter::Any);
         let network = track("edge-network", repo, DeployQaTagFilter::Any);
         let tip = release_tip(repo, "1.2.3", "Adds #99");
 
-        let issue = build_deploy_qa_issue(&db, &tip, bundled_playbook());
+        let issue = build_deploy_qa_issue(&database, &tip, bundled_playbook());
         assert_eq!(issue.source, DEPLOY_QA_SOURCE);
         assert_eq!(
             issue.get_metadata::<bool>(OBSERVE_ONLY_METADATA_KEY),
@@ -484,7 +484,7 @@ mod tests {
             .unwrap()
             .contains(tip.body.as_deref().unwrap()));
 
-        let again = build_deploy_qa_issue(&db, &tip, bundled_playbook());
+        let again = build_deploy_qa_issue(&database, &tip, bundled_playbook());
         assert_eq!(issue.id, again.id);
 
         let other_track = build_deploy_qa_issue(&network, &tip, bundled_playbook());
@@ -494,40 +494,47 @@ mod tests {
     #[test]
     fn prompt_teaches_verdict_footers_the_classifier_understands() {
         let repo = "appwrite-labs/edge";
-        let issue = build_deploy_qa_issue(
-            &track("edge-db", repo, DeployQaTagFilter::Any),
-            &release_tip(repo, "1.2.3", "Adds #99"),
-            bundled_playbook(),
-        );
-        let description = issue.description.expect("issue should carry the prompt");
+        for (name, playbook) in [("empty", ""), ("bundled", bundled_playbook())] {
+            let issue = build_deploy_qa_issue(
+                &track("edge-db", repo, DeployQaTagFilter::Any),
+                &release_tip(repo, "1.2.3", "Adds #99"),
+                playbook,
+            );
+            let description = issue.description.expect("issue should carry the prompt");
 
-        let verdicts: Vec<DeployQaVerdict> = description
-            .match_indices(VERDICT_PREFIX)
-            .map(|(index, _)| {
-                description[index + VERDICT_PREFIX.len()..]
-                    .trim_start()
-                    .chars()
-                    .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
-                    .collect::<String>()
-            })
-            .filter(|token| !token.is_empty())
-            .map(|token| classify_deploy_qa_verdict(&format!("{VERDICT_PREFIX} {token}")))
-            .collect();
+            let verdicts: Vec<DeployQaVerdict> = description
+                .match_indices(VERDICT_PREFIX)
+                .map(|(index, _)| {
+                    description[index + VERDICT_PREFIX.len()..]
+                        .trim_start()
+                        .chars()
+                        .take_while(|character| {
+                            character.is_ascii_alphanumeric() || *character == '_'
+                        })
+                        .collect::<String>()
+                })
+                .filter(|token| !token.is_empty())
+                .map(|token| classify_deploy_qa_verdict(&format!("{VERDICT_PREFIX} {token}")))
+                .collect();
 
-        assert!(
-            verdicts.contains(&DeployQaVerdict::AllVerified),
-            "the prompt must teach a footer the classifier reads as all-verified: {verdicts:?}"
-        );
-        assert!(
-            verdicts.contains(&DeployQaVerdict::Fail),
-            "the prompt must teach a footer the classifier reads as a failure: {verdicts:?}"
-        );
+            for expected in [
+                DeployQaVerdict::AllVerified,
+                DeployQaVerdict::Unverified,
+                DeployQaVerdict::Fail,
+            ] {
+                assert!(
+                    verdicts.contains(&expected),
+                    "the prompt with the {name} playbook must teach a footer the classifier \
+                     reads as {expected:?}: {verdicts:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
     async fn last_seen_and_no_refire_on_same_tip() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let cfg = config(
+        let config = config(
             vec![track(
                 "edge-db",
                 "appwrite-labs/edge",
@@ -541,7 +548,7 @@ mod tests {
             200,
             &body,
         );
-        let tracker = poller(http, store.clone(), cfg);
+        let tracker = poller(http, store.clone(), config);
 
         let first = tracker.poll_once().await;
         assert_eq!(first.len(), 1);
@@ -563,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn suffix_filter_ignores_non_matching_latest() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let cfg = config(
+        let config = config(
             vec![track(
                 "edge-db",
                 "appwrite-labs/edge",
@@ -581,7 +588,7 @@ mod tests {
             200,
             &body,
         );
-        let tracker = poller(http, store, cfg);
+        let tracker = poller(http, store, config);
         let result = tracker.poll_once().await;
         assert_eq!(result[0].action, DeployQaPollAction::Enqueued);
         assert_eq!(result[0].tip.as_ref().unwrap().tag, "1.9.0-db");
@@ -595,7 +602,7 @@ mod tests {
         sqlite.upsert_deploy_qa_tip(&running).unwrap();
 
         let store: Arc<dyn FixAttemptTracker> = Arc::new(sqlite);
-        let cfg = config(
+        let config = config(
             vec![track(
                 "cloud",
                 "appwrite-labs/cloud",
@@ -609,7 +616,7 @@ mod tests {
             200,
             &body,
         );
-        let tracker = poller(http, store.clone(), cfg);
+        let tracker = poller(http, store.clone(), config);
         let result = tracker.poll_once().await;
         assert_eq!(result[0].action, DeployQaPollAction::SkippedPreviousRunning);
         assert!(store.get_deploy_qa_tip("cloud", "1.1.0").unwrap().is_none());
@@ -618,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn tags_fallback_when_releases_empty() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let cfg = config(
+        let config = config(
             vec![track("vibes", "appwrite/vibes", DeployQaTagFilter::Any)],
             true,
         );
@@ -633,7 +640,7 @@ mod tests {
                 200,
                 r#"[{"name":"v0.4.0","commit":{"sha":"abc"}}]"#,
             );
-        let tracker = poller(http, store.clone(), cfg);
+        let tracker = poller(http, store.clone(), config);
         let result = tracker.poll_once().await;
         assert_eq!(result[0].action, DeployQaPollAction::Enqueued);
         assert_eq!(result[0].tip.as_ref().unwrap().tag, "v0.4.0");
@@ -652,14 +659,14 @@ mod tests {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
         let first = track("cloud-a", "appwrite-labs/cloud", DeployQaTagFilter::Any);
         let second = track("cloud-b", "appwrite-labs/cloud", DeployQaTagFilter::Any);
-        let cfg = config(vec![first.clone(), second.clone()], true);
+        let config = config(vec![first.clone(), second.clone()], true);
         let body = format!("[{}]", release_json("1.0.0", ""));
         let http = MapMockHttp::new().on(
             "https://api.github.com/repos/appwrite-labs/cloud/releases",
             200,
             &body,
         );
-        let tracker = poller(http, store.clone(), cfg);
+        let tracker = poller(http, store.clone(), config);
 
         let mut ids = Vec::new();
         for track in [&first, &second] {
@@ -684,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn release_author_flows_to_tip_and_issue() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let cfg = config(
+        let config = config(
             vec![track(
                 "edge-db",
                 "appwrite-labs/edge",
@@ -698,7 +705,7 @@ mod tests {
             200,
             &body,
         );
-        let tracker = poller(http, store.clone(), cfg);
+        let tracker = poller(http, store.clone(), config);
 
         let results = tracker.poll_once().await;
 
@@ -708,16 +715,49 @@ mod tests {
             .expect("tip should be persisted");
         assert_eq!(stored.author_login.as_deref(), Some("abnegate"));
         let issue = results[0].issue.as_ref().expect("issue should be built");
-        assert_eq!(
-            issue.get_metadata::<String>("github_login").as_deref(),
-            Some("abnegate")
+        let description = issue.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("Author: abnegate"),
+            "the prompt should name the release author: {description}"
         );
+    }
+
+    #[tokio::test]
+    async fn unverified_tip_does_not_block_newer_tip() {
+        let sqlite = SqliteTracker::in_memory().unwrap();
+        let previous = sqlite
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.0.0"))
+            .unwrap();
+        sqlite
+            .update_deploy_qa_tip_status(previous.id, DeployQaTipStatus::Unverified, None)
+            .unwrap();
+
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(sqlite);
+        let config = config(
+            vec![track(
+                "cloud",
+                "appwrite-labs/cloud",
+                DeployQaTagFilter::Any,
+            )],
+            true,
+        );
+        let body = format!("[{}]", release_json("1.1.0", ""));
+        let http = MapMockHttp::new().on(
+            "https://api.github.com/repos/appwrite-labs/cloud/releases",
+            200,
+            &body,
+        );
+        let tracker = poller(http, store, config);
+
+        let result = tracker.poll_once().await;
+
+        assert_eq!(result[0].action, DeployQaPollAction::Enqueued);
     }
 
     #[tokio::test]
     async fn track_error_is_isolated_and_reported() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let cfg = config(
+        let config = config(
             vec![
                 track("a", "org/a", DeployQaTagFilter::Any),
                 track("b", "org/b", DeployQaTagFilter::Any),
@@ -732,7 +772,7 @@ mod tests {
                 r#"{"message":"Bad credentials"}"#,
             )
             .on("https://api.github.com/repos/org/b/releases", 200, &body);
-        let tracker = poller(http, store.clone(), cfg);
+        let tracker = poller(http, store.clone(), config);
 
         let results = tracker.poll_once().await;
 
@@ -751,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn no_tag_fallback_when_releases_exist_but_none_match() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let cfg = config(
+        let config = config(
             vec![track(
                 "edge-db",
                 "appwrite-labs/edge",
@@ -771,7 +811,7 @@ mod tests {
                 200,
                 r#"[{"name":"1.0.0-db","commit":{"sha":"abc"}}]"#,
             );
-        let tracker = poller(http, store.clone(), cfg);
+        let tracker = poller(http, store.clone(), config);
 
         let results = tracker.poll_once().await;
 

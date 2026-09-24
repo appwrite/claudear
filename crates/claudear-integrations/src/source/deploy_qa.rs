@@ -1,8 +1,8 @@
 //! Synthetic `deploy_qa` issue source.
 //!
 //! Surfaces pending tips persisted by [`claudear_analysis::deploy_qa::DeployQaTracker`].
-//! Observe/report only — `add_comment` posts Discord `#releases` outcomes and
-//! never opens a fix PR.
+//! Observe/report only — `add_comment` records the report's verdict, posts it to
+//! Discord `#releases`, and never opens a fix PR.
 
 use super::IssueSource;
 use crate::deploy_qa::{report_deploy_qa_outcome, DeployQaDiscord};
@@ -12,8 +12,8 @@ use claudear_analysis::deploy_qa::{
     TAG_METADATA_KEY, TRACK_METADATA_KEY,
 };
 use claudear_config::config::{DeployQaConfig, DeployQaTrackConfig};
-use claudear_core::error::Result;
-use claudear_core::types::{DeployQaTip, Issue, MatchPriority, MatchResult};
+use claudear_core::error::{Error, Result};
+use claudear_core::types::{DeployQaTip, Issue, MatchResult};
 use claudear_storage::FixAttemptTracker;
 use std::path::Path;
 use std::sync::Arc;
@@ -48,7 +48,7 @@ impl DeployQaSource {
         self.config
             .tracks
             .iter()
-            .find(|t| t.name == name)
+            .find(|track| track.name == name)
             .cloned()
             .unwrap_or(DeployQaTrackConfig {
                 name: name.to_string(),
@@ -105,28 +105,18 @@ impl IssueSource for DeployQaSource {
         let tag = issue
             .get_metadata::<String>(TAG_METADATA_KEY)
             .unwrap_or_default();
-        if track.is_empty() {
-            return MatchResult::matched("deploy_qa pending tip", MatchPriority::High);
-        }
         deploy_qa_match_result(&track, &tag)
     }
 
     async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
-        Ok(issue.description.clone().unwrap_or_else(|| {
-            format!(
-                "{}\n\nObserve/report only. Do not open a fix PR.",
-                self.playbook
-            )
-        }))
+        Ok(issue.description.clone().unwrap_or_default())
     }
 
     async fn get_issue(&self, issue_id: &str) -> Result<Issue> {
         let tip = self
             .store
             .get_deploy_qa_tip_by_issue_id(issue_id)?
-            .ok_or_else(|| {
-                claudear_core::error::Error::Other(format!("deploy_qa tip {issue_id} not found"))
-            })?;
+            .ok_or_else(|| Error::Other(format!("deploy_qa tip {issue_id} not found")))?;
         Ok(self.issue_for_tip(&tip))
     }
 
@@ -142,10 +132,13 @@ impl IssueSource for DeployQaSource {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
-    use claudear_analysis::deploy_qa::OBSERVE_ONLY_METADATA_KEY;
+    use claudear_analysis::deploy_qa::{
+        OBSERVE_ONLY_METADATA_KEY, VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX,
+        VERDICT_UNVERIFIED,
+    };
     use claudear_core::types::DeployQaTipStatus;
     use claudear_storage::SqliteTracker;
 
@@ -196,6 +189,49 @@ mod tests {
                 issue.get_metadata::<String>(DISCORD_MESSAGE_METADATA_KEY),
                 stored.discord_message_id
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn add_comment_records_the_classified_verdict() {
+        let cases = [
+            (
+                format!("- #1 route LIVE PASS\n{VERDICT_PREFIX} {VERDICT_ALL_VERIFIED}"),
+                DeployQaTipStatus::Verified,
+            ),
+            (
+                format!("- #1 route LIVE BLOCKED\n{VERDICT_PREFIX} {VERDICT_UNVERIFIED}"),
+                DeployQaTipStatus::Unverified,
+            ),
+            (
+                "- #1 route LIVE BLOCKED\nno footer".to_string(),
+                DeployQaTipStatus::Unverified,
+            ),
+            (
+                format!("- #1 route LIVE FAIL\n{VERDICT_PREFIX} {VERDICT_FAIL}"),
+                DeployQaTipStatus::Failed,
+            ),
+        ];
+        for (report, expected) in cases {
+            let sqlite = SqliteTracker::in_memory().unwrap();
+            let stored = sqlite
+                .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.0.0"))
+                .unwrap();
+            sqlite
+                .update_deploy_qa_tip_status(stored.id, DeployQaTipStatus::Running, Some(3))
+                .unwrap();
+            let store: Arc<dyn FixAttemptTracker> = Arc::new(sqlite);
+            let source =
+                DeployQaSource::new(DeployQaConfig::default(), store.clone(), None).unwrap();
+
+            source.add_comment(&stored.issue_id, &report).await.unwrap();
+
+            let tip = store
+                .get_deploy_qa_tip_by_issue_id(&stored.issue_id)
+                .unwrap()
+                .expect("tip should still exist");
+            assert_eq!(tip.status, expected, "{report}");
+            assert_eq!(tip.attempt_id, Some(3), "the attempt link must survive");
         }
     }
 }

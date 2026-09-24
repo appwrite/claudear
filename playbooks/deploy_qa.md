@@ -22,15 +22,17 @@ Persist last-seen tip per track. Skip if unchanged. Skip-if-previous-still-runni
 5. API: HTTP client only (curl). Hosts: `cloud.appwrite.io`, `cloud.staging.appwrite.io`, regional fra/nyc/sfo/sgp/syd/tor, dedicated-DB hosts when that shipped. Health/version only as precondition, then routes the PR changed.
 6. Console UI: rewrite preview only — `https://appwrite.io` / prod console rewrite (legacy `new.appwrite.io` → `appwrite.io`); staging `https://new.staging.appwrite.io`. Never classic `/console`. Debug menu: type `pink`. Enable Dedicated DBs support before DAT flows.
 7. Dedicated-DB / DAT: throwaway project `qa-1044` / project id `6a8415b8002ea65eec9c` only. **Never** touch M01 or Production PostgreSQL.
-8. Finish every LIVE-TESTABLE PR with pass / fail / blocked before posting.
+8. Finish every LIVE-TESTABLE PR with pass / fail / blocked before reporting.
 
-## Discord `#releases` (Appwrite Labs)
+## Discord `#releases` (posted by Claudear)
 
-- Guild `938747207446839356`, channel `990878183580651571` (🚀│releases).
-- Find the automated release message for this tip; reply under it.
-- **All verified** (no LIVE failures): reply on the release message, **no @**. Short embed preferred: bold “All PRs verified”, one bullet per PR (`#N name PASS` / INFRA), pin in footer. Attach real screenshots for UI checks (no spoilers; skip blank/tiny fails).
-- **FAIL**: create a thread under the release message; post evidence; **@ the releaser** (author of the automated release post). Map GitHub login → Discord id via `github-discord-map.json` (`<@id>`).
-- Keep Discord short. No curl dumps or URL walls. Detail stays in operator chat / attempt log.
+Claudear posts the outcome under the automated release announcement in `#releases` from your report's verdict footer. **Do not post to Discord yourself** — no messages, replies, threads, or reactions.
+
+- **All verified** (`ALL_VERIFIED`, nothing blocked): a reply on the release announcement, **no @**.
+- **Unverified** (`UNVERIFIED`: nothing failed, but a LIVE-TESTABLE check was blocked or incomplete): a reply on the release announcement, **no @**.
+- **FAIL** (`FAIL`: a LIVE-TESTABLE PR failed): a thread under the release announcement that **@s the releaser**, mapped from their GitHub login via `github-discord-map.json`.
+
+Your report becomes the post, so keep it short: one bullet per PR, no curl dumps or URL walls. Detail stays in the attempt log.
 
 ## Non-goals
 
@@ -40,18 +42,22 @@ Persist last-seen tip per track. Skip if unchanged. Skip-if-previous-still-runni
 
 ## Required report format (machine-readable footer)
 
+List each PR as `- #N title LIVE PASS|FAIL|BLOCKED` or `- #N title INFRA`.
+
 End the attempt with exactly one of:
 
 ```
 DEPLOY_QA_VERDICT: ALL_VERIFIED
 ```
 
-or
+```
+DEPLOY_QA_VERDICT: UNVERIFIED
+```
 
 ```
 DEPLOY_QA_VERDICT: FAIL
 ```
 
-List each PR as `- #N title LIVE PASS|FAIL|BLOCKED` or `- #N title INFRA`.
-
-Any `LIVE FAIL` or `LIVE BLOCKED` line, or a missing footer, is treated as FAIL.
+- Any `LIVE FAIL` line means FAIL, whatever the footer says.
+- Otherwise a `LIVE BLOCKED` line, an `UNVERIFIED` footer, or a missing or unrecognised footer means UNVERIFIED — blocked is never a pass.
+- Only `ALL_VERIFIED` with no blocked PR counts as verified.

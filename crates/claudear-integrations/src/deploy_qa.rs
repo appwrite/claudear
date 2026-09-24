@@ -1,22 +1,35 @@
-//! Discord posting hooks for `[deploy_qa]` outcomes.
+//! Discord `#releases` posting for `[deploy_qa]` outcomes.
 //!
-//! All-verified: reply under the automated `#releases` message (no @).
-//! FAIL: create a thread from that message and `@` the mapped releaser.
+//! All verified or unverified: reply under the automated release announcement
+//! (no @). FAIL: post in the announcement's thread and `@` the mapped releaser.
 
 use claudear_analysis::deploy_qa::{
     classify_deploy_qa_verdict, DeployQaVerdict, GitHubDiscordMap, DEPLOY_QA_SOURCE,
 };
 use claudear_core::error::Result;
-use claudear_core::types::DeployQaTipStatus;
-use claudear_storage::FixAttemptTracker;
+use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+use claudear_storage::DeployQaStore;
 
 use crate::discord::{
-    CreateMessageParams, CreateThreadParams, DiscordClient, DiscordHttpClient, MessageEmbed,
-    ReqwestDiscordClient,
+    CreateMessageParams, CreateThreadParams, DiscordClient, DiscordHttpClient, DiscordMessage,
+    MessageEmbed, ReqwestDiscordClient,
 };
 
 const COLOR_VERIFIED: u32 = 0x2ecc71;
+const COLOR_UNVERIFIED: u32 = 0xffbf00;
 const COLOR_FAIL: u32 = 0xe74c3c;
+
+const TITLE_VERIFIED: &str = "All PRs verified";
+const TITLE_UNVERIFIED: &str = "Not fully verified";
+
+/// Recent `#releases` messages searched for the release announcement.
+const RELEASE_SEARCH_PAGE_SIZE: usize = 50;
+
+/// Longest posted report in characters, under Discord's 4096-character embed
+/// description limit.
+const REPORT_CHARACTER_LIMIT: usize = 4000;
+
+const ELLIPSIS: char = '…';
 
 /// Discord reporter for deploy-QA results.
 pub struct DeployQaDiscord<H: DiscordHttpClient = ReqwestDiscordClient> {
@@ -54,105 +67,154 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
         }
     }
 
-    /// Find the automated `#releases` message for this tip (tag / repo).
-    pub async fn find_release_message(&self, tag: &str, repo: &str) -> Result<Option<String>> {
+    /// Find the automated `#releases` announcement for `tip`.
+    ///
+    /// Searches the most recent messages, newest first, skipping Claudear's own
+    /// deploy-QA posts. A message announces the tip when it links the release's
+    /// `html_url`, or names both its `owner/repo` and its tag as whole tokens,
+    /// so `1.2.3` never matches `1.2.3-db`, `1.2.30` or `1.2.3-rc.1`.
+    pub async fn find_release_message(&self, tip: &DeployQaTip) -> Result<Option<String>> {
         let messages = self
             .client
-            .list_channel_messages(&self.channel_id, 50)
+            .list_channel_messages(&self.channel_id, RELEASE_SEARCH_PAGE_SIZE)
             .await?;
-        for msg in messages {
-            if message_mentions_tip(&msg.content, tag, repo) {
-                return Ok(Some(msg.id));
-            }
-            for embed in &msg.embeds {
-                let title = embed.title.as_deref().unwrap_or("");
-                let desc = embed.description.as_deref().unwrap_or("");
-                if message_mentions_tip(title, tag, repo) || message_mentions_tip(desc, tag, repo) {
-                    return Ok(Some(msg.id));
-                }
-            }
-        }
-        Ok(None)
+        Ok(messages
+            .into_iter()
+            .find(|message| !is_deploy_qa_post(message) && announces(message, tip))
+            .map(|message| message.id))
     }
 
-    /// Post the all-verified reply (no @) under the release message.
+    /// Reply under the release announcement, without an @, when every
+    /// LIVE-TESTABLE PR passed.
     pub async fn post_verified(
         &self,
         release_message_id: &str,
         report: &str,
-        pin: Option<&str>,
+        release_url: Option<&str>,
     ) -> Result<String> {
-        let embed = MessageEmbed::new()
-            .title("All PRs verified")
-            .description(truncate_report(report, 1800))
-            .color(COLOR_VERIFIED)
-            .footer(pin.unwrap_or(DEPLOY_QA_SOURCE))
-            .timestamp(chrono::Utc::now().to_rfc3339());
+        self.reply(
+            release_message_id,
+            report_embed(TITLE_VERIFIED, COLOR_VERIFIED, report, release_url),
+        )
+        .await
+    }
+
+    /// Reply under the release announcement, without an @, when nothing failed
+    /// but a LIVE-TESTABLE check was blocked or the report was incomplete.
+    pub async fn post_unverified(
+        &self,
+        release_message_id: &str,
+        report: &str,
+        release_url: Option<&str>,
+    ) -> Result<String> {
+        self.reply(
+            release_message_id,
+            report_embed(TITLE_UNVERIFIED, COLOR_UNVERIFIED, report, release_url),
+        )
+        .await
+    }
+
+    /// Post the FAIL report in the release announcement's thread and `@` the
+    /// releaser. Returns the thread id and the posted message id.
+    ///
+    /// Reuses the tip's stored thread. Otherwise opens a thread from the
+    /// announcement, falling back to the thread Discord already attached to it:
+    /// a message starts at most one thread, and that thread's id is the
+    /// message id.
+    pub async fn post_fail(
+        &self,
+        release_message_id: &str,
+        tip: &DeployQaTip,
+        report: &str,
+    ) -> Result<(String, String)> {
+        let title = format!("FAIL {}", tip.tag);
+        let thread_id = match tip.discord_thread_id.clone() {
+            Some(thread_id) => thread_id,
+            None => self.open_thread(release_message_id, &title).await,
+        };
+        let summary = format!("Deploy QA failed for `{}`.", tip.tag);
+        let content = match self.releaser_mention(tip) {
+            Some(mention) => format!("{mention} {summary}"),
+            None => summary,
+        };
+        let embed = report_embed(&title, COLOR_FAIL, report, tip.html_url.as_deref());
+        let sent = self
+            .client
+            .send_message(&thread_id, CreateMessageParams::with_embed(content, embed))
+            .await?;
+        Ok((thread_id, sent.id))
+    }
+
+    async fn reply(&self, release_message_id: &str, embed: MessageEmbed) -> Result<String> {
         let params = CreateMessageParams::with_embed("", embed).replying_to(release_message_id);
         let sent = self.client.send_message(&self.channel_id, params).await?;
         Ok(sent.id)
     }
 
-    /// Create a FAIL thread under the release message and @ the releaser.
-    pub async fn post_fail(
-        &self,
-        release_message_id: &str,
-        tag: &str,
-        report: &str,
-        github_login: Option<&str>,
-    ) -> Result<(String, String)> {
-        let thread = self
+    async fn open_thread(&self, release_message_id: &str, name: &str) -> String {
+        match self
             .client
             .create_thread_from_message(
                 &self.channel_id,
                 release_message_id,
-                CreateThreadParams::public(format!("FAIL {tag}")),
+                CreateThreadParams::public(name),
             )
-            .await?;
+            .await
+        {
+            Ok(thread) => thread.id,
+            Err(error) => {
+                tracing::warn!(
+                    release_message_id,
+                    %error,
+                    "deploy_qa: could not open a FAIL thread; posting into the release announcement's existing thread"
+                );
+                release_message_id.to_string()
+            }
+        }
+    }
 
-        let mention = github_login
-            .and_then(|login| self.map.mention_for(login))
-            .unwrap_or_default();
-        let content = if mention.is_empty() {
-            format!("Deploy QA failed for `{tag}`.")
-        } else {
-            format!("{mention} Deploy QA failed for `{tag}`.")
+    fn releaser_mention(&self, tip: &DeployQaTip) -> Option<String> {
+        let Some(login) = tip.author_login.as_deref() else {
+            tracing::warn!(
+                tag = %tip.tag,
+                "deploy_qa: release has no author login; posting FAIL without @releaser"
+            );
+            return None;
         };
-        let embed = MessageEmbed::new()
-            .title(format!("FAIL {tag}"))
-            .description(truncate_report(report, 1800))
-            .color(COLOR_FAIL)
-            .footer(DEPLOY_QA_SOURCE)
-            .timestamp(chrono::Utc::now().to_rfc3339());
-        let sent = self
-            .client
-            .send_message(&thread.id, CreateMessageParams::with_embed(content, embed))
-            .await?;
-        Ok((thread.id, sent.id))
+        let mention = self.map.mention_for(login);
+        if mention.is_none() {
+            tracing::warn!(
+                login,
+                tag = %tip.tag,
+                "deploy_qa: releaser is not in the GitHub↔Discord map; posting FAIL without @releaser"
+            );
+        }
+        mention
     }
 }
 
-/// Post a deploy-QA report to Discord when a bot client is configured.
+/// Classify a deploy-QA report, persist the tip's status, and post the outcome
+/// to Discord `#releases`.
 ///
-/// When Discord is unavailable the tip status is still updated so the poller
-/// does not re-fire. Missing thread APIs are not an issue — DiscordClient
-/// already implements `create_thread_from_message`.
-pub async fn report_deploy_qa_outcome(
-    store: &dyn FixAttemptTracker,
-    discord: Option<&DeployQaDiscord>,
+/// Only loading the tip or persisting its status can fail. Once the status is
+/// stored, Discord problems (no reporter, no announcement, a failed post, ids
+/// that could not be recorded) are logged instead, so a report Discord already
+/// received is never broadcast again.
+pub async fn report_deploy_qa_outcome<S, H>(
+    store: &S,
+    discord: Option<&DeployQaDiscord<H>>,
     issue_id: &str,
     report: &str,
-) -> Result<DeployQaVerdict> {
+) -> Result<DeployQaVerdict>
+where
+    S: DeployQaStore + ?Sized,
+    H: DiscordHttpClient,
+{
     let verdict = classify_deploy_qa_verdict(report);
     let Some(tip) = store.get_deploy_qa_tip_by_issue_id(issue_id)? else {
         return Ok(verdict);
     };
-
-    let status = match verdict {
-        DeployQaVerdict::AllVerified => DeployQaTipStatus::Verified,
-        DeployQaVerdict::Fail => DeployQaTipStatus::Failed,
-    };
-    store.update_deploy_qa_tip_status(tip.id, status, None)?;
+    store.update_deploy_qa_tip_status(tip.id, tip_status(verdict), None)?;
 
     let Some(discord) = discord else {
         tracing::info!(
@@ -163,82 +225,169 @@ pub async fn report_deploy_qa_outcome(
         return Ok(verdict);
     };
 
-    let release_message_id = match tip.discord_message_id.as_deref() {
-        Some(id) => id.to_string(),
-        None => match discord.find_release_message(&tip.tag, &tip.repo).await {
-            Ok(Some(id)) => {
-                store.update_deploy_qa_discord_ids(tip.id, Some(&id), None)?;
-                id
-            }
+    let release_message_id = match tip.discord_message_id.clone() {
+        Some(id) => id,
+        None => match discord.find_release_message(&tip).await {
+            Ok(Some(id)) => id,
             Ok(None) => {
                 tracing::warn!(
                     tag = %tip.tag,
-                    "deploy_qa: no #releases message found; skipping Discord post"
+                    "deploy_qa: no #releases announcement found; skipping Discord post"
                 );
                 return Ok(verdict);
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "deploy_qa: failed to search #releases");
+            Err(error) => {
+                tracing::warn!(%error, "deploy_qa: failed to search #releases");
                 return Ok(verdict);
             }
         },
     };
 
-    match verdict {
-        DeployQaVerdict::AllVerified => {
-            if let Err(e) = discord
-                .post_verified(&release_message_id, report, tip.html_url.as_deref())
-                .await
-            {
-                tracing::warn!(error = %e, "deploy_qa: failed to post verified reply");
-            }
-        }
-        DeployQaVerdict::Fail => {
-            match discord
-                .post_fail(
-                    &release_message_id,
-                    &tip.tag,
-                    report,
-                    tip.author_login.as_deref(),
-                )
-                .await
-            {
-                Ok((thread_id, _)) => {
-                    store.update_deploy_qa_discord_ids(
-                        tip.id,
-                        Some(&release_message_id),
-                        Some(&thread_id),
-                    )?;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "deploy_qa: failed to post FAIL thread");
-                }
-            }
-        }
-    }
+    let release_url = tip.html_url.as_deref();
+    let posted = match verdict {
+        DeployQaVerdict::AllVerified => discord
+            .post_verified(&release_message_id, report, release_url)
+            .await
+            .map(|_| None),
+        DeployQaVerdict::Unverified => discord
+            .post_unverified(&release_message_id, report, release_url)
+            .await
+            .map(|_| None),
+        DeployQaVerdict::Fail => discord
+            .post_fail(&release_message_id, &tip, report)
+            .await
+            .map(|(thread_id, _)| Some(thread_id)),
+    };
+    let thread_id = posted.unwrap_or_else(|error| {
+        tracing::warn!(
+            tag = %tip.tag,
+            ?verdict,
+            %error,
+            "deploy_qa: failed to post the outcome to #releases"
+        );
+        None
+    });
+    record_discord_ids(store, &tip, &release_message_id, thread_id.as_deref());
 
     Ok(verdict)
 }
 
-fn message_mentions_tip(text: &str, tag: &str, repo: &str) -> bool {
-    if text.is_empty() {
-        return false;
+fn tip_status(verdict: DeployQaVerdict) -> DeployQaTipStatus {
+    match verdict {
+        DeployQaVerdict::AllVerified => DeployQaTipStatus::Verified,
+        DeployQaVerdict::Unverified => DeployQaTipStatus::Unverified,
+        DeployQaVerdict::Fail => DeployQaTipStatus::Failed,
     }
-    text.contains(tag)
-        && (text.contains(repo) || text.contains(repo.split('/').next_back().unwrap_or(repo)))
 }
 
-fn truncate_report(report: &str, max: usize) -> String {
+fn record_discord_ids<S: DeployQaStore + ?Sized>(
+    store: &S,
+    tip: &DeployQaTip,
+    release_message_id: &str,
+    thread_id: Option<&str>,
+) {
+    let message_id = (tip.discord_message_id.as_deref() != Some(release_message_id))
+        .then_some(release_message_id);
+    let thread_id = thread_id.filter(|id| tip.discord_thread_id.as_deref() != Some(*id));
+    if message_id.is_none() && thread_id.is_none() {
+        return;
+    }
+    if let Err(error) = store.update_deploy_qa_discord_ids(tip.id, message_id, thread_id) {
+        tracing::warn!(
+            issue_id = %tip.issue_id,
+            %error,
+            "deploy_qa: failed to record the #releases message and thread ids"
+        );
+    }
+}
+
+fn report_embed(title: &str, color: u32, report: &str, release_url: Option<&str>) -> MessageEmbed {
+    let embed = MessageEmbed::new()
+        .title(title)
+        .description(truncate_report(report))
+        .color(color)
+        .footer(DEPLOY_QA_SOURCE)
+        .timestamp(chrono::Utc::now().to_rfc3339());
+    match release_url {
+        Some(url) => embed.url(url),
+        None => embed,
+    }
+}
+
+fn is_deploy_qa_post(message: &DiscordMessage) -> bool {
+    message.embeds.iter().any(|embed| {
+        embed
+            .footer
+            .as_ref()
+            .is_some_and(|footer| footer.text == DEPLOY_QA_SOURCE)
+    })
+}
+
+fn announces(message: &DiscordMessage, tip: &DeployQaTip) -> bool {
+    let texts: Vec<&str> = std::iter::once(message.content.as_str())
+        .chain(message.embeds.iter().flat_map(|embed| {
+            [
+                embed.title.as_deref(),
+                embed.description.as_deref(),
+                embed.url.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+        }))
+        .collect();
+    let mentions = |token: &str| texts.iter().any(|text| contains_token(text, token));
+    let repo = tip.repo.to_ascii_lowercase();
+    tip.html_url.as_deref().is_some_and(mentions)
+        || (texts
+            .iter()
+            .any(|text| contains_token(&text.to_ascii_lowercase(), &repo))
+            && mentions(&tip.tag))
+}
+
+/// Whether `token` occurs in `text` without running into a neighbouring name
+/// or version character, so `1.2.3` does not match inside `1.2.3-db`,
+/// `1.2.30`, `v1.2.3` or `1.2.3.4`.
+fn contains_token(text: &str, token: &str) -> bool {
+    !token.is_empty()
+        && text.match_indices(token).any(|(start, _)| {
+            bounded_before(&text[..start], token) && bounded_after(&text[start + token.len()..])
+        })
+}
+
+fn bounded_before(before: &str, token: &str) -> bool {
+    match before.chars().next_back() {
+        None => true,
+        Some('.') => !token.starts_with(char::is_alphanumeric),
+        Some(neighbour) => !extends_token(neighbour),
+    }
+}
+
+fn bounded_after(after: &str) -> bool {
+    let mut characters = after.chars();
+    match characters.next() {
+        None => true,
+        Some('.') => !characters.next().is_some_and(char::is_alphanumeric),
+        Some(neighbour) => !extends_token(neighbour),
+    }
+}
+
+fn extends_token(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '-' | '_' | '+')
+}
+
+/// Trim the report to [`REPORT_CHARACTER_LIMIT`], keeping the tail: the per-PR
+/// results and the verdict footer come last.
+fn truncate_report(report: &str) -> String {
     let trimmed = report.trim();
-    if trimmed.chars().count() <= max {
+    let length = trimmed.chars().count();
+    if length <= REPORT_CHARACTER_LIMIT {
         return trimmed.to_string();
     }
-    let mut out = trimmed
+    let tail: String = trimmed
         .chars()
-        .take(max.saturating_sub(3))
-        .collect::<String>();
-    out.push_str("...");
-    out
+        .skip(length - (REPORT_CHARACTER_LIMIT - 1))
+        .collect();
+    format!("{ELLIPSIS}{tail}")
 }
 
 /// Build a reporter from a bot token + channel, or `None` when unconfigured.
@@ -247,8 +396,8 @@ pub fn try_build_discord(
     channel_id: Option<&str>,
     map: GitHubDiscordMap,
 ) -> Result<Option<DeployQaDiscord>> {
-    let token = bot_token.filter(|t| !t.is_empty());
-    let channel = channel_id.filter(|c| !c.is_empty());
+    let token = bot_token.filter(|token| !token.is_empty());
+    let channel = channel_id.filter(|channel| !channel.is_empty());
     match (token, channel) {
         (Some(token), Some(channel)) => Ok(Some(DeployQaDiscord::new(token, channel, map)?)),
         _ => Ok(None),
@@ -258,24 +407,556 @@ pub fn try_build_discord(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use claudear_analysis::deploy_qa::{VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX};
+    use claudear_core::error::Error;
+    use claudear_core::http::HttpResponse;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    const CHANNEL: &str = "990878183580651571";
+    const RELEASE_MESSAGE: &str = "1111";
+    const CREATED_THREAD: &str = "5555";
+    const REPO: &str = "appwrite-labs/cloud";
+    const TAG: &str = "1.2.3";
+    const RELEASER: &str = "abnegate";
+    const RELEASER_DISCORD_ID: &str = "452316113016193024";
+
+    #[derive(Debug, Clone)]
+    struct Request {
+        method: &'static str,
+        url: String,
+        body: Value,
+    }
+
+    impl Request {
+        fn is_post_to(&self, path: &str) -> bool {
+            self.method == "POST" && self.url.ends_with(path)
+        }
+    }
+
+    type Requests = Arc<Mutex<Vec<Request>>>;
+
+    struct FakeDiscord {
+        channel_messages: Vec<Value>,
+        thread_creation_fails: bool,
+        requests: Requests,
+    }
+
+    impl FakeDiscord {
+        fn record(&self, method: &'static str, url: &str, body: Value) {
+            self.requests.lock().unwrap().push(Request {
+                method,
+                url: url.to_string(),
+                body,
+            });
+        }
+    }
+
+    fn respond(status: u16, body: Value) -> Result<HttpResponse> {
+        Ok(HttpResponse {
+            status,
+            body: body.to_string(),
+        })
+    }
+
+    #[async_trait]
+    impl DiscordHttpClient for FakeDiscord {
+        async fn get(&self, url: &str) -> Result<HttpResponse> {
+            self.record("GET", url, Value::Null);
+            if url.contains(&format!("/channels/{CHANNEL}/messages?")) {
+                return respond(200, Value::Array(self.channel_messages.clone()));
+            }
+            respond(404, json!({ "message": "Unknown Channel", "code": 10003 }))
+        }
+
+        async fn post(&self, url: &str, body: Value) -> Result<HttpResponse> {
+            self.record("POST", url, body.clone());
+            if url.ends_with("/threads") {
+                if self.thread_creation_fails {
+                    return respond(
+                        400,
+                        json!({
+                            "message": "A thread has already been created for this message",
+                            "code": 160004
+                        }),
+                    );
+                }
+                return respond(
+                    200,
+                    json!({ "id": CREATED_THREAD, "type": 11, "name": body["name"] }),
+                );
+            }
+            let channel = url
+                .trim_end_matches("/messages")
+                .rsplit('/')
+                .next()
+                .unwrap_or_default();
+            respond(
+                200,
+                json!({
+                    "id": format!("sent-in-{channel}"),
+                    "channel_id": channel,
+                    "content": body["content"],
+                    "timestamp": "2026-09-24T00:00:00Z"
+                }),
+            )
+        }
+
+        async fn patch(&self, url: &str, body: Value) -> Result<HttpResponse> {
+            self.record("PATCH", url, body);
+            respond(404, Value::Null)
+        }
+
+        async fn put_empty(&self, url: &str) -> Result<HttpResponse> {
+            self.record("PUT", url, Value::Null);
+            respond(404, Value::Null)
+        }
+    }
+
+    fn reporter(
+        channel_messages: Vec<Value>,
+        thread_creation_fails: bool,
+    ) -> (DeployQaDiscord<FakeDiscord>, Requests) {
+        let requests = Requests::default();
+        let http = FakeDiscord {
+            channel_messages,
+            thread_creation_fails,
+            requests: requests.clone(),
+        };
+        let client = DiscordClient::with_http_client("test-token", http).unwrap();
+        let map = GitHubDiscordMap::from_json_bytes(
+            json!({ "byGithubLogin": { RELEASER: { "discordUserId": RELEASER_DISCORD_ID } } })
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        (DeployQaDiscord::with_client(client, CHANNEL, map), requests)
+    }
+
+    fn posts(requests: &Requests) -> Vec<Request> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == "POST")
+            .cloned()
+            .collect()
+    }
+
+    fn release_url(repo: &str, tag: &str) -> String {
+        format!("https://github.com/{repo}/releases/tag/{tag}")
+    }
+
+    fn announcement(id: &str, repo: &str, tag: &str) -> Value {
+        json!({
+            "id": id,
+            "channel_id": CHANNEL,
+            "content": "",
+            "timestamp": "2026-09-23T01:00:00Z",
+            "author": { "id": "900", "username": "GitHub", "bot": true },
+            "webhook_id": "901",
+            "embeds": [{
+                "title": format!("[{repo}] New release published: {tag}"),
+                "url": release_url(repo, tag)
+            }]
+        })
+    }
+
+    fn tip() -> DeployQaTip {
+        let mut tip = DeployQaTip::new("cloud", REPO, TAG);
+        tip.id = 7;
+        tip.html_url = Some(release_url(REPO, TAG));
+        tip.author_login = Some(RELEASER.to_string());
+        tip
+    }
+
+    fn verdict_report(result: &str, verdict: &str) -> String {
+        format!("- #42 new route {result}\n- #43 ci INFRA\n{VERDICT_PREFIX} {verdict}")
+    }
+
+    struct MemoryStore {
+        tip: Mutex<DeployQaTip>,
+        discord_ids_writable: bool,
+    }
+
+    impl MemoryStore {
+        fn new(tip: DeployQaTip) -> Self {
+            Self {
+                tip: Mutex::new(tip),
+                discord_ids_writable: true,
+            }
+        }
+
+        fn read_only_discord_ids(tip: DeployQaTip) -> Self {
+            Self {
+                discord_ids_writable: false,
+                ..Self::new(tip)
+            }
+        }
+
+        fn tip(&self) -> DeployQaTip {
+            self.tip.lock().unwrap().clone()
+        }
+    }
+
+    impl DeployQaStore for MemoryStore {
+        fn get_deploy_qa_tip_by_issue_id(&self, issue_id: &str) -> Result<Option<DeployQaTip>> {
+            let tip = self.tip();
+            Ok((tip.issue_id == issue_id).then_some(tip))
+        }
+
+        fn update_deploy_qa_tip_status(
+            &self,
+            id: i64,
+            status: DeployQaTipStatus,
+            attempt_id: Option<i64>,
+        ) -> Result<()> {
+            let mut tip = self.tip.lock().unwrap();
+            if tip.id == id {
+                tip.status = status;
+                tip.attempt_id = attempt_id.or(tip.attempt_id);
+            }
+            Ok(())
+        }
+
+        fn update_deploy_qa_discord_ids(
+            &self,
+            id: i64,
+            message_id: Option<&str>,
+            thread_id: Option<&str>,
+        ) -> Result<()> {
+            if !self.discord_ids_writable {
+                return Err(Error::storage("database is locked"));
+            }
+            let mut tip = self.tip.lock().unwrap();
+            if tip.id == id {
+                if let Some(message_id) = message_id {
+                    tip.discord_message_id = Some(message_id.to_string());
+                }
+                if let Some(thread_id) = thread_id {
+                    tip.discord_thread_id = Some(thread_id.to_string());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    async fn report(
+        store: &MemoryStore,
+        discord: &DeployQaDiscord<FakeDiscord>,
+        report: &str,
+    ) -> DeployQaVerdict {
+        let issue_id = store.tip().issue_id;
+        report_deploy_qa_outcome(store, Some(discord), &issue_id, report)
+            .await
+            .expect("reporting should not fail once the status is stored")
+    }
+
+    fn assert_reply_without_mention(request: &Request) {
+        assert!(request.is_post_to(&format!("/channels/{CHANNEL}/messages")));
+        assert_eq!(
+            request.body["message_reference"]["message_id"], RELEASE_MESSAGE,
+            "the outcome should reply to the release announcement: {:?}",
+            request.body
+        );
+        let content = request.body["content"].as_str().unwrap_or_default();
+        assert!(
+            !content.contains("<@"),
+            "no one should be pinged: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_report_replies_under_release_message_without_mention() {
+        let store = MemoryStore::new(tip());
+        let (discord, requests) = reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+
+        let verdict = report(
+            &store,
+            &discord,
+            &verdict_report("LIVE PASS", VERDICT_ALL_VERIFIED),
+        )
+        .await;
+
+        assert_eq!(verdict, DeployQaVerdict::AllVerified);
+        let posts = posts(&requests);
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_reply_without_mention(&posts[0]);
+        assert_eq!(posts[0].body["embeds"][0]["title"], TITLE_VERIFIED);
+        let stored = store.tip();
+        assert_eq!(stored.status, DeployQaTipStatus::Verified);
+        assert_eq!(stored.discord_message_id.as_deref(), Some(RELEASE_MESSAGE));
+        assert_eq!(stored.discord_thread_id, None);
+    }
+
+    #[tokio::test]
+    async fn unverified_report_replies_without_mention_or_thread() {
+        let store = MemoryStore::new(tip());
+        let (discord, requests) = reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+
+        let verdict = report(
+            &store,
+            &discord,
+            &verdict_report("LIVE BLOCKED", VERDICT_ALL_VERIFIED),
+        )
+        .await;
+
+        assert_eq!(verdict, DeployQaVerdict::Unverified);
+        let posts = posts(&requests);
+        assert_eq!(posts.len(), 1, "exactly one reply, no thread: {posts:?}");
+        assert_reply_without_mention(&posts[0]);
+        assert_ne!(
+            posts[0].body["embeds"][0]["title"], TITLE_VERIFIED,
+            "a blocked check must not be reported as verified"
+        );
+        let stored = store.tip();
+        assert_eq!(stored.status, DeployQaTipStatus::Unverified);
+        assert_eq!(stored.discord_thread_id, None);
+    }
+
+    #[tokio::test]
+    async fn fail_report_opens_thread_and_mentions_mapped_releaser_ignoring_case() {
+        let mut tip = tip();
+        tip.author_login = Some("AbNeGaTe".to_string());
+        let store = MemoryStore::new(tip);
+        let (discord, requests) = reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+
+        let verdict = report(&store, &discord, &verdict_report("LIVE FAIL", VERDICT_FAIL)).await;
+
+        assert_eq!(verdict, DeployQaVerdict::Fail);
+        let posts = posts(&requests);
+        assert_eq!(posts.len(), 2, "{posts:?}");
+        assert!(posts[0].is_post_to(&format!(
+            "/channels/{CHANNEL}/messages/{RELEASE_MESSAGE}/threads"
+        )));
+        assert!(posts[1].is_post_to(&format!("/channels/{CREATED_THREAD}/messages")));
+        let content = posts[1].body["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains(&format!("<@{RELEASER_DISCORD_ID}>")),
+            "the releaser should be pinged: {content}"
+        );
+        let stored = store.tip();
+        assert_eq!(stored.status, DeployQaTipStatus::Failed);
+        assert_eq!(stored.discord_message_id.as_deref(), Some(RELEASE_MESSAGE));
+        assert_eq!(stored.discord_thread_id.as_deref(), Some(CREATED_THREAD));
+    }
+
+    #[tokio::test]
+    async fn fail_posts_into_existing_release_thread_when_thread_creation_fails() {
+        let store = MemoryStore::new(tip());
+        let (discord, requests) = reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], true);
+
+        let verdict = report(&store, &discord, &verdict_report("LIVE FAIL", VERDICT_FAIL)).await;
+
+        assert_eq!(verdict, DeployQaVerdict::Fail);
+        let posts = posts(&requests);
+        let report_post = posts.last().expect("the FAIL report should be posted");
+        assert!(
+            report_post.is_post_to(&format!("/channels/{RELEASE_MESSAGE}/messages")),
+            "{posts:?}"
+        );
+        let content = report_post.body["content"].as_str().unwrap_or_default();
+        assert!(content.contains(&format!("<@{RELEASER_DISCORD_ID}>")));
+        assert_eq!(
+            store.tip().discord_thread_id.as_deref(),
+            Some(RELEASE_MESSAGE)
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_reuses_stored_thread_without_creating_another() {
+        let mut tip = tip();
+        tip.discord_message_id = Some(RELEASE_MESSAGE.to_string());
+        tip.discord_thread_id = Some("7777".to_string());
+        let store = MemoryStore::new(tip);
+        let (discord, requests) = reporter(Vec::new(), false);
+
+        report(&store, &discord, &verdict_report("LIVE FAIL", VERDICT_FAIL)).await;
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "no search and no new thread: {recorded:?}"
+        );
+        assert!(recorded[0].is_post_to("/channels/7777/messages"));
+        assert_eq!(store.tip().discord_thread_id.as_deref(), Some("7777"));
+    }
+
+    #[tokio::test]
+    async fn fail_without_mapped_releaser_posts_without_mention() {
+        for author in [None, Some("someone-else")] {
+            let mut tip = tip();
+            tip.author_login = author.map(str::to_string);
+            let store = MemoryStore::new(tip);
+            let (discord, requests) =
+                reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+
+            report(&store, &discord, &verdict_report("LIVE FAIL", VERDICT_FAIL)).await;
+
+            let posts = posts(&requests);
+            let content = posts.last().expect("the FAIL report should be posted").body["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(!content.contains("<@"), "{author:?}: {content}");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_release_message_persists_status_without_posting() {
+        let store = MemoryStore::new(tip());
+        let (discord, requests) = reporter(vec![announcement("2222", REPO, "1.2.2")], false);
+
+        let verdict = report(&store, &discord, &verdict_report("LIVE FAIL", VERDICT_FAIL)).await;
+
+        assert_eq!(verdict, DeployQaVerdict::Fail);
+        assert!(posts(&requests).is_empty());
+        let stored = store.tip();
+        assert_eq!(stored.status, DeployQaTipStatus::Failed);
+        assert_eq!(stored.discord_message_id, None);
+    }
+
+    #[tokio::test]
+    async fn discord_id_write_failure_after_posting_is_not_an_error() {
+        let store = MemoryStore::read_only_discord_ids(tip());
+        let (discord, requests) = reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+
+        let result = report_deploy_qa_outcome(
+            &store,
+            Some(&discord),
+            &store.tip().issue_id,
+            &verdict_report("LIVE PASS", VERDICT_ALL_VERIFIED),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(DeployQaVerdict::AllVerified)),
+            "{result:?}"
+        );
+        assert_eq!(posts(&requests).len(), 1);
+        assert_eq!(store.tip().status, DeployQaTipStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn find_release_message_picks_exact_tag_over_newer_lookalikes() {
+        let (discord, _) = reporter(
+            vec![
+                announcement("5000", REPO, "1.2.3-db"),
+                announcement("4000", REPO, "1.2.30"),
+                announcement("3000", REPO, "1.2.3-rc.1"),
+                announcement("2000", "appwrite-labs/cloud-sdk", TAG),
+                announcement(RELEASE_MESSAGE, REPO, TAG),
+            ],
+            false,
+        );
+
+        let found = discord.find_release_message(&tip()).await.unwrap();
+
+        assert_eq!(found.as_deref(), Some(RELEASE_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn find_release_message_skips_claudears_own_posts() {
+        let (seed, seed_requests) = reporter(Vec::new(), false);
+        seed.post_verified(
+            RELEASE_MESSAGE,
+            &format!("{REPO} {TAG}\n{}", release_url(REPO, TAG)),
+            Some(&release_url(REPO, TAG)),
+        )
+        .await
+        .unwrap();
+        let posted = posts(&seed_requests).remove(0).body;
+        let own_post = json!({
+            "id": "9999",
+            "channel_id": CHANNEL,
+            "content": posted["content"],
+            "timestamp": "2026-09-24T00:00:00Z",
+            "embeds": posted["embeds"]
+        });
+        let (discord, _) = reporter(
+            vec![own_post, announcement(RELEASE_MESSAGE, REPO, TAG)],
+            false,
+        );
+
+        let found = discord.find_release_message(&tip()).await.unwrap();
+
+        assert_eq!(found.as_deref(), Some(RELEASE_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn find_release_message_matches_release_url_alone() {
+        let mut tip = tip();
+        tip.repo = "appwrite/cloud".to_string();
+        let message = json!({
+            "id": RELEASE_MESSAGE,
+            "channel_id": CHANNEL,
+            "content": "",
+            "timestamp": "2026-09-23T01:00:00Z",
+            "embeds": [{ "title": "Cloud shipped", "url": release_url(REPO, TAG) }]
+        });
+        let (discord, _) = reporter(vec![message], false);
+
+        let found = discord.find_release_message(&tip).await.unwrap();
+
+        assert_eq!(found.as_deref(), Some(RELEASE_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn find_release_message_ignores_repo_case() {
+        let (discord, _) = reporter(
+            vec![announcement(RELEASE_MESSAGE, "Appwrite-Labs/Cloud", TAG)],
+            false,
+        );
+        let mut tip = tip();
+        tip.html_url = None;
+
+        let found = discord.find_release_message(&tip).await.unwrap();
+
+        assert_eq!(found.as_deref(), Some(RELEASE_MESSAGE));
+    }
 
     #[test]
-    fn tip_match_requires_tag() {
-        assert!(message_mentions_tip(
-            "Released appwrite-labs/cloud 1.2.3",
-            "1.2.3",
-            "appwrite-labs/cloud"
-        ));
-        assert!(!message_mentions_tip(
-            "Released appwrite-labs/cloud 1.2.2",
-            "1.2.3",
-            "appwrite-labs/cloud"
-        ));
+    fn tokens_must_not_run_into_neighbouring_version_characters() {
+        let cases = [
+            ("Released 1.2.3", "1.2.3", true),
+            ("Released 1.2.3.", "1.2.3", true),
+            ("(1.2.3)", "1.2.3", true),
+            ("`1.2.3`", "1.2.3", true),
+            ("releases/tag/1.2.3", "1.2.3", true),
+            ("Released 1.2.3-db", "1.2.3", false),
+            ("Released 1.2.30", "1.2.3", false),
+            ("Released 1.2.3-rc.1", "1.2.3", false),
+            ("Released 1.2.3+build", "1.2.3", false),
+            ("Released 1.2.3_hotfix", "1.2.3", false),
+            ("Released 1.2.3.4", "1.2.3", false),
+            ("Released v1.2.3", "1.2.3", false),
+            ("Released 0.1.2.3", "1.2.3", false),
+            ("Released 1.2.3-db then 1.2.3", "1.2.3", true),
+            ("[appwrite-labs/cloud]", "appwrite-labs/cloud", true),
+            ("appwrite-labs/cloud-sdk", "appwrite-labs/cloud", false),
+            ("anything", "", false),
+        ];
+        for (text, token, expected) in cases {
+            assert_eq!(contains_token(text, token), expected, "{token} in {text}");
+        }
     }
 
     #[test]
     fn truncate_keeps_short_reports() {
-        assert_eq!(truncate_report("ok", 10), "ok");
-        assert!(truncate_report(&"x".repeat(50), 10).ends_with("..."));
+        assert_eq!(truncate_report("  ok \n"), "ok");
+    }
+
+    #[test]
+    fn truncate_keeps_the_tail_with_the_verdict_footer() {
+        let footer = format!("{VERDICT_PREFIX} {VERDICT_FAIL}");
+        let report = format!("{}\n- #42 route LIVE FAIL\n{footer}", "x".repeat(10_000));
+
+        let truncated = truncate_report(&report);
+
+        assert_eq!(truncated.chars().count(), REPORT_CHARACTER_LIMIT);
+        assert!(truncated.starts_with(ELLIPSIS));
+        assert!(truncated.ends_with(&footer));
     }
 }

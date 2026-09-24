@@ -6,6 +6,8 @@
 
 use async_trait::async_trait;
 use claudear_core::error::Result;
+use regex_lite::Regex;
+use std::sync::LazyLock;
 
 /// Prefix of the machine-readable footer that ends every deploy-QA report.
 pub const VERDICT_PREFIX: &str = "DEPLOY_QA_VERDICT:";
@@ -13,23 +15,27 @@ pub const VERDICT_PREFIX: &str = "DEPLOY_QA_VERDICT:";
 /// Footer value declaring every LIVE-TESTABLE PR passed.
 pub const VERDICT_ALL_VERIFIED: &str = "ALL_VERIFIED";
 
-/// Footer value declaring at least one live failure or blocked check.
+/// Footer value declaring nothing failed but at least one LIVE-TESTABLE PR
+/// could not be checked.
+pub const VERDICT_UNVERIFIED: &str = "UNVERIFIED";
+
+/// Footer value declaring at least one LIVE-TESTABLE PR failed.
 pub const VERDICT_FAIL: &str = "FAIL";
 
-const LIVE_FAIL: &str = "LIVE FAIL";
+static LIVE_FAIL: LazyLock<Regex> = LazyLock::new(|| live_result("FAIL(ED)?"));
 
-const LIVE_BLOCKED: &str = "LIVE BLOCKED";
+static LIVE_BLOCKED: LazyLock<Regex> = LazyLock::new(|| live_result("BLOCKED"));
 
 /// Outcome of a deploy-QA attempt, used for Discord posting.
-///
-/// Classification is fail-closed: anything short of an explicit all-verified
-/// report is a [`DeployQaVerdict::Fail`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeployQaVerdict {
     /// The report ends with an all-verified footer and no LIVE-TESTABLE PR
     /// failed or was blocked.
     AllVerified,
-    /// A live failure, a blocked check, or no explicit all-verified verdict.
+    /// Nothing failed, but a LIVE-TESTABLE PR was blocked or the report lacks
+    /// an all-verified footer.
+    Unverified,
+    /// A LIVE-TESTABLE PR failed.
     Fail,
 }
 
@@ -70,25 +76,38 @@ impl LiveQaProbe for NoopLiveQaProbe {
     }
 }
 
-/// Classify an agent report into a Discord posting verdict, failing closed.
+/// Classify an agent report into a Discord posting verdict.
 ///
-/// The footer is the last line starting with [`VERDICT_PREFIX`] (ignoring
-/// case, surrounding whitespace, backticks and `*`). The report is
-/// [`DeployQaVerdict::AllVerified`] only when that footer's value is
-/// [`VERDICT_ALL_VERIFIED`] (ignoring case) and no line reports a `LIVE FAIL`
-/// or `LIVE BLOCKED` result. Everything else, including a missing or
-/// unrecognised footer, is a [`DeployQaVerdict::Fail`].
+/// Any line reporting a word-bounded `LIVE FAIL` / `LIVE FAILED` result is a
+/// [`DeployQaVerdict::Fail`], whatever the footer says. Otherwise the footer
+/// decides: the last line starting with [`VERDICT_PREFIX`] (ignoring case,
+/// surrounding whitespace, backticks and `*`). A [`VERDICT_FAIL`] footer is a
+/// failure, and a [`VERDICT_ALL_VERIFIED`] footer is
+/// [`DeployQaVerdict::AllVerified`] unless a line reports `LIVE BLOCKED`.
+/// Everything else, including a blocked check and a missing or unrecognised
+/// footer, is [`DeployQaVerdict::Unverified`].
 pub fn classify_deploy_qa_verdict(report: &str) -> DeployQaVerdict {
-    let upper = report.to_ascii_uppercase();
-    if upper.contains(LIVE_FAIL) || upper.contains(LIVE_BLOCKED) {
+    if reports(report, &LIVE_FAIL) {
         return DeployQaVerdict::Fail;
     }
     match footer(report) {
-        Some(value) if value.eq_ignore_ascii_case(VERDICT_ALL_VERIFIED) => {
+        Some(value) if value.eq_ignore_ascii_case(VERDICT_FAIL) => DeployQaVerdict::Fail,
+        Some(value)
+            if value.eq_ignore_ascii_case(VERDICT_ALL_VERIFIED)
+                && !reports(report, &LIVE_BLOCKED) =>
+        {
             DeployQaVerdict::AllVerified
         }
-        _ => DeployQaVerdict::Fail,
+        _ => DeployQaVerdict::Unverified,
     }
+}
+
+fn live_result(result: &str) -> Regex {
+    Regex::new(&format!(r"(?i)\bLIVE\s+{result}\b")).expect("live result pattern is valid")
+}
+
+fn reports(report: &str, result: &Regex) -> bool {
+    report.lines().any(|line| result.is_match(line))
 }
 
 fn footer(report: &str) -> Option<&str> {
@@ -143,9 +162,30 @@ mod tests {
     }
 
     #[test]
-    fn missing_footer_fails() {
+    fn unverified_footer_is_unverified() {
+        let text = report(&["- #1 foo LIVE PASS", &verdict_line(VERDICT_UNVERIFIED)]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::Unverified
+        );
+    }
+
+    #[test]
+    fn missing_footer_is_unverified() {
         let text = report(&["- #1 ci INFRA", "- #2 docs INFRA", "all good"]);
-        assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::Unverified
+        );
+    }
+
+    #[test]
+    fn garbled_footer_is_unverified() {
+        let text = report(&["- #1 foo LIVE PASS", &verdict_line("MOSTLY_FINE")]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::Unverified
+        );
     }
 
     #[test]
@@ -155,9 +195,21 @@ mod tests {
     }
 
     #[test]
-    fn blocked_line_without_footer_fails() {
-        let text = report(&["- #1 foo LIVE BLOCKED", "- #2 ci INFRA"]);
+    fn live_failed_line_fails() {
+        let text = report(&[
+            "- #1 foo live failed: 500 on /v1/health",
+            &verdict_line(VERDICT_UNVERIFIED),
+        ]);
         assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn blocked_line_without_footer_is_unverified() {
+        let text = report(&["- #1 foo LIVE BLOCKED", "- #2 ci INFRA"]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::Unverified
+        );
     }
 
     #[test]
@@ -167,6 +219,15 @@ mod tests {
             "- #2 bar live blocked",
             &verdict_line(VERDICT_ALL_VERIFIED),
         ]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::Unverified
+        );
+    }
+
+    #[test]
+    fn blocked_line_does_not_soften_fail_footer() {
+        let text = report(&["- #1 foo LIVE BLOCKED", &verdict_line(VERDICT_FAIL)]);
         assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
     }
 
@@ -181,9 +242,50 @@ mod tests {
     }
 
     #[test]
-    fn unverified_footer_fails() {
-        let text = report(&["- #1 foo LIVE PASS", &verdict_line("UNVERIFIED")]);
+    fn live_fail_line_overrides_unverified_footer() {
+        let text = report(&[
+            "- #1 foo LIVE BLOCKED",
+            "- #2 bar LIVE FAIL",
+            &verdict_line(VERDICT_UNVERIFIED),
+        ]);
         assert_eq!(classify_deploy_qa_verdict(&text), DeployQaVerdict::Fail);
+    }
+
+    #[test]
+    fn keep_alive_failures_are_not_a_live_failure() {
+        let text = report(&[
+            "- #1 fix keep-alive failures on edge LIVE PASS",
+            &verdict_line(VERDICT_ALL_VERIFIED),
+        ]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::AllVerified
+        );
+    }
+
+    #[test]
+    fn live_failover_is_not_a_live_failure() {
+        let text = report(&[
+            "- #1 live failover drill for fra LIVE PASS",
+            &verdict_line(VERDICT_ALL_VERIFIED),
+        ]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::AllVerified
+        );
+    }
+
+    #[test]
+    fn live_and_fail_on_separate_lines_are_not_a_live_failure() {
+        let text = report(&[
+            "- #1 foo LIVE",
+            "FAIL handling documented; LIVE PASS",
+            &verdict_line(VERDICT_ALL_VERIFIED),
+        ]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::AllVerified
+        );
     }
 
     #[test]
@@ -235,6 +337,19 @@ mod tests {
     }
 
     #[test]
+    fn last_unverified_footer_overrides_earlier_all_verified() {
+        let text = report(&[
+            &verdict_line(VERDICT_ALL_VERIFIED),
+            "- #1 foo LIVE PASS",
+            &verdict_line(VERDICT_UNVERIFIED),
+        ]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::Unverified
+        );
+    }
+
+    #[test]
     fn backticked_fail_footer_fails() {
         let text = report(&[
             "- #1 foo LIVE PASS",
@@ -261,6 +376,18 @@ mod tests {
         assert_eq!(
             classify_deploy_qa_verdict(&text),
             DeployQaVerdict::AllVerified
+        );
+    }
+
+    #[test]
+    fn bold_unverified_footer_is_unverified() {
+        let text = report(&[
+            "- #1 foo LIVE BLOCKED",
+            &format!("**{}**", verdict_line(VERDICT_UNVERIFIED)),
+        ]);
+        assert_eq!(
+            classify_deploy_qa_verdict(&text),
+            DeployQaVerdict::Unverified
         );
     }
 
