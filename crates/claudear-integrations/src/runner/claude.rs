@@ -771,6 +771,7 @@ The PR title should include the issue ID: {}
             // would let `--verbose` diagnostics fill the OS buffer and block the
             // child before it writes the `result` event to stdout.
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| Error::runner(format!("Failed to spawn {}: {}", self.config.binary, e)))?;
 
@@ -1278,6 +1279,7 @@ The PR title should include the issue ID: {}
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(child) => child,
@@ -2874,6 +2876,15 @@ mod tests {
     #[cfg(unix)]
     const FAKE_CLI_ARGS_FILE: &str = "args";
 
+    /// File, beside the hanging stub CLI, that it records its PID to.
+    #[cfg(unix)]
+    const FAKE_CLI_PID_FILE: &str = "pid";
+
+    /// How long a test waits for a stub CLI to start or to exit. Generous
+    /// because CI runs tests under `cargo tarpaulin`'s ptrace.
+    #[cfg(unix)]
+    const FAKE_CLI_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// A stub `claude` binary that records its arguments, drains the prompt
     /// from stdin, prints `events` as stream-json lines and exits with
     /// `exit_code`.
@@ -2883,6 +2894,15 @@ mod tests {
         format!(
             "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$(dirname \"$0\")/{FAKE_CLI_ARGS_FILE}\"\ncat > /dev/null\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
             lines.join("\n")
+        )
+    }
+
+    /// A stub `claude` binary that drains the prompt, records its PID and then
+    /// sleeps far longer than any test waits.
+    #[cfg(unix)]
+    fn hanging_cli_script() -> String {
+        format!(
+            "#!/bin/sh\ncat > /dev/null\ndirectory=\"$(dirname \"$0\")\"\necho $$ > \"$directory/{FAKE_CLI_PID_FILE}.partial\"\nmv \"$directory/{FAKE_CLI_PID_FILE}.partial\" \"$directory/{FAKE_CLI_PID_FILE}\"\nexec sleep 30\n"
         )
     }
 
@@ -3194,6 +3214,66 @@ mod tests {
             !args.iter().any(|arg| arg.starts_with("mcp__helpdesk")),
             "servers for other sources must stay detached, got: {args:?}"
         );
+    }
+
+    /// Whether `pid` is a live process. A zombie counts as gone: it has exited
+    /// and only waits to be reaped.
+    #[cfg(unix)]
+    fn process_is_running(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    /// Wait for the hanging stub CLI to record its PID.
+    #[cfg(unix)]
+    async fn recorded_pid(directory: &Path) -> u32 {
+        let path = directory.join(FAKE_CLI_PID_FILE);
+        let read_pid = async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|contents| contents.trim().parse().ok())
+                {
+                    return pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(FAKE_CLI_DEADLINE, read_pid)
+            .await
+            .expect("the stub CLI never recorded its PID")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dropping_a_run_kills_the_cli() {
+        let cli = FakeCli::install(&hanging_cli_script());
+        let runner = cli.runner(ClaudeRunnerConfig::default());
+        let issue = deploy_qa_issue(DEPLOY_QA_SOURCE);
+
+        let pid = block_on(async {
+            let run = runner.run_reply(&issue, "ctx", None, ReplyKind::Answer, cli.directory());
+            tokio::select! {
+                result = run => panic!("the stub CLI finished before the run was dropped: {result:?}"),
+                pid = recorded_pid(cli.directory()) => pid,
+            }
+        });
+
+        let deadline = std::time::Instant::now() + FAKE_CLI_DEADLINE;
+        while process_is_running(pid) {
+            if std::time::Instant::now() >= deadline {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+                panic!("the agent CLI (pid {pid}) outlived its dropped run");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[test]
