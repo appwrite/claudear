@@ -4908,9 +4908,9 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
     /// issue, bypassing classification. Backs the `claudear action ...` CLI.
     ///
-    /// Every action is refused for observe-only `deploy_qa` issues: `resolve`
-    /// would enter the fix pipeline, and `reply` / `verify` would post through
-    /// the source, which records any comment as the release's QA verdict.
+    /// Every action is refused for `deploy_qa` issues, which only run live QA:
+    /// `resolve` would enter the fix pipeline, and `reply` / `verify` would post
+    /// through the source, which records any comment as the release's QA verdict.
     pub async fn run_action(
         &self,
         action: ActionKind,
@@ -4931,11 +4931,11 @@ Create a PR with your changes.{custom_instructions}"#,
                 source = source_name,
                 issue_id = issue_id,
                 %action,
-                "Refusing manual action for observe-only deploy_qa issue"
+                "Refusing manual action for live-QA deploy_qa issue"
             );
             return Ok(ProcessingOutcome::Failed {
                 error: format!(
-                    "{DEPLOY_QA_SOURCE} issues are observe-only; {action} is not permitted"
+                    "{DEPLOY_QA_SOURCE} issues only run live QA; {action} is not permitted"
                 ),
             });
         }
@@ -9221,7 +9221,7 @@ mod tests {
                     error.contains(&action.to_string()),
                     "the refusal should name the {action} action: {error}"
                 ),
-                _ => panic!("{action} on an observe-only deploy_qa issue must be refused"),
+                _ => panic!("{action} on a deploy_qa issue must be refused"),
             }
             assert_eq!(
                 self.agent_calls(),
@@ -9290,7 +9290,7 @@ mod tests {
         assert_eq!(
             harness.agent_calls(),
             1,
-            "a triggered deploy_qa attempt must take the read-only QA path, not the fix pipeline"
+            "a triggered deploy_qa attempt must take the live QA path, not the fix pipeline"
         );
     }
 
@@ -9315,7 +9315,7 @@ mod tests {
         assert_eq!(
             harness.agent_calls(),
             1,
-            "observe-only deploy_qa attempts must not wait on human approval"
+            "live-QA deploy_qa attempts must not wait on human approval"
         );
         assert_ne!(
             harness.stored_status(),

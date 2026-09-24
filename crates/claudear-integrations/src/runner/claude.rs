@@ -2773,7 +2773,7 @@ mod tests {
         }
     }
 
-    const DEPLOY_QA_BODY: &str = "Follow the playbook.\n\n# Release tip\n\n- Tag: 1.2.3\n\n## Agent constraints\n\n- Observe and report only.";
+    const DEPLOY_QA_BODY: &str = "Follow the playbook.\n\n# Release tip\n\n- Tag: 1.2.3\n\n## Agent constraints\n\n- Live QA: run the playbook's checks and report what you observed.";
 
     fn deploy_qa_issue(source: &str) -> Issue {
         let mut issue = Issue::new(

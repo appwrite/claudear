@@ -185,7 +185,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 ### Deploy QA
 - Durable last-seen watches for GitHub release tips (separate from regression inclusion tracking)
 - Tag filters (`any`, `suffix:-db`, `not_suffix:-db`) per track
-- Observe/report agent enqueue — never opens fix PRs for a release announcement
+- Live QA agent enqueue — runs real checks against the release, never opens fix PRs for a release announcement
 - Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + mapped `@releaser`
 
 ### Notifications

@@ -329,7 +329,7 @@ fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notif
     Arc::new(composite)
 }
 
-/// Build the synthetic observe/report `deploy_qa` issue source.
+/// Build the synthetic live-QA `deploy_qa` issue source.
 ///
 /// Returns `None` when `[deploy_qa]` is disabled or the source cannot be built
 /// (e.g. an unreadable playbook). An unreadable GitHub↔Discord map or a Discord
@@ -372,7 +372,7 @@ pub fn build_deploy_qa_source(
 
     match source::DeployQaSource::new(config.deploy_qa.clone(), tracker, discord) {
         Ok(source) => {
-            tracing::info!("Deploy QA source initialized (observe/report only)");
+            tracing::info!("Deploy QA source initialized (live QA, no fix PRs)");
             Some(Arc::new(source))
         }
         Err(e) => {

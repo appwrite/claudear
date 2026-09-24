@@ -482,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_is_observe_only_and_not_a_fix() {
+    fn issue_is_report_only_and_not_a_fix() {
         let repo = "appwrite-labs/edge";
         let database = track("edge-db", repo, DeployQaTagFilter::Any);
         let network = track("edge-network", repo, DeployQaTagFilter::Any);

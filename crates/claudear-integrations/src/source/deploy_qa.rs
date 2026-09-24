@@ -1,8 +1,8 @@
 //! Synthetic `deploy_qa` issue source.
 //!
 //! Surfaces pending tips persisted by [`claudear_analysis::deploy_qa::DeployQaTracker`].
-//! Observe/report only — `add_comment` records the report's verdict, posts it to
-//! Discord `#releases`, and never opens a fix PR.
+//! Live QA that only reports — `add_comment` records the report's verdict, posts
+//! it to Discord `#releases`, and never opens a fix PR.
 
 use super::IssueSource;
 use crate::deploy_qa::{report_deploy_qa_outcome, DeployQaDiscord};

@@ -2,8 +2,8 @@
 //!
 //! Distinct from [`crate::release::ReleaseTracker`] / `[regression]`, which
 //! watch **bug-fix inclusion**. This module durable-watches **new tips** on
-//! configured tracks, persists last-seen + attempt status, and enqueues an
-//! observe/report agent run (no fix PRs).
+//! configured tracks, persists last-seen + attempt status, and enqueues a
+//! live-QA agent run that reports what it finds (no fix PRs).
 
 mod map;
 mod playbook;
