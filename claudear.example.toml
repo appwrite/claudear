@@ -820,8 +820,9 @@ poll_interval_ms = 300000
 skip_if_previous_running = true
 discord_channel_id = "990878183580651571"
 github_discord_map_path = "github-discord-map.json"
-# Optional; bundled playbooks/deploy_qa.md is used when unset.
-instructions_path = "playbooks/deploy_qa.md"
+# Optional; defaults to the bundled playbooks/deploy_qa.md. When set, use an
+# absolute path: a relative one breaks under systemd and disables deploy_qa.
+# instructions_path = "/etc/claudear/deploy_qa.md"
 
 # Track names must be unique and must not contain ':'; repo is owner/name.
 [[deploy_qa.tracks]]
