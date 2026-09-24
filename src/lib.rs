@@ -677,13 +677,46 @@ mod tests {
         assert_eq!(sources.len(), 2);
     }
 
+    /// Environment variable naming the directory agent runs log to.
+    const LOG_DIRECTORY_VARIABLE: &str = "CLAUDEAR_LOG_DIR";
+
+    /// Held by every test that sets a process-wide environment variable.
+    static ENVIRONMENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Sets an environment variable until dropped, then restores its previous
+    /// value.
+    struct EnvironmentVariableGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvironmentVariableGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvironmentVariableGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn build_provider_runner_stops_live_qa_at_the_deploy_qa_timeout() {
         use std::os::unix::fs::PermissionsExt;
 
         const AGENT_CLI_SLEEP_SECS: u64 = 30;
+        let _environment = ENVIRONMENT_LOCK.lock().await;
         let directory = tempfile::tempdir().unwrap();
+        let logs = directory.path().join("logs");
+        let _log_directory = EnvironmentVariableGuard::set(LOG_DIRECTORY_VARIABLE, &logs);
         let binary = directory.path().join("claude");
         std::fs::write(
             &binary,
@@ -715,6 +748,10 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(AGENT_CLI_SLEEP_SECS / 2),
             "the run waited for the agent CLI instead of `[deploy_qa] timeout_secs`: {elapsed:?}"
+        );
+        assert!(
+            logs.is_dir(),
+            "the run must log to the test's own directory, never the repository's"
         );
     }
 
