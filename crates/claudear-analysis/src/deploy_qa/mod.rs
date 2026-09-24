@@ -18,6 +18,5 @@ pub use probe::{
 };
 pub use tracker::{
     build_deploy_qa_issue, deploy_qa_match_result, DeployQaPollAction, DeployQaPollResult,
-    DeployQaTracker, ReleaseTip, OBSERVE_ONLY_METADATA_KEY, REPO_METADATA_KEY, TAG_METADATA_KEY,
-    TRACK_METADATA_KEY,
+    DeployQaTracker, ReleaseTip, REPO_METADATA_KEY, TAG_METADATA_KEY, TRACK_METADATA_KEY,
 };

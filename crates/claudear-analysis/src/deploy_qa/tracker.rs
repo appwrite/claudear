@@ -21,9 +21,6 @@ pub const TRACK_METADATA_KEY: &str = "deploy_qa_track";
 pub const REPO_METADATA_KEY: &str = "deploy_qa_repo";
 /// Issue metadata key holding the release tag.
 pub const TAG_METADATA_KEY: &str = "deploy_qa_tag";
-/// Issue metadata flag marking the issue as report-only: no fix PR, branch or
-/// commit.
-pub const OBSERVE_ONLY_METADATA_KEY: &str = "observe_only";
 
 /// A normalized tip the poller can persist and enqueue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,7 +310,6 @@ pub fn build_deploy_qa_issue(
     issue.priority = IssuePriority::High;
     issue.status = IssueStatus::Open;
     issue.set_metadata("routing_intent", "QA");
-    issue.set_metadata(OBSERVE_ONLY_METADATA_KEY, true);
     issue.set_metadata(TRACK_METADATA_KEY, track.name.clone());
     issue.set_metadata(REPO_METADATA_KEY, tip.repo.clone());
     issue.set_metadata(TAG_METADATA_KEY, tip.tag.clone());
@@ -489,16 +485,16 @@ mod tests {
         let tip = release_tip(repo, "1.2.3", "Adds #99");
 
         let issue = build_deploy_qa_issue(&database, &tip, bundled_playbook());
-        assert_eq!(issue.source, DEPLOY_QA_SOURCE);
         assert_eq!(
-            issue.get_metadata::<bool>(OBSERVE_ONLY_METADATA_KEY),
-            Some(true)
+            issue.source, DEPLOY_QA_SOURCE,
+            "the engine runs an issue as live QA, never a fix, by its source"
         );
-        assert!(issue
-            .description
-            .as_deref()
-            .unwrap()
-            .contains(tip.body.as_deref().unwrap()));
+        let description = issue.description.as_deref().unwrap();
+        assert!(description.contains(tip.body.as_deref().unwrap()));
+        assert!(
+            description.contains("Do **not** open a fix PR, branch, or commit"),
+            "the agent must be told the tip is report-only: {description}"
+        );
 
         let again = build_deploy_qa_issue(&database, &tip, bundled_playbook());
         assert_eq!(issue.id, again.id);
