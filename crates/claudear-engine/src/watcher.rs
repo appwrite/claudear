@@ -3050,8 +3050,11 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Poll a single source.
+    ///
+    /// The `deploy_qa` source is skipped: its tips are dispatched only by
+    /// [`Self::dispatch_pending_deploy_qa_tips`], so a tip never runs twice.
     async fn poll_source(self: &Arc<Self>, source: &Arc<dyn IssueSource>) -> Result<()> {
-        if self.is_rate_limit_paused().await {
+        if source.name() == DEPLOY_QA_SOURCE || self.is_rate_limit_paused().await {
             return Ok(());
         }
 
@@ -3243,15 +3246,7 @@ Create a PR with your changes.{custom_instructions}"#,
             && crate::processing::qa_eligible_source(source.name())
             && self.intent_classifier.is_some();
 
-        let is_deploy_qa = source.name() == DEPLOY_QA_SOURCE;
-        let to_process: Vec<(Issue, MatchResult, Option<Intent>)> = if is_deploy_qa {
-            // Release announcements are observe/report only — never open a fix PR.
-            ordered
-                .into_iter()
-                .take(source_max_issues)
-                .map(|(issue, match_result)| (issue, match_result, Some(Intent::Question)))
-                .collect()
-        } else if qa_split_enabled {
+        let to_process: Vec<(Issue, MatchResult, Option<Intent>)> = if qa_split_enabled {
             // Classify each ordered issue via the configured backend. The local LLM
             // backend offloads its synchronous inference to a blocking thread; the
             // agent backend awaits an agent run. Fix-bias on ambiguity / errors,
@@ -9018,8 +9013,8 @@ mod tests {
             self.agent_calls.load(AtomicOrdering::SeqCst)
         }
 
-        /// Drive the seeded tip through the watcher the way a poll would:
-        /// fetch it from the source, then process it.
+        /// Drive the seeded tip through the watcher: list it from the source,
+        /// then process it without a routing intent.
         async fn process_pending_tip(&self) {
             let mut pending = self.source.fetch_issues().await.unwrap();
             assert_eq!(pending.len(), 1, "the seeded tip should be pending");
@@ -9242,6 +9237,26 @@ mod tests {
                 .unwrap(),
             "a verified tip must not block its track"
         );
+    }
+
+    #[tokio::test]
+    async fn test_poll_leaves_deploy_qa_tips_to_dispatch() {
+        let harness = DeployQaHarness::dispatching(test_config());
+
+        harness.watcher.poll().await.unwrap();
+        harness.watcher.drain_spawned_tasks().await;
+
+        assert_eq!(
+            harness.agent_calls(),
+            0,
+            "a poll cycle must leave deploy_qa tips to the dispatcher so a tip never runs twice"
+        );
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Pending);
+
+        finish_deploy_qa_runs(harness.dispatch_pending_tips().await).await;
+
+        assert_eq!(harness.agent_calls(), 1, "dispatch should run the tip once");
+        assert_eq!(harness.stored_status(), DeployQaTipStatus::Verified);
     }
 
     #[tokio::test]
