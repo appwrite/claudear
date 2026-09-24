@@ -119,6 +119,9 @@ instructions_file = "./claude-instructions.md"
 
 # Tool permissions granted without prompting (--allowedTools)
 # See: https://docs.anthropic.com/en/docs/claude-code/settings
+# permissions and skip_permissions govern fix runs and [deploy_qa] live QA,
+# which gets them on top of readonly_tools: its shell/curl checks need
+# skip_permissions = true or a Bash(...) entry here.
 permissions = ["Bash(git *)", "Read", "Edit"]
 
 readonly_tools = ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]
@@ -174,6 +177,14 @@ sandbox = ""
 # When Grafana sits behind Cloudflare Access, pass the service-token headers as a
 # JSON string (inline literals or ${VAR} both work).
 # GRAFANA_EXTRA_HEADERS         = "{\"CF-Access-Client-Id\": \"your-cf-access-client-id\", \"CF-Access-Client-Secret\": \"your-cf-access-client-secret\"}"
+
+# Headless browser (@playwright/mcp) for [deploy_qa] live QA of console UI
+# changes. Attached to deploy_qa runs only, so fix runs never drive a browser.
+# --isolated keeps each run's profile in memory, so concurrent runs don't clash.
+# [agent.providers.claude.mcp.playwright]
+# command = "npx"
+# args    = ["-y", "@playwright/mcp@latest", "--headless", "--isolated"]
+# sources = ["deploy_qa"]
 
 # A/B Experiments (optional)
 # Test different providers or configurations against each other.
@@ -803,7 +814,8 @@ github_search_repos = []
 # ============================================
 # Deploy QA (live release-tip watches)
 # ============================================
-# Durable-watches new GitHub release tips and runs observe/report live QA.
+# Durable-watches new GitHub release tips and runs live QA against them: the
+# agent runs real checks and reports, but never opens fix PRs.
 # Separate from [regression] / ReleaseTracker (those track bug-fix inclusion).
 # Do not point issues.discord at #releases — that would spawn fix agents on
 # bot posts. Required env for a live host (not used in CI):
@@ -811,6 +823,9 @@ github_search_repos = []
 #                                    required (or scm.github.token) whenever
 #                                    deploy_qa is enabled with tracks
 #   CLAUDEAR_DISCORD_BOT_TOKEN     - bot that can reply / create threads
+#   QA credentials the playbook's checks need (e.g. a throwaway QA project's
+#   API key) - set in the daemon or provider env, which the agent inherits;
+#   an MCP server env (e.g. the browser) references them as ${VAR}
 # Live host probes are performed by the agent; CI uses a no-op probe seam.
 
 [deploy_qa]
@@ -818,6 +833,8 @@ github_search_repos = []
 enabled = false
 poll_interval_ms = 300000
 skip_if_previous_running = true
+# Seconds one live-QA run may take before it is killed and its tip marked errored.
+timeout_secs = 1800
 discord_channel_id = "990878183580651571"
 # GitHub login -> Discord user map for the FAIL @releaser mention. Use an
 # absolute path: a relative one breaks under systemd and drops the mention.

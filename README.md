@@ -733,6 +733,7 @@ Works in every daemon mode — `claudear start` (no `--poll` needed), `claudear 
 enabled = true
 poll_interval_ms = 300000
 skip_if_previous_running = true
+timeout_secs = 1800                # one live-QA run; killed and marked errored past this
 discord_channel_id = "990878183580651571"
 github_discord_map_path = "/etc/claudear/github-discord-map.json"  # absolute: relative paths break under systemd
 
@@ -745,14 +746,16 @@ tag_filter = "any"                 # any | suffix:-db | not_suffix:-db
 On a new tip Claudear:
 
 1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates. On first enable a track has no last-seen tag, so its current tip counts as new and gets one QA run.
-2. Skips enqueue if a previous attempt on that track is still pending or running. A tip whose attempt ends without a verdict (agent error or timeout) is marked `errored` so it no longer blocks the track. Tips left `running` longer than twice the QA answer timeout (`[qa] answer_timeout_secs`) are marked `errored` on the next poll tick, so a crashed or interrupted run stops blocking its track without affecting runs live in other processes that share the database (a `claudear trigger`, `claudear retries process` or second `claudear poll`). The retry manager may still retry a failed attempt, but only an `errored` tip is re-run: a tip that is running or has a recorded verdict is never re-run, by a retry or by `claudear trigger`.
-3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs. `claudear action` (`reply`, `verify` or `resolve`) refuses these issues.
+2. Skips enqueue if a previous attempt on that track is still pending or running. A tip whose attempt ends without a verdict (agent error or timeout) is marked `errored` so it no longer blocks the track. Tips left `running` longer than twice `[deploy_qa] timeout_secs` are marked `errored` on the next poll tick, so a crashed or interrupted run stops blocking its track without affecting runs live in other processes that share the database (a `claudear trigger`, `claudear retries process` or second `claudear poll`). The retry manager may still retry a failed attempt, but only an `errored` tip is re-run: a tip that is running or has a recorded verdict is never re-run, by a retry or by `claudear trigger`.
+3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **live QA that only reports**: the agent runs real checks against the release, but never opens fix PRs, branches or commits. `claudear action` (`reply`, `verify` or `resolve`) refuses these issues.
 4. Classifies the agent's report, records the tip as `verified`, `unverified` or `failed`, and posts the outcome under the release announcement in Discord `#releases` (the agent never posts itself):
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
    - **Unverified** — nothing failed, but a PR is `LIVE BLOCKED`, the footer is `DEPLOY_QA_VERDICT: UNVERIFIED`, or the footer is missing: reply, no @, so blocked checks never page the releaser but are never reported as verified either.
    - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser via `github-discord-map.json` (reusing the announcement's existing thread when it already has one).
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
+
+**Tool access.** A live-QA run gets the provider's fix-run access (`skip_permissions`, `permissions`) in addition to its read-only tools (`readonly_tools`), so it can run real checks. Shell and `curl` checks need `skip_permissions = true` or a `Bash(...)` entry in `permissions`; Claudear warns when neither is set. A browser comes from an MCP server entry with `sources = ["deploy_qa"]`, such as the commented Playwright example in [`claudear.example.toml`](claudear.example.toml). QA credentials reach shell checks through the provider `env` (or the daemon environment the agent inherits) and a browser through the MCP server's `env`, where `${VAR}` references the daemon environment so secrets stay out of the config file. Every run works in a dedicated scratch directory, never a repo checkout, and a run that exceeds `timeout_secs` is killed and its tip marked `errored`.
 
 Requires a GitHub token (`scm.github.token` or `CLAUDEAR_GITHUB_TOKEN`) for release polling: config validation rejects an enabled `[deploy_qa]` with tracks but no token. A live host also needs a Discord bot token with message + create-thread permissions.
 
