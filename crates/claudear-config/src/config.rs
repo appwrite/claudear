@@ -8169,15 +8169,19 @@ sms_number = "+1111111111"
 
     #[test]
     fn test_validation_deploy_qa_counts_as_source() {
-        let mut config = Config::default();
-        config.deploy_qa = deploy_qa_with_tracks(true, &[("cloud", "appwrite-labs/cloud")]);
+        let config = Config {
+            deploy_qa: deploy_qa_with_tracks(true, &[("cloud", "appwrite-labs/cloud")]),
+            ..Config::default()
+        };
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_validation_deploy_qa_without_tracks_is_not_a_source() {
-        let mut config = Config::default();
-        config.deploy_qa = deploy_qa_with_tracks(true, &[]);
+        let config = Config {
+            deploy_qa: deploy_qa_with_tracks(true, &[]),
+            ..Config::default()
+        };
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("No sources configured"), "{error}");
     }
