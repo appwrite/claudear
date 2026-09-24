@@ -93,8 +93,6 @@ pub struct DeployQaPollResult {
     pub action: DeployQaPollAction,
     /// Tip under consideration, when one existed.
     pub tip: Option<ReleaseTip>,
-    /// Synthetic issue built for enqueue (only on [`DeployQaPollAction::Enqueued`]).
-    pub issue: Option<Issue>,
 }
 
 /// Background poller for `[deploy_qa]` tracks.
@@ -102,22 +100,23 @@ pub struct DeployQaTracker<C: HttpClient = ReqwestHttpClient> {
     client: ReleaseClient<C>,
     store: Arc<dyn FixAttemptTracker>,
     config: DeployQaConfig,
-    playbook: String,
 }
 
 impl DeployQaTracker<ReqwestHttpClient> {
     /// Create a poller with the default HTTP client.
+    ///
+    /// Fails when the configured playbook cannot be loaded, since the
+    /// `deploy_qa` source could never run the tips this poller would persist.
     pub fn new(
         token: impl Into<String>,
         store: Arc<dyn FixAttemptTracker>,
         config: DeployQaConfig,
     ) -> Result<Self> {
-        let playbook = load_configured_playbook(&config)?;
+        load_configured_playbook(&config)?;
         Ok(Self {
             client: ReleaseClient::new(token),
             store,
             config,
-            playbook,
         })
     }
 }
@@ -128,13 +127,11 @@ impl<C: HttpClient> DeployQaTracker<C> {
         client: ReleaseClient<C>,
         store: Arc<dyn FixAttemptTracker>,
         config: DeployQaConfig,
-        playbook: impl Into<String>,
     ) -> Self {
         Self {
             client,
             store,
             config,
-            playbook: playbook.into(),
         }
     }
 
@@ -150,7 +147,6 @@ impl<C: HttpClient> DeployQaTracker<C> {
                     track: track.name.clone(),
                     action: DeployQaPollAction::Errored(error.to_string()),
                     tip: None,
-                    issue: None,
                 },
             };
             results.push(result);
@@ -168,7 +164,6 @@ impl<C: HttpClient> DeployQaTracker<C> {
                 track: track.name.clone(),
                 action: DeployQaPollAction::NoMatchingTip,
                 tip: None,
-                issue: None,
             });
         };
 
@@ -181,7 +176,6 @@ impl<C: HttpClient> DeployQaTracker<C> {
                 track: track.name.clone(),
                 action: DeployQaPollAction::SkippedDuplicate,
                 tip: Some(tip),
-                issue: None,
             });
         }
 
@@ -192,7 +186,6 @@ impl<C: HttpClient> DeployQaTracker<C> {
                 track: track.name.clone(),
                 action: DeployQaPollAction::SkippedPreviousRunning,
                 tip: Some(tip),
-                issue: None,
             });
         }
 
@@ -209,16 +202,13 @@ impl<C: HttpClient> DeployQaTracker<C> {
                 track: track.name.clone(),
                 action: DeployQaPollAction::SkippedDuplicate,
                 tip: Some(tip),
-                issue: None,
             });
         }
 
-        let issue = build_deploy_qa_issue(track, &tip, &self.playbook);
         Ok(DeployQaPollResult {
             track: track.name.clone(),
             action: DeployQaPollAction::Enqueued,
             tip: Some(tip),
-            issue: Some(issue),
         })
     }
 
@@ -440,7 +430,29 @@ mod tests {
         config: DeployQaConfig,
     ) -> DeployQaTracker<MapMockHttp> {
         let client = ReleaseClient::with_http_client("test-token", http);
-        DeployQaTracker::with_http_client(client, store, config, bundled_playbook())
+        DeployQaTracker::with_http_client(client, store, config)
+    }
+
+    #[test]
+    fn unreadable_playbook_stops_the_poller() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let config = DeployQaConfig {
+            instructions_path: Some(directory.path().join("missing.md").display().to_string()),
+            ..config(
+                vec![track(
+                    "cloud",
+                    "appwrite-labs/cloud",
+                    DeployQaTagFilter::Any,
+                )],
+                true,
+            )
+        };
+
+        assert!(
+            DeployQaTracker::new("test-token", store, config).is_err(),
+            "a poller must not persist tips that the deploy_qa source cannot run"
+        );
     }
 
     #[test]
@@ -553,7 +565,6 @@ mod tests {
         let first = tracker.poll_once().await;
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].action, DeployQaPollAction::Enqueued);
-        assert!(first[0].issue.is_some());
 
         let last = store
             .get_last_seen_deploy_qa_tip("edge-db")
@@ -564,7 +575,11 @@ mod tests {
 
         let second = tracker.poll_once().await;
         assert_eq!(second[0].action, DeployQaPollAction::SkippedDuplicate);
-        assert!(second[0].issue.is_none());
+        assert_eq!(
+            store.list_pending_deploy_qa_tips().unwrap().len(),
+            1,
+            "a duplicate tip must not be queued again"
+        );
     }
 
     #[tokio::test]
@@ -677,11 +692,12 @@ mod tests {
                 "{}",
                 track.name
             );
-            let issue = result.issue.unwrap();
+            let tip = result.tip.expect("an enqueued track should carry its tip");
+            let issue = build_deploy_qa_issue(track, &tip, bundled_playbook());
             let stored = store
                 .get_deploy_qa_tip_by_issue_id(&issue.id)
                 .unwrap()
-                .unwrap();
+                .expect("the enqueued tip should be stored under its issue id");
             assert_eq!(stored.track, track.name);
             ids.push(issue.id);
         }
@@ -691,14 +707,12 @@ mod tests {
     #[tokio::test]
     async fn release_author_flows_to_tip_and_issue() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let config = config(
-            vec![track(
-                "edge-db",
-                "appwrite-labs/edge",
-                DeployQaTagFilter::Suffix("-db".into()),
-            )],
-            true,
+        let edge_database = track(
+            "edge-db",
+            "appwrite-labs/edge",
+            DeployQaTagFilter::Suffix("-db".into()),
         );
+        let config = config(vec![edge_database.clone()], true);
         let body = format!("[{}]", release_json("1.2.3-db", ""));
         let http = MapMockHttp::new().on(
             "https://api.github.com/repos/appwrite-labs/edge/releases",
@@ -714,7 +728,11 @@ mod tests {
             .unwrap()
             .expect("tip should be persisted");
         assert_eq!(stored.author_login.as_deref(), Some("abnegate"));
-        let issue = results[0].issue.as_ref().expect("issue should be built");
+        let tip = results[0]
+            .tip
+            .as_ref()
+            .expect("the polled tip should be kept");
+        let issue = build_deploy_qa_issue(&edge_database, tip, bundled_playbook());
         let description = issue.description.as_deref().unwrap_or_default();
         assert!(
             description.contains("Author: abnegate"),
