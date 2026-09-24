@@ -42,14 +42,110 @@ const RETRIEVAL_JUDGE_CONCURRENCY: usize = 4;
 /// resolved repo.
 const QA_SCRATCH_DIRECTORY: &str = "claudear-qa";
 
-/// Scratch directory, under the system temp dir, that every `[deploy_qa]`
-/// live-QA run works in. Live QA runs with full tool access, so it must never
-/// run inside a repo checkout that fix runs also use.
-const DEPLOY_QA_SCRATCH_DIRECTORY: &str = "claudear-deploy-qa";
+/// Directory, under the configured `workspace`, holding one private directory
+/// per `[deploy_qa]` live-QA run. Live QA runs with full tool access, so a run
+/// never works in a repo checkout or a shared, world-writable temp directory.
+/// Hidden, so repository discovery, which skips hidden directories, never
+/// indexes anything a run clones into it.
+const LIVE_QA_DIRECTORY: &str = ".claudear-deploy-qa";
 
-/// `name` under the system temp dir, created if missing.
-fn scratch_directory(name: &str) -> std::path::PathBuf {
-    let directory = std::env::temp_dir().join(name);
+/// Most characters of an issue's short id that a live-QA run directory's name
+/// keeps, so a long release tag cannot push the name past the file-name limit.
+const LIVE_QA_DIRECTORY_PREFIX_LENGTH: usize = 64;
+
+/// Unix mode of every live-QA directory: owner-only, so no other local user can
+/// read what a run leaves in it or plant files the agent would load.
+#[cfg(unix)]
+const LIVE_QA_DIRECTORY_MODE: u32 = 0o700;
+
+/// What [`IssueProcessor::answer_question_issue`] runs for an issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnswerRun {
+    /// A read-only answer to a question, in the resolved checkout or the QA
+    /// scratch directory, bounded by `[qa] answer_timeout_secs`.
+    Question,
+    /// A `[deploy_qa]` live-QA run of a release tip, with full tool access, in
+    /// a fresh private directory and bounded by the `[deploy_qa]` backstop.
+    LiveQa,
+}
+
+impl AnswerRun {
+    /// The run for `issue`, decided by the issue's own source as the agent
+    /// runner decides live-QA tool access, so a release tip gets the same
+    /// containment whichever source name its caller passes.
+    fn for_issue(issue: &Issue) -> Self {
+        if issue.source == DEPLOY_QA_SOURCE {
+            Self::LiveQa
+        } else {
+            Self::Question
+        }
+    }
+
+    /// Decision key recorded when the run starts.
+    fn started_decision(self) -> &'static str {
+        match self {
+            Self::Question => "question_detected",
+            Self::LiveQa => "live_qa_started",
+        }
+    }
+
+    /// Message recorded with [`Self::started_decision`].
+    fn started_message(self, short_id: &str) -> String {
+        match self {
+            Self::Question => format!("Answering {short_id} as a question (read-only)"),
+            Self::LiveQa => format!("Running live QA for {short_id}"),
+        }
+    }
+
+    /// Decision key recorded once the run's answer or report is delivered.
+    fn delivered_decision(self) -> &'static str {
+        match self {
+            Self::Question => "question_answered",
+            Self::LiveQa => "live_qa_reported",
+        }
+    }
+
+    /// Message recorded with [`Self::delivered_decision`].
+    fn delivered_message(self, short_id: &str) -> String {
+        match self {
+            Self::Question => format!("Answered question {short_id}"),
+            Self::LiveQa => format!("Reported live QA for {short_id}"),
+        }
+    }
+
+    /// How long processing waits on the agent under `config`.
+    fn timeout(self, config: &Config) -> Duration {
+        match self {
+            Self::Question => Duration::from_secs(config.qa.answer_timeout_secs.max(1)),
+            Self::LiveQa => config.deploy_qa.backstop_timeout(),
+        }
+    }
+
+    /// The error recorded when the agent outlasts [`Self::timeout`].
+    fn timeout_error(self, config: &Config) -> String {
+        let waited_secs = self.timeout(config).as_secs();
+        match self {
+            Self::Question => format!("Answer generation timed out after {waited_secs}s"),
+            Self::LiveQa => format!(
+                "Live QA exceeded its {}s limit ([deploy_qa] timeout_secs) and timed out after {waited_secs}s",
+                config.deploy_qa.effective_timeout_secs()
+            ),
+        }
+    }
+}
+
+/// The outcome of refusing a manual `action` on a live-QA issue: `resolve`
+/// would enter the fix pipeline, and `reply` / `verify` would post through the
+/// source, which records any comment as the release's QA verdict.
+pub(crate) fn refuse_live_qa_action(action: ActionKind) -> ProcessingOutcome {
+    ProcessingOutcome::Failed {
+        error: format!("{DEPLOY_QA_SOURCE} issues only run live QA; {action} is not permitted"),
+    }
+}
+
+/// [`QA_SCRATCH_DIRECTORY`] under the system temp dir, created if missing.
+pub(crate) fn qa_scratch_directory() -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(QA_SCRATCH_DIRECTORY);
     if let Err(error) = std::fs::create_dir_all(&directory) {
         tracing::warn!(
             directory = %directory.display(),
@@ -58,6 +154,54 @@ fn scratch_directory(name: &str) -> std::path::PathBuf {
         );
     }
     directory
+}
+
+/// Create `directory`, owner-only on Unix, unless it already exists as a
+/// directory. Its parent must exist.
+fn create_private_directory(directory: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(LIVE_QA_DIRECTORY_MODE);
+    }
+    match builder.create(directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+/// `short_id` as the name prefix of a live-QA run directory. Anything but ASCII
+/// letters, digits, `-`, `_` and `.` becomes `_`, so the name can never reach
+/// outside [`LIVE_QA_DIRECTORY`].
+fn live_qa_directory_prefix(short_id: &str) -> String {
+    let mut prefix: String = short_id
+        .chars()
+        .take(LIVE_QA_DIRECTORY_PREFIX_LENGTH)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    prefix.push('-');
+    prefix
+}
+
+/// Remove a finished live-QA run's directory, warning when some of it remains.
+fn remove_live_qa_directory(directory: tempfile::TempDir) {
+    let path = directory.path().to_path_buf();
+    if let Err(error) = directory.close() {
+        tracing::warn!(
+            directory = %path.display(),
+            error = %error,
+            "Failed to remove live-QA run directory"
+        );
+    }
 }
 
 /// Strip Discord mention tokens (`<@ID>`, `<@!ID>`, `<@&ID>`) from text and trim.
@@ -330,7 +474,7 @@ impl IssueProcessor {
     ) -> ProcessingOutcome {
         // Release QA only reports: it must never enter the action, fix, or
         // customer-reply pipelines, whatever `[reply]` says.
-        if input.source_name == DEPLOY_QA_SOURCE {
+        if AnswerRun::for_issue(&input.issue) == AnswerRun::LiveQa {
             tracing::info!(
                 short_id = %input.issue.short_id,
                 source = %input.source_name,
@@ -2229,9 +2373,12 @@ impl IssueProcessor {
     /// Delivery follows [`Self::deliver_answer`]: conversational sources get the
     /// answer via the notifier, tracker-style sources as a comment on the ticket.
     ///
-    /// `[deploy_qa]` release tips take this path as live QA: they run in
-    /// [`DEPLOY_QA_SCRATCH_DIRECTORY`] whatever repo resolved, bounded by
-    /// `[deploy_qa] timeout_secs` instead of `[qa] answer_timeout_secs`.
+    /// `[deploy_qa]` release tips take this path as [live QA](AnswerRun::LiveQa):
+    /// whatever repo resolved, each run works in a fresh
+    /// [private directory](Self::create_live_qa_directory) kept until its report
+    /// is delivered, and processing waits on it only until the
+    /// [backstop](claudear_config::config::DeployQaConfig::backstop_timeout)
+    /// instead of `[qa] answer_timeout_secs`.
     async fn answer_question_issue(
         &self,
         issue: &Issue,
@@ -2247,11 +2394,28 @@ impl IssueProcessor {
             json!({}),
         );
 
-        let live_qa = source_name == DEPLOY_QA_SOURCE;
-        let project_dir = if live_qa {
-            scratch_directory(DEPLOY_QA_SCRATCH_DIRECTORY)
-        } else {
-            self.action_project_dir(resolution)
+        let run = AnswerRun::for_issue(issue);
+        let live_qa_directory = match run {
+            AnswerRun::LiveQa => match self.create_live_qa_directory(issue) {
+                Ok(directory) => Some(directory),
+                Err(error) => {
+                    let error = format!(
+                        "Could not create a private live-QA directory in {}: {error}",
+                        self.live_qa_base_directory().display()
+                    );
+                    return self.fail_answer(
+                        issue,
+                        source_name,
+                        error,
+                        format!("QA failed for {}", issue.short_id),
+                    );
+                }
+            },
+            AnswerRun::Question => None,
+        };
+        let project_dir = match live_qa_directory {
+            Some(ref directory) => directory.path().to_path_buf(),
+            None => self.action_project_dir(resolution),
         };
 
         // Retrieve grounding context from the code index across ALL repos, plus
@@ -2323,35 +2487,23 @@ impl IssueProcessor {
         // when a repo resolved).
         let context = self.prepend_operator_instructions(context, resolution.repo_name());
 
-        let (decision, activity, timeout_secs) = if live_qa {
-            (
-                format!("Running live QA for {}", issue.short_id),
-                "Live QA",
-                self.config.deploy_qa.effective_timeout_secs(),
-            )
-        } else {
-            (
-                format!("Answering {} as a question (read-only)", issue.short_id),
-                "Answer generation",
-                self.config.qa.answer_timeout_secs.max(1),
-            )
-        };
         self.record_issue_decision(
             issue,
-            "question_detected",
-            decision,
+            run.started_decision(),
+            run.started_message(&issue.short_id),
             json!({ "context_chars": context.len() }),
         );
 
         // Answer with the QA-specific runner when configured, else the main agent.
         let qa_agent = self.qa_agent.as_ref().unwrap_or(&self.agent);
+        let timeout = run.timeout(&self.config);
         let answer_result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
+            timeout,
             qa_agent.answer_question(issue, &context, &project_dir),
         )
         .await;
 
-        match answer_result {
+        let outcome = match answer_result {
             Ok(Ok(answer)) => {
                 // Append jump links to the referenced discussions for delivery only;
                 // the stored answer (for reply-chain grounding) stays clean.
@@ -2385,8 +2537,8 @@ impl IssueProcessor {
                 }
                 self.record_issue_decision(
                     issue,
-                    "question_answered",
-                    format!("Answered question {}", issue.short_id),
+                    run.delivered_decision(),
+                    run.delivered_message(&issue.short_id),
                     json!({ "answer_chars": answer.len() }),
                 );
                 self.record_timeline_event(
@@ -2399,42 +2551,89 @@ impl IssueProcessor {
                     reason: "answered question".to_string(),
                 }
             }
-            Ok(Err(e)) => {
-                let error = e.to_string();
-                let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
-                self.record_timeline_event(
-                    issue,
-                    TimelineEventStatus::QaFailed,
-                    format!("QA failed for {}", issue.short_id),
-                    json!({ "error": error.chars().take(300).collect::<String>() }),
-                );
-                ProcessingOutcome::Failed { error }
-            }
-            Err(_) => {
-                let error = format!("{activity} timed out after {timeout_secs}s");
-                let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
-                self.record_timeline_event(
-                    issue,
-                    TimelineEventStatus::QaFailed,
-                    format!(
-                        "QA timed out for {} after {}s",
-                        issue.short_id, timeout_secs
-                    ),
-                    json!({ "error": error }),
-                );
-                ProcessingOutcome::Failed { error }
-            }
+            Ok(Err(e)) => self.fail_answer(
+                issue,
+                source_name,
+                e.to_string(),
+                format!("QA failed for {}", issue.short_id),
+            ),
+            Err(_) => self.fail_answer(
+                issue,
+                source_name,
+                run.timeout_error(&self.config),
+                format!(
+                    "QA timed out for {} after {}s",
+                    issue.short_id,
+                    timeout.as_secs()
+                ),
+            ),
+        };
+        if let Some(directory) = live_qa_directory {
+            remove_live_qa_directory(directory);
         }
+        outcome
+    }
+
+    /// Record `issue`'s answer or live-QA run as failed with `error`, with
+    /// `message` on its timeline.
+    fn fail_answer(
+        &self,
+        issue: &Issue,
+        source_name: &str,
+        error: String,
+        message: String,
+    ) -> ProcessingOutcome {
+        let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::QaFailed,
+            message,
+            json!({ "error": error.chars().take(300).collect::<String>() }),
+        );
+        ProcessingOutcome::Failed { error }
+    }
+
+    /// Where every live-QA run directory is created.
+    fn live_qa_base_directory(&self) -> std::path::PathBuf {
+        self.config.workspace.join(LIVE_QA_DIRECTORY)
+    }
+
+    /// A fresh private directory for one live-QA run of `issue`, removed when
+    /// the returned guard drops.
+    ///
+    /// It is randomly named and owner-only on Unix, inside
+    /// [`LIVE_QA_DIRECTORY`] under the configured `workspace` (created
+    /// owner-only too when missing), so neither another local user nor an
+    /// earlier run can create it first or plant files the agent would load.
+    fn create_live_qa_directory(&self, issue: &Issue) -> std::io::Result<tempfile::TempDir> {
+        std::fs::create_dir_all(&self.config.workspace)?;
+        let base = self.live_qa_base_directory();
+        create_private_directory(&base)?;
+        let prefix = live_qa_directory_prefix(&issue.short_id);
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(&prefix);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(LIVE_QA_DIRECTORY_MODE));
+        }
+        builder.tempdir_in(&base)
     }
 
     /// Run a single, explicitly-chosen action against a payload (for the manual
     /// `claudear action ...` CLI). Unlike `run`, this does not classify or chain.
+    ///
+    /// Every action is refused for a `[deploy_qa]` release tip, which only
+    /// ever runs as live QA.
     pub async fn run_single_action(
         &self,
         action: ActionKind,
         input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
+        if AnswerRun::for_issue(&input.issue) == AnswerRun::LiveQa {
+            return refuse_live_qa_action(action);
+        }
         match action {
             ActionKind::Verify => {
                 let verdict = self
@@ -2877,7 +3076,7 @@ impl IssueProcessor {
     fn action_project_dir(&self, resolution: &RepoResolution) -> std::path::PathBuf {
         match resolution {
             RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
-            RepoResolution::Skip { .. } => scratch_directory(QA_SCRATCH_DIRECTORY),
+            RepoResolution::Skip { .. } => qa_scratch_directory(),
         }
     }
 
@@ -5938,16 +6137,77 @@ mod tests {
 
     const TRACKER_SOURCE: &str = "linear";
 
-    fn answering_processor() -> IssueProcessor {
-        processor_answering_with(Arc::new(AnsweringAgent::default()))
+    /// How long a slow agent takes to answer: far past every timeout these
+    /// tests configure, so only a timeout ends its run. A timeout drops the
+    /// run, so a passing test never waits this long.
+    const SLOW_AGENT_RUN: Duration = Duration::from_secs(10);
+
+    /// An [`IssueProcessor`] answering through an [`AnsweringAgent`], with its
+    /// `workspace` in a temporary directory removed when the fixture drops.
+    struct AnsweringFixture {
+        processor: IssueProcessor,
+        agent: Arc<AnsweringAgent>,
+        workspace: tempfile::TempDir,
     }
 
-    fn processor_answering_with(agent: Arc<AnsweringAgent>) -> IssueProcessor {
-        let tracker: Arc<dyn FixAttemptTracker> =
-            Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
-        let mut processor = make_reply_chain_processor(tracker);
-        processor.agent = agent;
-        processor
+    impl AnsweringFixture {
+        fn new() -> Self {
+            Self::with_agent(AnsweringAgent::default())
+        }
+
+        fn with_agent(agent: AnsweringAgent) -> Self {
+            let agent = Arc::new(agent);
+            let tracker: Arc<dyn FixAttemptTracker> =
+                Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
+            let mut processor = make_reply_chain_processor(tracker);
+            processor.agent = Arc::clone(&agent) as Arc<dyn AgentRunner>;
+            let workspace = tempfile::tempdir().unwrap();
+            processor.config.workspace = workspace.path().to_path_buf();
+            Self {
+                processor,
+                agent,
+                workspace,
+            }
+        }
+
+        /// The Claudear-owned directory each live-QA run gets its own
+        /// directory in.
+        fn live_qa_base(&self) -> std::path::PathBuf {
+            self.workspace.path().join(LIVE_QA_DIRECTORY)
+        }
+
+        async fn run(
+            &self,
+            input: ProcessingInput,
+            context: &RecordingContextProvider,
+        ) -> ProcessingOutcome {
+            self.processor.run(input, context).await
+        }
+
+        /// Every decision key the processor recorded.
+        fn decisions(&self) -> Vec<String> {
+            self.processor
+                .tracker
+                .get_recent_activities(100)
+                .unwrap()
+                .into_iter()
+                .filter(|activity| activity.activity_type == "decision")
+                .filter_map(|activity| {
+                    activity
+                        .metadata?
+                        .get("decision")?
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .collect()
+        }
+    }
+
+    /// A question from `source` that is really a `[deploy_qa]` release tip.
+    fn live_qa_input_from(source: &str) -> ProcessingInput {
+        let mut input = question_input(source);
+        input.issue.source = DEPLOY_QA_SOURCE.to_string();
+        input
     }
 
     fn resolved_to(project_dir: &std::path::Path) -> RepoResolution {
@@ -6010,13 +6270,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_question_answer_posts_reply_for_non_conversational_source() {
-        let processor = answering_processor();
-        assert!(!processor.config.reply().enabled);
+        let fixture = AnsweringFixture::new();
+        assert!(!fixture.processor.config.reply().enabled);
         let input = question_input(TRACKER_SOURCE);
         let issue_id = input.issue.id.clone();
         let context = RecordingContextProvider::default();
 
-        assert_completed_no_pr(processor.run(input, &context).await);
+        assert_completed_no_pr(fixture.run(input, &context).await);
 
         assert_eq!(
             context.replies(),
@@ -6027,13 +6287,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_deploy_qa_posts_report_via_post_reply_whatever_the_intent() {
-        let processor = answering_processor();
+        let fixture = AnsweringFixture::new();
         let mut input = question_input(DEPLOY_QA_SOURCE);
         input.intent = Some(Intent::Fix);
         let issue_id = input.issue.id.clone();
         let context = RecordingContextProvider::default();
 
-        assert_completed_no_pr(processor.run(input, &context).await);
+        assert_completed_no_pr(fixture.run(input, &context).await);
 
         assert_eq!(
             context.replies(),
@@ -6044,10 +6304,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_question_answer_uses_notifier_for_conversational_source() {
-        let processor = answering_processor();
+        let fixture = AnsweringFixture::new();
         let context = RecordingContextProvider::default();
 
-        assert_completed_no_pr(processor.run(question_input("discord"), &context).await);
+        assert_completed_no_pr(fixture.run(question_input("discord"), &context).await);
 
         assert!(
             context.replies().is_empty(),
@@ -6057,14 +6317,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_deploy_qa_uses_answer_path_when_reply_pipeline_enabled() {
-        let mut processor = answering_processor();
-        processor.config.notifiers.helpscout.enabled = true;
-        assert!(processor.config.reply().enabled);
+        let mut fixture = AnsweringFixture::new();
+        fixture.processor.config.notifiers.helpscout.enabled = true;
+        assert!(fixture.processor.config.reply().enabled);
         let input = question_input(DEPLOY_QA_SOURCE);
         let issue_id = input.issue.id.clone();
         let context = RecordingContextProvider::default();
 
-        assert_completed_no_pr(processor.run(input, &context).await);
+        assert_completed_no_pr(fixture.run(input, &context).await);
 
         assert_eq!(
             context.replies(),
@@ -6074,43 +6334,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deploy_qa_is_bounded_by_its_own_timeout() {
-        let mut processor =
-            processor_answering_with(Arc::new(AnsweringAgent::slow(Duration::from_secs(3))));
-        processor.config.deploy_qa.timeout_secs = 0;
-        processor.config.qa.answer_timeout_secs = 3600;
-        let timeout_secs = processor.config.deploy_qa.effective_timeout_secs();
+    async fn test_deploy_qa_backstop_waits_past_the_runner_limit_then_gives_up() {
+        let mut fixture = AnsweringFixture::with_agent(AnsweringAgent::slow(SLOW_AGENT_RUN));
+        fixture.processor.config.deploy_qa.timeout_secs = 1;
+        fixture.processor.config.qa.answer_timeout_secs = 3600;
+        let limit_secs = fixture.processor.config.deploy_qa.effective_timeout_secs();
+        let backstop = fixture.processor.config.deploy_qa.backstop_timeout();
         let context = RecordingContextProvider::default();
+        let started = std::time::Instant::now();
 
         let error = expect_failed(
-            processor
+            fixture
                 .run(question_input(DEPLOY_QA_SOURCE), &context)
                 .await,
         );
 
+        let elapsed = started.elapsed();
         assert!(
-            error.contains(&format!("after {timeout_secs}s")),
-            "the timeout error must report the [deploy_qa] timeout that stopped the run: {error}"
+            elapsed >= backstop,
+            "processing must leave the runner its grace to enforce the {limit_secs}s limit \
+             itself, but gave up after {elapsed:?}"
+        );
+        assert!(
+            elapsed < SLOW_AGENT_RUN,
+            "the backstop must stop waiting on a run that outlives it, waited {elapsed:?}"
+        );
+        assert!(
+            error.contains(&format!("{limit_secs}s limit"))
+                && error.contains("[deploy_qa] timeout_secs"),
+            "the error must say live QA exceeded the configured [deploy_qa] limit: {error}"
         );
         assert!(
             context.replies().is_empty(),
             "a timed-out live QA run must not post a report"
         );
+        let directories = fixture.agent.project_dirs();
+        assert!(
+            directories.iter().all(|directory| !directory.exists()),
+            "a timed-out run's directory must be removed too: {directories:?}"
+        );
     }
 
     #[tokio::test]
     async fn test_question_answer_keeps_qa_timeout_when_deploy_qa_timeout_differs() {
-        let mut processor =
-            processor_answering_with(Arc::new(AnsweringAgent::slow(Duration::from_secs(2))));
-        processor.config.qa.answer_timeout_secs = 1;
-        processor.config.deploy_qa.timeout_secs = 3600;
+        let mut fixture = AnsweringFixture::with_agent(AnsweringAgent::slow(SLOW_AGENT_RUN));
+        fixture.processor.config.qa.answer_timeout_secs = 1;
+        fixture.processor.config.deploy_qa.timeout_secs = 3600;
         let context = RecordingContextProvider::default();
 
-        let error = expect_failed(
-            processor
-                .run(question_input(TRACKER_SOURCE), &context)
-                .await,
-        );
+        let error = expect_failed(fixture.run(question_input(TRACKER_SOURCE), &context).await);
 
         assert!(
             error.contains("after 1s"),
@@ -6120,46 +6392,270 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deploy_qa_runs_in_scratch_directory_not_resolved_checkout() {
+    async fn test_deploy_qa_runs_in_a_private_directory_not_the_resolved_checkout() {
         let checkout = tempfile::tempdir().unwrap();
-        let agent = Arc::new(AnsweringAgent::default());
-        let processor = processor_answering_with(Arc::clone(&agent));
+        let fixture = AnsweringFixture::new();
         let mut input = question_input(DEPLOY_QA_SOURCE);
         input.resolution = resolved_to(checkout.path());
 
         assert_completed_no_pr(
-            processor
+            fixture
                 .run(input, &RecordingContextProvider::default())
                 .await,
         );
 
-        let project_dirs = agent.project_dirs();
-        assert!(
-            !project_dirs.iter().any(|dir| dir == checkout.path()),
-            "live QA must never run inside a resolved repo checkout: {project_dirs:?}"
+        let calls = fixture.agent.calls();
+        assert_eq!(calls.len(), 1, "one run, one agent call: {calls:?}");
+        let directory = &calls[0].project_dir;
+        assert_ne!(
+            directory,
+            checkout.path(),
+            "live QA must never run inside a resolved repo checkout"
         );
         assert_eq!(
-            project_dirs,
-            vec![std::env::temp_dir().join(DEPLOY_QA_SCRATCH_DIRECTORY)]
+            directory.parent(),
+            Some(fixture.live_qa_base().as_path()),
+            "live QA must run in its own directory under the Claudear-owned base"
         );
-        assert!(project_dirs[0].is_dir());
+        assert!(
+            calls[0].permissions.is_some(),
+            "the run directory must exist while the agent works in it"
+        );
+        assert!(
+            !directory.exists(),
+            "the run directory must be removed once the report is delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_runs_never_share_a_directory() {
+        let fixture = AnsweringFixture::new();
+
+        for _ in 0..2 {
+            assert_completed_no_pr(
+                fixture
+                    .run(
+                        question_input(DEPLOY_QA_SOURCE),
+                        &RecordingContextProvider::default(),
+                    )
+                    .await,
+            );
+        }
+
+        let directories = fixture.agent.project_dirs();
+        assert_eq!(directories.len(), 2);
+        assert_ne!(
+            directories[0], directories[1],
+            "every live-QA run needs a fresh directory, never one an earlier run used"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_deploy_qa_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = AnsweringFixture::new();
+
+        assert_completed_no_pr(
+            fixture
+                .run(
+                    question_input(DEPLOY_QA_SOURCE),
+                    &RecordingContextProvider::default(),
+                )
+                .await,
+        );
+
+        let permissions = fixture.agent.calls()[0]
+            .permissions
+            .clone()
+            .expect("the run directory must exist while the agent works in it");
+        assert_eq!(
+            permissions.mode() & 0o777,
+            0o700,
+            "no other local user may read or plant files in a live-QA run directory"
+        );
+        let base_permissions = std::fs::metadata(fixture.live_qa_base())
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            base_permissions.mode() & 0o777,
+            0o700,
+            "the base Claudear creates for live-QA runs must be owner-only too"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_fails_clearly_when_its_directory_cannot_be_created() {
+        let fixture = AnsweringFixture::new();
+        std::fs::write(fixture.live_qa_base(), "not a directory").unwrap();
+        let context = RecordingContextProvider::default();
+
+        let error = expect_failed(
+            fixture
+                .run(question_input(DEPLOY_QA_SOURCE), &context)
+                .await,
+        );
+
+        assert!(
+            error.contains(&fixture.live_qa_base().display().to_string()),
+            "the error must name the directory live QA could not create: {error}"
+        );
+        assert!(
+            fixture.agent.calls().is_empty(),
+            "live QA must not fall back to running anywhere else"
+        );
+        assert!(context.replies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_directory_stays_inside_the_base_whatever_the_short_id() {
+        let fixture = AnsweringFixture::new();
+        let mut input = question_input(DEPLOY_QA_SOURCE);
+        input.issue.short_id = format!("../../{}/tag v1", "x".repeat(300));
+
+        assert_completed_no_pr(
+            fixture
+                .run(input, &RecordingContextProvider::default())
+                .await,
+        );
+        assert_eq!(
+            fixture.agent.calls().len(),
+            1,
+            "a short id longer than a file name allows must still get a run directory"
+        );
+
+        let directories = fixture.agent.project_dirs();
+        assert_eq!(
+            directories[0].parent(),
+            Some(fixture.live_qa_base().as_path()),
+            "a short id with path separators must not move the run directory: {directories:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_issue_is_contained_whatever_the_source_name() {
+        let checkout = tempfile::tempdir().unwrap();
+        let fixture = AnsweringFixture::new();
+        let mut input = live_qa_input_from(TRACKER_SOURCE);
+        input.intent = Some(Intent::Fix);
+        input.resolution = resolved_to(checkout.path());
+        let issue_id = input.issue.id.clone();
+        let context = RecordingContextProvider::default();
+
+        assert_completed_no_pr(fixture.run(input, &context).await);
+
+        let directories = fixture.agent.project_dirs();
+        assert_eq!(
+            directories.len(),
+            1,
+            "a deploy_qa issue must take the live-QA path, never the fix pipeline"
+        );
+        assert_eq!(
+            directories[0].parent(),
+            Some(fixture.live_qa_base().as_path()),
+            "a deploy_qa issue must get live-QA containment whichever source name delivers it"
+        );
+        assert_eq!(context.replies(), vec![(issue_id, QA_REPORT.to_string())]);
+    }
+
+    #[tokio::test]
+    async fn test_live_qa_is_recorded_under_its_own_decision() {
+        let fixture = AnsweringFixture::new();
+
+        assert_completed_no_pr(
+            fixture
+                .run(
+                    question_input(DEPLOY_QA_SOURCE),
+                    &RecordingContextProvider::default(),
+                )
+                .await,
+        );
+
+        let decisions = fixture.decisions();
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision == "live_qa_started"),
+            "live QA must be recorded as live QA: {decisions:?}"
+        );
+        assert!(
+            !decisions
+                .iter()
+                .any(|decision| decision == "question_detected"),
+            "live QA is not a detected question: {decisions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_question_answer_is_still_recorded_as_a_detected_question() {
+        let fixture = AnsweringFixture::new();
+
+        assert_completed_no_pr(
+            fixture
+                .run(
+                    question_input(TRACKER_SOURCE),
+                    &RecordingContextProvider::default(),
+                )
+                .await,
+        );
+
+        let decisions = fixture.decisions();
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision == "question_detected"),
+            "a question must still be recorded as a detected question: {decisions:?}"
+        );
+        assert!(
+            !decisions
+                .iter()
+                .any(|decision| decision == "live_qa_started"),
+            "a question is not live QA: {decisions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_actions_are_refused_for_live_qa_issues() {
+        let fixture = AnsweringFixture::new();
+
+        for action in [ActionKind::Reply, ActionKind::Verify, ActionKind::Resolve] {
+            let context = RecordingContextProvider::default();
+            let outcome = fixture
+                .processor
+                .run_single_action(action, live_qa_input_from(TRACKER_SOURCE), &context)
+                .await;
+
+            assert_eq!(
+                expect_failed(outcome),
+                expect_failed(refuse_live_qa_action(action)),
+                "{action} must be refused for a deploy_qa issue"
+            );
+            assert!(context.replies().is_empty(), "{action} must post nothing");
+        }
+        assert!(
+            fixture.agent.calls().is_empty(),
+            "a refused action must never reach the agent"
+        );
     }
 
     #[tokio::test]
     async fn test_question_answer_runs_in_resolved_checkout() {
         let checkout = tempfile::tempdir().unwrap();
-        let agent = Arc::new(AnsweringAgent::default());
-        let processor = processor_answering_with(Arc::clone(&agent));
+        let fixture = AnsweringFixture::new();
         let mut input = question_input(TRACKER_SOURCE);
         input.resolution = resolved_to(checkout.path());
 
         assert_completed_no_pr(
-            processor
+            fixture
                 .run(input, &RecordingContextProvider::default())
                 .await,
         );
 
-        assert_eq!(agent.project_dirs(), vec![checkout.path().to_path_buf()]);
+        assert_eq!(
+            fixture.agent.project_dirs(),
+            vec![checkout.path().to_path_buf()]
+        );
     }
 
     /// Intent classifier stub returning a fixed verdict (for routing tests).
@@ -6234,11 +6730,20 @@ mod tests {
     }
 
     /// Agent runner whose `answer_question` returns [`QA_REPORT`] after
-    /// `delay`, recording every `project_dir` it is asked to answer in.
+    /// `delay`, recording every directory it is asked to answer, reply or
+    /// verify in.
     #[derive(Default)]
     struct AnsweringAgent {
         delay: Duration,
-        project_dirs: std::sync::Mutex<Vec<std::path::PathBuf>>,
+        calls: std::sync::Mutex<Vec<AgentCall>>,
+    }
+
+    /// A directory an [`AnsweringAgent`] was asked to work in, as it found it.
+    #[derive(Debug, Clone)]
+    struct AgentCall {
+        project_dir: std::path::PathBuf,
+        /// `None` when the directory did not exist.
+        permissions: Option<std::fs::Permissions>,
     }
 
     impl AnsweringAgent {
@@ -6249,8 +6754,25 @@ mod tests {
             }
         }
 
+        fn record(&self, project_dir: &std::path::Path) {
+            let permissions = std::fs::metadata(project_dir)
+                .ok()
+                .map(|metadata| metadata.permissions());
+            self.calls.lock().unwrap().push(AgentCall {
+                project_dir: project_dir.to_path_buf(),
+                permissions,
+            });
+        }
+
+        fn calls(&self) -> Vec<AgentCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
         fn project_dirs(&self) -> Vec<std::path::PathBuf> {
-            self.project_dirs.lock().unwrap().clone()
+            self.calls()
+                .into_iter()
+                .map(|call| call.project_dir)
+                .collect()
         }
     }
 
@@ -6291,12 +6813,33 @@ mod tests {
             _context: &str,
             project_dir: &std::path::Path,
         ) -> claudear_core::error::Result<String> {
-            self.project_dirs
-                .lock()
-                .unwrap()
-                .push(project_dir.to_path_buf());
+            self.record(project_dir);
             tokio::time::sleep(self.delay).await;
             Ok(QA_REPORT.to_string())
+        }
+
+        async fn generate_reply(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _guideline: Option<&str>,
+            _kind: ReplyKind,
+            project_dir: &std::path::Path,
+        ) -> claudear_core::error::Result<String> {
+            self.record(project_dir);
+            Ok(QA_REPORT.to_string())
+        }
+
+        async fn verify_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            project_dir: &std::path::Path,
+        ) -> claudear_core::error::Result<VerifyResult> {
+            self.record(project_dir);
+            Err(claudear_core::error::Error::runner(
+                "verify is not supported by the answering agent",
+            ))
         }
     }
 

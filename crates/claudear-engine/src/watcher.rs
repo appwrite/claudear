@@ -2779,8 +2779,7 @@ Create a PR with your changes.{custom_instructions}"#,
             None => String::new(),
         };
 
-        let scratch = std::env::temp_dir().join("claudear-qa");
-        let _ = std::fs::create_dir_all(&scratch);
+        let scratch = crate::processing::qa_scratch_directory();
 
         let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
         let reply = match tokio::time::timeout(
@@ -4917,7 +4916,7 @@ Create a PR with your changes.{custom_instructions}"#,
         source_name: &str,
         issue_id: &str,
     ) -> Result<crate::processing::ProcessingOutcome> {
-        use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
+        use crate::processing::{refuse_live_qa_action, IssueProcessor, ProcessingInput};
 
         let source = self
             .sources
@@ -4933,11 +4932,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 %action,
                 "Refusing manual action for live-QA deploy_qa issue"
             );
-            return Ok(ProcessingOutcome::Failed {
-                error: format!(
-                    "{DEPLOY_QA_SOURCE} issues only run live QA; {action} is not permitted"
-                ),
-            });
+            return Ok(refuse_live_qa_action(action));
         }
 
         let issue = source.get_issue(issue_id).await?;
@@ -9037,6 +9032,9 @@ mod tests {
         tracker: Arc<SqliteTracker>,
         tip: DeployQaTip,
         agent_calls: Arc<AtomicUsize>,
+        /// The watcher's `workspace`, where live-QA runs create their private
+        /// directories; removed when the harness drops.
+        _workspace: tempfile::TempDir,
     }
 
     impl DeployQaHarness {
@@ -9093,10 +9091,12 @@ mod tests {
         }
 
         fn build(
-            config: Config,
+            mut config: Config,
             answer: QaAnswer,
             source: impl FnOnce(Arc<dyn FixAttemptTracker>, &DeployQaTip) -> Arc<dyn IssueSource>,
         ) -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            config.workspace = workspace.path().to_path_buf();
             let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
             let tip = tracker
                 .upsert_deploy_qa_tip(&DeployQaTip::new(DEPLOY_QA_TRACK, DEPLOY_QA_REPO, "1.2.3"))
@@ -9118,6 +9118,7 @@ mod tests {
                 tracker,
                 tip,
                 agent_calls,
+                _workspace: workspace,
             }
         }
 
