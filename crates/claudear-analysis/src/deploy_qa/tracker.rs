@@ -1,6 +1,7 @@
 //! Poll GitHub for new release tips and persist last-seen / attempt state.
 
 use crate::deploy_qa::playbook::{load_playbook, DEPLOY_QA_SOURCE};
+use crate::deploy_qa::probe::{VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX};
 use crate::release::{GitHubRelease, GitHubTag, ReleaseClient};
 use claudear_config::config::{DeployQaConfig, DeployQaTagFilter, DeployQaTrackConfig};
 use claudear_core::error::Result;
@@ -289,7 +290,7 @@ pub fn build_deploy_qa_issue(
          ## Agent constraints\n\n\
          - Source is `{source}` — observe, probe, and report only.\n\
          - Do **not** open a fix PR, branch, or commit for this announcement.\n\
-         - End with `DEPLOY_QA_VERDICT: ALL_VERIFIED` or `DEPLOY_QA_VERDICT: FAIL`.\n",
+         - End with `{prefix} {all_verified}` or `{prefix} {fail}`.\n",
         playbook = playbook.trim(),
         track = track.name,
         repo = tip.repo,
@@ -298,6 +299,9 @@ pub fn build_deploy_qa_issue(
         published = tip.published_at.as_deref().unwrap_or("unknown"),
         author = tip.author_login.as_deref().unwrap_or("unknown"),
         source = DEPLOY_QA_SOURCE,
+        prefix = VERDICT_PREFIX,
+        all_verified = VERDICT_ALL_VERIFIED,
+        fail = VERDICT_FAIL,
     );
 
     let mut issue = Issue::new(
@@ -333,6 +337,7 @@ pub fn deploy_qa_match_result(track: &str, tag: &str) -> MatchResult {
 mod tests {
     use super::*;
     use crate::deploy_qa::playbook::bundled_playbook;
+    use crate::deploy_qa::probe::{classify_deploy_qa_verdict, DeployQaVerdict};
     use async_trait::async_trait;
     use claudear_core::http::{HttpClient, HttpResponse};
     use claudear_storage::SqliteTracker;
@@ -484,6 +489,39 @@ mod tests {
 
         let other_track = build_deploy_qa_issue(&network, &tip, bundled_playbook());
         assert_ne!(issue.id, other_track.id);
+    }
+
+    #[test]
+    fn prompt_teaches_verdict_footers_the_classifier_understands() {
+        let repo = "appwrite-labs/edge";
+        let issue = build_deploy_qa_issue(
+            &track("edge-db", repo, DeployQaTagFilter::Any),
+            &release_tip(repo, "1.2.3", "Adds #99"),
+            bundled_playbook(),
+        );
+        let description = issue.description.expect("issue should carry the prompt");
+
+        let verdicts: Vec<DeployQaVerdict> = description
+            .match_indices(VERDICT_PREFIX)
+            .map(|(index, _)| {
+                description[index + VERDICT_PREFIX.len()..]
+                    .trim_start()
+                    .chars()
+                    .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                    .collect::<String>()
+            })
+            .filter(|token| !token.is_empty())
+            .map(|token| classify_deploy_qa_verdict(&format!("{VERDICT_PREFIX} {token}")))
+            .collect();
+
+        assert!(
+            verdicts.contains(&DeployQaVerdict::AllVerified),
+            "the prompt must teach a footer the classifier reads as all-verified: {verdicts:?}"
+        );
+        assert!(
+            verdicts.contains(&DeployQaVerdict::Fail),
+            "the prompt must teach a footer the classifier reads as a failure: {verdicts:?}"
+        );
     }
 
     #[tokio::test]
