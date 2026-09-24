@@ -168,6 +168,8 @@ pub struct ProviderConfig {
     pub sandbox: Option<String>,
     /// Extra environment variables to set when spawning the agent process.
     /// Useful when the agent binary needs PATH or other vars not in the daemon env.
+    /// Passed verbatim, with no `${VAR}` expansion, to every agent run of every
+    /// source.
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
     /// Provider-specific extra configuration.
@@ -187,7 +189,8 @@ pub struct McpServerConfig {
     pub command: Option<String>,
     /// Arguments passed to `command`.
     pub args: Vec<String>,
-    /// Environment for the server process. Values may contain `${VAR}` references.
+    /// Environment for the server process. Values may contain `${VAR}`
+    /// references, which the agent CLI expands from its own environment.
     pub env: std::collections::HashMap<String, String>,
     /// URL for an HTTP/SSE transport server (alternative to `command`).
     pub url: Option<String>,
@@ -2162,10 +2165,15 @@ pub struct DeployQaTrackConfig {
     pub tag_filter: DeployQaTagFilter,
 }
 
-/// How many [`DeployQaConfig::timeout_secs`] a `[deploy_qa]` tip may stay
-/// `running` before it is treated as orphaned: a live run cannot outlast its
-/// timeout, and the margin covers setup and delivery around the agent call.
-const DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER: u32 = 2;
+/// Longest grace [`DeployQaConfig::backstop_timeout`] gives the agent runner,
+/// past the live-QA limit it enforces itself, to kill the agent CLI and record
+/// the timed-out run before processing abandons the run.
+const DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE: Duration = Duration::from_secs(60);
+
+/// Smallest margin [`DeployQaConfig::stale_run_after`] leaves past the live-QA
+/// timeout, covering the backstop grace plus setup and delivery around the
+/// agent run, so a tip with a small timeout is never swept while it runs.
+const DEPLOY_QA_STALE_RUN_MINIMUM_MARGIN: Duration = Duration::from_secs(10 * 60);
 
 /// Live deploy QA for new GitHub release tips.
 ///
@@ -2188,8 +2196,9 @@ pub struct DeployQaConfig {
     /// Optional path to the live-QA playbook. When unset, the bundled playbook
     /// shipped with Claudear is used.
     pub instructions_path: Option<String>,
-    /// How long one live-QA run may take before it is killed and its tip
-    /// marked `errored`, in seconds (default: 1800). Separate from
+    /// How long one live-QA run may take, in seconds (default: 1800). The agent
+    /// runner kills a run that outlasts the smaller of this and
+    /// `[agent] timeout_secs`, and its tip is marked `errored`. Separate from
     /// `[qa] answer_timeout_secs` because live QA runs real checks.
     pub timeout_secs: u64,
     /// Tracks to poll. Each track is a repo + tag filter.
@@ -2207,11 +2216,24 @@ impl DeployQaConfig {
         self.timeout_secs.max(1)
     }
 
+    /// How long processing waits on a live-QA run before abandoning it.
+    ///
+    /// The agent runner enforces [`Self::effective_timeout_secs`] itself, so
+    /// this only fires when the runner fails to. It adds a grace of the timeout
+    /// again, capped at a minute, for the runner to kill the agent CLI and
+    /// record the timed-out run first.
+    pub fn backstop_timeout(&self) -> Duration {
+        let timeout = Duration::from_secs(self.effective_timeout_secs());
+        timeout.saturating_add(timeout.min(DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE))
+    }
+
     /// How long a tip may stay `running` before the poller treats its run as
-    /// orphaned and marks it `errored`.
+    /// orphaned and marks it `errored`: the timeout plus a margin of the
+    /// timeout again, at least ten minutes, so it always outlasts
+    /// [`Self::backstop_timeout`] with setup and delivery.
     pub fn stale_run_after(&self) -> Duration {
-        Duration::from_secs(self.effective_timeout_secs())
-            .saturating_mul(DEPLOY_QA_STALE_RUN_TIMEOUT_MULTIPLIER)
+        let timeout = Duration::from_secs(self.effective_timeout_secs());
+        timeout.saturating_add(timeout.max(DEPLOY_QA_STALE_RUN_MINIMUM_MARGIN))
     }
 
     /// Validate `[[deploy_qa.tracks]]`.
@@ -5240,27 +5262,92 @@ monitoring_duration_hours = 12
         };
         assert!(zero_timeout.effective_timeout_secs() >= 1);
 
-        assert!(
-            config.stale_run_after() > Duration::from_secs(config.effective_timeout_secs()),
-            "a run must be able to use its whole timeout before it is swept as stale"
-        );
-        let doubled_timeout = DeployQaConfig {
-            timeout_secs: config.timeout_secs * 2,
-            ..Default::default()
-        };
-        assert_eq!(
-            doubled_timeout.stale_run_after(),
-            config.stale_run_after() * 2
-        );
-        let unbounded_timeout = DeployQaConfig {
-            timeout_secs: u64::MAX,
-            ..Default::default()
-        };
-        assert!(unbounded_timeout.stale_run_after() >= Duration::from_secs(u64::MAX));
-
         let root = Config::default();
         assert!(!root.deploy_qa.enabled);
         assert!(root.deploy_qa.tracks.is_empty());
+    }
+
+    /// `[deploy_qa] timeout_secs` values from the clamped zero up to a day,
+    /// either side of the backstop grace cap and the stale-run minimum margin.
+    const DEPLOY_QA_TIMEOUTS_SECS: &[u64] = &[0, 1, 59, 60, 61, 599, 600, 601, 1800, 86_400];
+
+    fn deploy_qa_with_timeout(timeout_secs: u64) -> DeployQaConfig {
+        DeployQaConfig {
+            timeout_secs,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_backstop_leaves_the_runner_time_to_enforce_its_limit() {
+        for &timeout_secs in DEPLOY_QA_TIMEOUTS_SECS {
+            let config = deploy_qa_with_timeout(timeout_secs);
+            let limit = Duration::from_secs(config.effective_timeout_secs());
+            let grace = config.backstop_timeout().saturating_sub(limit);
+
+            assert!(
+                !grace.is_zero(),
+                "processing must not abandon a {timeout_secs}s run before the runner enforces that limit itself"
+            );
+            assert!(
+                grace <= limit,
+                "a short run must not be held longer than its own limit again: {timeout_secs}s got {grace:?}"
+            );
+            assert!(
+                grace <= DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE,
+                "a long run must be abandoned soon after the runner should have killed it: {timeout_secs}s got {grace:?}"
+            );
+            if limit >= DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE {
+                assert_eq!(
+                    grace, DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE,
+                    "a long run gives the runner the whole grace to kill and record it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_backstop_for_a_one_second_limit_is_two_seconds() {
+        assert_eq!(
+            deploy_qa_with_timeout(1).backstop_timeout(),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn test_deploy_qa_stale_sweep_never_catches_a_run_processing_still_waits_on() {
+        for &timeout_secs in DEPLOY_QA_TIMEOUTS_SECS {
+            let config = deploy_qa_with_timeout(timeout_secs);
+            assert!(
+                config.stale_run_after() > config.backstop_timeout(),
+                "a {timeout_secs}s run must be abandoned before its tip can be swept as stale"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_stale_margin_covers_small_and_large_timeouts() {
+        for &timeout_secs in DEPLOY_QA_TIMEOUTS_SECS {
+            let config = deploy_qa_with_timeout(timeout_secs);
+            let limit = Duration::from_secs(config.effective_timeout_secs());
+            let margin = config.stale_run_after().saturating_sub(limit);
+
+            assert!(
+                margin >= DEPLOY_QA_STALE_RUN_MINIMUM_MARGIN,
+                "setup and delivery around a {timeout_secs}s run need at least the minimum margin, got {margin:?}"
+            );
+            assert!(
+                margin >= limit,
+                "the margin must grow with a {timeout_secs}s timeout, got {margin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_timeouts_saturate_instead_of_overflowing() {
+        let unbounded = deploy_qa_with_timeout(u64::MAX);
+        assert!(unbounded.backstop_timeout() >= Duration::from_secs(u64::MAX));
+        assert!(unbounded.stale_run_after() >= Duration::from_secs(u64::MAX));
     }
 
     #[test]
