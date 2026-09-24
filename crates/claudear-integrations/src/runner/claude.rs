@@ -60,7 +60,8 @@ enum RunProfile {
     Reply,
     /// A [`DEPLOY_QA_SOURCE`] live-QA run: plain text with the fix-run access
     /// plus the read-only tools, so it can probe live hosts. It loads no MCP
-    /// servers or settings from its working directory.
+    /// servers or settings from its working directory, and is bounded by
+    /// [`ClaudeRunnerConfig::live_qa_timeout_secs`].
     LiveQa,
 }
 
@@ -344,6 +345,9 @@ struct StdoutParseResult {
 pub struct ClaudeRunnerConfig {
     /// Timeout for Claude process execution in seconds (default: 21600 = 6 hours).
     pub timeout_secs: u64,
+    /// Timeout for deploy_qa live-QA runs in seconds. They get the shorter of
+    /// this and `timeout_secs`; `None` leaves them on `timeout_secs`.
+    pub live_qa_timeout_secs: Option<u64>,
     /// Model to use (e.g., sonnet, opus, haiku, or full model ID).
     pub model: Option<String>,
     /// Custom instructions appended to Claude's system prompt.
@@ -373,6 +377,7 @@ impl Default for ClaudeRunnerConfig {
     fn default() -> Self {
         Self {
             timeout_secs: 21600, // 6 hours default
+            live_qa_timeout_secs: None,
             model: None,
             instructions: None,
             permissions: Vec::new(),
@@ -866,8 +871,10 @@ The PR title should include the issue ID: {}
     ///
     /// Release tips from [`DEPLOY_QA_SOURCE`] are the exception: they run live
     /// QA with the fix-run tool access (`permissions`, `skip_permissions`) plus
-    /// the read-only tools, so the agent can probe live hosts, and return a
-    /// live-QA report. Either way the result is the run's [`final_reply`].
+    /// the read-only tools, so the agent can probe live hosts, within
+    /// `live_qa_timeout_secs`, and return a live-QA report. Either way the
+    /// result is the run's [`final_reply`], and a run that times out is an
+    /// error.
     pub async fn run_reply(
         &self,
         issue: &Issue,
@@ -1031,6 +1038,18 @@ The PR title should include the issue ID: {}
                 .any(|permission| grants_shell(permission))
     }
 
+    /// How long a run under `profile` may take before it is killed: the
+    /// shorter of `timeout_secs` and `live_qa_timeout_secs` for a live-QA
+    /// run, else `timeout_secs`.
+    fn timeout_secs(&self, profile: RunProfile) -> u64 {
+        match (profile, self.config.live_qa_timeout_secs) {
+            (RunProfile::LiveQa, Some(live_qa_timeout_secs)) => {
+                live_qa_timeout_secs.min(self.config.timeout_secs)
+            }
+            _ => self.config.timeout_secs,
+        }
+    }
+
     /// The CLI arguments for a run under `profile`, attaching the rendered
     /// `mcp_config` and allowlisting `mcp_tool_globs` when servers matched.
     ///
@@ -1120,11 +1139,12 @@ The PR title should include the issue ID: {}
                 .unwrap_or_else(|| "claude-code".to_string()),
         );
         execution.working_directory = Some(project_dir.display().to_string());
+        let timeout_secs = self.timeout_secs(profile);
 
         tracing::info!(
             component = "claude",
             label = label,
-            timeout_secs = self.config.timeout_secs,
+            timeout_secs,
             "Starting execution"
         );
 
@@ -1135,7 +1155,7 @@ The PR title should include the issue ID: {}
         )
         .with_source("claude".to_string())
         .with_metadata(json!({
-            "timeout_secs": self.config.timeout_secs,
+            "timeout_secs": timeout_secs,
             "working_dir": project_dir.display().to_string(),
             "label": label
         }));
@@ -1277,7 +1297,7 @@ The PR title should include the issue ID: {}
             "execution_initialized",
             json!({
                 "attempt_id": attempt_id,
-                "timeout_secs": self.config.timeout_secs,
+                "timeout_secs": timeout_secs,
                 "working_dir": project_dir.display().to_string(),
                 "model": self.config.model.clone(),
                 "skip_permissions": self.skips_permissions(profile),
@@ -1780,7 +1800,7 @@ The PR title should include the issue ID: {}
             output
         });
 
-        let timeout_duration = std::time::Duration::from_secs(self.config.timeout_secs);
+        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
 
         enum WaitOutcome {
             Exited(std::result::Result<std::process::ExitStatus, std::io::Error>),
@@ -1835,7 +1855,7 @@ The PR title should include the issue ID: {}
                     label,
                     "subprocess_timed_out",
                     json!({
-                        "timeout_secs": self.config.timeout_secs,
+                        "timeout_secs": timeout_secs,
                     }),
                 )
                 .await;
@@ -1843,7 +1863,7 @@ The PR title should include the issue ID: {}
                 tracing::error!(
                     component = "claude",
                     label = label,
-                    timeout_secs = self.config.timeout_secs,
+                    timeout_secs,
                     "Process timed out, attempting to kill"
                 );
                 Self::append_execution_event(
@@ -1873,17 +1893,15 @@ The PR title should include the issue ID: {}
                 )
                 .with_source("claude".to_string())
                 .with_metadata(json!({
-                    "timeout_secs": self.config.timeout_secs,
+                    "timeout_secs": timeout_secs,
                     "label": label
                 }));
                 self.tracker.record_activity(&activity).ok();
 
                 // Record the timed-out execution
                 execution.complete(None, true);
-                execution.stderr_preview = Some(format!(
-                    "Process timed out after {} seconds",
-                    self.config.timeout_secs
-                ));
+                execution.stderr_preview =
+                    Some(format!("Process timed out after {} seconds", timeout_secs));
                 if let Err(e) = self.tracker.record_execution(&execution) {
                     Self::append_execution_event(
                         &event_writer,
@@ -1914,10 +1932,7 @@ The PR title should include the issue ID: {}
                         output: String::new(),
                         pr_url: None,
                         changelog: None,
-                        error: Some(format!(
-                            "Process timed out after {} seconds",
-                            self.config.timeout_secs
-                        )),
+                        error: Some(format!("Process timed out after {} seconds", timeout_secs)),
                         blocking_question: None,
                         used_qa_ids: Vec::new(),
                         confidence: 0,
@@ -2907,19 +2922,25 @@ mod tests {
     /// `exit_code`.
     #[cfg(unix)]
     fn fake_cli_script(events: &[serde_json::Value], exit_code: i32) -> String {
+        delayed_cli_script(0, events, exit_code)
+    }
+
+    /// A [`fake_cli_script`] that waits `delay_secs` before printing `events`.
+    #[cfg(unix)]
+    fn delayed_cli_script(delay_secs: u64, events: &[serde_json::Value], exit_code: i32) -> String {
         let lines: Vec<String> = events.iter().map(|event| event.to_string()).collect();
         format!(
-            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$(dirname \"$0\")/{FAKE_CLI_ARGS_FILE}\"\ncat > /dev/null\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$(dirname \"$0\")/{FAKE_CLI_ARGS_FILE}\"\ncat > /dev/null\nsleep {delay_secs}\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
             lines.join("\n")
         )
     }
 
-    /// A stub `claude` binary that drains the prompt, records its PID and then
+    /// A stub `claude` binary that records its PID, drains the prompt and then
     /// sleeps far longer than any test waits.
     #[cfg(unix)]
     fn hanging_cli_script() -> String {
         format!(
-            "#!/bin/sh\ncat > /dev/null\ndirectory=\"$(dirname \"$0\")\"\necho $$ > \"$directory/{FAKE_CLI_PID_FILE}.partial\"\nmv \"$directory/{FAKE_CLI_PID_FILE}.partial\" \"$directory/{FAKE_CLI_PID_FILE}\"\nexec sleep 30\n"
+            "#!/bin/sh\ndirectory=\"$(dirname \"$0\")\"\necho $$ > \"$directory/{FAKE_CLI_PID_FILE}.partial\"\nmv \"$directory/{FAKE_CLI_PID_FILE}.partial\" \"$directory/{FAKE_CLI_PID_FILE}\"\ncat > /dev/null\nexec sleep 30\n"
         )
     }
 
@@ -3428,6 +3449,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_execution_log_reports_the_shorter_timeout_for_live_qa() {
+        let cases: [(Option<u64>, u64); 3] = [(Some(60), 60), (Some(7200), 3600), (None, 3600)];
+        for (live_qa_timeout_secs, reported_timeout_secs) in cases {
+            let config = ClaudeRunnerConfig {
+                timeout_secs: 3600,
+                live_qa_timeout_secs,
+                ..ClaudeRunnerConfig::default()
+            };
+
+            assert_eq!(
+                reply_execution_initialized(DEPLOY_QA_SOURCE, config)["timeout_secs"],
+                reported_timeout_secs,
+                "live_qa_timeout_secs = {live_qa_timeout_secs:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_execution_log_reports_the_agent_timeout_for_customer_replies() {
+        let config = ClaudeRunnerConfig {
+            timeout_secs: 3600,
+            live_qa_timeout_secs: Some(60),
+            ..ClaudeRunnerConfig::default()
+        };
+
+        assert_eq!(
+            reply_execution_initialized(HELPSCOUT_SOURCE, config)["timeout_secs"],
+            3600
+        );
+    }
+
     /// Whether `pid` is a live process. A zombie counts as gone: it has exited
     /// and only waits to be reaped.
     #[cfg(unix)]
@@ -3510,6 +3565,69 @@ mod tests {
         });
 
         assert_exits(pid, "the agent CLI outlived its dropped structured query");
+    }
+
+    /// The live-QA timeout the timeout tests configure, far shorter than the
+    /// stub CLIs they spawn take to finish.
+    #[cfg(unix)]
+    const TEST_LIVE_QA_TIMEOUT_SECS: u64 = 1;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_deploy_qa_times_out_at_the_live_qa_timeout() {
+        let cli = FakeCli::install(&hanging_cli_script());
+        let runner = cli.runner(ClaudeRunnerConfig {
+            live_qa_timeout_secs: Some(TEST_LIVE_QA_TIMEOUT_SECS),
+            ..ClaudeRunnerConfig::default()
+        });
+        let issue = deploy_qa_issue(DEPLOY_QA_SOURCE);
+
+        let started = std::time::Instant::now();
+        let (reply, pid) = block_on(async {
+            tokio::join!(
+                runner.run_reply(&issue, "ctx", None, ReplyKind::Answer, cli.directory()),
+                recorded_pid(cli.directory()),
+            )
+        });
+        let elapsed = started.elapsed();
+
+        let error = reply
+            .expect_err("a live QA run past its timeout must fail")
+            .to_string();
+        assert!(error.contains("timed out"), "got: {error}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(TEST_LIVE_QA_TIMEOUT_SECS) + FAKE_CLI_DEADLINE,
+            "the run outlived its live-QA timeout: {elapsed:?}"
+        );
+        assert_exits(pid, "the agent CLI outlived its timed-out live QA run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_customer_reply_ignores_the_live_qa_timeout() {
+        let cli = FakeCli::install(&delayed_cli_script(
+            TEST_LIVE_QA_TIMEOUT_SECS + 1,
+            &[
+                assistant_text_event("Thanks for reaching out!"),
+                result_event("Thanks for reaching out!", false),
+            ],
+            0,
+        ));
+        let runner = cli.runner(ClaudeRunnerConfig {
+            live_qa_timeout_secs: Some(TEST_LIVE_QA_TIMEOUT_SECS),
+            ..ClaudeRunnerConfig::default()
+        });
+
+        let reply = block_on(runner.run_reply(
+            &deploy_qa_issue(HELPSCOUT_SOURCE),
+            "ctx",
+            None,
+            ReplyKind::Answer,
+            cli.directory(),
+        ))
+        .expect("a customer reply runs until `timeout_secs`, not the live-QA timeout");
+
+        assert_eq!(reply, "Thanks for reaching out!");
     }
 
     #[test]

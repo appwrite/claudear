@@ -166,7 +166,8 @@ pub struct AppComponents {
 /// Build a Claude agent runner for the default provider, optionally overriding
 /// the model. When `model_override` is `None`, the provider's configured `model`
 /// is used. All other settings (timeout, instructions, permissions, binary,
-/// env) come from the default provider config.
+/// env) come from the default provider config, except that deploy_qa live-QA
+/// runs are also bounded by `[deploy_qa] timeout_secs`.
 pub fn build_provider_runner(
     config: &Config,
     tracker: Arc<dyn storage::FixAttemptTracker>,
@@ -177,6 +178,7 @@ pub fn build_provider_runner(
     let runner = runner::ClaudeAgentRunner::new(
         runner::ClaudeRunnerConfig {
             timeout_secs: config.agent.timeout_secs,
+            live_qa_timeout_secs: Some(config.deploy_qa.effective_timeout_secs()),
             model,
             instructions: provider.and_then(|p| p.instructions.clone()),
             permissions: provider.map(|p| p.permissions.clone()).unwrap_or_default(),
@@ -594,6 +596,47 @@ mod tests {
         });
         let sources = build_sources(&config);
         assert_eq!(sources.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_provider_runner_stops_live_qa_at_the_deploy_qa_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const AGENT_CLI_SLEEP_SECS: u64 = 30;
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("claude");
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\ncat > /dev/null\nexec sleep {AGENT_CLI_SLEEP_SECS}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = Config::default();
+        config.deploy_qa.timeout_secs = 1;
+        config.agent.default_provider_config_mut().binary = Some(binary.display().to_string());
+        let runner = build_provider_runner(&config, Arc::new(storage::NoopTracker), None);
+        let issue = Issue::new(
+            "deploy-qa-1",
+            "cloud-1.2.3",
+            "cloud 1.2.3 live QA",
+            "url",
+            deploy_qa::DEPLOY_QA_SOURCE,
+        );
+
+        let started = std::time::Instant::now();
+        let error = runner
+            .answer_question(&issue, "ctx", directory.path())
+            .await
+            .expect_err("a live QA run past `[deploy_qa] timeout_secs` must fail")
+            .to_string();
+        let elapsed = started.elapsed();
+
+        assert!(error.contains("timed out"), "got: {error}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(AGENT_CLI_SLEEP_SECS / 2),
+            "the run waited for the agent CLI instead of `[deploy_qa] timeout_secs`: {elapsed:?}"
+        );
     }
 
     fn deploy_qa_config() -> Config {

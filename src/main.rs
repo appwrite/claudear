@@ -3913,6 +3913,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             InstrumentedRunner::wrap(Arc::new(ClaudeAgentRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.agent.timeout_secs,
+                    live_qa_timeout_secs: Some(config.deploy_qa.effective_timeout_secs()),
                     model: config
                         .agent
                         .default_provider_config()
