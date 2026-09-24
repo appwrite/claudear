@@ -3730,12 +3730,14 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Start QA for pending `deploy_qa` release tips without waiting for it to
     /// finish, returning a handle per started run.
     ///
-    /// The `[deploy_qa]` poller calls this after every poll, so tips run in
-    /// every daemon mode rather than only when the watcher polls its sources.
-    /// Oldest tips go first, at most `qa.max_concurrent` dispatched runs are in
-    /// flight, and a tip is never dispatched twice at once. Nothing starts
-    /// while the watcher is not running (before warm start or during shutdown)
-    /// or is rate limited; tips left out stay pending for a later call.
+    /// The `[deploy_qa]` poller calls this after every poll, in every daemon
+    /// mode. It is the only in-process path that runs tips: source polls skip
+    /// the `deploy_qa` source. Oldest tips go first, at most
+    /// `qa.max_concurrent` dispatched runs are in flight, a tip is never
+    /// dispatched twice at once, and a tip that left pending before its run
+    /// starts is skipped. Nothing starts while the watcher is not running
+    /// (before warm start or during shutdown) or is rate limited; tips left
+    /// out stay pending for a later call.
     pub async fn dispatch_pending_deploy_qa_tips(
         self: &Arc<Self>,
     ) -> Result<Vec<tokio::task::JoinHandle<()>>> {

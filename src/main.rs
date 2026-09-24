@@ -1562,9 +1562,10 @@ fn start_regression_monitoring(
 /// `ReleaseTracker` or `[regression]` watches.
 ///
 /// After every poll it dispatches pending tips through `watcher`, including
-/// tips a previous process left pending, so tips run in every daemon mode, not
-/// only when the watcher polls its sources. Dispatch waits for the watcher to
-/// finish warm start, so tips seen before then run after the next poll.
+/// tips a previous process left pending. That dispatch is the only path that
+/// runs tips in every daemon mode, since the watcher's source polls skip
+/// `deploy_qa`. Dispatch waits for the watcher to finish warm start, so tips
+/// seen before then run after the next poll.
 ///
 /// Before polling starts, every tip still `running` is marked `errored` to
 /// unblock its track. That is usually a run orphaned by a previous process,

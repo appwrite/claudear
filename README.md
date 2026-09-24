@@ -726,7 +726,7 @@ claudear inference feedback 43 --actual-repo my-other-repo
 
 Durable driver for **new GitHub release tips** (Appwrite Labs cloud / edge / vibes). Separate from `[regression]` release tracking, which watches **bug-fix inclusion** after a merge.
 
-Works in every daemon mode — `claudear start` (no `--poll` needed), `claudear webhook` and `claudear poll`. After each poll, pending tips are dispatched to the QA agent, at most `qa.max_concurrent` at a time, once the daemon has finished warm start.
+Works in every daemon mode — `claudear start` (no `--poll` needed), `claudear webhook` and `claudear poll`. After each release poll, pending tips are dispatched to the QA agent, at most `qa.max_concurrent` at a time, once the daemon has finished warm start. That dispatch is the only path that runs tips inside the daemon: the `--poll` source loop leaves `deploy_qa` tips to it, and a tip another process started or finished in the meantime is skipped.
 
 ```toml
 [deploy_qa]
