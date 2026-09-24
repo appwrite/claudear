@@ -4394,8 +4394,9 @@ impl DeployQaStore for SqliteTracker {
         id: i64,
         expected: claudear_core::types::DeployQaTipStatus,
         status: claudear_core::types::DeployQaTipStatus,
+        attempt_id: Option<i64>,
     ) -> Result<bool> {
-        SqliteTracker::update_deploy_qa_tip_status_if(self, id, expected, status)
+        SqliteTracker::update_deploy_qa_tip_status_if(self, id, expected, status, attempt_id)
     }
 
     fn release_running_deploy_qa_tips(&self) -> Result<usize> {
@@ -7957,22 +7958,25 @@ impl SqliteTracker {
         Ok(())
     }
 
-    /// Set tip status only while it is still `expected`; returns whether a row changed.
+    /// Set tip status (and optional attempt id) only while it is still
+    /// `expected`; returns whether a row changed.
     pub fn update_deploy_qa_tip_status_if(
         &self,
         id: i64,
         expected: claudear_core::types::DeployQaTipStatus,
         status: claudear_core::types::DeployQaTipStatus,
+        attempt_id: Option<i64>,
     ) -> Result<bool> {
         let conn = self.acquire_lock()?;
         let changed = conn.execute(
             r#"
             UPDATE deploy_qa_tips
             SET status = ?1,
+                attempt_id = COALESCE(?2, attempt_id),
                 updated_at = datetime('now')
-            WHERE id = ?2 AND status = ?3
+            WHERE id = ?3 AND status = ?4
             "#,
-            params![status.to_string(), id, expected.to_string()],
+            params![status.to_string(), attempt_id, id, expected.to_string()],
         )?;
         Ok(changed > 0)
     }
@@ -11228,6 +11232,7 @@ mod tests {
                 concluded.id,
                 DeployQaTipStatus::Running,
                 DeployQaTipStatus::Errored,
+                None,
             )
             .unwrap();
 
@@ -11250,6 +11255,7 @@ mod tests {
                 unfinished.id,
                 DeployQaTipStatus::Running,
                 DeployQaTipStatus::Errored,
+                None,
             )
             .unwrap();
 
@@ -11265,8 +11271,69 @@ mod tests {
                 i64::MAX,
                 DeployQaTipStatus::Running,
                 DeployQaTipStatus::Errored,
+                None,
             )
             .unwrap());
+    }
+
+    #[test]
+    fn test_update_deploy_qa_tip_status_if_claims_once_and_links_attempt() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let tip = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.2.3"))
+            .unwrap();
+        let stored = || {
+            tracker
+                .get_deploy_qa_tip_by_issue_id(&tip.issue_id)
+                .unwrap()
+                .unwrap()
+        };
+        let claim = || {
+            tracker
+                .update_deploy_qa_tip_status_if(
+                    tip.id,
+                    DeployQaTipStatus::Pending,
+                    DeployQaTipStatus::Running,
+                    None,
+                )
+                .unwrap()
+        };
+        let link_attempt = |attempt_id| {
+            tracker
+                .update_deploy_qa_tip_status_if(
+                    tip.id,
+                    DeployQaTipStatus::Running,
+                    DeployQaTipStatus::Running,
+                    Some(attempt_id),
+                )
+                .unwrap()
+        };
+
+        assert!(claim(), "a pending tip should be claimed");
+        assert!(!claim(), "a claimed tip must not be claimed again");
+        assert!(link_attempt(7), "a running tip should take its attempt");
+        let claimed = stored();
+        assert_eq!(claimed.status, DeployQaTipStatus::Running);
+        assert_eq!(claimed.attempt_id, Some(7));
+
+        tracker
+            .update_deploy_qa_tip_status(tip.id, DeployQaTipStatus::Verified, None)
+            .unwrap();
+
+        assert!(!link_attempt(8), "a tip with a verdict must be left alone");
+        let concluded = stored();
+        assert_eq!(
+            concluded.status,
+            DeployQaTipStatus::Verified,
+            "linking an attempt must not overwrite a verdict"
+        );
+        assert_eq!(
+            concluded.attempt_id,
+            Some(7),
+            "a tip that left the expected status must keep its attempt"
+        );
     }
 
     #[test]

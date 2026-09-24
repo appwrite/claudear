@@ -1779,14 +1779,16 @@ pub trait DeployQaStore: Send + Sync {
         Ok(())
     }
 
-    /// Set tip status only while it is still `expected`, returning whether it
-    /// changed, so a verdict another process wrote concurrently is never
-    /// overwritten.
+    /// Set tip status (and optional attempt id) only while it is still
+    /// `expected`, returning whether it changed, so a verdict another process
+    /// wrote concurrently is never overwritten and only one process can claim
+    /// a tip.
     fn update_deploy_qa_tip_status_if(
         &self,
         _id: i64,
         _expected: DeployQaTipStatus,
         _status: DeployQaTipStatus,
+        _attempt_id: Option<i64>,
     ) -> Result<bool> {
         Ok(false)
     }
