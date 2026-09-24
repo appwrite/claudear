@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use claudear::{
     api::ApiServer,
     config::Config,
-    deploy_qa::DeployQaTracker,
+    deploy_qa::{DeployQaPollAction, DeployQaTracker},
     feedback::{EmbeddingClient, IssueEmbeddingService},
     github::GitHubClient,
     housekeeping::HousekeepingWorker,
@@ -1564,8 +1564,6 @@ fn start_deploy_qa_monitoring(
     config: &Config,
     tracker: Arc<dyn FixAttemptTracker>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    use claudear::deploy_qa::DeployQaPollAction;
-
     if !config.deploy_qa.enabled {
         tracing::info!("Deploy QA disabled in configuration");
         return None;
