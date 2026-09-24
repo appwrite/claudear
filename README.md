@@ -186,7 +186,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Durable last-seen watches for GitHub release tips (separate from regression inclusion tracking)
 - Tag filters (`any`, `suffix:-db`, `not_suffix:-db`) per track
 - Observe/report agent enqueue — never opens fix PRs for a release announcement
-- Discord `#releases` verified reply vs FAIL thread + mapped `@releaser`
+- Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + mapped `@releaser`
 
 ### Notifications
 - **Discord**: Webhook messages + bot reply polling for Q&A, rich embeds, thread tracking
@@ -745,7 +745,10 @@ On a new tip Claudear:
 1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates.
 2. Skips enqueue if a previous attempt on that track is still running. An attempt that ends without a verdict is marked `errored` so it no longer blocks the track.
 3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs.
-4. Posts to Discord `#releases`: all-verified reply (no @), or a FAIL thread that `@`s the releaser via `github-discord-map.json`. Classification fails closed: only a report ending in `DEPLOY_QA_VERDICT: ALL_VERIFIED` with no `LIVE FAIL` / `LIVE BLOCKED` line counts as verified.
+4. Classifies the agent's report and posts the outcome under the release announcement in Discord `#releases` (the agent never posts itself):
+   - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
+   - **Unverified** — nothing failed, but a PR is `LIVE BLOCKED`, the footer is `DEPLOY_QA_VERDICT: UNVERIFIED`, or the footer is missing: reply, no @, so blocked checks never page the releaser but are never reported as verified either.
+   - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser via `github-discord-map.json` (reusing the announcement's existing thread when it already has one).
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
 
