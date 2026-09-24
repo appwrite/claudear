@@ -744,8 +744,8 @@ On a new tip Claudear:
 
 1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates. On first enable a track has no last-seen tag, so its current tip counts as new and gets one QA run.
 2. Skips enqueue if a previous attempt on that track is still running. A tip whose attempt ends without a verdict (agent error or timeout) is marked `errored` so it no longer blocks the track, as is a tip left `running` by an interrupted run when the daemon next starts; the retry manager may still retry a failed attempt.
-3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs.
-4. Classifies the agent's report and posts the outcome under the release announcement in Discord `#releases` (the agent never posts itself):
+3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs. `claudear action` (`reply`, `verify` or `resolve`) refuses these issues.
+4. Classifies the agent's report, records the tip as `verified`, `unverified` or `failed`, and posts the outcome under the release announcement in Discord `#releases` (the agent never posts itself):
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
    - **Unverified** — nothing failed, but a PR is `LIVE BLOCKED`, the footer is `DEPLOY_QA_VERDICT: UNVERIFIED`, or the footer is missing: reply, no @, so blocked checks never page the releaser but are never reported as verified either.
    - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser via `github-discord-map.json` (reusing the announcement's existing thread when it already has one).
