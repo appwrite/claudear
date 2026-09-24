@@ -9183,8 +9183,6 @@ custom_value = "hello"
         });
     }
 
-    // --- Additional AgentConfig tests ---
-
     #[test]
     fn test_agent_config_default_has_claude_provider() {
         let config = AgentConfig::default();

@@ -769,7 +769,6 @@ impl IssueProcessor {
             }
         }
 
-        // --- Main processing pipeline (with repo-swap retry) ---
         let processing_started_at = std::time::Instant::now();
         let mut current_resolution = resolution.clone();
         let mut current_project_dir = project_dir.clone();
@@ -3518,8 +3517,6 @@ mod tests {
         }
     }
 
-    // --- truncate_error_for_activity ---
-
     #[test]
     fn test_truncate_error_for_activity_short_message() {
         let short = "Something failed";
@@ -3570,8 +3567,6 @@ mod tests {
         let without_dots = &result[..result.len() - 3];
         assert!(without_dots.len() <= 497);
     }
-
-    // --- error classification ---
 
     #[test]
     fn test_classify_error_timeout() {
@@ -3653,8 +3648,6 @@ mod tests {
         );
     }
 
-    // --- error hash ---
-
     #[test]
     fn test_error_hash_deterministic() {
         let hash1 = claudear_storage::compute_error_hash("git merge conflict in file.rs");
@@ -3684,8 +3677,6 @@ mod tests {
         let hash = claudear_storage::compute_error_hash("some error");
         assert!(!hash.is_empty());
     }
-
-    // --- ProcessingOutcome ---
 
     #[test]
     fn test_processing_outcome_success_variant() {
@@ -3725,8 +3716,6 @@ mod tests {
             _ => panic!("Expected Failed variant"),
         }
     }
-
-    // --- ProcessingInput ---
 
     #[test]
     fn test_processing_input_fields() {
@@ -3779,8 +3768,6 @@ mod tests {
         assert!(input.review_feedback.is_none());
         assert!(input.existing_pr_branch.is_none());
     }
-
-    // --- enhance_prompt_with_learning ---
 
     #[test]
     fn test_enhance_prompt_no_repo_returns_base() {
@@ -3848,8 +3835,6 @@ mod tests {
         assert_eq!(result, "base prompt");
     }
 
-    // --- is_hard_error / is_rate_limit_error ---
-
     #[test]
     fn test_is_hard_error_rate_limit() {
         assert!(claudear_integrations::runner::is_hard_error(
@@ -3913,8 +3898,6 @@ mod tests {
         ));
     }
 
-    // --- RepoResolution ---
-
     #[test]
     fn test_repo_resolution_skip() {
         let resolution = RepoResolution::Skip {
@@ -3941,8 +3924,6 @@ mod tests {
         assert_eq!(resolution.repo_id(), Some(42));
         assert!(resolution.is_resolved());
     }
-
-    // --- record_error_pattern integration ---
 
     #[test]
     fn test_record_error_pattern_uses_tracker() {
@@ -3985,8 +3966,6 @@ mod tests {
         assert_eq!(patterns[0].error_type.as_deref(), Some("build_failure"));
     }
 
-    // --- parse_pr_url ---
-
     #[test]
     fn test_parse_pr_url_github() {
         let result = claudear_storage::parse_pr_url("https://github.com/org/repo/pull/42");
@@ -4001,8 +3980,6 @@ mod tests {
         let result = claudear_storage::parse_pr_url("not a url");
         assert!(result.is_none());
     }
-
-    // --- parse_pr_url extended ---
 
     #[test]
     fn test_parse_pr_url_empty_string() {
@@ -4043,8 +4020,6 @@ mod tests {
         assert_eq!(repo, "org/repo");
         assert_eq!(pr_number, 999999);
     }
-
-    // --- classify_error extended ---
 
     #[test]
     fn test_classify_error_cargo_keyword() {
@@ -4103,8 +4078,6 @@ mod tests {
         );
     }
 
-    // --- error hash extended ---
-
     #[test]
     fn test_error_hash_empty_string() {
         let hash = claudear_storage::compute_error_hash("");
@@ -4123,8 +4096,6 @@ mod tests {
         let hash2 = claudear_storage::compute_error_hash("git merge conflict in file.py");
         assert_ne!(hash1, hash2);
     }
-
-    // --- ProcessingMetric ---
 
     #[test]
     fn test_processing_metric_new() {
@@ -4183,8 +4154,6 @@ mod tests {
         assert!((metric.metric_value - (-5.0)).abs() < f64::EPSILON);
     }
 
-    // --- ErrorPattern ---
-
     #[test]
     fn test_error_pattern_new() {
         let pattern = ErrorPattern::new("abc123");
@@ -4225,8 +4194,6 @@ mod tests {
         let deserialized: ErrorPattern = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.pattern_hash, "hash456");
     }
-
-    // --- Issue construction and metadata ---
 
     #[test]
     fn test_make_test_issue_fields() {
@@ -4306,8 +4273,6 @@ mod tests {
         );
     }
 
-    // --- RepoResolution extended ---
-
     #[test]
     fn test_repo_resolution_skip_is_not_resolved() {
         let resolution = RepoResolution::Skip {
@@ -4349,8 +4314,6 @@ mod tests {
         };
         assert!(resolution.project_dir().is_none());
     }
-
-    // --- record_error_pattern extended ---
 
     #[test]
     fn test_record_error_pattern_network() {
@@ -4423,8 +4386,6 @@ mod tests {
         assert!(!patterns[0].pattern_hash.is_empty());
     }
 
-    // --- record_metric with tracker ---
-
     #[test]
     fn test_record_metric_stores_in_tracker() {
         let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
@@ -4437,8 +4398,6 @@ mod tests {
         assert!(!metrics.is_empty());
         assert_eq!(metrics[0].metric_name, "test_counter");
     }
-
-    // --- notify_failed_with_escalation ---
 
     #[tokio::test]
     async fn test_notify_failed_with_escalation_non_hard_error() {
@@ -4541,8 +4500,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- record_feedback_outcome ---
-
     #[tokio::test]
     async fn test_record_feedback_outcome_no_attempt() {
         let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
@@ -4628,8 +4585,6 @@ mod tests {
         assert!(!outcomes.is_empty());
     }
 
-    // --- IssueProcessor::run with Skip resolution ---
-
     #[tokio::test]
     async fn test_issue_processor_run_with_skip_resolution() {
         let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
@@ -4694,8 +4649,6 @@ mod tests {
         }
     }
 
-    // --- truncate_error_for_activity edge cases ---
-
     #[test]
     fn test_truncate_error_for_activity_single_char() {
         assert_eq!(truncate_error_for_activity("a"), "a");
@@ -4734,8 +4687,6 @@ mod tests {
         assert!(result.ends_with("..."));
         assert!(result.len() <= 503);
     }
-
-    // --- is_hard_error extended ---
 
     #[test]
     fn test_is_hard_error_internal_server_error() {
@@ -4797,8 +4748,6 @@ mod tests {
     fn test_is_hard_error_empty_string() {
         assert!(!claudear_integrations::runner::is_hard_error(""));
     }
-
-    // --- is_rate_limit_error extended ---
 
     #[test]
     fn test_is_rate_limit_error_ratelimit_one_word() {
@@ -4867,8 +4816,6 @@ mod tests {
             r#"rate_limit_event "status":"allowed_warning""#
         ));
     }
-
-    // --- enhance_prompt_with_learning extended ---
 
     #[test]
     fn test_enhance_prompt_only_qa_promotion_empty_db() {
@@ -4955,8 +4902,6 @@ mod tests {
         assert!(result.contains(base));
     }
 
-    // --- Activity logging integration ---
-
     #[test]
     fn test_activity_log_entry_construction() {
         let entry = ActivityLogEntry::new("processing_started", "Started processing T-1")
@@ -4995,8 +4940,6 @@ mod tests {
         assert_eq!(activities[0].activity_type, "test_event");
     }
 
-    // --- MatchResult ---
-
     #[test]
     fn test_match_result_matched() {
         let m = claudear_core::types::MatchResult::matched(
@@ -5030,8 +4973,6 @@ mod tests {
             claudear_core::types::MatchPriority::Urgent
         );
     }
-
-    // --- AgentResult ---
 
     #[test]
     fn test_agent_result_success_with_pr() {
@@ -5118,8 +5059,6 @@ mod tests {
         assert_eq!(deserialized.used_qa_ids, vec![10, 20]);
     }
 
-    // --- BlockingQuestion ---
-
     #[test]
     fn test_blocking_question_minimal() {
         let bq = claudear_core::types::BlockingQuestion {
@@ -5148,8 +5087,6 @@ mod tests {
             serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.options.len(), 2);
     }
-
-    // --- FixAttemptStatus ---
 
     #[test]
     fn test_fix_attempt_status_display() {
@@ -5193,8 +5130,6 @@ mod tests {
         assert!(claudear_core::types::FixAttemptStatus::from_str("invalid").is_err());
     }
 
-    // --- IssuePriority ---
-
     #[test]
     fn test_issue_priority_ordering() {
         use claudear_core::types::IssuePriority;
@@ -5226,8 +5161,6 @@ mod tests {
         assert_eq!(deserialized, claudear_core::types::IssuePriority::High);
     }
 
-    // --- IssueStatus ---
-
     #[test]
     fn test_issue_status_display() {
         assert_eq!(claudear_core::types::IssueStatus::Open.to_string(), "open");
@@ -5253,8 +5186,6 @@ mod tests {
         let deserialized: claudear_core::types::IssueStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, claudear_core::types::IssueStatus::InProgress);
     }
-
-    // --- PrRecord ---
 
     #[test]
     fn test_pr_record_new() {
@@ -5284,8 +5215,6 @@ mod tests {
         assert_eq!(pr.issue_id.as_deref(), Some("SENTRY-42"));
         assert_eq!(pr.pr_number, 5);
     }
-
-    // --- FixAttempt.is_bug ---
 
     #[test]
     fn test_fix_attempt_is_bug_sentry_source() {
@@ -5383,8 +5312,6 @@ mod tests {
         assert!(attempt.is_bug());
     }
 
-    // --- QaKnowledgeEntry ---
-
     #[test]
     fn test_qa_knowledge_entry_serialization() {
         let entry = QaKnowledgeEntry {
@@ -5415,8 +5342,6 @@ mod tests {
         let deserialized: QaKnowledgeEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.channel, "discord");
     }
-
-    // --- tracker integration: attempt lifecycle ---
 
     #[test]
     fn test_tracker_attempt_lifecycle() {
@@ -5517,8 +5442,6 @@ mod tests {
         assert!(!tracker.has_attempted("test", "nonexistent").unwrap());
     }
 
-    // --- validate_issue_id ---
-
     #[test]
     fn test_validate_issue_id_valid() {
         assert!(claudear_core::types::validate_issue_id("PROJ-123").is_ok());
@@ -5556,8 +5479,6 @@ mod tests {
     fn test_validate_issue_id_null_byte() {
         assert!(claudear_core::types::validate_issue_id("a\0b").is_err());
     }
-
-    // --- Confidence comment formatting tests ---
 
     /// Build the confidence PR comment body, matching the logic in `execute_pipeline`.
     fn build_confidence_comment(confidence: u8, reasoning: Option<&str>) -> String {
@@ -5672,8 +5593,6 @@ mod tests {
         assert!(should_post);
     }
 
-    // --- Confidence comment: edge cases and integration patterns ---
-
     #[test]
     fn test_confidence_comment_has_markdown_header() {
         let comment = build_confidence_comment(50, None);
@@ -5772,8 +5691,6 @@ mod tests {
         assert!(confidence_comment.starts_with("##"));
         assert!(confidence_comment.contains("85/100"));
     }
-
-    // --- Reply-chain assembly ---
 
     #[test]
     fn test_strip_discord_mentions() {
