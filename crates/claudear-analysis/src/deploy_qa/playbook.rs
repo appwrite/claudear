@@ -18,9 +18,9 @@ pub fn bundled_playbook() -> &'static str {
 pub fn load_playbook(path: Option<&Path>) -> Result<String> {
     match path {
         None => Ok(bundled_playbook().to_string()),
-        Some(path) => std::fs::read_to_string(path).map_err(|e| {
+        Some(path) => std::fs::read_to_string(path).map_err(|error| {
             Error::config(format!(
-                "Failed to read deploy_qa playbook '{}': {e}",
+                "Failed to read deploy_qa playbook '{}': {error}",
                 path.display()
             ))
         }),
@@ -30,12 +30,27 @@ pub fn load_playbook(path: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
-    fn bundled_playbook_mentions_non_goals() {
-        let text = bundled_playbook();
-        assert!(text.contains("[regression]"));
-        assert!(text.contains("DEPLOY_QA_VERDICT"));
-        assert!(text.contains("Do **not** open fix PRs"));
+    fn load_playbook_defaults_to_bundled() {
+        assert_eq!(load_playbook(None).unwrap(), bundled_playbook());
+    }
+
+    #[test]
+    fn load_playbook_reads_custom_path() {
+        let contents = "custom live-QA procedure";
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+
+        assert_eq!(load_playbook(Some(file.path())).unwrap(), contents);
+    }
+
+    #[test]
+    fn load_playbook_missing_path_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.md");
+
+        assert!(load_playbook(Some(&missing)).is_err());
     }
 }

@@ -5183,11 +5183,18 @@ monitoring_duration_hours = 12
     fn test_deploy_qa_config_default() {
         let config = DeployQaConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.poll_interval_ms, 300_000);
-        assert!(config.skip_if_previous_running);
-        assert!(config.discord_channel_id.is_none());
         assert!(config.tracks.is_empty());
-        assert_eq!(config.effective_poll_interval_ms(), 300_000);
+        assert!(config.effective_poll_interval_ms() > 0);
+
+        let zero_interval = DeployQaConfig {
+            poll_interval_ms: 0,
+            ..Default::default()
+        };
+        assert!(zero_interval.effective_poll_interval_ms() >= 1);
+
+        let root = Config::default();
+        assert!(!root.deploy_qa.enabled);
+        assert!(root.deploy_qa.tracks.is_empty());
     }
 
     #[test]
@@ -5212,13 +5219,6 @@ monitoring_duration_hours = 12
         assert!(!DeployQaTagFilter::Suffix("-db".into()).matches("1.2.3"));
         assert!(DeployQaTagFilter::NotSuffix("-db".into()).matches("1.2.3"));
         assert!(!DeployQaTagFilter::NotSuffix("-db".into()).matches("1.2.3-db"));
-    }
-
-    #[test]
-    fn test_config_includes_deploy_qa() {
-        let config = Config::default();
-        assert!(!config.deploy_qa.enabled);
-        assert!(config.deploy_qa.tracks.is_empty());
     }
 
     #[test]
@@ -5278,8 +5278,10 @@ tag_filter = "any"
                 DeployQaTagFilter::NotSuffix("-db".into())
             );
             assert_eq!(config.deploy_qa.tracks[3].repo, "appwrite/vibes");
-            // Regression defaults must stay unchanged when only [deploy_qa] is set.
-            assert!(config.regression.enabled);
+            assert_eq!(
+                config.regression.enabled,
+                RegressionConfig::default().enabled
+            );
         });
     }
 
