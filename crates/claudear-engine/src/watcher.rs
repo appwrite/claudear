@@ -3793,7 +3793,14 @@ Create a PR with your changes.{custom_instructions}"#,
     ) -> bool {
         use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
 
+        // Retries, IPC and review-feedback triggers pass no intent, and a
+        // deploy_qa attempt must never reach the fix pipeline.
         let is_deploy_qa = source.name() == DEPLOY_QA_SOURCE;
+        let intent = if is_deploy_qa {
+            Some(Intent::Question)
+        } else {
+            intent
+        };
 
         if self.is_rate_limit_paused().await {
             tracing::info!(
@@ -3951,7 +3958,7 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         // Confidence-aware approval gate
-        if self.should_request_approval(&resolution) {
+        if !is_deploy_qa && self.should_request_approval(&resolution) {
             match self
                 .request_approval(source.name(), &issue, &resolution)
                 .await
@@ -8825,6 +8832,53 @@ mod tests {
                 .track_has_in_flight_deploy_qa("cloud")
                 .unwrap(),
             "an errored tip must not block the track"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_trigger_forces_question_path() {
+        let harness = DeployQaHarness::new(test_config());
+
+        harness
+            .watcher
+            .trigger_issue(DEPLOY_QA_SOURCE, &harness.tip.issue_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness.answer_calls(),
+            1,
+            "a triggered deploy_qa attempt must take the read-only QA path, not the fix pipeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_skips_approval_gate() {
+        let mut config = test_config();
+        config.ask.approval_confidence_threshold = Some("high".to_string());
+        let harness = DeployQaHarness::new(config);
+
+        harness
+            .watcher
+            .process_issue(
+                harness.source.clone(),
+                harness.issue(),
+                MatchResult::matched("deploy_qa pending tip", MatchPriority::High),
+                None,
+                None,
+                Some(Intent::Question),
+            )
+            .await;
+
+        assert_eq!(
+            harness.answer_calls(),
+            1,
+            "observe-only deploy_qa attempts must not wait on human approval"
+        );
+        assert_ne!(
+            harness.stored_status(),
+            DeployQaTipStatus::Running,
+            "the tip must not be left running"
         );
     }
 
