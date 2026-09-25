@@ -32,8 +32,10 @@ use claudear_storage::FixAttemptTracker;
 use futures::future::join_all;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{interval, Duration};
 
@@ -1200,7 +1202,11 @@ impl Watcher {
         let max_wait = std::time::Duration::from_secs(30);
         let start = std::time::Instant::now();
 
-        while self.active_processing.load(Ordering::SeqCst) > 0 {
+        loop {
+            let released = self.next_slot_release();
+            if self.active_processing.load(Ordering::SeqCst) == 0 {
+                break;
+            }
             if start.elapsed() > max_wait {
                 tracing::warn!(
                     remaining = self.active_processing.load(Ordering::SeqCst),
@@ -1212,10 +1218,8 @@ impl Watcher {
                 active_count = self.active_processing.load(Ordering::SeqCst),
                 "Waiting for active tasks to complete..."
             );
-            // Wait for a task to finish (notifies via slot_available) or fall back
-            // to a periodic check in case the notification was missed.
             let remaining = max_wait.saturating_sub(start.elapsed());
-            let _ = tokio::time::timeout(remaining, self.slot_available.notified()).await;
+            let _ = tokio::time::timeout(remaining, released).await;
         }
 
         tracing::info!("Claude Watcher stopped gracefully");
@@ -2611,11 +2615,15 @@ Create a PR with your changes.{custom_instructions}"#,
                     "max_concurrent_for source evaluated to 0, clamping to 1"
                 );
             }
-            while self.active_processing_for_source(&attempt.source) >= retry_max_concurrent {
+            loop {
+                let released = self.next_slot_release();
+                if self.active_processing_for_source(&attempt.source) < retry_max_concurrent {
+                    break;
+                }
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                self.slot_available.notified().await;
+                released.await;
             }
 
             tracing::info!(
@@ -3525,6 +3533,17 @@ Create a PR with your changes.{custom_instructions}"#,
         self.lock_processing().qa_source_count(source_name)
     }
 
+    /// Resolve on the next processing slot release or [`Self::stop`].
+    ///
+    /// `notify_waiters` wakes only futures that already exist, so callers take
+    /// this before checking whether a slot is free: a release between that
+    /// check and the await then still wakes them.
+    fn next_slot_release(&self) -> Pin<Box<Notified<'_>>> {
+        let mut released = Box::pin(self.slot_available.notified());
+        released.as_mut().enable();
+        released
+    }
+
     /// Lock the processing set, recovering it from a poisoned lock: its
     /// methods keep keys and counts in step without panicking, so a holder
     /// that panicked cannot leave it inconsistent.
@@ -3582,6 +3601,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
             // Wait for a concurrency slot in THIS lane.
             loop {
+                let released = self.next_slot_release();
                 let in_flight = if is_qa {
                     self.active_qa_for_source(source.name())
                 } else {
@@ -3601,7 +3621,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     );
                     return;
                 }
-                self.slot_available.notified().await;
+                released.await;
             }
 
             // Carry the trusted routing intent (classified upstream on trusted
@@ -6446,6 +6466,58 @@ mod tests {
         // Clean up simulated work so test state remains consistent.
         watcher.lock_processing().remove("other:inflight");
         watcher.active_processing.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_lane_wakes_for_slot_freed_during_rate_limit_check() {
+        let issue = Issue::new("1", "T-1", "Test Issue", "http://example.com/1", "mock");
+        let source =
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            vec![source.clone()],
+            true,
+        );
+        watcher.set_running(true);
+        let items = vec![(
+            issue,
+            MatchResult::matched("Test", MatchPriority::Normal),
+            None,
+        )];
+        let inflight = watcher
+            .claim_processing("mock:inflight".to_string(), false)
+            .expect("the in-flight key should be free");
+        let pauses = watcher.rate_limit_pause_until.write().await;
+        // The lane queues on the rate-limit lock for its pause check. Handing
+        // it the lock and queuing again parks the lane on the same lock in its
+        // slot wait, after it has seen the lane full, where the slot is freed.
+        let free_slot_during_wait = async {
+            tokio::task::yield_now().await;
+            drop(pauses);
+            let pauses = watcher.rate_limit_pause_until.write().await;
+            drop(inflight);
+            drop(pauses);
+        };
+
+        let dispatched = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                watcher.dispatch_lane(&source, items, 1, false),
+                free_slot_during_wait,
+            )
+        })
+        .await;
+
+        assert!(
+            dispatched.is_ok(),
+            "a slot freed while the lane checks for a rate-limit pause must wake the lane"
+        );
+        assert_eq!(
+            watcher.spawn_handles.lock().await.len(),
+            1,
+            "the lane should dispatch its issue into the freed slot"
+        );
+        watcher.drain_spawned_tasks().await;
     }
 
     #[tokio::test]
