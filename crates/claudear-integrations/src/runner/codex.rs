@@ -220,6 +220,7 @@ impl AgentRunner for CodexAgentRunner {
         command
             .args(&args)
             .current_dir(project_dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let (mut child, mut group) =
@@ -376,6 +377,11 @@ mod tests {
 
     #[cfg(unix)]
     const PR_URL: &str = "https://github.com/org/repo/pull/1";
+
+    /// Set when a test re-runs itself in a child process whose stdin the parent
+    /// holds open.
+    #[cfg(unix)]
+    const STDIN_HELD_OPEN: &str = "CLAUDEAR_TEST_STDIN_HELD_OPEN";
 
     #[test]
     fn test_codex_runner_config_default() {
@@ -651,6 +657,48 @@ mod tests {
         assert!(
             escaped_running,
             "the process must survive the group kill for this test to reach the drain deadline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_finishes_when_the_cli_reads_stdin_claudear_holds_open() {
+        if std::env::var_os(STDIN_HELD_OPEN).is_some() {
+            let (directory, runner) = stub_runner(&pull_request_script("cat > /dev/null\n"));
+            let result = tokio::time::timeout(
+                RUN_DEADLINE,
+                runner.execute_with_attempt("fix", None, None, directory.path()),
+            )
+            .await
+            .expect("the CLI must not wait for input on claudear's stdin")
+            .unwrap();
+            assert_eq!(result.pr_url.as_deref(), Some(PR_URL));
+            return;
+        }
+
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let test =
+            format!("{module}::test_execute_finishes_when_the_cli_reads_stdin_claudear_holds_open");
+        let mut rerun = Command::new(std::env::current_exe().unwrap())
+            .args([test.as_str(), "--exact"])
+            .env(STDIN_HELD_OPEN, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let _held_open = rerun.stdin.take();
+        let output = tokio::time::timeout(2 * RUN_DEADLINE, rerun.wait_with_output())
+            .await
+            .expect("the re-run test must finish")
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the re-run test failed:\n{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
