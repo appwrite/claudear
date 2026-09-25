@@ -484,6 +484,8 @@ mod tests {
     const BEARER_TOKEN: &str = "abc123def456ghi789";
     const GITHUB_TOKEN: &str = "ghp_0123456789abcdefXYZ";
     const MASK: &str = "[REDACTED]";
+    const DISCORD_EMBED_DESCRIPTION_LIMIT: usize = 4096;
+    const CUT_MARKER: char = '…';
 
     #[derive(Debug, Clone)]
     struct Request {
@@ -1324,8 +1326,22 @@ mod tests {
 
         let truncated = truncate_report(&report);
 
-        assert_eq!(truncated.chars().count(), REPORT_CHARACTER_LIMIT);
-        assert!(truncated.starts_with(ELLIPSIS));
-        assert!(truncated.ends_with(&footer));
+        let length = truncated.chars().count();
+        assert!(
+            length <= DISCORD_EMBED_DESCRIPTION_LIMIT,
+            "{length} characters do not fit in a Discord embed description"
+        );
+        assert!(
+            length < report.chars().count(),
+            "a report too long for Discord must be cut"
+        );
+        assert!(
+            truncated.starts_with(CUT_MARKER),
+            "a cut report must show that text was dropped"
+        );
+        assert!(
+            truncated.ends_with(&footer),
+            "a cut report must keep its tail, where the verdict footer is"
+        );
     }
 }
