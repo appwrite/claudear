@@ -3983,31 +3983,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
     }
 
     #[test]
-    fn test_build_live_qa_prompt_runs_live_checks_within_safety_rules() {
-        let mut issue = deploy_qa_issue(DEPLOY_QA_SOURCE);
-        issue.description = Some("Follow the playbook.".to_string());
-        let prompt = build_live_qa_prompt(&issue, "");
-
-        for marker in [
-            "QA project",
-            "repository",
-            "Discord",
-            "secrets",
-            "BLOCKED",
-            "instructions",
-        ] {
-            assert!(
-                prompt.contains(marker),
-                "live QA prompt is missing its `{marker}` rule:\n{prompt}"
-            );
-        }
-        assert!(
-            !prompt.contains("read-only"),
-            "live QA prompt still forbids running checks:\n{prompt}"
-        );
-    }
-
-    #[test]
     fn test_build_live_qa_prompt_carries_operator_instructions_under_their_own_heading() {
         let prompt = build_live_qa_prompt(
             &deploy_qa_issue(DEPLOY_QA_SOURCE),

@@ -6694,6 +6694,49 @@ mod tests {
             vec![(issue_id, QA_REPORT.to_string())],
             "release QA must bypass the reply pipeline and deliver the QA answer"
         );
+        let directories = fixture.agent.project_dirs();
+        assert_eq!(
+            directories.len(),
+            1,
+            "release QA must run once, never as a customer reply: {directories:?}"
+        );
+        assert_eq!(
+            directories[0].parent(),
+            Some(fixture.live_qa_base().as_path()),
+            "release QA must bypass the reply pipeline and run as live QA: {directories:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_never_reaches_the_fix_pipeline_when_reply_pipeline_enabled() {
+        for intent in [Intent::Bug, Intent::Security] {
+            let mut fixture = AnsweringFixture::new();
+            fixture.processor.config.notifiers.helpscout.enabled = true;
+            let mut input = question_input(DEPLOY_QA_SOURCE);
+            input.intent = Some(intent);
+            let issue_id = input.issue.id.clone();
+            let context = RecordingContextProvider::default();
+
+            assert_completed_no_pr(fixture.run(input, &context).await);
+
+            assert_eq!(
+                context.replies(),
+                vec![(issue_id, QA_REPORT.to_string())],
+                "a deploy_qa issue marked {intent:?} must deliver its QA report, not a fix"
+            );
+            let directories = fixture.agent.project_dirs();
+            assert_eq!(
+                directories.len(),
+                1,
+                "a deploy_qa issue marked {intent:?} must run live QA once, never verify it \
+                 for a fix: {directories:?}"
+            );
+            assert_eq!(
+                directories[0].parent(),
+                Some(fixture.live_qa_base().as_path()),
+                "a deploy_qa issue marked {intent:?} must run as live QA: {directories:?}"
+            );
+        }
     }
 
     /// The `[deploy_qa] timeout_secs` the live-QA timeout tests configure.

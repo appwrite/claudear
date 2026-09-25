@@ -478,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_is_report_only_and_not_a_fix() {
+    fn issue_is_routed_as_live_qa_and_scoped_to_its_track() {
         let repo = "appwrite-labs/edge";
         let database = track("edge-db", repo, DeployQaTagFilter::Any);
         let network = track("edge-network", repo, DeployQaTagFilter::Any);
@@ -489,18 +489,26 @@ mod tests {
             issue.source, DEPLOY_QA_SOURCE,
             "the engine runs an issue as live QA, never a fix, by its source"
         );
-        let description = issue.description.as_deref().unwrap();
-        assert!(description.contains(tip.body.as_deref().unwrap()));
+        let description = issue
+            .description
+            .as_deref()
+            .expect("the issue should carry the prompt");
         assert!(
-            description.contains("Do **not** open a fix PR, branch, or commit"),
-            "the agent must be told the tip is report-only: {description}"
+            description.contains(tip.body.as_deref().unwrap()),
+            "the agent must get the release body it checks: {description}"
         );
 
         let again = build_deploy_qa_issue(&database, &tip, bundled_playbook());
-        assert_eq!(issue.id, again.id);
+        assert_eq!(
+            issue.id, again.id,
+            "the same tip on the same track must map to the same issue"
+        );
 
         let other_track = build_deploy_qa_issue(&network, &tip, bundled_playbook());
-        assert_ne!(issue.id, other_track.id);
+        assert_ne!(
+            issue.id, other_track.id,
+            "tracks sharing a repo must not share an issue"
+        );
     }
 
     #[test]
