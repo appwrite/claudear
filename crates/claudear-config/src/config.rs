@@ -110,6 +110,12 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    /// How long an agent run waits, once its CLI has exited or been killed,
+    /// for the CLI's stdout and stderr to close before it stops reading them.
+    /// A command the CLI started can hold them open long after the CLI is
+    /// gone.
+    pub const OUTPUT_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
     /// Get the default provider's config.
     pub fn default_provider_config(&self) -> Option<&ProviderConfig> {
         self.providers.get(&self.default_provider)
@@ -2170,6 +2176,19 @@ pub struct DeployQaTrackConfig {
 /// the timed-out run before processing abandons the run.
 const DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE: Duration = Duration::from_secs(60);
 
+/// Time [`DeployQaConfig::backstop_timeout`] allows the agent runner, beyond a
+/// live-QA run's limit and its wait for the CLI's output, to start the CLI and
+/// to kill it or record its run.
+const DEPLOY_QA_BACKSTOP_SLACK: Duration = Duration::from_secs(5);
+
+/// Least grace [`DeployQaConfig::backstop_timeout`] gives the agent runner past
+/// the live-QA limit: long enough to wait out
+/// [`AgentConfig::OUTPUT_GRACE_PERIOD`] for a finished CLI's output and record
+/// the run, so a run that finished within even a one-second limit is never
+/// abandoned.
+const DEPLOY_QA_BACKSTOP_MINIMUM_GRACE: Duration =
+    AgentConfig::OUTPUT_GRACE_PERIOD.saturating_add(DEPLOY_QA_BACKSTOP_SLACK);
+
 /// Smallest margin [`DeployQaConfig::stale_run_after`] leaves past the live-QA
 /// timeout, covering the backstop grace plus setup and delivery around the
 /// agent run, so a tip with a small timeout is never swept while it runs.
@@ -2219,12 +2238,18 @@ impl DeployQaConfig {
     /// How long processing waits on a live-QA run before abandoning it.
     ///
     /// The agent runner enforces [`Self::effective_timeout_secs`] itself, so
-    /// this only fires when the runner fails to. It adds a grace of the timeout
-    /// again, capped at a minute, for the runner to kill the agent CLI and
-    /// record the timed-out run first.
+    /// this only fires when the runner fails to. Past that limit it allows the
+    /// timeout again, capped at a minute, for the runner to kill the agent CLI
+    /// and record the timed-out run first, and never less than the runner may
+    /// take to return a run that finished within the limit, after waiting
+    /// [`AgentConfig::OUTPUT_GRACE_PERIOD`] for output a command the CLI
+    /// started held open.
     pub fn backstop_timeout(&self) -> Duration {
         let timeout = Duration::from_secs(self.effective_timeout_secs());
-        timeout.saturating_add(timeout.min(DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE))
+        let grace = timeout
+            .min(DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE)
+            .max(DEPLOY_QA_BACKSTOP_MINIMUM_GRACE);
+        timeout.saturating_add(grace)
     }
 
     /// How long a tip may stay `running` before the poller treats its run as
@@ -5278,40 +5303,24 @@ monitoring_duration_hours = 12
         }
     }
 
-    #[test]
-    fn test_deploy_qa_backstop_leaves_the_runner_time_to_enforce_its_limit() {
-        for &timeout_secs in DEPLOY_QA_TIMEOUTS_SECS {
-            let config = deploy_qa_with_timeout(timeout_secs);
-            let limit = Duration::from_secs(config.effective_timeout_secs());
-            let grace = config.backstop_timeout().saturating_sub(limit);
-
-            assert!(
-                !grace.is_zero(),
-                "processing must not abandon a {timeout_secs}s run before the runner enforces that limit itself"
-            );
-            assert!(
-                grace <= limit,
-                "a short run must not be held longer than its own limit again: {timeout_secs}s got {grace:?}"
-            );
-            assert!(
-                grace <= DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE,
-                "a long run must be abandoned soon after the runner should have killed it: {timeout_secs}s got {grace:?}"
-            );
-            if limit >= DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE {
-                assert_eq!(
-                    grace, DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE,
-                    "a long run gives the runner the whole grace to kill and record it"
-                );
-            }
-        }
+    /// The limit the agent runner enforces on a live-QA run under `config`
+    /// when `[agent] timeout_secs` is no shorter.
+    fn runner_limit(config: &DeployQaConfig) -> Duration {
+        Duration::from_secs(config.effective_timeout_secs())
     }
 
     #[test]
-    fn test_deploy_qa_backstop_for_a_one_second_limit_is_two_seconds() {
-        assert_eq!(
-            deploy_qa_with_timeout(1).backstop_timeout(),
-            Duration::from_secs(2)
-        );
+    fn test_deploy_qa_backstop_outlasts_a_run_that_finished_within_its_limit() {
+        for &timeout_secs in DEPLOY_QA_TIMEOUTS_SECS {
+            let config = deploy_qa_with_timeout(timeout_secs);
+            let longest_finished_run = runner_limit(&config) + AgentConfig::OUTPUT_GRACE_PERIOD;
+
+            assert!(
+                config.backstop_timeout() > longest_finished_run,
+                "processing must not abandon a {timeout_secs}s run whose CLI finished within its \
+                 limit while the runner still waits on output a command the CLI started held open"
+            );
+        }
     }
 
     #[test]

@@ -3988,6 +3988,7 @@ pub async fn record_feedback_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claudear_config::config::AgentConfig;
     use claudear_storage::AttemptTracker;
 
     fn make_test_issue() -> Issue {
@@ -6442,7 +6443,7 @@ mod tests {
     /// How long a slow agent takes to answer: far past every timeout these
     /// tests configure, so only a timeout ends its run. A timeout drops the
     /// run, so a passing test never waits this long.
-    const SLOW_AGENT_RUN: Duration = Duration::from_secs(10);
+    const SLOW_AGENT_RUN: Duration = Duration::from_secs(60);
 
     /// An [`IssueProcessor`] answering through an [`AnsweringAgent`], with its
     /// `workspace` in a temporary directory removed when the fixture drops,
@@ -6695,34 +6696,50 @@ mod tests {
         );
     }
 
+    /// The `[deploy_qa] timeout_secs` the live-QA timeout tests configure.
+    const LIVE_QA_LIMIT_SECS: u64 = 1;
+
+    /// How soon processing must give up on a live-QA run with a
+    /// [`LIVE_QA_LIMIT_SECS`] limit that the runner failed to stop.
+    const UNSTOPPED_LIVE_QA_ABANDONED_WITHIN: Duration = Duration::from_secs(15);
+
     #[tokio::test]
-    async fn test_deploy_qa_backstop_waits_past_the_runner_limit_then_gives_up() {
-        let mut fixture = AnsweringFixture::with_agent(AnsweringAgent::slow(SLOW_AGENT_RUN));
-        fixture.processor.config.deploy_qa.timeout_secs = 1;
-        fixture.processor.config.qa.answer_timeout_secs = 3600;
-        let limit_secs = fixture.processor.config.deploy_qa.effective_timeout_secs();
-        let backstop = fixture.processor.config.deploy_qa.backstop_timeout();
+    async fn test_deploy_qa_delivers_a_finished_run_whose_output_stayed_open_past_its_limit() {
+        let drained_run =
+            Duration::from_secs(LIVE_QA_LIMIT_SECS) + AgentConfig::OUTPUT_GRACE_PERIOD;
+        let mut fixture = AnsweringFixture::with_agent(AnsweringAgent::slow(drained_run));
+        fixture.processor.config.deploy_qa.timeout_secs = LIVE_QA_LIMIT_SECS;
+        let input = question_input(DEPLOY_QA_SOURCE);
+        let issue_id = input.issue.id.clone();
         let context = RecordingContextProvider::default();
-        let started = std::time::Instant::now();
 
-        let error = expect_failed(
-            fixture
-                .run(question_input(DEPLOY_QA_SOURCE), &context)
-                .await,
-        );
+        assert_completed_no_pr(fixture.run(input, &context).await);
 
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= backstop,
-            "processing must leave the runner its grace to enforce the {limit_secs}s limit \
-             itself, but gave up after {elapsed:?}"
+        assert_eq!(
+            context.replies(),
+            vec![(issue_id, QA_REPORT.to_string())],
+            "a run whose CLI finished within its limit must have its report delivered, \
+             however long the runner then waited on output a leftover process held open"
         );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_gives_up_on_a_run_the_runner_failed_to_stop() {
+        let mut fixture = AnsweringFixture::with_agent(AnsweringAgent::slow(SLOW_AGENT_RUN));
+        fixture.processor.config.deploy_qa.timeout_secs = LIVE_QA_LIMIT_SECS;
+        fixture.processor.config.qa.answer_timeout_secs = 3600;
+        let context = RecordingContextProvider::default();
+
+        let outcome = tokio::time::timeout(
+            UNSTOPPED_LIVE_QA_ABANDONED_WITHIN,
+            fixture.run(question_input(DEPLOY_QA_SOURCE), &context),
+        )
+        .await
+        .expect("processing must give up by itself on a run that outlives its limit");
+        let error = expect_failed(outcome);
+
         assert!(
-            elapsed < SLOW_AGENT_RUN,
-            "the backstop must stop waiting on a run that outlives it, waited {elapsed:?}"
-        );
-        assert!(
-            error.contains(&format!("{limit_secs}s limit"))
+            error.contains(&format!("{LIVE_QA_LIMIT_SECS}s limit"))
                 && error.contains("[deploy_qa] timeout_secs"),
             "the error must say live QA exceeded the configured [deploy_qa] limit: {error}"
         );

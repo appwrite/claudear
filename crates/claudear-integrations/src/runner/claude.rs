@@ -3,7 +3,7 @@
 use super::{AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
 use claudear_analysis::deploy_qa::{DEPLOY_QA_SOURCE, VERDICT_PREFIX};
-use claudear_config::McpServerConfig;
+use claudear_config::{AgentConfig, McpServerConfig};
 use claudear_core::error::{Error, Result};
 use claudear_core::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
 use claudear_core::types::{
@@ -18,7 +18,6 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -54,11 +53,6 @@ const NESTED_SESSION_VARIABLE: &str = "CLAUDECODE";
 /// Timeout for read-only structured queries (classification-scale, not the long
 /// fix-run timeout).
 const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
-
-/// How long a run waits, once its CLI has exited or been killed, for the
-/// CLI's stdout and stderr to close before it stops reading them. A command
-/// the CLI started can hold them open long after the CLI is gone.
-const OUTPUT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Issue source whose ticket system renders reply bodies as HTML, not Markdown.
 const HELPSCOUT_SOURCE: &str = "helpscout";
@@ -762,7 +756,8 @@ The PR title should include the issue ID: {}
     /// What the `stdout` and `stderr` readers collected. They finish once the
     /// CLI's output closes, but a command the CLI started can hold it open
     /// after the CLI is gone, so readers still waiting after
-    /// [`OUTPUT_GRACE_PERIOD`] are stopped at the output they have read.
+    /// [`AgentConfig::OUTPUT_GRACE_PERIOD`] are stopped at the output they
+    /// have read.
     async fn finish_reading(
         stdout: JoinHandle<StdoutParseResult>,
         stderr: JoinHandle<String>,
@@ -772,13 +767,14 @@ The PR title should include the issue ID: {}
     ) -> (StdoutParseResult, String) {
         let readers = async { tokio::join!(stdout, stderr) };
         tokio::pin!(readers);
-        let (stdout, stderr) = match tokio::time::timeout(OUTPUT_GRACE_PERIOD, &mut readers).await {
+        let grace = AgentConfig::OUTPUT_GRACE_PERIOD;
+        let (stdout, stderr) = match tokio::time::timeout(grace, &mut readers).await {
             Ok(finished) => finished,
             Err(_) => {
                 tracing::warn!(
                     component = "claude",
                     label = label,
-                    grace_secs = OUTPUT_GRACE_PERIOD.as_secs(),
+                    grace_secs = grace.as_secs(),
                     "A process the CLI started still holds its output pipes open; continuing with the output read so far"
                 );
                 Self::append_execution_event(
@@ -786,7 +782,7 @@ The PR title should include the issue ID: {}
                     label,
                     "output_held_open",
                     json!({
-                        "grace_secs": OUTPUT_GRACE_PERIOD.as_secs(),
+                        "grace_secs": grace.as_secs(),
                     }),
                 )
                 .await;
