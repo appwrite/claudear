@@ -1,6 +1,6 @@
 //! Claude CLI runner for executing fixes.
 
-use super::{AgentRunner, ProviderCapabilities};
+use super::{process_group, AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
 use claudear_analysis::deploy_qa::{DEPLOY_QA_SOURCE, VERDICT_PREFIX};
 use claudear_config::McpServerConfig;
@@ -32,6 +32,14 @@ const DEFAULT_READONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebFetch", "W
 /// Timeout for read-only structured queries (classification-scale, not the long
 /// fix-run timeout).
 const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
+
+/// How long to keep reading the CLI's output after its process group is killed.
+/// Its own output is already buffered by then, so this only bounds the wait on
+/// processes that escaped the group while holding the pipes.
+const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+const OUTPUT_HELD_OPEN_MESSAGE: &str =
+    "Stopped reading Claude output held open by a process outside its process group";
 
 /// Issue source whose ticket system renders reply bodies as HTML, not Markdown.
 const HELPSCOUT_SOURCE: &str = "helpscout";
@@ -647,6 +655,41 @@ The PR title should include the issue ID: {}
         (env, label)
     }
 
+    /// The CLI invocation every run spawns through a [`process_group::Guard`].
+    fn command(
+        &self,
+        arguments: &[String],
+        environment: HashMap<String, String>,
+        project_dir: &Path,
+    ) -> Command {
+        let mut command = Command::new(&self.config.binary);
+        command
+            .args(arguments)
+            .current_dir(project_dir)
+            .envs(environment)
+            .env_remove("CLAUDECODE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        command
+    }
+
+    /// The next line of the CLI's `stream`, or `None` once `drain_deadline`
+    /// passes with the pipe still held open.
+    async fn next_output_line<R: tokio::io::AsyncBufRead + Unpin>(
+        lines: &mut tokio::io::Lines<R>,
+        drain_deadline: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+        label: &str,
+        stream: &str,
+    ) -> Option<std::io::Result<Option<String>>> {
+        tokio::select! {
+            line = lines.next_line() => Some(line),
+            () = drain_deadline => {
+                tracing::warn!(component = "claude", label, stream, "{OUTPUT_HELD_OPEN_MESSAGE}");
+                None
+            }
+        }
+    }
+
     async fn execute(
         &self,
         prompt: &str,
@@ -719,21 +762,18 @@ The PR title should include the issue ID: {}
         // long"). `--print` with no positional prompt reads the prompt from stdin.
         args.push("--print".to_string());
 
-        let (env, _label) = self.prepare_env_and_label(None);
+        let (env, label) = self.prepare_env_and_label(None);
 
-        let mut child = Command::new(&self.config.binary)
-            .args(&args)
-            .current_dir(project_dir)
-            .envs(env)
-            .env_remove("CLAUDECODE")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+        let (mut child, mut group) = process_group::Guard::spawn(
             // Discard stderr: this lean path never reads it, and leaving it piped
             // would let `--verbose` diagnostics fill the OS buffer and block the
             // child before it writes the `result` event to stdout.
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| Error::runner(format!("Failed to spawn {}: {}", self.config.binary, e)))?;
+            self.command(&args, env, project_dir).stderr(Stdio::null()),
+            process_group::Registry::global(),
+        )
+        .map_err(|error| {
+            Error::runner(format!("Failed to spawn {}: {}", self.config.binary, error))
+        })?;
 
         // Write the prompt to stdin concurrently with reading stdout to avoid a
         // pipe-buffer deadlock when the prompt is large.
@@ -754,10 +794,18 @@ The PR title should include the issue ID: {}
             .take()
             .ok_or_else(|| Error::runner("Failed to capture stdout"))?;
 
+        let drain_deadline = group.drain_deadline(OUTPUT_DRAIN_TIMEOUT);
         let collect = async {
+            tokio::pin!(drain_deadline);
             let mut lines = BufReader::new(stdout).lines();
             let mut structured: Option<serde_json::Value> = None;
-            while let Ok(Some(line)) = lines.next_line().await {
+            loop {
+                let Some(Ok(Some(line))) =
+                    Self::next_output_line(&mut lines, drain_deadline.as_mut(), label, "stdout")
+                        .await
+                else {
+                    break;
+                };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -772,15 +820,13 @@ The PR title should include the issue ID: {}
             }
             structured
         };
+        let run = async { tokio::join!(collect, group.wait(&mut child)).0 };
 
         let timeout = std::time::Duration::from_secs(STRUCTURED_QUERY_TIMEOUT_SECS);
-        let structured = match tokio::time::timeout(timeout, collect).await {
-            Ok(s) => {
-                let _ = child.wait().await;
-                s
-            }
+        let structured = match tokio::time::timeout(timeout, run).await {
+            Ok(structured) => structured,
             Err(_) => {
-                let _ = child.start_kill();
+                group.kill();
                 return Err(Error::runner(format!(
                     "structured query timed out after {}s",
                     STRUCTURED_QUERY_TIMEOUT_SECS
@@ -1172,17 +1218,11 @@ The PR title should include the issue ID: {}
         )
         .await;
 
-        let mut child = match Command::new(&self.config.binary)
-            .args(&args)
-            .current_dir(project_dir)
-            .envs(env)
-            .env_remove("CLAUDECODE")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
+        let (mut child, mut group) = match process_group::Guard::spawn(
+            self.command(&args, env, project_dir).stderr(Stdio::piped()),
+            process_group::Registry::global(),
+        ) {
+            Ok(spawned) => spawned,
             Err(e) => {
                 Self::append_execution_event(
                     &event_writer,
@@ -1257,6 +1297,8 @@ The PR title should include the issue ID: {}
 
         let label_stdout = label.to_string();
         let label_stderr = label.to_string();
+        let stdout_drain_deadline = group.drain_deadline(OUTPUT_DRAIN_TIMEOUT);
+        let stderr_drain_deadline = group.drain_deadline(OUTPUT_DRAIN_TIMEOUT);
         let stdout_log_path = log_files.as_ref().map(|f| f.stdout.clone());
         let stderr_log_path = log_files.as_ref().map(|f| f.stderr.clone());
         let stdout_event_writer = event_writer.clone();
@@ -1267,6 +1309,7 @@ The PR title should include the issue ID: {}
         drop(early_failure_tx);
 
         let stdout_handle = tokio::spawn(async move {
+            tokio::pin!(stdout_drain_deadline);
             let mut lines = BufReader::new(stdout).lines();
             let mut text_output = String::new();
             let mut final_result = FinalResult::default();
@@ -1305,7 +1348,16 @@ The PR title should include the issue ID: {}
             let mut signaled_rate_limit = false;
 
             loop {
-                let next_line = lines.next_line().await;
+                let Some(next_line) = ClaudeAgentRunner::next_output_line(
+                    &mut lines,
+                    stdout_drain_deadline.as_mut(),
+                    label_stdout.as_str(),
+                    "stdout",
+                )
+                .await
+                else {
+                    break;
+                };
                 let line = match next_line {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
@@ -1528,6 +1580,7 @@ The PR title should include the issue ID: {}
 
         // Stream stderr
         let stderr_handle = tokio::spawn(async move {
+            tokio::pin!(stderr_drain_deadline);
             let mut lines = BufReader::new(stderr).lines();
             let mut output = String::new();
             let mut line_number: u64 = 0;
@@ -1556,7 +1609,16 @@ The PR title should include the issue ID: {}
             let mut signaled_rate_limit = false;
 
             loop {
-                let next_line = lines.next_line().await;
+                let Some(next_line) = ClaudeAgentRunner::next_output_line(
+                    &mut lines,
+                    stderr_drain_deadline.as_mut(),
+                    label_stderr.as_str(),
+                    "stderr",
+                )
+                .await
+                else {
+                    break;
+                };
                 let line = match next_line {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
@@ -1676,15 +1738,16 @@ The PR title should include the issue ID: {}
 
         let outcome = loop {
             tokio::select! {
-                result = child.wait() => break WaitOutcome::Exited(result),
+                result = group.wait(&mut child) => break WaitOutcome::Exited(result),
                 _ = &mut timeout_sleep => break WaitOutcome::TimedOut,
-                maybe_msg = early_failure_rx.recv() => {
-                    if let Some(msg) = maybe_msg {
-                        break WaitOutcome::EarlyFailure(msg);
+                message = early_failure_rx.recv() => {
+                    if let Some(message) = message {
+                        break WaitOutcome::EarlyFailure(message);
                     }
                 }
             }
         };
+        group.kill();
 
         let mut forced_failure_msg: Option<String> = None;
         let (status, timed_out) = match outcome {
@@ -2574,6 +2637,8 @@ fn parse_verify_result(output: &str) -> VerifyResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::runner::process_group::tests::{exits_within, is_running, kill};
 
     /// Create a runner with a no-op tracker for tests that don't need persistence.
     fn new_simple(config: ClaudeRunnerConfig) -> ClaudeAgentRunner {
@@ -2758,13 +2823,18 @@ mod tests {
         })
     }
 
-    /// A stub `claude` binary that drains the prompt from stdin, prints
-    /// `events` as stream-json lines and exits with `exit_code`.
+    /// Start of every stub `claude` binary: answers [`wait_until_executable`]'s
+    /// probe, then drains the prompt from stdin.
     #[cfg(unix)]
-    fn fake_cli_script(events: &[serde_json::Value], exit_code: i32) -> String {
+    const STUB_HEADER: &str = "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\ncat > /dev/null\n";
+
+    /// A stub `claude` binary that runs `setup`, prints `events` as stream-json
+    /// lines and exits with `exit_code`.
+    #[cfg(unix)]
+    fn fake_cli_script(setup: &str, events: &[serde_json::Value], exit_code: i32) -> String {
         let lines: Vec<String> = events.iter().map(|event| event.to_string()).collect();
         format!(
-            "#!/bin/sh\ncat > /dev/null\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
+            "{STUB_HEADER}{setup}cat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
             lines.join("\n")
         )
     }
@@ -2782,21 +2852,97 @@ mod tests {
         ]
     }
 
-    /// Run [`ClaudeAgentRunner::run_reply`] for an issue from `source` against a
-    /// stub CLI emitting `events`, with execution logs kept in a temp dir.
+    /// Stub setup that leaves `sleep 300` running in the background, holding
+    /// the stub's stdout, and records "<background pid> <stub pid>" in `pids`.
     #[cfg(unix)]
-    fn run_reply_with_fake_cli(
-        source: &str,
-        events: &[serde_json::Value],
-        exit_code: i32,
-    ) -> Result<String> {
+    const BACKGROUND_PROCESS: &str = "sleep 300 &\necho \"$! $$\" > pids\n";
+
+    /// Stub setup that leaves `sleep 300` running in a session of its own,
+    /// beyond the reach of a process group kill, holding the stub's stdout. It
+    /// records its pid in `escaped` once it has left the group.
+    #[cfg(unix)]
+    const ESCAPED_PROCESS: &str = concat!(
+        r#"perl -e 'use POSIX; setsid(); open(my $f, ">", "escaped") or die; "#,
+        r#"print $f "$$\n"; close $f; sleep 300' &"#,
+        "\nwhile [ ! -s escaped ]; do sleep 0.1; done\n",
+    );
+
+    /// Generous, because CI runs the tests under `cargo tarpaulin`'s ptrace.
+    #[cfg(unix)]
+    const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    #[cfg(unix)]
+    fn recorded_escaped_pid(directory: &Path) -> Option<u32> {
+        let contents = std::fs::read_to_string(directory.join("escaped")).ok()?;
+        contents.strip_suffix('\n')?.parse().ok()
+    }
+
+    /// The `(background, stub)` pids [`BACKGROUND_PROCESS`] recorded.
+    #[cfg(unix)]
+    fn recorded_pids(directory: &Path) -> Option<(u32, u32)> {
+        let contents = std::fs::read_to_string(directory.join("pids")).ok()?;
+        let (background, stub) = contents.strip_suffix('\n')?.split_once(' ')?;
+        Some((background.parse().ok()?, stub.parse().ok()?))
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_recorded_pids(directory: &Path) -> (u32, u32) {
+        loop {
+            if let Some(pids) = recorded_pids(directory) {
+                return pids;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Exec `binary` until the kernel stops refusing it with ETXTBSY: a process
+    /// a concurrent test forks can briefly inherit the descriptor it was
+    /// written through.
+    #[cfg(unix)]
+    fn wait_until_executable(binary: &Path) {
+        let start = std::time::Instant::now();
+        loop {
+            let probe = std::process::Command::new(binary)
+                .arg("--probe")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            match probe {
+                Ok(_) => return,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && start.elapsed() < RUN_DEADLINE =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("the stub CLI must be executable: {error}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    /// Call `run` with a runner whose `claude` binary is a stub running
+    /// `script`, and a temp project directory that also holds the execution
+    /// logs.
+    #[cfg(unix)]
+    fn with_fake_cli<T>(script: &str, run: impl FnOnce(&ClaudeAgentRunner, &Path) -> T) -> T {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let binary = directory.path().join("claude");
-        std::fs::write(&binary, fake_cli_script(events, exit_code)).unwrap();
+        std::fs::write(&binary, script).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&binary);
         let previous_log_dir = std::env::var("CLAUDEAR_LOG_DIR").ok();
         std::env::set_var("CLAUDEAR_LOG_DIR", directory.path().join("logs"));
 
@@ -2804,23 +2950,191 @@ mod tests {
             binary: binary.display().to_string(),
             ..ClaudeRunnerConfig::default()
         });
-        let reply = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(runner.run_reply(
-                &deploy_qa_issue(source),
-                "ctx",
-                None,
-                ReplyKind::Answer,
-                directory.path(),
-            ));
+        let result = run(&runner, directory.path());
 
         match previous_log_dir {
             Some(value) => std::env::set_var("CLAUDEAR_LOG_DIR", value),
             None => std::env::remove_var("CLAUDEAR_LOG_DIR"),
         }
-        reply
+        result
+    }
+
+    /// Run [`ClaudeAgentRunner::run_reply`] for an issue from `source` against a
+    /// stub CLI emitting `events`.
+    #[cfg(unix)]
+    fn run_reply_with_fake_cli(
+        source: &str,
+        events: &[serde_json::Value],
+        exit_code: i32,
+    ) -> Result<String> {
+        with_fake_cli(
+            &fake_cli_script("", events, exit_code),
+            |runner, directory| {
+                block_on(runner.run_reply(
+                    &deploy_qa_issue(source),
+                    "ctx",
+                    None,
+                    ReplyKind::Answer,
+                    directory,
+                ))
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_returns_while_a_background_process_holds_stdout() {
+        let script = fake_cli_script(
+            BACKGROUND_PROCESS,
+            &[
+                assistant_text_event("Thanks!"),
+                result_event("Thanks!", false),
+            ],
+            0,
+        );
+        let (reply, pids) = with_fake_cli(&script, |runner, directory| {
+            let reply = block_on(async {
+                tokio::time::timeout(
+                    RUN_DEADLINE,
+                    runner.run_reply(&verify_issue(), "ctx", None, ReplyKind::Answer, directory),
+                )
+                .await
+            });
+            (reply, recorded_pids(directory))
+        });
+        let (background, _) = pids.expect("the stub records its pids");
+
+        let reply = reply.expect("the run must not wait for background processes to close stdout");
+        assert_eq!(reply.unwrap(), "Thanks!");
+        assert!(
+            exits_within(background),
+            "background process {background} outlived the run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_structured_query_returns_while_a_background_process_holds_stdout() {
+        let verdict = json!({"verdict": "ok"});
+        let script = fake_cli_script(
+            BACKGROUND_PROCESS,
+            &[json!({"type": "result", "is_error": false, "structured_output": verdict})],
+            0,
+        );
+        let (structured, pids) = with_fake_cli(&script, |runner, directory| {
+            let structured = block_on(async {
+                tokio::time::timeout(
+                    RUN_DEADLINE,
+                    runner.run_structured_query("prompt", "{}", directory),
+                )
+                .await
+            });
+            (structured, recorded_pids(directory))
+        });
+        let (background, _) = pids.expect("the stub records its pids");
+
+        let structured =
+            structured.expect("the query must not wait for background processes to close stdout");
+        assert_eq!(structured.unwrap(), verdict);
+        assert!(
+            exits_within(background),
+            "background process {background} outlived the query"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dropping_a_run_kills_the_cli_and_its_background_processes() {
+        let script = format!("{STUB_HEADER}{BACKGROUND_PROCESS}exec sleep 300\n");
+        let issue = verify_issue();
+        let pids = with_fake_cli(&script, |runner, directory| {
+            block_on(async {
+                let recorded = async {
+                    let (background, cli) = wait_for_recorded_pids(directory).await;
+                    (background, cli, is_running(background) && is_running(cli))
+                };
+                tokio::select! {
+                    _ = runner.run_reply(&issue, "ctx", None, ReplyKind::Answer, directory) => None,
+                    recorded = tokio::time::timeout(RUN_DEADLINE, recorded) => recorded.ok(),
+                }
+            })
+        });
+        let (background, cli, running) = pids.expect("the stub records its pids and keeps running");
+
+        assert!(
+            running,
+            "the stub's processes must be running when the run is dropped"
+        );
+        assert!(exits_within(cli), "CLI {cli} outlived its dropped run");
+        assert!(
+            exits_within(background),
+            "background process {background} outlived the dropped run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_reply_stops_reading_output_held_open_outside_the_process_group() {
+        let script = fake_cli_script(
+            ESCAPED_PROCESS,
+            &[
+                assistant_text_event("Thanks!"),
+                result_event("Thanks!", false),
+            ],
+            0,
+        );
+        let (reply, escaped) = with_fake_cli(&script, |runner, directory| {
+            let reply = block_on(async {
+                tokio::time::timeout(
+                    RUN_DEADLINE,
+                    runner.run_reply(&verify_issue(), "ctx", None, ReplyKind::Answer, directory),
+                )
+                .await
+            });
+            (reply, recorded_escaped_pid(directory))
+        });
+        let escaped = escaped.expect("the stub records the escaped pid");
+        let escaped_running = is_running(escaped);
+        kill(escaped);
+
+        let reply = reply.expect("the run must not wait on output held open outside its group");
+        assert_eq!(reply.unwrap(), "Thanks!");
+        assert!(
+            escaped_running,
+            "the process must survive the group kill for this test to reach the drain deadline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_structured_query_stops_reading_output_held_open_outside_the_process_group() {
+        let verdict = json!({"verdict": "ok"});
+        let script = fake_cli_script(
+            ESCAPED_PROCESS,
+            &[json!({"type": "result", "is_error": false, "structured_output": verdict})],
+            0,
+        );
+        let (structured, escaped) = with_fake_cli(&script, |runner, directory| {
+            let structured = block_on(async {
+                tokio::time::timeout(
+                    RUN_DEADLINE,
+                    runner.run_structured_query("prompt", "{}", directory),
+                )
+                .await
+            });
+            (structured, recorded_escaped_pid(directory))
+        });
+        let escaped = escaped.expect("the stub records the escaped pid");
+        let escaped_running = is_running(escaped);
+        kill(escaped);
+
+        let structured =
+            structured.expect("the query must not wait on output held open outside its group");
+        assert_eq!(structured.unwrap(), verdict);
+        assert!(
+            escaped_running,
+            "the process must survive the group kill for this test to reach the drain deadline"
+        );
     }
 
     #[cfg(unix)]

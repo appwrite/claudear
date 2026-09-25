@@ -8,6 +8,7 @@ pub mod codex;
 pub mod copilot;
 pub mod gemini;
 pub mod orchestrator;
+pub mod process_group;
 
 use async_trait::async_trait;
 use claudear_core::error::Result;

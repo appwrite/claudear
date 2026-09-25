@@ -57,9 +57,6 @@ tower-cookies = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 # Crypto
 hex = { workspace = true }
 rand = { workspace = true }
@@ -81,6 +78,10 @@ tower = { workspace = true }
 
 # CLI
 indicatif = { workspace = true }
+
+# Process checking and IPC on Unix
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
