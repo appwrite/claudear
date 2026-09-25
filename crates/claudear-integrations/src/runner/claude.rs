@@ -3056,10 +3056,6 @@ mod tests {
     #[cfg(unix)]
     const FAKE_CLI_BINARY: &str = "claude";
 
-    /// File, beside the stub CLI, that it records its NUL-separated arguments to.
-    #[cfg(unix)]
-    const FAKE_CLI_ARGS_FILE: &str = "args";
-
     /// File, beside the stub CLI, that it records its environment to, one
     /// `NAME=value` per line.
     #[cfg(unix)]
@@ -3084,9 +3080,9 @@ mod tests {
     #[cfg(unix)]
     const FAKE_CLI_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-    /// A stub `claude` binary that records its arguments and environment,
-    /// drains the prompt from stdin, prints `events` as stream-json lines and
-    /// exits with `exit_code`.
+    /// A stub `claude` binary that records its environment, drains the prompt
+    /// from stdin, prints `events` as stream-json lines and exits with
+    /// `exit_code`.
     #[cfg(unix)]
     fn fake_cli_script(events: &[serde_json::Value], exit_code: i32) -> String {
         delayed_cli_script(0, events, exit_code)
@@ -3097,7 +3093,7 @@ mod tests {
     fn delayed_cli_script(delay_secs: u64, events: &[serde_json::Value], exit_code: i32) -> String {
         let lines: Vec<String> = events.iter().map(|event| event.to_string()).collect();
         format!(
-            "#!/bin/sh\ndirectory=\"$(dirname \"$0\")\"\nprintf '%s\\0' \"$@\" > \"$directory/{FAKE_CLI_ARGS_FILE}\"\nenv > \"$directory/{FAKE_CLI_ENVIRONMENT_FILE}\"\ncat > /dev/null\nsleep {delay_secs}\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
+            "#!/bin/sh\nenv > \"$(dirname \"$0\")/{FAKE_CLI_ENVIRONMENT_FILE}\"\ncat > /dev/null\nsleep {delay_secs}\ncat <<'EVENTS'\n{}\nEVENTS\nexit {exit_code}\n",
             lines.join("\n")
         )
     }
@@ -3185,18 +3181,6 @@ mod tests {
 
         fn directory(&self) -> &Path {
             self.directory.path()
-        }
-
-        /// The arguments the stub was last spawned with.
-        fn recorded_args(&self) -> Vec<String> {
-            let recorded = std::fs::read_to_string(self.directory().join(FAKE_CLI_ARGS_FILE))
-                .expect("the stub CLI was never spawned");
-            recorded
-                .strip_suffix('\0')
-                .unwrap_or(&recorded)
-                .split('\0')
-                .map(str::to_string)
-                .collect()
         }
 
         /// The environment the stub was last spawned with.
@@ -3287,28 +3271,6 @@ mod tests {
             .block_on(future)
     }
 
-    /// Run [`ClaudeAgentRunner::run_reply`] for an issue from `source` with
-    /// `config` against a stub CLI emitting `events`, returning the reply and
-    /// the arguments the CLI was spawned with.
-    #[cfg(unix)]
-    fn run_reply_with_fake_cli_config(
-        source: &str,
-        config: ClaudeRunnerConfig,
-        events: &[serde_json::Value],
-        exit_code: i32,
-    ) -> (Result<String>, Vec<String>) {
-        let cli = FakeCli::install(&fake_cli_script(events, exit_code));
-        let runner = cli.runner(config);
-        let reply = block_on(runner.run_reply(
-            &deploy_qa_issue(source),
-            "ctx",
-            None,
-            ReplyKind::Answer,
-            cli.directory(),
-        ));
-        (reply, cli.recorded_args())
-    }
-
     /// Run [`ClaudeAgentRunner::run_reply`] for an issue from `source` with the
     /// default config against a stub CLI emitting `events`.
     #[cfg(unix)]
@@ -3317,21 +3279,14 @@ mod tests {
         events: &[serde_json::Value],
         exit_code: i32,
     ) -> Result<String> {
-        run_reply_with_fake_cli_config(source, ClaudeRunnerConfig::default(), events, exit_code).0
-    }
-
-    /// The arguments a successful reply run for an issue from `source` spawns
-    /// the CLI with under `config`.
-    #[cfg(unix)]
-    fn reply_cli_args(source: &str, config: ClaudeRunnerConfig) -> Vec<String> {
-        let (reply, args) = run_reply_with_fake_cli_config(
-            source,
-            config,
-            &[result_event(LIVE_QA_FINAL_REPORT, false)],
-            0,
-        );
-        reply.expect("the stub reply run succeeds");
-        args
+        let cli = FakeCli::install(&fake_cli_script(events, exit_code));
+        block_on(cli.runner(ClaudeRunnerConfig::default()).run_reply(
+            &deploy_qa_issue(source),
+            "ctx",
+            None,
+            ReplyKind::Answer,
+            cli.directory(),
+        ))
     }
 
     /// The `execution_initialized` event data of a successful reply run for an
@@ -3354,27 +3309,10 @@ mod tests {
         cli.execution_initialized()
     }
 
-    /// The model [`full_access_config`] runs.
+    /// The permissions [`full_access_config`] grants fix runs: the shell and
+    /// file edits.
     #[cfg(unix)]
-    const FULL_ACCESS_MODEL: &str = "opus";
-
-    /// The instructions [`full_access_config`] appends to the system prompt.
-    #[cfg(unix)]
-    const FULL_ACCESS_INSTRUCTIONS: &str = "Follow AGENT.md";
-
-    /// The permissions [`full_access_config`] grants fix runs.
-    #[cfg(unix)]
-    const FULL_ACCESS_PERMISSIONS: [&str; 2] = ["Bash(git *)", "Edit"];
-
-    /// The MCP server [`full_access_config_with_mcp_servers`] attaches to
-    /// deploy_qa runs.
-    #[cfg(unix)]
-    const BROWSER_MCP_SERVER: &str = "browser";
-
-    /// The MCP server [`full_access_config_with_mcp_servers`] attaches to
-    /// HelpScout runs.
-    #[cfg(unix)]
-    const HELPDESK_MCP_SERVER: &str = "helpdesk";
+    const FULL_ACCESS_PERMISSIONS: [&str; 2] = ["Bash", "Edit"];
 
     /// A config that grants fix runs full access.
     #[cfg(unix)]
@@ -3382,266 +3320,316 @@ mod tests {
         ClaudeRunnerConfig {
             skip_permissions: true,
             permissions: FULL_ACCESS_PERMISSIONS.map(str::to_string).to_vec(),
-            model: Some(FULL_ACCESS_MODEL.to_string()),
-            instructions: Some(FULL_ACCESS_INSTRUCTIONS.to_string()),
             ..ClaudeRunnerConfig::default()
         }
     }
 
-    /// [`full_access_config`] with a browser MCP server for deploy_qa runs and
-    /// a helpdesk one for HelpScout runs.
+    /// The MCP server [`browser_mcp_config`] attaches to deploy_qa runs.
     #[cfg(unix)]
-    fn full_access_config_with_mcp_servers() -> ClaudeRunnerConfig {
+    const BROWSER_MCP_SERVER: &str = "browser";
+
+    /// A config that attaches the [`BROWSER_MCP_SERVER`] to deploy_qa runs only.
+    #[cfg(unix)]
+    fn browser_mcp_config() -> ClaudeRunnerConfig {
         let browser = McpServerConfig {
             command: Some("npx".to_string()),
             args: vec!["@playwright/mcp".to_string()],
             sources: vec![DEPLOY_QA_SOURCE.to_string()],
             ..Default::default()
         };
-        let helpdesk = McpServerConfig {
-            command: Some("uvx".to_string()),
-            sources: vec![HELPSCOUT_SOURCE.to_string()],
-            ..Default::default()
-        };
         ClaudeRunnerConfig {
-            mcp: HashMap::from([
-                (BROWSER_MCP_SERVER.to_string(), browser),
-                (HELPDESK_MCP_SERVER.to_string(), helpdesk),
-            ]),
-            ..full_access_config()
+            mcp: HashMap::from([(BROWSER_MCP_SERVER.to_string(), browser)]),
+            ..ClaudeRunnerConfig::default()
         }
     }
 
-    /// The `--allowedTools` arguments that grant each of `tools`.
+    /// The MCP server a repository declares in its own `.mcp.json`.
     #[cfg(unix)]
-    fn allowed_tools_args<'a>(tools: &[&'a str]) -> Vec<&'a str> {
-        tools
-            .iter()
-            .flat_map(|&tool| ["--allowedTools", tool])
-            .collect()
+    const REPOSITORY_MCP_SERVER: &str = "repository";
+
+    /// A stub `claude` binary that honours Claude Code's documented permission
+    /// contract. `--dangerously-skip-permissions` allows every tool; otherwise
+    /// only the tools `--allowedTools` names are allowed, where `Bash` allows
+    /// any command and `Bash(<prefix>...)` the commands starting with
+    /// `<prefix>`. It attaches the MCP servers each `--mcp-config` file names,
+    /// plus those in its working directory's `.mcp.json` unless given
+    /// `--strict-mcp-config`, and loads that directory's
+    /// `.claude/settings.json` unless `--setting-sources` leaves out `project`.
+    ///
+    /// Its final answer reports what the run could do, as [`Access`] reads it:
+    /// whether it could run `curl` through the shell, edit a file and fetch a
+    /// web page, which MCP servers it attached, and whether it loaded the
+    /// project settings.
+    #[cfg(unix)]
+    const PERMISSION_ENFORCING_CLI_SCRIPT: &str = r#"#!/bin/sh
+curl=blocked
+edit=blocked
+fetch=blocked
+servers=
+strict=
+sources=user,project,local
+settings=ignored
+
+attach() {
+    for server in $(awk '
+        { json = json $0 "\n" }
+        END {
+            for (i = 1; i <= length(json); i++) {
+                character = substr(json, i, 1)
+                if (quoted) {
+                    if (character == "\\") { i++ }
+                    else if (character == "\"") { quoted = 0 }
+                    else { key = key character }
+                }
+                else if (character == "\"") { quoted = 1; key = "" }
+                else if (character == "{") { depth++ }
+                else if (character == "}") { depth-- }
+                else if (character == ":" && depth == 2) { print key }
+            }
+        }' "$1"); do
+        servers="${servers:+$servers,}$server"
+    done
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dangerously-skip-permissions) curl=ran edit=ran fetch=ran ;;
+        --allowedTools)
+            case "$2" in
+                Bash) curl=ran ;;
+                'Bash('*')')
+                    prefix=${2#'Bash('}
+                    prefix=${prefix%')'}
+                    prefix=${prefix%'*'}
+                    prefix=${prefix%:}
+                    case 'curl https://cloud.appwrite.io/v1/health' in "$prefix"*) curl=ran ;; esac
+                    ;;
+                Edit) edit=ran ;;
+                WebFetch) fetch=ran ;;
+            esac
+            shift
+            ;;
+        --mcp-config) attach "$2"; shift ;;
+        --strict-mcp-config) strict=1 ;;
+        --setting-sources) sources=$2; shift ;;
+        --output-format|--model|--append-system-prompt|--json-schema) shift ;;
+    esac
+    shift
+done
+
+cat > /dev/null
+if [ -z "$strict" ] && [ -f .mcp.json ]; then attach .mcp.json; fi
+case ",$sources," in *,project,*) if [ -f .claude/settings.json ]; then settings=loaded; fi ;; esac
+report="shell:curl=$curl edit=$edit web-fetch=$fetch mcp=$servers project-settings=$settings"
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$report"
+printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' "$report"
+"#;
+
+    /// What a run could do, as a [`PERMISSION_ENFORCING_CLI_SCRIPT`] stub
+    /// reports it.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct Access {
+        /// Whether it could run `curl` through the shell.
+        curl: bool,
+        /// Whether it could edit a file.
+        edit: bool,
+        /// Whether it could fetch a web page.
+        web_fetch: bool,
+        /// The MCP servers attached to it.
+        mcp_servers: Vec<String>,
+        /// Whether it loaded its working directory's `.claude/settings.json`.
+        project_settings: bool,
     }
 
-    /// The tool name that grants every tool of the MCP server `server`.
     #[cfg(unix)]
-    fn mcp_server_tools(server: &str) -> String {
-        format!("mcp__{server}")
+    impl Access {
+        /// The access the stub's `action=outcome` `report` describes.
+        fn reported_in(report: &str) -> Self {
+            let outcome = |action: &str| {
+                report
+                    .split_whitespace()
+                    .find_map(|entry| entry.strip_prefix(action)?.strip_prefix('='))
+                    .unwrap_or_else(|| panic!("the stub reported no `{action}` outcome: {report}"))
+            };
+            Self {
+                curl: outcome("shell:curl") == "ran",
+                edit: outcome("edit") == "ran",
+                web_fetch: outcome("web-fetch") == "ran",
+                mcp_servers: outcome("mcp")
+                    .split(',')
+                    .filter(|server| !server.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                project_settings: outcome("project-settings") == "loaded",
+            }
+        }
     }
 
-    /// The rendered MCP config file that `args` pass via `--mcp-config`.
+    /// The access a reply to an issue from `source` gets under `config`, as
+    /// `cli`, a [`PERMISSION_ENFORCING_CLI_SCRIPT`] stub, reports it.
     #[cfg(unix)]
-    fn mcp_config_path(args: &[String]) -> String {
-        let path = args
-            .iter()
-            .position(|arg| arg == "--mcp-config")
-            .and_then(|index| args.get(index + 1))
-            .expect("a matched MCP server is passed via --mcp-config")
-            .clone();
-        assert!(path.ends_with(".json"), "got: {path}");
-        path
+    fn reply_access(cli: &FakeCli, source: &str, config: ClaudeRunnerConfig) -> Access {
+        let report = block_on(cli.runner(config).run_reply(
+            &deploy_qa_issue(source),
+            "ctx",
+            None,
+            ReplyKind::Answer,
+            cli.directory(),
+        ))
+        .unwrap_or_else(|error| panic!("the stub {source} reply failed: {error}"));
+        Access::reported_in(&report)
+    }
+
+    /// The access a live-QA run gets under `config`.
+    #[cfg(unix)]
+    fn live_qa_access(config: ClaudeRunnerConfig) -> Access {
+        reply_access(
+            &FakeCli::install(PERMISSION_ENFORCING_CLI_SCRIPT),
+            DEPLOY_QA_SOURCE,
+            config,
+        )
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_deploy_qa_gets_fix_run_access_plus_read_only_tools() {
-        assert_eq!(
-            reply_cli_args(DEPLOY_QA_SOURCE, full_access_config()),
-            [
-                vec![
-                    "--verbose",
-                    "--output-format",
-                    "stream-json",
-                    "--strict-mcp-config",
-                    "--setting-sources",
-                    LIVE_QA_SETTING_SOURCES,
-                    "--dangerously-skip-permissions",
-                    "--model",
-                    FULL_ACCESS_MODEL,
-                    "--append-system-prompt",
-                    FULL_ACCESS_INSTRUCTIONS,
-                ],
-                allowed_tools_args(&FULL_ACCESS_PERMISSIONS),
-                allowed_tools_args(DEFAULT_READONLY_TOOLS),
-                vec!["--print"],
-            ]
-            .concat()
+    fn test_live_qa_skipping_permissions_may_run_commands_and_edit_files() {
+        let access = live_qa_access(ClaudeRunnerConfig {
+            skip_permissions: true,
+            ..ClaudeRunnerConfig::default()
+        });
+
+        assert!(
+            access.curl,
+            "live QA skipping permissions could not run curl"
+        );
+        assert!(
+            access.edit,
+            "live QA skipping permissions could not edit a file"
+        );
+    }
+
+    /// A permission that lets a run execute `curl` and no other command.
+    #[cfg(unix)]
+    const CURL_PERMISSION: &str = "Bash(curl:*)";
+
+    #[cfg(unix)]
+    #[test]
+    fn test_live_qa_may_run_the_commands_its_bash_rules_allow() {
+        let access = live_qa_access(ClaudeRunnerConfig {
+            permissions: vec![CURL_PERMISSION.to_string()],
+            ..ClaudeRunnerConfig::default()
+        });
+
+        assert!(
+            access.curl,
+            "live QA could not run the curl `{CURL_PERMISSION}` allows"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_deploy_qa_keeps_read_only_tools_without_fix_access() {
+    fn test_live_qa_without_fix_access_may_fetch_pages_but_not_run_commands() {
+        let access = live_qa_access(ClaudeRunnerConfig::default());
+
+        assert!(!access.curl, "live QA ran curl without shell access");
+        assert!(access.web_fetch, "live QA lost the read-only tools");
         assert_eq!(
-            reply_cli_args(DEPLOY_QA_SOURCE, ClaudeRunnerConfig::default()),
-            [
-                vec![
-                    "--verbose",
-                    "--output-format",
-                    "stream-json",
-                    "--strict-mcp-config",
-                    "--setting-sources",
-                    LIVE_QA_SETTING_SOURCES,
-                ],
-                allowed_tools_args(DEFAULT_READONLY_TOOLS),
-                vec!["--print"],
-            ]
-            .concat()
+            new_simple(ClaudeRunnerConfig::default()).live_qa_shell_warning(),
+            Some(LIVE_QA_NO_SHELL_WARNING),
+            "a live QA run that cannot run curl must warn that it has no shell access"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_customer_reply_stays_read_only_under_full_access_config() {
-        assert_eq!(
-            reply_cli_args(HELPSCOUT_SOURCE, full_access_config()),
-            [
-                vec![
-                    "--verbose",
-                    "--output-format",
-                    "stream-json",
-                    "--model",
-                    FULL_ACCESS_MODEL,
-                    "--append-system-prompt",
-                    FULL_ACCESS_INSTRUCTIONS,
-                ],
-                allowed_tools_args(DEFAULT_READONLY_TOOLS),
-                vec!["--print"],
-            ]
-            .concat()
-        );
+    fn test_read_only_runs_stay_read_only_under_full_access() {
+        let cli = FakeCli::install(PERMISSION_ENFORCING_CLI_SCRIPT);
+        let customer_reply = reply_access(&cli, HELPSCOUT_SOURCE, full_access_config());
+        let verification = block_on(cli.runner(full_access_config()).run_verify(
+            &verify_issue(),
+            "ctx",
+            cli.directory(),
+        ))
+        .expect("the stub verification succeeds");
+        let verification = Access::reported_in(&verification.evidence);
+
+        for (run, access) in [
+            ("customer reply", customer_reply),
+            ("verification", verification),
+        ] {
+            assert!(!access.curl, "a {run} ran curl");
+            assert!(!access.edit, "a {run} edited a file");
+            assert!(access.web_fetch, "a {run} lost the read-only tools");
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_run_verify_stays_read_only_under_full_access_config() {
-        let cli = FakeCli::install(&fake_cli_script(
-            &[result_event(r#"{"reproduced": false}"#, false)],
-            0,
-        ));
-        let runner = cli.runner(full_access_config());
-
-        block_on(runner.run_verify(&verify_issue(), "ctx", cli.directory()))
-            .expect("the stub verify run succeeds");
-
-        assert_eq!(
-            cli.recorded_args(),
-            [
-                vec![
-                    "--verbose",
-                    "--output-format",
-                    "stream-json",
-                    "--model",
-                    FULL_ACCESS_MODEL,
-                    "--append-system-prompt",
-                    FULL_ACCESS_INSTRUCTIONS,
-                ],
-                allowed_tools_args(DEFAULT_READONLY_TOOLS),
-                vec!["--print"],
-            ]
-            .concat()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_fix_run_keeps_schema_and_configured_access() {
-        let cli = FakeCli::install(&fake_cli_script(
-            &[json!({
-                "type": "result",
-                "is_error": false,
-                "result": "done",
-                "structured_output": {"summary": "done", "success": true, "confidence": 90}
-            })],
-            0,
-        ));
-        let runner = cli.runner(full_access_config());
+    fn test_fix_run_may_run_commands_and_edit_files_under_full_access() {
+        let cli = FakeCli::install(PERMISSION_ENFORCING_CLI_SCRIPT);
         let issue = Issue::new("1", "SENTRY-1", "Crash on login", "url", "sentry");
 
-        block_on(runner.execute_with_attempt("Fix it", Some(&issue), None, cli.directory()))
-            .expect("the stub fix run succeeds");
+        let fix = block_on(cli.runner(full_access_config()).execute_with_attempt(
+            "Fix it",
+            Some(&issue),
+            None,
+            cli.directory(),
+        ))
+        .expect("the stub fix run succeeds");
 
-        assert_eq!(
-            cli.recorded_args(),
-            [
-                vec![
-                    "--verbose",
-                    "--output-format",
-                    "stream-json",
-                    "--json-schema",
-                    RESULT_SCHEMA,
-                    "--dangerously-skip-permissions",
-                    "--model",
-                    FULL_ACCESS_MODEL,
-                    "--append-system-prompt",
-                    FULL_ACCESS_INSTRUCTIONS,
-                ],
-                allowed_tools_args(&FULL_ACCESS_PERMISSIONS),
-                vec!["--print"],
-            ]
-            .concat()
-        );
+        let access = Access::reported_in(&fix.output);
+        assert!(access.curl, "a fix run could not run curl");
+        assert!(access.edit, "a fix run could not edit a file");
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_run_reply_deploy_qa_attaches_only_its_mcp_servers() {
-        let args = reply_cli_args(DEPLOY_QA_SOURCE, full_access_config_with_mcp_servers());
+    fn test_live_qa_ignores_the_mcp_servers_and_settings_of_its_working_directory() {
+        let cli = FakeCli::install(PERMISSION_ENFORCING_CLI_SCRIPT);
+        let repository_mcp = json!({
+            "mcpServers": {
+                REPOSITORY_MCP_SERVER: {"command": "node", "args": ["server.js"]}
+            }
+        });
+        std::fs::write(
+            cli.directory().join(".mcp.json"),
+            repository_mcp.to_string(),
+        )
+        .unwrap();
+        let settings_directory = cli.directory().join(".claude");
+        std::fs::create_dir(&settings_directory).unwrap();
+        std::fs::write(settings_directory.join("settings.json"), "{}").unwrap();
 
-        let config_path = mcp_config_path(&args);
-        let browser_tools = mcp_server_tools(BROWSER_MCP_SERVER);
+        let live_qa = reply_access(&cli, DEPLOY_QA_SOURCE, browser_mcp_config());
+        let unconfigured_live_qa =
+            reply_access(&cli, DEPLOY_QA_SOURCE, ClaudeRunnerConfig::default());
+        let customer_reply = reply_access(&cli, HELPSCOUT_SOURCE, browser_mcp_config());
+
         assert_eq!(
-            args,
-            [
-                vec![
-                    "--verbose",
-                    "--output-format",
-                    "stream-json",
-                    "--mcp-config",
-                    config_path.as_str(),
-                    "--strict-mcp-config",
-                    "--setting-sources",
-                    LIVE_QA_SETTING_SOURCES,
-                    "--dangerously-skip-permissions",
-                    "--model",
-                    FULL_ACCESS_MODEL,
-                    "--append-system-prompt",
-                    FULL_ACCESS_INSTRUCTIONS,
-                ],
-                allowed_tools_args(&FULL_ACCESS_PERMISSIONS),
-                allowed_tools_args(DEFAULT_READONLY_TOOLS),
-                allowed_tools_args(&[browser_tools.as_str()]),
-                vec!["--print"],
-            ]
-            .concat()
+            live_qa.mcp_servers,
+            [BROWSER_MCP_SERVER],
+            "live QA must attach only its configured MCP servers"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_run_reply_customer_reply_attaches_only_its_mcp_servers() {
-        let args = reply_cli_args(HELPSCOUT_SOURCE, full_access_config_with_mcp_servers());
-
-        let config_path = mcp_config_path(&args);
-        let helpdesk_tools = mcp_server_tools(HELPDESK_MCP_SERVER);
+        assert!(
+            unconfigured_live_qa.mcp_servers.is_empty(),
+            "live QA attached MCP servers it was not configured with: {:?}",
+            unconfigured_live_qa.mcp_servers
+        );
+        for access in [&live_qa, &unconfigured_live_qa] {
+            assert!(
+                !access.project_settings,
+                "live QA loaded the repository's project settings"
+            );
+        }
         assert_eq!(
-            args,
-            [
-                vec![
-                    "--verbose",
-                    "--output-format",
-                    "stream-json",
-                    "--mcp-config",
-                    config_path.as_str(),
-                    "--strict-mcp-config",
-                    "--model",
-                    FULL_ACCESS_MODEL,
-                    "--append-system-prompt",
-                    FULL_ACCESS_INSTRUCTIONS,
-                ],
-                allowed_tools_args(DEFAULT_READONLY_TOOLS),
-                allowed_tools_args(&[helpdesk_tools.as_str()]),
-                vec!["--print"],
-            ]
-            .concat()
+            customer_reply.mcp_servers,
+            [REPOSITORY_MCP_SERVER],
+            "a customer reply keeps attaching the repository's MCP servers"
+        );
+        assert!(
+            customer_reply.project_settings,
+            "a customer reply keeps loading the repository's project settings"
         );
     }
 
@@ -4074,38 +4062,6 @@ mod tests {
                 "{source} replies must stay read-only"
             );
         }
-    }
-
-    #[test]
-    fn test_allowed_tools_live_qa_adds_read_only_tools_not_already_permitted() {
-        let runner = new_simple(ClaudeRunnerConfig {
-            permissions: vec!["Read".to_string(), "Bash".to_string()],
-            readonly_tools: vec!["Read".to_string(), "Grep".to_string()],
-            ..ClaudeRunnerConfig::default()
-        });
-
-        assert_eq!(
-            runner.allowed_tools(RunProfile::LiveQa),
-            vec!["Read", "Bash", "Grep"]
-        );
-        assert_eq!(runner.allowed_tools(RunProfile::Fix), vec!["Read", "Bash"]);
-        assert_eq!(
-            runner.allowed_tools(RunProfile::Reply),
-            vec!["Read", "Grep"]
-        );
-    }
-
-    #[test]
-    fn test_skips_permissions_never_for_read_only_runs() {
-        let runner = new_simple(ClaudeRunnerConfig {
-            skip_permissions: true,
-            ..ClaudeRunnerConfig::default()
-        });
-
-        assert!(runner.skips_permissions(RunProfile::Fix));
-        assert!(runner.skips_permissions(RunProfile::LiveQa));
-        assert!(!runner.skips_permissions(RunProfile::Reply));
-        assert!(!new_simple(ClaudeRunnerConfig::default()).skips_permissions(RunProfile::LiveQa));
     }
 
     #[test]
