@@ -2638,7 +2638,10 @@ fn parse_verify_result(output: &str) -> VerifyResult {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use crate::runner::process_group::tests::{exits_within, is_running, kill};
+    use crate::runner::process_group::tests::{
+        exits_within, install_stub, is_running, kill, recorded_escaped_pid, recorded_pids,
+        wait_for_recorded_pids, BACKGROUND_PROCESS, ESCAPED_PROCESS, RUN_DEADLINE,
+    };
 
     /// Create a runner with a no-op tracker for tests that don't need persistence.
     fn new_simple(config: ClaudeRunnerConfig) -> ClaudeAgentRunner {
@@ -2823,10 +2826,9 @@ mod tests {
         })
     }
 
-    /// Start of every stub `claude` binary: answers [`wait_until_executable`]'s
-    /// probe, then drains the prompt from stdin.
+    /// Start of every stub `claude` binary: drains the prompt from stdin.
     #[cfg(unix)]
-    const STUB_HEADER: &str = "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\ncat > /dev/null\n";
+    const STUB_HEADER: &str = "cat > /dev/null\n";
 
     /// A stub `claude` binary that runs `setup`, prints `events` as stream-json
     /// lines and exits with `exit_code`.
@@ -2852,75 +2854,6 @@ mod tests {
         ]
     }
 
-    /// Stub setup that leaves `sleep 300` running in the background, holding
-    /// the stub's stdout, and records "<background pid> <stub pid>" in `pids`.
-    #[cfg(unix)]
-    const BACKGROUND_PROCESS: &str = "sleep 300 &\necho \"$! $$\" > pids\n";
-
-    /// Stub setup that leaves `sleep 300` running in a session of its own,
-    /// beyond the reach of a process group kill, holding the stub's stdout. It
-    /// records its pid in `escaped` once it has left the group.
-    #[cfg(unix)]
-    const ESCAPED_PROCESS: &str = concat!(
-        r#"perl -e 'use POSIX; setsid(); open(my $f, ">", "escaped") or die; "#,
-        r#"print $f "$$\n"; close $f; sleep 300' &"#,
-        "\nwhile [ ! -s escaped ]; do sleep 0.1; done\n",
-    );
-
-    /// Generous, because CI runs the tests under `cargo tarpaulin`'s ptrace.
-    #[cfg(unix)]
-    const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-
-    #[cfg(unix)]
-    fn recorded_escaped_pid(directory: &Path) -> Option<u32> {
-        let contents = std::fs::read_to_string(directory.join("escaped")).ok()?;
-        contents.strip_suffix('\n')?.parse().ok()
-    }
-
-    /// The `(background, stub)` pids [`BACKGROUND_PROCESS`] recorded.
-    #[cfg(unix)]
-    fn recorded_pids(directory: &Path) -> Option<(u32, u32)> {
-        let contents = std::fs::read_to_string(directory.join("pids")).ok()?;
-        let (background, stub) = contents.strip_suffix('\n')?.split_once(' ')?;
-        Some((background.parse().ok()?, stub.parse().ok()?))
-    }
-
-    #[cfg(unix)]
-    async fn wait_for_recorded_pids(directory: &Path) -> (u32, u32) {
-        loop {
-            if let Some(pids) = recorded_pids(directory) {
-                return pids;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    /// Exec `binary` until the kernel stops refusing it with ETXTBSY: a process
-    /// a concurrent test forks can briefly inherit the descriptor it was
-    /// written through.
-    #[cfg(unix)]
-    fn wait_until_executable(binary: &Path) {
-        let start = std::time::Instant::now();
-        loop {
-            let probe = std::process::Command::new(binary)
-                .arg("--probe")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            match probe {
-                Ok(_) => return,
-                Err(error)
-                    if error.raw_os_error() == Some(libc::ETXTBSY)
-                        && start.elapsed() < RUN_DEADLINE =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("the stub CLI must be executable: {error}"),
-            }
-        }
-    }
-
     #[cfg(unix)]
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
@@ -2935,14 +2868,10 @@ mod tests {
     /// logs.
     #[cfg(unix)]
     fn with_fake_cli<T>(script: &str, run: impl FnOnce(&ClaudeAgentRunner, &Path) -> T) -> T {
-        use std::os::unix::fs::PermissionsExt;
-
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let binary = directory.path().join("claude");
-        std::fs::write(&binary, script).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        wait_until_executable(&binary);
+        install_stub(&binary, script);
         let previous_log_dir = std::env::var("CLAUDEAR_LOG_DIR").ok();
         std::env::set_var("CLAUDEAR_LOG_DIR", directory.path().join("logs"));
 
