@@ -1,10 +1,12 @@
 //! Agent CLIs lead process groups of their own, so a run can kill whatever it
 //! leaves behind and claudear can reach every CLI when it shuts down.
 
+mod drain;
 mod guard;
 mod registry;
 mod signal;
 
+pub use drain::Drain;
 pub use guard::Guard;
 pub use registry::Registry;
 

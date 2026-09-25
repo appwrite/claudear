@@ -33,10 +33,14 @@ const DEFAULT_READONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebFetch", "W
 /// fix-run timeout).
 const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
 
-/// How long to keep reading the CLI's output after its process group is killed.
-/// Its own output is already buffered by then, so this only bounds the wait on
-/// processes that escaped the group while holding the pipes.
+/// How long to keep waiting for the CLI's output after its process group is
+/// killed. Its own output is already buffered by then, so this only bounds the
+/// wait on processes that escaped the group while holding the pipes.
 const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// When to stop reading the CLI's output after its process group is killed,
+/// even while a process that escaped the group keeps writing to the pipes.
+const OUTPUT_DRAIN_CUTOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
 const OUTPUT_HELD_OPEN_MESSAGE: &str =
     "Stopped reading Claude output held open by a process outside its process group";
@@ -673,21 +677,24 @@ The PR title should include the issue ID: {}
         command
     }
 
-    /// The next line of the CLI's `stream`, or `None` once `drain_deadline`
-    /// passes with the pipe still held open.
+    /// The next line of the CLI's `stream`, or `None` once `drain` is over with
+    /// the pipe still held open.
     async fn next_output_line<R: tokio::io::AsyncBufRead + Unpin>(
         lines: &mut tokio::io::Lines<R>,
-        drain_deadline: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+        drain: &mut process_group::Drain,
         label: &str,
         stream: &str,
     ) -> Option<std::io::Result<Option<String>>> {
-        tokio::select! {
-            line = lines.next_line() => Some(line),
-            () = drain_deadline => {
-                tracing::warn!(component = "claude", label, stream, "{OUTPUT_HELD_OPEN_MESSAGE}");
-                None
-            }
+        let line = drain.next_line(lines).await;
+        if line.is_none() {
+            tracing::warn!(
+                component = "claude",
+                label,
+                stream,
+                "{OUTPUT_HELD_OPEN_MESSAGE}"
+            );
         }
+        line
     }
 
     async fn execute(
@@ -794,15 +801,13 @@ The PR title should include the issue ID: {}
             .take()
             .ok_or_else(|| Error::runner("Failed to capture stdout"))?;
 
-        let drain_deadline = group.drain_deadline(OUTPUT_DRAIN_TIMEOUT);
+        let mut drain = group.drain(OUTPUT_DRAIN_TIMEOUT, OUTPUT_DRAIN_CUTOFF);
         let collect = async {
-            tokio::pin!(drain_deadline);
             let mut lines = BufReader::new(stdout).lines();
             let mut structured: Option<serde_json::Value> = None;
             loop {
                 let Some(Ok(Some(line))) =
-                    Self::next_output_line(&mut lines, drain_deadline.as_mut(), label, "stdout")
-                        .await
+                    Self::next_output_line(&mut lines, &mut drain, label, "stdout").await
                 else {
                     break;
                 };
@@ -1297,8 +1302,8 @@ The PR title should include the issue ID: {}
 
         let label_stdout = label.to_string();
         let label_stderr = label.to_string();
-        let stdout_drain_deadline = group.drain_deadline(OUTPUT_DRAIN_TIMEOUT);
-        let stderr_drain_deadline = group.drain_deadline(OUTPUT_DRAIN_TIMEOUT);
+        let mut stdout_drain = group.drain(OUTPUT_DRAIN_TIMEOUT, OUTPUT_DRAIN_CUTOFF);
+        let mut stderr_drain = group.drain(OUTPUT_DRAIN_TIMEOUT, OUTPUT_DRAIN_CUTOFF);
         let stdout_log_path = log_files.as_ref().map(|f| f.stdout.clone());
         let stderr_log_path = log_files.as_ref().map(|f| f.stderr.clone());
         let stdout_event_writer = event_writer.clone();
@@ -1309,7 +1314,6 @@ The PR title should include the issue ID: {}
         drop(early_failure_tx);
 
         let stdout_handle = tokio::spawn(async move {
-            tokio::pin!(stdout_drain_deadline);
             let mut lines = BufReader::new(stdout).lines();
             let mut text_output = String::new();
             let mut final_result = FinalResult::default();
@@ -1350,7 +1354,7 @@ The PR title should include the issue ID: {}
             loop {
                 let Some(next_line) = ClaudeAgentRunner::next_output_line(
                     &mut lines,
-                    stdout_drain_deadline.as_mut(),
+                    &mut stdout_drain,
                     label_stdout.as_str(),
                     "stdout",
                 )
@@ -1580,7 +1584,6 @@ The PR title should include the issue ID: {}
 
         // Stream stderr
         let stderr_handle = tokio::spawn(async move {
-            tokio::pin!(stderr_drain_deadline);
             let mut lines = BufReader::new(stderr).lines();
             let mut output = String::new();
             let mut line_number: u64 = 0;
@@ -1611,7 +1614,7 @@ The PR title should include the issue ID: {}
             loop {
                 let Some(next_line) = ClaudeAgentRunner::next_output_line(
                     &mut lines,
-                    stderr_drain_deadline.as_mut(),
+                    &mut stderr_drain,
                     label_stderr.as_str(),
                     "stderr",
                 )
