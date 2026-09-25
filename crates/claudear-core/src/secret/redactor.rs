@@ -1,6 +1,10 @@
 //! Credential redaction for untrusted text leaving Claudear.
 
 use super::{redact_secrets, SecretValue, REDACTED};
+use base64::alphabet;
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+use base64::engine::DecodePaddingMode;
+use base64::Engine;
 use regex_lite::{Captures, NoExpand, Regex};
 use std::sync::LazyLock;
 
@@ -70,6 +74,18 @@ const MINIMUM_APPWRITE_KEY_SECRET_LENGTH: usize = 32;
 
 /// Characters found in tokens but not in words.
 const TOKEN_SYMBOLS: &str = "_.~+/=";
+
+/// Decodes the base64 of `Basic` credentials, padded or not, and even when
+/// the text cuts it short.
+const BASIC_CREDENTIALS_ENCODING: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+        .with_decode_allow_trailing_bits(true),
+);
+
+/// Separates the user from the password in decoded `Basic` credentials.
+const USER_PASSWORD_SEPARATOR: char = ':';
 
 /// Borders a markdown table cell: it ends an unquoted header value in a
 /// cell, and stands in for the colon after a header's name or a label.
@@ -243,18 +259,18 @@ impl Redactor {
     }
 
     /// Replace every credential in `text` with [`REDACTED`]: the known
-    /// secrets, PEM blocks, credential header values, `Bearer` and `Basic`
-    /// credentials, URL passwords, the values of secret-named `NAME=value`
-    /// assignments and JSON fields (Appwrite `a_session_*` cookies among
-    /// them), Appwrite API keys, generated-looking values after a credential
-    /// label or flag such as `API key:` or `--key`, JWTs, and tokens with a
-    /// known prefix.
+    /// secrets, PEM blocks, credential header values, every value of eight or
+    /// more characters after `Bearer`, `Basic` credentials, URL passwords, the
+    /// values of secret-named `NAME=value` assignments and JSON fields
+    /// (Appwrite `a_session_*` cookies among them), Appwrite API keys,
+    /// generated-looking values after a credential label or flag such as
+    /// `API key:` or `--key`, JWTs, and tokens with a known prefix.
     pub fn redact(&self, text: &str) -> String {
         let text = self.redact_known(text);
         let text = PEM_BLOCK.replace_all(&text, NoExpand(REDACTED));
         let text = redact_credential_headers(&text);
-        let text = redact_matches(&text, &BEARER_CREDENTIALS, is_credential);
-        let text = redact_matches(&text, &BASIC_CREDENTIALS, is_credential);
+        let text = redact_matches(&text, &BEARER_CREDENTIALS, is_bearer_credential);
+        let text = redact_matches(&text, &BASIC_CREDENTIALS, is_basic_credential);
         let text = redact_matches(&text, &URL_PASSWORD, |_, _| true);
         let text = redact_matches(&text, &VARIABLE_ASSIGNMENT, has_secret_name);
         let text = redact_matches(&text, &JSON_FIELD, has_secret_name);
@@ -343,8 +359,33 @@ fn redact_matches(
         .into_owned()
 }
 
-fn is_credential(_: &Captures<'_>, token: &str) -> bool {
-    looks_like_credential(token)
+/// Whether the value after `Bearer` is a credential: the scheme says it is,
+/// whatever characters it uses, unless it is too short to be one, like the
+/// `token` in "Bearer token".
+fn is_bearer_credential(_: &Captures<'_>, token: &str) -> bool {
+    token.chars().count() >= MINIMUM_SECRET_LENGTH
+}
+
+/// Whether the value after `Basic` is a credential rather than a word, as in
+/// "basic functionality": shaped like a credential, or base64 of the
+/// `user:password` pair every `Basic` credential encodes, whatever characters
+/// that base64 happens to use.
+fn is_basic_credential(_: &Captures<'_>, token: &str) -> bool {
+    looks_like_credential(token) || encodes_user_password(token)
+}
+
+/// Whether `token` is base64 of a `user:password` pair: at least
+/// [`MINIMUM_SECRET_LENGTH`] characters that decode to text holding a
+/// [`USER_PASSWORD_SEPARATOR`] and no control characters.
+fn encodes_user_password(token: &str) -> bool {
+    token.chars().count() >= MINIMUM_SECRET_LENGTH
+        && BASIC_CREDENTIALS_ENCODING
+            .decode(token)
+            .ok()
+            .and_then(|decoded| String::from_utf8(decoded).ok())
+            .is_some_and(|pair| {
+                pair.contains(USER_PASSWORD_SEPARATOR) && !pair.contains(char::is_control)
+            })
 }
 
 fn has_secret_name(assignment: &Captures<'_>, _: &str) -> bool {
@@ -434,6 +475,15 @@ mod tests {
 
     /// An encoded Appwrite session, as its session cookie holds it.
     const SESSION: &str = "eyJpZCI6IjZhODQxNWI4MDAyZWE2NWVlYzljIiwic2VjcmV0IjoiNGYxYyJ9";
+
+    /// A `Bearer` credential of lowercase letters only: no digit, symbol or
+    /// capital marks it as generated.
+    const LOWERCASE_BEARER_CREDENTIAL: &str = "abcdefghijklmnop";
+
+    /// `nick:organic` as `Basic` credentials: base64 that happens to be
+    /// lowercase letters only, so no digit, symbol or capital marks it as
+    /// generated.
+    const LOWERCASE_BASIC_CREDENTIALS: &str = "bmljazpvcmdhbmlj";
 
     fn redact(text: &str) -> String {
         Redactor::default().redact(text)
@@ -598,14 +648,70 @@ mod tests {
     }
 
     #[test]
+    fn lowercase_bearer_credentials_are_redacted_anywhere() {
+        let cases = [
+            (
+                format!("retried with Bearer {LOWERCASE_BEARER_CREDENTIAL} and got 200"),
+                format!("retried with Bearer {REDACTED} and got 200"),
+            ),
+            (
+                format!("Signed in with bearer {LOWERCASE_BEARER_CREDENTIAL}."),
+                format!("Signed in with bearer {REDACTED}."),
+            ),
+            (
+                format!(
+                    r#"curl -H "X-Access-Token: Bearer {LOWERCASE_BEARER_CREDENTIAL}" https://cloud.appwrite.io/v1/account"#
+                ),
+                format!(
+                    r#"curl -H "X-Access-Token: Bearer {REDACTED}" https://cloud.appwrite.io/v1/account"#
+                ),
+            ),
+            (
+                format!(
+                    "curl --oauth2-bearer {LOWERCASE_BEARER_CREDENTIAL} https://cloud.appwrite.io/v1/account"
+                ),
+                format!("curl --oauth2-bearer {REDACTED} https://cloud.appwrite.io/v1/account"),
+            ),
+            (
+                format!(
+                    r#"{{"name": "authorization", "value": "Bearer {LOWERCASE_BEARER_CREDENTIAL}"}}"#
+                ),
+                format!(r#"{{"name": "authorization", "value": "Bearer {REDACTED}"}}"#),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(redact(&text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn basic_credentials_are_redacted_whatever_characters_their_base64_uses() {
+        let cases = [
+            (
+                format!("retried with basic {LOWERCASE_BASIC_CREDENTIALS} and got 200"),
+                format!("retried with basic {REDACTED} and got 200"),
+            ),
+            (
+                format!(
+                    r#"{{"name": "authorization", "value": "Basic {LOWERCASE_BASIC_CREDENTIALS}"}}"#
+                ),
+                format!(r#"{{"name": "authorization", "value": "Basic {REDACTED}"}}"#),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(redact(&text), expected, "{text}");
+        }
+    }
+
+    #[test]
     fn words_after_bearer_and_basic_are_kept() {
         for text in [
             "Basic functionality works",
             "Ran a basic health-check against /v1/health",
+            "Basic validation of every endpoint passed",
             "The bearer token was rotated",
+            "Bearer tokens expire hourly",
             "Basic Auth is enabled",
-            "Bearer tokens-are-rotated nightly",
-            "The API uses Bearer authentication.",
         ] {
             assert_eq!(redact(text), text);
         }
