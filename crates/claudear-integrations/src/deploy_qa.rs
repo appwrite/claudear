@@ -470,7 +470,6 @@ mod tests {
     };
     use claudear_core::error::Error;
     use claudear_core::http::HttpResponse;
-    use claudear_core::secret::REDACTED;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
 
@@ -484,6 +483,7 @@ mod tests {
     const KNOWN_SECRET: &str = "configured-bot-token-0001";
     const BEARER_TOKEN: &str = "abc123def456ghi789";
     const GITHUB_TOKEN: &str = "ghp_0123456789abcdefXYZ";
+    const MASK: &str = "[REDACTED]";
 
     #[derive(Debug, Clone)]
     struct Request {
@@ -970,7 +970,7 @@ mod tests {
         assert!(fail_post.is_post_to(&format!("/channels/{CREATED_THREAD}/messages")));
         let description = description(&fail_post);
         assert!(
-            description.contains(REDACTED),
+            description.contains(MASK),
             "the FAIL report must show where a credential was masked"
         );
         assert!(
@@ -1015,7 +1015,7 @@ mod tests {
                 );
             }
             assert!(
-                description.contains(REDACTED),
+                description.contains(MASK),
                 "{result}: the reply must show where a credential was masked"
             );
             assert!(

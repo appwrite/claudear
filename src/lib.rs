@@ -803,6 +803,8 @@ mod tests {
         );
     }
 
+    const MASK: &str = "[REDACTED]";
+
     #[test]
     fn deploy_qa_redactor_masks_configured_and_inherited_secrets() {
         let mut config = deploy_qa_config();
@@ -877,7 +879,7 @@ mod tests {
         }
         assert_eq!(
             redacted,
-            format!("{} {kept}", vec![secret::REDACTED; values.len()].join(" "))
+            format!("{} {kept}", vec![MASK; values.len()].join(" "))
         );
     }
 }

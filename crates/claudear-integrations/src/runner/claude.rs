@@ -3530,10 +3530,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
 
         assert!(!access.curl, "live QA ran curl without shell access");
         assert!(access.web_fetch, "live QA lost the read-only tools");
-        assert_eq!(
-            new_simple(ClaudeRunnerConfig::default()).live_qa_shell_warning(),
-            Some(LIVE_QA_NO_SHELL_WARNING),
-            "a live QA run that cannot run curl must warn that it has no shell access"
+        let warning = new_simple(ClaudeRunnerConfig::default()).live_qa_shell_warning();
+        assert!(
+            warning.is_some_and(|warning| warning.contains("no shell access")),
+            "a live QA run that cannot run curl must warn that it has no shell access: {warning:?}"
         );
     }
 
@@ -3878,6 +3878,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
     #[cfg(unix)]
     const QA_PROJECT_VARIABLE: (&str, &str) = ("APPWRITE_QA_PROJECT_ID", "qa-1044");
 
+    #[cfg(unix)]
+    const DOCUMENTED_CLAUDEAR_PREFIX: &str = "CLAUDEAR_";
+
     /// The environment a run under `profile` spawns the stub CLI with, while
     /// the provider `env` holds a fake [`MASTER_KEY_VARIABLE`] beside
     /// [`QA_PROJECT_VARIABLE`], and the daemon's environment a fake
@@ -3931,7 +3934,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
 
         let inherited: Vec<&String> = environment
             .keys()
-            .filter(|name| name.starts_with(CLAUDEAR_VARIABLE_PREFIX))
+            .filter(|name| name.starts_with(DOCUMENTED_CLAUDEAR_PREFIX))
             .collect();
         assert!(
             inherited.is_empty(),
@@ -3982,18 +3985,32 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
         }
     }
 
+    /// The lines just above and just below the line of `prompt` that is
+    /// exactly `line`.
+    fn lines_around<'a>(prompt: &'a str, line: &str) -> Option<(&'a str, &'a str)> {
+        let lines: Vec<&str> = prompt.lines().collect();
+        let position = lines.iter().position(|candidate| *candidate == line)?;
+        Some((
+            *lines.get(position.checked_sub(1)?)?,
+            *lines.get(position + 1)?,
+        ))
+    }
+
     #[test]
     fn test_build_live_qa_prompt_carries_operator_instructions_under_their_own_heading() {
-        let prompt = build_live_qa_prompt(
-            &deploy_qa_issue(DEPLOY_QA_SOURCE),
-            &format!("{OPERATOR_INSTRUCTION}\n"),
-        );
+        let issue = deploy_qa_issue(DEPLOY_QA_SOURCE);
+        let prompt = build_live_qa_prompt(&issue, &format!("{OPERATOR_INSTRUCTION}\n"));
+        let without_instructions = build_live_qa_prompt(&issue, "");
 
+        let (heading, next) = lines_around(&prompt, OPERATOR_INSTRUCTION)
+            .expect("live QA prompt must carry the operator instructions on lines of their own");
         assert!(
-            prompt.contains(&format!(
-                "{OPERATOR_INSTRUCTIONS_HEADING}\n{OPERATOR_INSTRUCTION}\n\n"
-            )),
-            "live QA prompt must present its only context as operator instructions:\n{prompt}"
+            !heading.trim().is_empty() && !without_instructions.contains(heading),
+            "live QA prompt must present its only context under a heading of its own:\n{prompt}"
+        );
+        assert!(
+            next.is_empty(),
+            "live QA prompt must set the operator instructions apart from the ticket:\n{prompt}"
         );
         assert_eq!(
             prompt.matches(OPERATOR_INSTRUCTION).count(),
@@ -4005,12 +4022,15 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
     #[test]
     fn test_build_live_qa_prompt_leaves_out_operator_instructions_when_there_are_none() {
         let issue = deploy_qa_issue(DEPLOY_QA_SOURCE);
+        let with_instructions = build_live_qa_prompt(&issue, OPERATOR_INSTRUCTION);
+        let (heading, _) = lines_around(&with_instructions, OPERATOR_INSTRUCTION)
+            .expect("live QA prompt must carry the operator instructions on lines of their own");
 
         for none in ["", " \n\t\n"] {
             let prompt = build_live_qa_prompt(&issue, none);
 
             assert!(
-                !prompt.contains(OPERATOR_INSTRUCTIONS_HEADING),
+                !prompt.contains(heading),
                 "live QA prompt has an empty operator instructions section:\n{prompt}"
             );
             assert!(
@@ -4092,26 +4112,38 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
 
     #[test]
     fn test_live_qa_shell_warning_flags_shell_access_limited_to_scoped_rules() {
-        assert_eq!(
+        let no_shell = live_qa_shell_warning_for(&[], &[], false);
+
+        for warning in [
             live_qa_shell_warning_for(&["Bash(git *)", "Edit"], &[], false),
-            Some(LIVE_QA_SCOPED_SHELL_WARNING)
-        );
-        assert_eq!(
             live_qa_shell_warning_for(&["Edit"], &["Read", "Bash(curl:*)"], false),
-            Some(LIVE_QA_SCOPED_SHELL_WARNING)
-        );
+        ] {
+            assert!(
+                warning.is_some_and(|warning| warning.contains("skip_permissions")),
+                "shell access limited to scoped rules must warn how to allow any command: \
+                 {warning:?}"
+            );
+            assert_ne!(
+                warning, no_shell,
+                "shell access limited to scoped rules needs its own warning, not the one for no \
+                 shell access"
+            );
+        }
     }
 
     #[test]
     fn test_live_qa_shell_warning_flags_a_run_without_shell_access() {
-        assert_eq!(
+        for warning in [
             live_qa_shell_warning_for(&[], &[], false),
-            Some(LIVE_QA_NO_SHELL_WARNING)
-        );
-        assert_eq!(
             live_qa_shell_warning_for(&["Edit", "BashOutput", "mcp__bash"], &["Read"], false),
-            Some(LIVE_QA_NO_SHELL_WARNING)
-        );
+        ] {
+            assert!(
+                warning.is_some_and(|warning| {
+                    warning.contains("no shell access") && warning.contains("skip_permissions")
+                }),
+                "a run without shell access must say so, and how to allow commands: {warning:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

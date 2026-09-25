@@ -477,6 +477,8 @@ mod tests {
         }
     }
 
+    const DOCUMENTED_SOURCE: &str = "deploy_qa";
+
     #[test]
     fn issue_is_routed_as_live_qa_and_scoped_to_its_track() {
         let repo = "appwrite-labs/edge";
@@ -486,8 +488,8 @@ mod tests {
 
         let issue = build_deploy_qa_issue(&database, &tip, bundled_playbook());
         assert_eq!(
-            issue.source, DEPLOY_QA_SOURCE,
-            "the engine runs an issue as live QA, never a fix, by its source"
+            issue.source, DOCUMENTED_SOURCE,
+            "the engine runs an issue as live QA, never a fix, by its documented source"
         );
         let description = issue
             .description

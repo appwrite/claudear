@@ -136,6 +136,8 @@ mod tests {
     use claudear_core::types::DeployQaTipStatus;
     use claudear_storage::SqliteTracker;
 
+    const DOCUMENTED_SOURCE: &str = "deploy_qa";
+
     #[tokio::test]
     async fn fetch_issues_returns_pending_tips_only() {
         let sqlite = SqliteTracker::in_memory().unwrap();
@@ -153,8 +155,8 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].id, stored.issue_id);
         assert_eq!(
-            issues[0].source, DEPLOY_QA_SOURCE,
-            "the engine runs an issue as live QA, never a fix, by its source"
+            issues[0].source, DOCUMENTED_SOURCE,
+            "the engine runs an issue as live QA, never a fix, by its documented source"
         );
         assert!(source.matches_criteria(&issues[0]).matches);
         let context = source.build_issue_context(&issues[0]).await.unwrap();
