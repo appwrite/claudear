@@ -489,14 +489,14 @@ mod tests {
         Redactor::default().redact(text)
     }
 
-    /// An Appwrite API key of every type: hex project, organization and
-    /// account keys, and JWT ephemeral keys under their current and former
-    /// names.
-    fn appwrite_keys() -> Vec<String> {
+    /// Every Appwrite API key type with a key of that type: hex project,
+    /// organization and account keys, and JWT ephemeral keys under their
+    /// current and former names.
+    fn appwrite_keys() -> Vec<(&'static str, String)> {
         ["standard", "organization", "account"]
-            .map(|kind| format!("{kind}_{LEGACY_APPWRITE_KEY}"))
+            .map(|kind| (kind, format!("{kind}_{LEGACY_APPWRITE_KEY}")))
             .into_iter()
-            .chain(["ephemeral", "dynamic"].map(|kind| format!("{kind}_{SAMPLE_JWT}")))
+            .chain(["ephemeral", "dynamic"].map(|kind| (kind, format!("{kind}_{SAMPLE_JWT}"))))
             .collect()
     }
 
@@ -538,7 +538,11 @@ mod tests {
         ];
         for header in headers {
             let name = header.split(':').next().unwrap_or_default();
-            assert_eq!(redact(header), format!("{name}: {REDACTED}"), "{header}");
+            assert_eq!(
+                redact(header),
+                format!("{name}: {REDACTED}"),
+                "the {name} header's value must be masked"
+            );
         }
     }
 
@@ -546,24 +550,28 @@ mod tests {
     fn unquoted_header_values_run_to_the_end_of_the_line_or_table_cell() {
         let cases = [
             (
+                "a header line of an HTTP message",
                 "> Authorization: Bearer abc123 (expired) → 401\r\n> Accept: */*",
                 format!("> Authorization: {REDACTED}\r\n> Accept: */*"),
             ),
             (
+                "a header whose value names another header",
                 "Cookie: a_session=abc123; Authorization: Bearer abc123",
                 format!("Cookie: {REDACTED}"),
             ),
             (
+                "a header's name and value in separate table cells",
                 "| X-Appwrite-Key | standard_abc123 | 401 |",
                 format!("| X-Appwrite-Key | {REDACTED} | 401 |"),
             ),
             (
+                "a whole header in one table cell",
                 "| #42 | Authorization: Bearer abc123 | LIVE FAIL |",
                 format!("| #42 | Authorization: {REDACTED} | LIVE FAIL |"),
             ),
         ];
-        for (text, expected) in cases {
-            assert_eq!(redact(text), expected, "{text}");
+        for (case, text, expected) in cases {
+            assert_eq!(redact(text), expected, "{case}");
         }
     }
 
@@ -571,20 +579,23 @@ mod tests {
     fn emphasised_header_names_and_values_are_redacted() {
         let cases = [
             (
+                "an emphasised header name",
                 "**X-Appwrite-Key**: standard_abc123",
                 format!("**X-Appwrite-Key**: {REDACTED}"),
             ),
             (
+                "an emphasised header name and colon",
                 "**Authorization:** Bearer abc123",
                 format!("**Authorization:** {REDACTED}"),
             ),
             (
+                "an emphasised header value",
                 "Authorization: **Bearer abc123**",
                 format!("Authorization: **{REDACTED}**"),
             ),
         ];
-        for (text, expected) in cases {
-            assert_eq!(redact(text), expected, "{text}");
+        for (case, text, expected) in cases {
+            assert_eq!(redact(text), expected, "{case}");
         }
     }
 
@@ -592,36 +603,42 @@ mod tests {
     fn quoted_header_values_end_at_their_closing_quote() {
         let cases = [
             (
+                "a double-quoted curl header before a single-quoted one",
                 r#"curl -H "Authorization: Bearer abc123" -H 'X-Appwrite-Project: qa' https://cloud.appwrite.io/v1/account"#,
                 format!(
                     r#"curl -H "Authorization: {REDACTED}" -H 'X-Appwrite-Project: qa' https://cloud.appwrite.io/v1/account"#
                 ),
             ),
             (
+                "two double-quoted curl headers",
                 r#"curl -H "Authorization: Bearer abc123" -H "X-Appwrite-Key: key123" https://cloud.appwrite.io"#,
                 format!(
                     r#"curl -H "Authorization: {REDACTED}" -H "X-Appwrite-Key: {REDACTED}" https://cloud.appwrite.io"#
                 ),
             ),
             (
+                "a JSON object of headers",
                 r#"{"Authorization": "Bearer abc123", "Accept": "application/json"}"#,
                 format!(r#"{{"Authorization": "{REDACTED}", "Accept": "application/json"}}"#),
             ),
             (
+                "a header in a code span",
                 "`X-Appwrite-Key: abc123` returned 401",
                 format!("`X-Appwrite-Key: {REDACTED}` returned 401"),
             ),
             (
+                "a JavaScript object of headers",
                 "headers: { authorization: 'Bearer abc123' }",
                 format!("headers: {{ authorization: '{REDACTED}' }}"),
             ),
             (
+                "a single-quoted cookie header holding double quotes",
                 r#"-H 'Cookie: a="b"; c=d' -v"#,
                 format!("-H 'Cookie: {REDACTED}' -v"),
             ),
         ];
-        for (text, expected) in cases {
-            assert_eq!(redact(text), expected, "{text}");
+        for (case, text, expected) in cases {
+            assert_eq!(redact(text), expected, "{case}");
         }
     }
 
@@ -629,21 +646,28 @@ mod tests {
     fn bearer_and_basic_credentials_are_redacted_anywhere_ignoring_case() {
         let cases = [
             (
+                "a Bearer token in prose",
                 "retried with Bearer abc123def456 and got 200",
                 format!("retried with Bearer {REDACTED} and got 200"),
             ),
-            ("BEARER eyJhbGciOiJIUzI1NiJ9", format!("BEARER {REDACTED}")),
             (
+                "an uppercase Bearer scheme",
+                "BEARER eyJhbGciOiJIUzI1NiJ9",
+                format!("BEARER {REDACTED}"),
+            ),
+            (
+                "a lowercase Bearer scheme before a full stop",
                 "Signed in with bearer abc123def456.",
                 format!("Signed in with bearer {REDACTED}."),
             ),
             (
+                "a lowercase Basic scheme in prose",
                 "sent basic dXNlcjpwYXNzd29yZA== twice",
                 format!("sent basic {REDACTED} twice"),
             ),
         ];
-        for (text, expected) in cases {
-            assert_eq!(redact(text), expected, "{text}");
+        for (case, text, expected) in cases {
+            assert_eq!(redact(text), expected, "{case}");
         }
     }
 
@@ -651,14 +675,17 @@ mod tests {
     fn lowercase_bearer_credentials_are_redacted_anywhere() {
         let cases = [
             (
+                "prose",
                 format!("retried with Bearer {LOWERCASE_BEARER_CREDENTIAL} and got 200"),
                 format!("retried with Bearer {REDACTED} and got 200"),
             ),
             (
+                "prose ending in a full stop",
                 format!("Signed in with bearer {LOWERCASE_BEARER_CREDENTIAL}."),
                 format!("Signed in with bearer {REDACTED}."),
             ),
             (
+                "a header Claudear does not know",
                 format!(
                     r#"curl -H "X-Access-Token: Bearer {LOWERCASE_BEARER_CREDENTIAL}" https://cloud.appwrite.io/v1/account"#
                 ),
@@ -667,20 +694,22 @@ mod tests {
                 ),
             ),
             (
+                "curl's --oauth2-bearer flag",
                 format!(
                     "curl --oauth2-bearer {LOWERCASE_BEARER_CREDENTIAL} https://cloud.appwrite.io/v1/account"
                 ),
                 format!("curl --oauth2-bearer {REDACTED} https://cloud.appwrite.io/v1/account"),
             ),
             (
+                "a JSON header object",
                 format!(
                     r#"{{"name": "authorization", "value": "Bearer {LOWERCASE_BEARER_CREDENTIAL}"}}"#
                 ),
                 format!(r#"{{"name": "authorization", "value": "Bearer {REDACTED}"}}"#),
             ),
         ];
-        for (text, expected) in cases {
-            assert_eq!(redact(&text), expected, "{text}");
+        for (case, text, expected) in cases {
+            assert_eq!(redact(&text), expected, "{case}");
         }
     }
 
@@ -688,18 +717,20 @@ mod tests {
     fn basic_credentials_are_redacted_whatever_characters_their_base64_uses() {
         let cases = [
             (
+                "prose",
                 format!("retried with basic {LOWERCASE_BASIC_CREDENTIALS} and got 200"),
                 format!("retried with basic {REDACTED} and got 200"),
             ),
             (
+                "a JSON header object",
                 format!(
                     r#"{{"name": "authorization", "value": "Basic {LOWERCASE_BASIC_CREDENTIALS}"}}"#
                 ),
                 format!(r#"{{"name": "authorization", "value": "Basic {REDACTED}"}}"#),
             ),
         ];
-        for (text, expected) in cases {
-            assert_eq!(redact(&text), expected, "{text}");
+        for (case, text, expected) in cases {
+            assert_eq!(redact(&text), expected, "{case}");
         }
     }
 
@@ -720,15 +751,18 @@ mod tests {
     #[test]
     fn known_secrets_are_redacted_wherever_they_appear() {
         let redactor = Redactor::new([KNOWN_SECRET]);
-        for text in [
-            format!("bot token {KNOWN_SECRET} leaked"),
-            format!("https://discord.com/api/webhooks/1/{KNOWN_SECRET}?wait=true"),
-            format!(r#"{{"value":"{KNOWN_SECRET}"}}"#),
+        for (case, text) in [
+            ("prose", format!("bot token {KNOWN_SECRET} leaked")),
+            (
+                "a webhook URL",
+                format!("https://discord.com/api/webhooks/1/{KNOWN_SECRET}?wait=true"),
+            ),
+            ("a JSON value", format!(r#"{{"value":"{KNOWN_SECRET}"}}"#)),
         ] {
             assert_eq!(
                 redactor.redact(&text),
                 text.replace(KNOWN_SECRET, REDACTED),
-                "{text}"
+                "{case}"
             );
         }
     }
@@ -774,20 +808,20 @@ mod tests {
 
     #[test]
     fn known_token_prefixes_are_still_redacted() {
-        for token in [
-            "ghp_abc123XYZ456",
-            "gho_abc123XYZ456",
-            "ghr_abc123XYZ456",
-            "github_pat_abc123",
-            "xoxb-123-456-abc",
-            "lin_api_abc123",
-            "sntrys_abc123",
-            "sk-ant-api03-abc123",
+        for (kind, value) in [
+            ("GitHub personal access token", "ghp_abc123XYZ456"),
+            ("GitHub OAuth token", "gho_abc123XYZ456"),
+            ("GitHub refresh token", "ghr_abc123XYZ456"),
+            ("GitHub fine-grained token", "github_pat_abc123"),
+            ("Slack bot token", "xoxb-123-456-abc"),
+            ("Linear API key", "lin_api_abc123"),
+            ("Sentry system token", "sntrys_abc123"),
+            ("Anthropic API key", "sk-ant-api03-abc123"),
         ] {
             assert_eq!(
-                redact(&format!("found {token} here")),
+                redact(&format!("found {value} here")),
                 format!("found {REDACTED} here"),
-                "{token}"
+                "the {kind} must be masked"
             );
         }
     }
@@ -820,25 +854,33 @@ mod tests {
     fn secret_named_assignments_are_redacted() {
         let cases = [
             (
+                "an environment variable",
                 "GITHUB_TOKEN=q9w8e7r6 HOME=/root",
                 format!("GITHUB_TOKEN={REDACTED} HOME=/root"),
             ),
             (
+                "a quoted shell export",
                 "export DB_PASSWORD='p a s s'",
                 format!("export DB_PASSWORD={REDACTED}"),
             ),
-            ("_APP_DB_PASS=q9w8e7r6", format!("_APP_DB_PASS={REDACTED}")),
             (
+                "a name ending in _PASS",
+                "_APP_DB_PASS=q9w8e7r6",
+                format!("_APP_DB_PASS={REDACTED}"),
+            ),
+            (
+                "a query string parameter",
                 "GET /v1/users?project=qa&api_key=q9w8e7r6&limit=5",
                 format!("GET /v1/users?project=qa&api_key={REDACTED}&limit=5"),
             ),
             (
+                "JSON fields",
                 r#"{"name": "qa", "secret": "standard_q9w8e7r6", "apiKey": "q9w8e7r6"}"#,
                 format!(r#"{{"name": "qa", "secret": "{REDACTED}", "apiKey": "{REDACTED}"}}"#),
             ),
         ];
-        for (text, expected) in cases {
-            assert_eq!(redact(text), expected, "{text}");
+        for (case, text, expected) in cases {
+            assert_eq!(redact(text), expected, "{case}");
         }
     }
 
@@ -871,51 +913,59 @@ mod tests {
 
     #[test]
     fn appwrite_api_keys_are_redacted_wherever_they_appear() {
-        for key in appwrite_keys() {
+        for (kind, key) in appwrite_keys() {
             let texts = labelled_as_key(&key).into_iter().chain(unlabelled(&key));
             let redacted = labelled_as_key(REDACTED)
                 .into_iter()
                 .chain(unlabelled(REDACTED));
             for (text, expected) in texts.zip(redacted) {
-                assert_eq!(redact(&text), expected, "{text}");
+                assert_eq!(redact(&text), expected, "a {kind} key must be masked");
             }
         }
     }
 
     #[test]
     fn generated_values_after_a_credential_label_are_redacted() {
-        for credential in [GENERATED_TOKEN, LEGACY_APPWRITE_KEY] {
-            for (text, expected) in labelled_as_key(credential)
+        for (kind, value) in [
+            ("generated token", GENERATED_TOKEN),
+            ("legacy Appwrite key", LEGACY_APPWRITE_KEY),
+        ] {
+            for (text, expected) in labelled_as_key(value)
                 .into_iter()
                 .zip(labelled_as_key(REDACTED))
             {
-                assert_eq!(redact(&text), expected, "{text}");
+                assert_eq!(redact(&text), expected, "the {kind} must be masked");
             }
         }
         let cases = [
             (
+                "an emphasised label before a code span",
                 format!("**API key:** `{GENERATED_TOKEN}`"),
                 format!("**API key:** `{REDACTED}`"),
             ),
             (
+                "a value before a full stop",
                 format!("key: {GENERATED_TOKEN}."),
                 format!("key: {REDACTED}."),
             ),
             (
+                "an access token label",
                 format!("Access token: {GENERATED_TOKEN}"),
                 format!("Access token: {REDACTED}"),
             ),
             (
+                "a quoted flag value",
                 format!(r#"appwrite login --api-key "{GENERATED_TOKEN}""#),
                 format!(r#"appwrite login --api-key "{REDACTED}""#),
             ),
             (
+                "a table row",
                 format!("| API key | {GENERATED_TOKEN} |"),
                 format!("| API key | {REDACTED} |"),
             ),
         ];
-        for (text, expected) in cases {
-            assert_eq!(redact(&text), expected, "{text}");
+        for (case, text, expected) in cases {
+            assert_eq!(redact(&text), expected, "{case}");
         }
     }
 
@@ -923,20 +973,23 @@ mod tests {
     fn appwrite_session_cookies_are_redacted() {
         let cases = [
             (
+                "a cookie curl sends",
                 format!("curl -b 'a_session_6a8415b8002ea65eec9c={SESSION}' https://cloud.appwrite.io/v1/account"),
                 format!("curl -b 'a_session_6a8415b8002ea65eec9c={REDACTED}' https://cloud.appwrite.io/v1/account"),
             ),
             (
+                "a legacy cookie a response sets",
                 format!("got a_session_6a8415b8002ea65eec9c_legacy={SESSION}; Path=/; HttpOnly"),
                 format!("got a_session_6a8415b8002ea65eec9c_legacy={REDACTED}; Path=/; HttpOnly"),
             ),
             (
+                "the cookie fallback's JSON",
                 format!(r#"cookieFallback: {{"a_session_console": "{SESSION}"}}"#),
                 format!(r#"cookieFallback: {{"a_session_console": "{REDACTED}"}}"#),
             ),
         ];
-        for (text, expected) in cases {
-            assert_eq!(redact(&text), expected, "{text}");
+        for (case, text, expected) in cases {
+            assert_eq!(redact(&text), expected, "{case}");
         }
     }
 
