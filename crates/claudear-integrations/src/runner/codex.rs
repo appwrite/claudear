@@ -378,10 +378,10 @@ mod tests {
     #[cfg(unix)]
     const PR_URL: &str = "https://github.com/org/repo/pull/1";
 
-    /// Set when a test re-runs itself in a child process whose stdin the parent
-    /// holds open.
+    /// The project directory, when a test re-runs itself in a child process
+    /// whose stdin the parent holds open.
     #[cfg(unix)]
-    const STDIN_HELD_OPEN: &str = "CLAUDEAR_TEST_STDIN_HELD_OPEN";
+    const STDIN_HELD_OPEN_PROJECT: &str = "CLAUDEAR_TEST_STDIN_HELD_OPEN_PROJECT";
 
     #[test]
     fn test_codex_runner_config_default() {
@@ -569,14 +569,20 @@ mod tests {
     #[cfg(unix)]
     fn stub_runner(script: &str) -> (tempfile::TempDir, CodexAgentRunner) {
         let directory = tempfile::tempdir().unwrap();
-        let binary = directory.path().join("codex");
+        let runner = runner_with_stub_in(directory.path(), script);
+        (directory, runner)
+    }
+
+    /// A runner whose `codex` binary is a stub in `directory` running `script`.
+    #[cfg(unix)]
+    fn runner_with_stub_in(directory: &Path, script: &str) -> CodexAgentRunner {
+        let binary = directory.join("codex");
         install_stub(&binary, script);
         let config = CodexRunnerConfig {
             binary: binary.display().to_string(),
             ..CodexRunnerConfig::default()
         };
-        let runner = CodexAgentRunner::new(config, Arc::new(claudear_storage::NoopTracker));
-        (directory, runner)
+        CodexAgentRunner::new(config, Arc::new(claudear_storage::NoopTracker))
     }
 
     /// A stub `codex` binary that runs `setup`, then prints [`PR_URL`] and exits.
@@ -663,11 +669,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_execute_finishes_when_the_cli_reads_stdin_claudear_holds_open() {
-        if std::env::var_os(STDIN_HELD_OPEN).is_some() {
-            let (directory, runner) = stub_runner(&pull_request_script("cat > /dev/null\n"));
+        if let Some(project) = std::env::var_os(STDIN_HELD_OPEN_PROJECT) {
+            let project = Path::new(&project);
+            let runner = runner_with_stub_in(
+                project,
+                &pull_request_script("cat > /dev/null\ntouch stdin-read\n"),
+            );
             let result = tokio::time::timeout(
                 RUN_DEADLINE,
-                runner.execute_with_attempt("fix", None, None, directory.path()),
+                runner.execute_with_attempt("fix", None, None, project),
             )
             .await
             .expect("the CLI must not wait for input on claudear's stdin")
@@ -676,12 +686,13 @@ mod tests {
             return;
         }
 
+        let project = tempfile::tempdir().unwrap();
         let (_, module) = module_path!().split_once("::").unwrap();
         let test =
             format!("{module}::test_execute_finishes_when_the_cli_reads_stdin_claudear_holds_open");
         let mut rerun = Command::new(std::env::current_exe().unwrap())
             .args([test.as_str(), "--exact"])
-            .env(STDIN_HELD_OPEN, "1")
+            .env(STDIN_HELD_OPEN_PROJECT, project.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -694,11 +705,15 @@ mod tests {
             .expect("the re-run test must finish")
             .unwrap();
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "the re-run test failed:\n{stdout}{}",
+            output.status.success(),
+            "the re-run test failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            project.path().join("stdin-read").exists(),
+            "the stub CLI never got past reading its stdin"
         );
     }
 }
