@@ -94,6 +94,18 @@ const TABLE_CELL_BORDER: char = '|';
 /// Markdown emphasis that may wrap a header's name or value.
 const EMPHASIS: char = '*';
 
+/// Key of the field naming a cookie or header in the JSON objects browser
+/// tools write, as in `{"name": "a_session_…", "value": "…"}`.
+const NAME_KEY: &str = "name";
+
+/// Key of the field holding the named cookie's or header's value.
+const VALUE_KEY: &str = "value";
+
+/// What may separate two fields of one JSON object: anything but a brace
+/// outside a string, so both fields belong to the same object, never to
+/// neighbouring or nested ones.
+const SAME_OBJECT_GAP: &str = r#"(?:[^{}"]|"(?:[^"\\\r\n]|\\.)*")*?"#;
+
 /// Capture group holding the text to mask.
 const SECRET_GROUP: &str = "secret";
 
@@ -167,6 +179,27 @@ static JSON_FIELD: LazyLock<Regex> = LazyLock::new(|| {
         r#""(?<{NAME_GROUP}>[A-Za-z_$][A-Za-z0-9_.$-]*)"[ \t]*:[ \t]*"(?<{SECRET_GROUP}>(?:[^"\\\r\n]|\\.)+)""#
     ))
     .expect("JSON field pattern is valid")
+});
+
+/// A JSON object's `"name"` field, then its `"value"` field, as browser tools
+/// write a cookie or header.
+static NAME_THEN_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        "{}{SAME_OBJECT_GAP}{}",
+        json_string_field(NAME_KEY, NAME_GROUP),
+        json_string_field(VALUE_KEY, SECRET_GROUP)
+    ))
+    .expect("name-then-value pattern is valid")
+});
+
+/// A JSON object's `"value"` field, then its `"name"` field.
+static VALUE_THEN_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        "{}{SAME_OBJECT_GAP}{}",
+        json_string_field(VALUE_KEY, SECRET_GROUP),
+        json_string_field(NAME_KEY, NAME_GROUP)
+    ))
+    .expect("value-then-name pattern is valid")
 });
 
 /// A value after a label or command-line flag: `API key: value`,
@@ -262,9 +295,11 @@ impl Redactor {
     /// secrets, PEM blocks, credential header values, every value of eight or
     /// more characters after `Bearer`, `Basic` credentials, URL passwords, the
     /// values of secret-named `NAME=value` assignments and JSON fields
-    /// (Appwrite `a_session_*` cookies among them), Appwrite API keys,
-    /// generated-looking values after a credential label or flag such as
-    /// `API key:` or `--key`, JWTs, and tokens with a known prefix.
+    /// (Appwrite `a_session_*` cookies among them), the `"value"` of each JSON
+    /// object whose `"name"` is secret-named, as browser tools list cookies
+    /// and headers, Appwrite API keys, generated-looking values after a
+    /// credential label or flag such as `API key:` or `--key`, JWTs, and
+    /// tokens with a known prefix.
     pub fn redact(&self, text: &str) -> String {
         let text = self.redact_known(text);
         let text = PEM_BLOCK.replace_all(&text, NoExpand(REDACTED));
@@ -274,6 +309,8 @@ impl Redactor {
         let text = redact_matches(&text, &URL_PASSWORD, |_, _| true);
         let text = redact_matches(&text, &VARIABLE_ASSIGNMENT, has_secret_name);
         let text = redact_matches(&text, &JSON_FIELD, has_secret_name);
+        let text = redact_matches(&text, &NAME_THEN_VALUE, has_secret_name);
+        let text = redact_matches(&text, &VALUE_THEN_NAME, has_secret_name);
         let text = redact_matches(&text, &APPWRITE_KEY, |_, key| looks_generated(key));
         let text = redact_matches(&text, &LABELLED_VALUE, is_labelled_credential);
         let text = redact_matches(&text, &JWT, |_, _| true);
@@ -386,6 +423,12 @@ fn encodes_user_password(token: &str) -> bool {
             .is_some_and(|pair| {
                 pair.contains(USER_PASSWORD_SEPARATOR) && !pair.contains(char::is_control)
             })
+}
+
+/// A pattern for a JSON field keyed `key` whose value is a non-empty string,
+/// capturing that string's content as `group`.
+fn json_string_field(key: &str, group: &str) -> String {
+    format!(r#""{key}"\s*:\s*"(?<{group}>(?:[^"\\\r\n]|\\.)+)""#)
 }
 
 fn has_secret_name(assignment: &Captures<'_>, _: &str) -> bool {
@@ -705,7 +748,7 @@ mod tests {
                 format!(
                     r#"{{"name": "authorization", "value": "Bearer {LOWERCASE_BEARER_CREDENTIAL}"}}"#
                 ),
-                format!(r#"{{"name": "authorization", "value": "Bearer {REDACTED}"}}"#),
+                format!(r#"{{"name": "authorization", "value": "{REDACTED}"}}"#),
             ),
         ];
         for (case, text, expected) in cases {
@@ -726,7 +769,7 @@ mod tests {
                 format!(
                     r#"{{"name": "authorization", "value": "Basic {LOWERCASE_BASIC_CREDENTIALS}"}}"#
                 ),
-                format!(r#"{{"name": "authorization", "value": "Basic {REDACTED}"}}"#),
+                format!(r#"{{"name": "authorization", "value": "{REDACTED}"}}"#),
             ),
         ];
         for (case, text, expected) in cases {
@@ -994,6 +1037,74 @@ mod tests {
     }
 
     #[test]
+    fn values_of_json_cookies_with_secret_names_are_redacted_in_either_order() {
+        let cases = [
+            (
+                "a cookie as browser tools list it",
+                format!(
+                    r#"{{"name": "a_session_6a8415b8002ea65eec9c", "value": "{SESSION}", "domain": ".cloud.appwrite.io", "path": "/", "httpOnly": true, "sameSite": "Strict"}}"#
+                ),
+            ),
+            (
+                "a compact legacy cookie",
+                format!(
+                    r#"{{"name":"a_session_6a8415b8002ea65eec9c_legacy","value":"{SESSION}"}}"#
+                ),
+            ),
+            (
+                "a cookie with its value first",
+                format!(r#"{{"value": "{SESSION}", "path": "/", "name": "a_session_console"}}"#),
+            ),
+            (
+                "a compact cookie with its value first",
+                format!(r#"{{"value":"{SESSION}","name":"a_session_console"}}"#),
+            ),
+            (
+                "a cookie spaced around its colons",
+                format!("{{ \"name\" : \"a_session_console\" , \"value\"\t:\t\"{SESSION}\" }}"),
+            ),
+            (
+                "a pretty-printed cookie list",
+                format!(
+                    "[\n  {{\n    \"name\": \"theme\",\n    \"value\": \"dark\"\n  }},\n  {{\n    \"name\": \"a_session_console\",\n    \"domain\": \".cloud.appwrite.io\",\n    \"value\": \"{SESSION}\"\n  }}\n]"
+                ),
+            ),
+        ];
+        for (case, text) in cases {
+            assert_eq!(redact(&text), text.replace(SESSION, REDACTED), "{case}");
+        }
+    }
+
+    #[test]
+    fn values_of_json_objects_without_a_secret_name_are_kept() {
+        let cases = [
+            (
+                "a cookie that is no credential",
+                r#"{"name": "theme", "value": "dark"}"#,
+            ),
+            (
+                "that cookie with its value first",
+                r#"{"value":"dark","name":"theme"}"#,
+            ),
+            (
+                "a secret name in the object before",
+                r#"[{"name": "a_session_console", "path": "/"}, {"path": "/", "value": "dark"}]"#,
+            ),
+            (
+                "a secret name in the object after",
+                r#"[{"value": "dark", "path": "/"}, {"path": "/", "name": "a_session_console"}]"#,
+            ),
+            (
+                "a secret name in a nested object",
+                r#"{"value": "dark", "partitionKey": {"name": "a_session_console"}}"#,
+            ),
+        ];
+        for (case, text) in cases {
+            assert_eq!(redact(text), text, "{case}");
+        }
+    }
+
+    #[test]
     fn words_and_identifiers_that_resemble_credentials_are_kept() {
         for text in [
             "p95 standard_deviation stayed under 40ms",
@@ -1072,7 +1183,8 @@ mod tests {
         let redactor = Redactor::new([KNOWN_SECRET]);
         let once = redactor.redact(&format!(
             "Authorization: Bearer abc123\ntoken {KNOWN_SECRET} ghp_abc123 postgres://u:p4ss@h/db\n\
-             API key: {GENERATED_TOKEN} --key dynamic_{SAMPLE_JWT} a_session_console={SESSION}"
+             API key: {GENERATED_TOKEN} --key dynamic_{SAMPLE_JWT} a_session_console={SESSION}\n\
+             {{\"value\": \"{SESSION}\", \"name\": \"a_session_console\"}}"
         ));
 
         assert_eq!(redactor.redact(&once), once);
