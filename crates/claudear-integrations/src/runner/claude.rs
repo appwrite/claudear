@@ -820,12 +820,7 @@ The PR title should include the issue ID: {}
             }
             structured
         };
-        let reap = async {
-            let _ = child.wait().await;
-            group.kill();
-        };
-
-        let run = async { tokio::join!(collect, reap).0 };
+        let run = async { tokio::join!(collect, group.wait(&mut child)).0 };
 
         let timeout = std::time::Duration::from_secs(STRUCTURED_QUERY_TIMEOUT_SECS);
         let structured = match tokio::time::timeout(timeout, run).await {
@@ -1743,7 +1738,7 @@ The PR title should include the issue ID: {}
 
         let outcome = loop {
             tokio::select! {
-                result = child.wait() => break WaitOutcome::Exited(result),
+                result = group.wait(&mut child) => break WaitOutcome::Exited(result),
                 _ = &mut timeout_sleep => break WaitOutcome::TimedOut,
                 message = early_failure_rx.recv() => {
                     if let Some(message) = message {

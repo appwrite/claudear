@@ -59,6 +59,12 @@ impl Registry {
         }
     }
 
+    /// Whether [`Self::interrupt_all`] has been called, after which nothing
+    /// should start new agent runs.
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::SeqCst)
+    }
+
     pub fn kill_all(&self) {
         let ids = std::mem::take(&mut *self.ids());
         for id in ids {
@@ -84,11 +90,6 @@ impl Registry {
 
     pub fn is_empty(&self) -> bool {
         self.ids().is_empty()
-    }
-
-    #[cfg(all(test, unix))]
-    pub(crate) fn contains(&self, id: u32) -> bool {
-        self.ids().contains(&id)
     }
 
     fn ids(&self) -> MutexGuard<'_, BTreeSet<u32>> {
@@ -166,18 +167,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_kill_all_forgets_the_groups_it_killed() {
+    async fn test_kill_all_empties_the_registry() {
         let registry = Registry::new();
         let (mut leader, background) = spawn_group(BACKGROUND_SLEEP).await;
-        let id = leader.id().unwrap();
-        registry.insert(id);
+        registry.insert(leader.id().unwrap());
 
         registry.kill_all();
 
         assert_killed(&mut leader).await;
         assert!(exits_within(background));
         assert!(
-            !registry.contains(id),
+            registry.is_empty(),
             "a killed group must not be signalled again once the OS reuses its id"
         );
     }
@@ -208,18 +208,17 @@ mod tests {
     async fn test_interrupt_all_interrupts_without_forgetting_the_group() {
         let registry = Registry::new();
         let (mut leader, background) = spawn_group(INTERRUPTIBLE_LEADER).await;
-        let id = leader.id().unwrap();
-        registry.insert(id);
+        registry.insert(leader.id().unwrap());
 
         registry.interrupt_all();
 
         assert_interrupted(&mut leader).await;
+        assert!(registry.is_interrupted());
+        registry.kill_all();
         assert!(
-            registry.contains(id),
+            exits_within(background),
             "kill_all must still reach whatever ignored the interrupt"
         );
-        registry.kill_all();
-        assert!(exits_within(background));
     }
 
     #[tokio::test]

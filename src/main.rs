@@ -1704,6 +1704,9 @@ fn release_stale_deploy_qa_tips(tracker: &dyn FixAttemptTracker, stale_after: Du
 /// How long interrupted agent CLIs get to clean up before they are killed.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
+/// How long an interrupted one-shot command gets to record how its runs ended.
+const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Resolves on Ctrl-C or a terminal hangup. Agent CLIs lead their own process
 /// groups, so neither signal reaches them unless claudear passes it on.
 async fn interrupted() {
@@ -1759,9 +1762,10 @@ fn force_quit() -> ! {
 }
 
 /// Run a one-shot command that may start agent runs. On interrupt, pass it on
-/// to the agent CLIs, keep driving their runs until the CLIs exit or
-/// [`INTERRUPT_GRACE`] passes, then force-quit before the command starts
-/// anything new.
+/// to the agent CLIs, kill whatever is left after [`INTERRUPT_GRACE`], and give
+/// the command up to [`WRAP_UP_TIMEOUT`] to record how its runs ended before
+/// force-quitting. The command must not start new runs once
+/// [`process_group::Registry::is_interrupted`].
 async fn interruptible<F: std::future::Future>(command: F) -> F::Output {
     tokio::pin!(command);
     tokio::select! {
@@ -1769,16 +1773,16 @@ async fn interruptible<F: std::future::Future>(command: F) -> F::Output {
         () = interrupted() => {}
     }
     tracing::warn!("\nInterrupted, stopping agent runs");
-    let registry = process_group::Registry::global();
-    registry.interrupt_all();
-    let _ = tokio::time::timeout(INTERRUPT_GRACE, async {
-        tokio::select! {
-            _ = &mut command => {}
-            () = registry.emptied() => {}
-            () = interrupted() => {}
-        }
-    })
-    .await;
+    let wrap_up = async {
+        tokio::join!(
+            &mut command,
+            process_group::Registry::global().shutdown(INTERRUPT_GRACE)
+        )
+    };
+    tokio::select! {
+        _ = tokio::time::timeout(WRAP_UP_TIMEOUT, wrap_up) => {}
+        () = interrupted() => {}
+    }
     force_quit();
 }
 
@@ -4060,6 +4064,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         interruptible(async {
             for attempt in ready {
+                if process_group::Registry::global().is_interrupted() {
+                    break;
+                }
                 println!("\n  Retrying [{}] {}...", attempt.source, attempt.short_id);
                 retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
                 if let Err(error) = watcher
