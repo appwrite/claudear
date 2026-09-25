@@ -1,8 +1,8 @@
 //! Synthetic `deploy_qa` issue source.
 //!
 //! Surfaces pending tips persisted by [`claudear_analysis::deploy_qa::DeployQaTracker`].
-//! Observe/report only — `add_comment` records the report's verdict, posts it to
-//! Discord `#releases`, and never opens a fix PR.
+//! Live QA that only reports — `add_comment` records the report's verdict, posts
+//! it to Discord `#releases`, and never opens a fix PR.
 
 use super::IssueSource;
 use crate::deploy_qa::{report_deploy_qa_outcome, DeployQaDiscord};
@@ -131,8 +131,7 @@ impl IssueSource for DeployQaSource {
 mod tests {
     use super::*;
     use claudear_analysis::deploy_qa::{
-        OBSERVE_ONLY_METADATA_KEY, VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX,
-        VERDICT_UNVERIFIED,
+        VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX, VERDICT_UNVERIFIED,
     };
     use claudear_core::types::DeployQaTipStatus;
     use claudear_storage::SqliteTracker;
@@ -153,10 +152,9 @@ mod tests {
         let issues = source.fetch_issues().await.unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].id, stored.issue_id);
-        assert_eq!(issues[0].source, DEPLOY_QA_SOURCE);
         assert_eq!(
-            issues[0].get_metadata::<bool>(OBSERVE_ONLY_METADATA_KEY),
-            Some(true)
+            issues[0].source, DEPLOY_QA_SOURCE,
+            "the engine runs an issue as live QA, never a fix, by its source"
         );
         assert!(source.matches_criteria(&issues[0]).matches);
         let context = source.build_issue_context(&issues[0]).await.unwrap();

@@ -2789,8 +2789,7 @@ Create a PR with your changes.{custom_instructions}"#,
             None => String::new(),
         };
 
-        let scratch = std::env::temp_dir().join("claudear-qa");
-        let _ = std::fs::create_dir_all(&scratch);
+        let scratch = crate::processing::qa_scratch_directory();
 
         let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
         let reply = match tokio::time::timeout(
@@ -4958,16 +4957,16 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
     /// issue, bypassing classification. Backs the `claudear action ...` CLI.
     ///
-    /// Every action is refused for observe-only `deploy_qa` issues: `resolve`
-    /// would enter the fix pipeline, and `reply` / `verify` would post through
-    /// the source, which records any comment as the release's QA verdict.
+    /// Every action is refused for `deploy_qa` issues, which only run live QA:
+    /// `resolve` would enter the fix pipeline, and `reply` / `verify` would post
+    /// through the source, which records any comment as the release's QA verdict.
     pub async fn run_action(
         &self,
         action: ActionKind,
         source_name: &str,
         issue_id: &str,
     ) -> Result<crate::processing::ProcessingOutcome> {
-        use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
+        use crate::processing::{refuse_live_qa_action, IssueProcessor, ProcessingInput};
 
         let source = self
             .sources
@@ -4981,13 +4980,9 @@ Create a PR with your changes.{custom_instructions}"#,
                 source = source_name,
                 issue_id = issue_id,
                 %action,
-                "Refusing manual action for observe-only deploy_qa issue"
+                "Refusing manual action for live-QA deploy_qa issue"
             );
-            return Ok(ProcessingOutcome::Failed {
-                error: format!(
-                    "{DEPLOY_QA_SOURCE} issues are observe-only; {action} is not permitted"
-                ),
-            });
+            return Ok(refuse_live_qa_action(action));
         }
 
         let issue = source.get_issue(issue_id).await?;
@@ -9135,6 +9130,9 @@ mod tests {
         tracker: Arc<SqliteTracker>,
         tip: DeployQaTip,
         agent_calls: Arc<AtomicUsize>,
+        /// The watcher's `workspace`, where live-QA runs create their private
+        /// directories; removed when the harness drops.
+        _workspace: tempfile::TempDir,
     }
 
     impl DeployQaHarness {
@@ -9196,10 +9194,12 @@ mod tests {
         }
 
         fn build(
-            config: Config,
+            mut config: Config,
             answer: QaAnswer,
             source: impl FnOnce(Arc<dyn FixAttemptTracker>, &DeployQaTip) -> Arc<dyn IssueSource>,
         ) -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            config.workspace = workspace.path().to_path_buf();
             let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
             let tip = tracker
                 .upsert_deploy_qa_tip(&DeployQaTip::new(DEPLOY_QA_TRACK, DEPLOY_QA_REPO, "1.2.3"))
@@ -9221,6 +9221,7 @@ mod tests {
                 tracker,
                 tip,
                 agent_calls,
+                _workspace: workspace,
             }
         }
 
@@ -9324,7 +9325,7 @@ mod tests {
                     error.contains(&action.to_string()),
                     "the refusal should name the {action} action: {error}"
                 ),
-                _ => panic!("{action} on an observe-only deploy_qa issue must be refused"),
+                _ => panic!("{action} on a deploy_qa issue must be refused"),
             }
             assert_eq!(
                 self.agent_calls(),
@@ -9547,7 +9548,7 @@ mod tests {
         assert_eq!(
             harness.agent_calls(),
             1,
-            "a triggered deploy_qa attempt must take the read-only QA path, not the fix pipeline"
+            "a triggered deploy_qa attempt must take the live QA path, not the fix pipeline"
         );
     }
 
@@ -9572,7 +9573,7 @@ mod tests {
         assert_eq!(
             harness.agent_calls(),
             1,
-            "observe-only deploy_qa attempts must not wait on human approval"
+            "live-QA deploy_qa attempts must not wait on human approval"
         );
         assert_ne!(
             harness.stored_status(),

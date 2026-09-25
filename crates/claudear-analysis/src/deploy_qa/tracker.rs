@@ -21,8 +21,6 @@ pub const TRACK_METADATA_KEY: &str = "deploy_qa_track";
 pub const REPO_METADATA_KEY: &str = "deploy_qa_repo";
 /// Issue metadata key holding the release tag.
 pub const TAG_METADATA_KEY: &str = "deploy_qa_tag";
-/// Issue metadata flag marking the issue as observe/report only (no fix PR).
-pub const OBSERVE_ONLY_METADATA_KEY: &str = "observe_only";
 
 /// A normalized tip the poller can persist and enqueue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,7 +251,7 @@ fn load_configured_playbook(config: &DeployQaConfig) -> Result<String> {
     load_playbook(path)
 }
 
-/// Build the synthetic observe/report issue for a new tip.
+/// Build the synthetic live-QA issue for a new tip.
 ///
 /// Discord routing is deliberately absent from the metadata: the deploy_qa
 /// reporter posts to its configured `#releases` channel itself.
@@ -264,7 +262,7 @@ pub fn build_deploy_qa_issue(
 ) -> Issue {
     let issue_id = DeployQaTip::issue_id_for(&track.name, &tip.repo, &tip.tag);
     let title = format!(
-        "[deploy_qa] {} {} — live QA (observe/report only)",
+        "[deploy_qa] {} {} — live QA (report only, no fixes)",
         track.name, tip.tag
     );
     let body = tip.body.as_deref().unwrap_or("(no release body)");
@@ -278,7 +276,10 @@ pub fn build_deploy_qa_issue(
          - Author: {author}\n\n\
          ## Release body\n\n{body}\n\n\
          ## Agent constraints\n\n\
-         - Source is `{source}` — observe, probe, and report only.\n\
+         - Source is `{source}` — live QA: actually run the playbook's checks \
+         against the shipped release and report what you observed.\n\
+         - Make state-changing requests (create, update, delete) only in the \
+         playbook's throwaway QA project, never in any other project or production data.\n\
          - Do **not** open a fix PR, branch, or commit for this announcement.\n\
          - Do **not** post to Discord; Claudear posts the outcome from this report.\n\
          - End with `{prefix} {all_verified}` (every LIVE-TESTABLE PR passed), \
@@ -309,7 +310,6 @@ pub fn build_deploy_qa_issue(
     issue.priority = IssuePriority::High;
     issue.status = IssueStatus::Open;
     issue.set_metadata("routing_intent", "QA");
-    issue.set_metadata(OBSERVE_ONLY_METADATA_KEY, true);
     issue.set_metadata(TRACK_METADATA_KEY, track.name.clone());
     issue.set_metadata(REPO_METADATA_KEY, tip.repo.clone());
     issue.set_metadata(TAG_METADATA_KEY, tip.tag.clone());
@@ -478,29 +478,37 @@ mod tests {
     }
 
     #[test]
-    fn issue_is_observe_only_and_not_a_fix() {
+    fn issue_is_routed_as_live_qa_and_scoped_to_its_track() {
         let repo = "appwrite-labs/edge";
         let database = track("edge-db", repo, DeployQaTagFilter::Any);
         let network = track("edge-network", repo, DeployQaTagFilter::Any);
         let tip = release_tip(repo, "1.2.3", "Adds #99");
 
         let issue = build_deploy_qa_issue(&database, &tip, bundled_playbook());
-        assert_eq!(issue.source, DEPLOY_QA_SOURCE);
         assert_eq!(
-            issue.get_metadata::<bool>(OBSERVE_ONLY_METADATA_KEY),
-            Some(true)
+            issue.source, DEPLOY_QA_SOURCE,
+            "the engine runs an issue as live QA, never a fix, by its source"
         );
-        assert!(issue
+        let description = issue
             .description
             .as_deref()
-            .unwrap()
-            .contains(tip.body.as_deref().unwrap()));
+            .expect("the issue should carry the prompt");
+        assert!(
+            description.contains(tip.body.as_deref().unwrap()),
+            "the agent must get the release body it checks: {description}"
+        );
 
         let again = build_deploy_qa_issue(&database, &tip, bundled_playbook());
-        assert_eq!(issue.id, again.id);
+        assert_eq!(
+            issue.id, again.id,
+            "the same tip on the same track must map to the same issue"
+        );
 
         let other_track = build_deploy_qa_issue(&network, &tip, bundled_playbook());
-        assert_ne!(issue.id, other_track.id);
+        assert_ne!(
+            issue.id, other_track.id,
+            "tracks sharing a repo must not share an issue"
+        );
     }
 
     #[test]

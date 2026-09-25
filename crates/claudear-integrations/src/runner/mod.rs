@@ -58,6 +58,10 @@ pub trait AgentRunner: Send + Sync {
     /// Answer a question in read-only mode, grounded in `context` (RAG code
     /// search) and the repository at `project_dir`. Returns the answer text.
     ///
+    /// Exception: a `deploy_qa` release tip is live QA, not a question. Claude
+    /// runs it with the fix-run tool access so it can probe live hosts, and
+    /// returns its QA report.
+    ///
     /// Default: not supported. Providers that can run read-only (e.g. Claude)
     /// override this.
     async fn answer_question(
@@ -90,7 +94,8 @@ pub trait AgentRunner: Send + Sync {
 
     /// Generate a grounded, human-sounding reply to a ticket. `guideline` is an
     /// optional per-inbox template treated as a soft style guideline (not
-    /// reproduced verbatim); `kind` selects the framing. Read-only.
+    /// reproduced verbatim); `kind` selects the framing. Read-only, except for
+    /// `deploy_qa` live QA (see [`AgentRunner::answer_question`]).
     ///
     /// Default: not supported. Providers that can run read-only (e.g. Claude)
     /// override this.

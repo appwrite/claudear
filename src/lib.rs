@@ -166,7 +166,8 @@ pub struct AppComponents {
 /// Build a Claude agent runner for the default provider, optionally overriding
 /// the model. When `model_override` is `None`, the provider's configured `model`
 /// is used. All other settings (timeout, instructions, permissions, binary,
-/// env) come from the default provider config.
+/// env) come from the default provider config, except that deploy_qa live-QA
+/// runs are also bounded by `[deploy_qa] timeout_secs`.
 pub fn build_provider_runner(
     config: &Config,
     tracker: Arc<dyn storage::FixAttemptTracker>,
@@ -177,6 +178,7 @@ pub fn build_provider_runner(
     let runner = runner::ClaudeAgentRunner::new(
         runner::ClaudeRunnerConfig {
             timeout_secs: config.agent.timeout_secs,
+            live_qa_timeout_secs: Some(config.deploy_qa.effective_timeout_secs()),
             model,
             instructions: provider.and_then(|p| p.instructions.clone()),
             permissions: provider.map(|p| p.permissions.clone()).unwrap_or_default(),
@@ -329,7 +331,7 @@ fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notif
     Arc::new(composite)
 }
 
-/// Build the synthetic observe/report `deploy_qa` issue source.
+/// Build the synthetic live-QA `deploy_qa` issue source.
 ///
 /// Returns `None` when `[deploy_qa]` is disabled or the source cannot be built
 /// (e.g. an unreadable playbook). An unreadable GitHub↔Discord map or a Discord
@@ -360,10 +362,13 @@ pub fn build_deploy_qa_source(
         .discord_merged()
         .bot_token
         .map(|token| token.expose().to_string());
+    let environment = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)));
     let discord = claudear_integrations::deploy_qa::try_build_discord(
         bot_token.as_deref(),
         config.deploy_qa.discord_channel_id.as_deref(),
         map,
+        deploy_qa_redactor(config, environment),
     )
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "deploy_qa Discord reporter unavailable; reporting disabled");
@@ -372,7 +377,7 @@ pub fn build_deploy_qa_source(
 
     match source::DeployQaSource::new(config.deploy_qa.clone(), tracker, discord) {
         Ok(source) => {
-            tracing::info!("Deploy QA source initialized (observe/report only)");
+            tracing::info!("Deploy QA source initialized (live QA, no fix PRs)");
             Some(Arc::new(source))
         }
         Err(e) => {
@@ -380,6 +385,84 @@ pub fn build_deploy_qa_source(
             None
         }
     }
+}
+
+/// Redactor for live-QA reports. Masks every credential in `config` and the
+/// value of every secret-named variable the agent can read: `environment`
+/// (the daemon's, which the agent inherits minus Claudear's own `CLAUDEAR_*`
+/// variables), each provider's `env`, and each MCP server's `env` and
+/// `headers`. Those `CLAUDEAR_*` values are masked too: the agent runs as the
+/// daemon's user, so it can still find them outside its own environment.
+fn deploy_qa_redactor(
+    config: &Config,
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> secret::Redactor {
+    let providers = config.agent.providers.values();
+    let server_variables = providers
+        .clone()
+        .flat_map(|provider| provider.mcp.values())
+        .flat_map(|server| server.env.iter().chain(&server.headers));
+    secret::Redactor::new(configured_secrets(config).map(SecretValue::expose))
+        .with_variables(environment)
+        .with_variables(providers.flat_map(|provider| &provider.env))
+        .with_variables(server_variables)
+}
+
+/// Every credential in `config`: bot, API and auth tokens, webhook URLs and
+/// secrets, passwords, the inline GitHub App key and provider API keys.
+fn configured_secrets(config: &Config) -> impl Iterator<Item = &SecretValue> {
+    let notifiers = &config.notifiers;
+    let discord_source = config.issues.discord.as_ref();
+    let slack_source = config.issues.slack.as_ref();
+    let knowledgebase = config.knowledgebase.discord.as_ref();
+    let github = config.github();
+    let gitlab = config.gitlab();
+    let linear = config.linear();
+    let sentry = config.sentry_config();
+    let helpscout = config.helpscout();
+    [
+        notifiers.discord.bot_token.as_ref(),
+        notifiers.discord.webhook_url.as_ref(),
+        discord_source.and_then(|discord| discord.bot_token.as_ref()),
+        knowledgebase.and_then(|discord| discord.bot_token.as_ref()),
+        notifiers.slack.bot_token.as_ref(),
+        notifiers.slack.webhook_url.as_ref(),
+        slack_source.and_then(|slack| slack.bot_token.as_ref()),
+        slack_source.and_then(|slack| slack.signing_secret.as_ref()),
+        slack_source.and_then(|slack| slack.app_config_token.as_ref()),
+        notifiers.email.smtp_password.as_ref(),
+        notifiers.email.imap_password.as_ref(),
+        notifiers.sms.auth_token.as_ref(),
+        notifiers.push.api_token.as_ref(),
+        notifiers.whatsapp.access_token.as_ref(),
+        notifiers.whatsapp.app_secret.as_ref(),
+        notifiers.whatsapp.webhook_verify_token.as_ref(),
+        notifiers.telegram.bot_token.as_ref(),
+        github.token.as_ref(),
+        github.webhook_secret.as_ref(),
+        github.app.private_key.as_ref(),
+        github.app.webhook_secret.as_ref(),
+        github.app.client_secret.as_ref(),
+        gitlab.and_then(|gitlab| gitlab.token.as_ref()),
+        gitlab.and_then(|gitlab| gitlab.webhook_secret.as_ref()),
+        linear.map(|linear| &linear.api_key),
+        linear.and_then(|linear| linear.webhook_secret.as_ref()),
+        sentry.map(|sentry| &sentry.auth_token),
+        sentry.and_then(|sentry| sentry.client_secret.as_ref()),
+        config.jira().map(|jira| &jira.api_token),
+        helpscout.map(|helpscout| &helpscout.app_id),
+        helpscout.map(|helpscout| &helpscout.app_secret),
+        helpscout.and_then(|helpscout| helpscout.webhook_secret.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(
+        config
+            .agent
+            .providers
+            .values()
+            .filter_map(|provider| provider.api_key.as_ref()),
+    )
 }
 
 fn build_sources(config: &Config) -> Vec<Arc<dyn source::IssueSource>> {
@@ -596,6 +679,84 @@ mod tests {
         assert_eq!(sources.len(), 2);
     }
 
+    /// Environment variable naming the directory agent runs log to.
+    const LOG_DIRECTORY_VARIABLE: &str = "CLAUDEAR_LOG_DIR";
+
+    /// Held by every test that sets a process-wide environment variable.
+    static ENVIRONMENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Sets an environment variable until dropped, then restores its previous
+    /// value.
+    struct EnvironmentVariableGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvironmentVariableGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvironmentVariableGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_provider_runner_stops_live_qa_at_the_deploy_qa_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const AGENT_CLI_SLEEP_SECS: u64 = 30;
+        let _environment = ENVIRONMENT_LOCK.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let logs = directory.path().join("logs");
+        let _log_directory = EnvironmentVariableGuard::set(LOG_DIRECTORY_VARIABLE, &logs);
+        let binary = directory.path().join("claude");
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\ncat > /dev/null\nexec sleep {AGENT_CLI_SLEEP_SECS}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = Config::default();
+        config.deploy_qa.timeout_secs = 1;
+        config.agent.default_provider_config_mut().binary = Some(binary.display().to_string());
+        let runner = build_provider_runner(&config, Arc::new(storage::NoopTracker), None);
+        let issue = Issue::new(
+            "deploy-qa-1",
+            "cloud-1.2.3",
+            "cloud 1.2.3 live QA",
+            "url",
+            deploy_qa::DEPLOY_QA_SOURCE,
+        );
+
+        let started = std::time::Instant::now();
+        let error = runner
+            .answer_question(&issue, "ctx", directory.path())
+            .await
+            .expect_err("a live QA run past `[deploy_qa] timeout_secs` must fail")
+            .to_string();
+        let elapsed = started.elapsed();
+
+        assert!(error.contains("timed out"), "got: {error}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(AGENT_CLI_SLEEP_SECS / 2),
+            "the run waited for the agent CLI instead of `[deploy_qa] timeout_secs`: {elapsed:?}"
+        );
+        assert!(
+            logs.is_dir(),
+            "the run must log to the test's own directory, never the repository's"
+        );
+    }
+
     fn deploy_qa_config() -> Config {
         let mut config = Config::default();
         config.deploy_qa.enabled = true;
@@ -639,6 +800,84 @@ mod tests {
         assert!(
             source.is_some(),
             "a missing GitHub↔Discord map only disables FAIL @releaser mentions"
+        );
+    }
+
+    #[test]
+    fn deploy_qa_redactor_masks_configured_and_inherited_secrets() {
+        let mut config = deploy_qa_config();
+        config.notifiers.discord.bot_token = Some(SecretValue::new("notifier-discord-bot-token"));
+        config.issues.discord = Some(config::DiscordSourceConfig {
+            bot_token: Some(SecretValue::new("source-discord-bot-token")),
+            ..Default::default()
+        });
+        config.knowledgebase.discord = Some(config::DiscordKnowledgebaseConfig {
+            bot_token: Some(SecretValue::new("knowledgebase-discord-bot-token")),
+            ..Default::default()
+        });
+        config.scm.github.token = Some(SecretValue::new("configured-github-token"));
+        config.issues.linear = Some(config::LinearConfig {
+            api_key: SecretValue::new("configured-linear-api-key"),
+            ..Default::default()
+        });
+        let provider = config.agent.default_provider_config_mut();
+        provider.api_key = Some(SecretValue::new("provider-api-key-value"));
+        provider.env.insert(
+            "APPWRITE_API_KEY".to_string(),
+            "provider-env-api-key".to_string(),
+        );
+        provider.env.insert(
+            "APPWRITE_ENDPOINT".to_string(),
+            "https://cloud.appwrite.io/v1".to_string(),
+        );
+        provider.mcp.insert(
+            "appwrite".to_string(),
+            config::McpServerConfig {
+                headers: std::collections::HashMap::from([(
+                    "Authorization".to_string(),
+                    "mcp-authorization-value".to_string(),
+                )]),
+                ..Default::default()
+            },
+        );
+        let environment = [
+            (
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "inherited-oauth-token".to_string(),
+            ),
+            (
+                "CLAUDEAR_MASTER_KEY".to_string(),
+                "withheld-master-key".to_string(),
+            ),
+            ("HOME".to_string(), "/home/claudear".to_string()),
+        ];
+        let credentials = [
+            ("notifier Discord bot token", "notifier-discord-bot-token"),
+            ("Discord source bot token", "source-discord-bot-token"),
+            (
+                "knowledgebase Discord bot token",
+                "knowledgebase-discord-bot-token",
+            ),
+            ("GitHub token", "configured-github-token"),
+            ("Linear API key", "configured-linear-api-key"),
+            ("provider API key", "provider-api-key-value"),
+            ("provider env API key", "provider-env-api-key"),
+            ("MCP server Authorization header", "mcp-authorization-value"),
+            ("inherited OAuth token", "inherited-oauth-token"),
+            ("withheld Claudear master key", "withheld-master-key"),
+        ];
+        let kept = "https://cloud.appwrite.io/v1 /home/claudear";
+        let values = credentials.map(|(_, value)| value);
+
+        let redacted = deploy_qa_redactor(&config, environment)
+            .redact(&format!("{} {kept}", values.join(" ")));
+
+        for (kind, value) in credentials {
+            assert!(!redacted.contains(value), "the {kind} survived redaction");
+        }
+        assert_eq!(
+            redacted,
+            format!("{} {kept}", vec![secret::REDACTED; values.len()].join(" "))
         );
     }
 }
