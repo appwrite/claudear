@@ -3976,9 +3976,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
             let environment = stub_run_environment(profile);
 
             for name in [MASTER_KEY_VARIABLE, DISCORD_BOT_TOKEN_VARIABLE] {
-                assert_eq!(
-                    environment.get(name).map(String::as_str),
-                    Some(FAKE_CLAUDEAR_CREDENTIAL),
+                assert!(
+                    environment
+                        .get(name)
+                        .is_some_and(|value| value == FAKE_CLAUDEAR_CREDENTIAL),
                     "a {profile:?} run lost {name}"
                 );
             }

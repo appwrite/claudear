@@ -851,25 +851,33 @@ mod tests {
             ),
             ("HOME".to_string(), "/home/claudear".to_string()),
         ];
-        let secrets = [
-            "notifier-discord-bot-token",
-            "source-discord-bot-token",
-            "knowledgebase-discord-bot-token",
-            "configured-github-token",
-            "configured-linear-api-key",
-            "provider-api-key-value",
-            "provider-env-api-key",
-            "mcp-authorization-value",
-            "inherited-oauth-token",
-            "withheld-master-key",
+        let credentials = [
+            ("notifier Discord bot token", "notifier-discord-bot-token"),
+            ("Discord source bot token", "source-discord-bot-token"),
+            (
+                "knowledgebase Discord bot token",
+                "knowledgebase-discord-bot-token",
+            ),
+            ("GitHub token", "configured-github-token"),
+            ("Linear API key", "configured-linear-api-key"),
+            ("provider API key", "provider-api-key-value"),
+            ("provider env API key", "provider-env-api-key"),
+            ("MCP server Authorization header", "mcp-authorization-value"),
+            ("inherited OAuth token", "inherited-oauth-token"),
+            ("withheld Claudear master key", "withheld-master-key"),
         ];
         let kept = "https://cloud.appwrite.io/v1 /home/claudear";
+        let values = credentials.map(|(_, value)| value);
 
-        let redactor = deploy_qa_redactor(&config, environment);
+        let redacted = deploy_qa_redactor(&config, environment)
+            .redact(&format!("{} {kept}", values.join(" ")));
 
+        for (kind, value) in credentials {
+            assert!(!redacted.contains(value), "the {kind} survived redaction");
+        }
         assert_eq!(
-            redactor.redact(&format!("{} {kept}", secrets.join(" "))),
-            format!("{} {kept}", vec![secret::REDACTED; secrets.len()].join(" "))
+            redacted,
+            format!("{} {kept}", vec![secret::REDACTED; values.len()].join(" "))
         );
     }
 }
