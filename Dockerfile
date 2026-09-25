@@ -100,6 +100,7 @@ RUN cargo build --release --bin claudear && rm -rf src crates/*/src
 COPY src ./src
 COPY crates ./crates
 COPY migrations ./migrations
+COPY playbooks ./playbooks
 
 COPY --from=dashboard /app/dashboard/dist ./dashboard/dist
 RUN touch src/main.rs src/lib.rs \

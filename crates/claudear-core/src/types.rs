@@ -570,8 +570,49 @@ impl DiscordChannelKind {
     }
 }
 
+/// Triage call made during verify on whether an issue is worth a fix run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageVerdict {
+    /// A code defect this repo can fix.
+    Fix,
+    /// Log noise or a report of a handled condition; nothing to change.
+    Noise,
+    /// The code behaves as intended (e.g. rejecting invalid input).
+    Expected,
+    /// A dependency or infrastructure blip that no code change here removes.
+    InfraTransient,
+    /// The defect lives in another repository.
+    UpstreamOwned,
+    /// Needs a product or ops decision before anyone can fix it.
+    NeedsHuman,
+    /// No verdict given or not understood.
+    #[default]
+    #[serde(other)]
+    Unspecified,
+}
+
+impl TriageVerdict {
+    /// Verdicts that end the attempt without spending a fix run.
+    pub fn skips_fix(self) -> bool {
+        matches!(self, Self::Noise | Self::Expected | Self::InfraTransient)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fix => "fix",
+            Self::Noise => "noise",
+            Self::Expected => "expected",
+            Self::InfraTransient => "infra_transient",
+            Self::UpstreamOwned => "upstream_owned",
+            Self::NeedsHuman => "needs_human",
+            Self::Unspecified => "unspecified",
+        }
+    }
+}
+
 /// Outcome of a `Verify` action: whether the agent reproduced the reported issue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VerifyResult {
     /// Whether the issue was reproduced as described.
     pub reproduced: bool,
@@ -590,6 +631,9 @@ pub struct VerifyResult {
     /// Evidence supporting the verdict (repro steps, failing output, etc.).
     #[serde(default)]
     pub evidence: String,
+    /// Whether the issue deserves a fix run at all (telemetry sources only).
+    #[serde(default)]
+    pub triage: TriageVerdict,
 }
 
 /// Statistics about fix attempts.

@@ -71,22 +71,22 @@ fn frequency_component(issue: &Issue) -> f64 {
         .max(0.0);
     let escalation_rate = issue.get_metadata::<f64>("escalation_rate").unwrap_or(0.0);
 
-    // Log-scale event count: log2(count) / log2(10000) clamped to 0-1
+    // Log-scale event count up to 1M so 10k and 1M events still rank apart
     let event_score = if event_count <= 1.0 {
         0.0
     } else {
-        (event_count.log2() / 10_000f64.log2()).min(1.0)
+        (event_count.log10() / 6.0).min(1.0)
     };
 
-    // User count: log2(users) / log2(1000) clamped to 0-1
+    // Log-scale user count up to 10k
     let user_score = if user_count <= 1.0 {
         0.0
     } else {
-        (user_count.log2() / 1_000f64.log2()).min(1.0)
+        (user_count.log10() / 4.0).min(1.0)
     };
 
-    // Escalation rate already 0-1 (clamp for safety)
-    let escalation_score = escalation_rate.clamp(0.0, 1.0);
+    // Sources report escalation as a percentage (0-100)
+    let escalation_score = (escalation_rate / 100.0).clamp(0.0, 1.0);
 
     0.4 * event_score + 0.3 * user_score + 0.3 * escalation_score
 }
@@ -172,10 +172,38 @@ mod tests {
         let mut issue = make_issue(IssuePriority::Medium);
         issue.set_metadata("event_count", 1000i64);
         issue.set_metadata("user_count", 100i64);
-        issue.set_metadata("escalation_rate", 0.5);
+        issue.set_metadata("escalation_rate", 50.0);
         let fc = frequency_component(&issue);
         assert!(fc > 0.0);
         assert!(fc <= 1.0);
+    }
+
+    #[test]
+    fn escalation_rate_is_read_as_a_percentage() {
+        let mut slight = make_issue(IssuePriority::Medium);
+        slight.set_metadata("escalation_rate", 10.0);
+        let mut doubled = make_issue(IssuePriority::Medium);
+        doubled.set_metadata("escalation_rate", 100.0);
+        let (s, d) = (frequency_component(&slight), frequency_component(&doubled));
+        assert!(
+            (s - 0.03).abs() < 0.001,
+            "10% escalation should score 0.03, got {}",
+            s
+        );
+        assert!(
+            (d - 0.3).abs() < 0.001,
+            "100% escalation should score 0.3, got {}",
+            d
+        );
+    }
+
+    #[test]
+    fn busier_issues_keep_ranking_higher_past_ten_thousand_events() {
+        let mut busy = make_issue(IssuePriority::Medium);
+        busy.set_metadata("event_count", 10_000i64);
+        let mut busier = make_issue(IssuePriority::Medium);
+        busier.set_metadata("event_count", 1_000_000i64);
+        assert!(frequency_component(&busier) > frequency_component(&busy));
     }
 
     #[test]
@@ -244,7 +272,7 @@ mod tests {
         let mut issue = make_issue(IssuePriority::Medium);
         issue.set_metadata("event_count", 10_000_000i64);
         let fc = frequency_component(&issue);
-        // log2(10_000_000) / log2(10_000) = ~23.25 / ~13.29 = ~1.75, clamped to 1.0
+        // log10(10_000_000) / 6 = ~1.17, clamped to 1.0
         // event_score = 1.0
         // user_score = 0.0 (no user_count), escalation = 0.0
         // 0.4*1.0 + 0.3*0.0 + 0.3*0.0 = 0.4

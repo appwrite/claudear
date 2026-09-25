@@ -176,6 +176,10 @@ fn build_failing_test_prompt(issue: &Issue, context: &str) -> String {
     )
 }
 
+/// Discord chunks below this similarity are unrelated chatter that pulls the
+/// fix agent off course (billing threads were attached to a queue bug at ~53%).
+const FIX_DISCORD_MIN_SIMILARITY: f64 = 0.65;
+
 /// Whether a verify verdict has real findings (the conservative fallbacks don't).
 fn diagnosis_has_details(verdict: &VerifyResult) -> bool {
     !verdict.impact.trim().is_empty()
@@ -1215,8 +1219,9 @@ impl IssueProcessor {
 
         // Enrich context with indexed Discord discussions (independent of code index).
         // Reference links are for user-facing notifications, not this agent context.
-        let (discord_ctx, discord_items, _discord_refs) =
-            self.discord_grounding_context(issue, 5, attempt_id).await;
+        let (discord_ctx, discord_items, _discord_refs) = self
+            .discord_grounding_context(issue, 5, FIX_DISCORD_MIN_SIMILARITY, attempt_id)
+            .await;
         if !discord_ctx.is_empty() {
             let metric = ProcessingMetric::new("discord_search_context_added", 1.0)
                 .with_source(source_name.to_string());
@@ -1310,8 +1315,9 @@ impl IssueProcessor {
         context = self.with_reply_chain(issue, context).await;
 
         // Start the fix from the verify stage's diagnosis when it has real findings.
+        // An unreproduced verdict is framed as proof otherwise and steers the fix off course.
         if let Some(verdict) = diagnosis {
-            if diagnosis_has_details(verdict) {
+            if verdict.reproduced && diagnosis_has_details(verdict) {
                 context = format!("{}\n{}", build_diagnosis_context(verdict), context);
             }
         }
@@ -2277,7 +2283,7 @@ impl IssueProcessor {
             String::new()
         };
         let (discord_ctx, discord_items, discord_refs) = self
-            .discord_grounding_context(issue, self.config.qa.max_context_chunks, attempt_id)
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks, 0.0, attempt_id)
             .await;
         if !discord_ctx.is_empty() {
             context = if context.is_empty() {
@@ -2481,8 +2487,16 @@ impl IssueProcessor {
                 .await;
             // Telemetry sources (Sentry) ship a stacktrace that already pinpoints
             // the defect; an inability to reproduce at runtime is expected and must
-            // not deflect to a "share repro steps" reply. Always fix these.
+            // not deflect to a "share repro steps" reply. Always fix these, unless
+            // triage showed with evidence that there is nothing to fix.
             let always_fix = input.issue.source == "sentry";
+            if always_fix {
+                if let Some(outcome) =
+                    self.skip_after_triage(&input.issue, &input.source_name, &verdict)
+                {
+                    return outcome;
+                }
+            }
             if verdict.reproduced || always_fix {
                 // Carry the diagnosis into the fix run.
                 input.diagnosis = Some(verdict);
@@ -2609,6 +2623,42 @@ impl IssueProcessor {
     /// Attempt to reproduce a reported issue (read-only). On any failure, timeout,
     /// or lack of agent support, conservatively treats the issue as reproduced so
     /// the fix pipeline still runs (preserving the default issue-resolution path).
+    /// End the attempt without a fix run when triage calls the issue not worth
+    /// fixing. Recorded as cannot_fix so it is neither retried nor reselected.
+    fn skip_after_triage(
+        &self,
+        issue: &Issue,
+        source_name: &str,
+        verdict: &VerifyResult,
+    ) -> Option<ProcessingOutcome> {
+        // A skip must be argued; without evidence the fix run gets the benefit of the doubt
+        if !verdict.triage.skips_fix() || verdict.evidence.trim().is_empty() {
+            return None;
+        }
+        let reason = format!("Triage: {}: {}", verdict.triage.as_str(), verdict.summary);
+        if let Err(e) = self
+            .tracker
+            .mark_cannot_fix(source_name, &issue.id, &reason)
+        {
+            tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to record triage skip");
+        }
+        self.record_issue_decision(
+            issue,
+            "triage_skipped",
+            format!(
+                "Skipped {} after triage: {}",
+                issue.short_id,
+                verdict.triage.as_str()
+            ),
+            json!({
+                "triage": verdict.triage.as_str(),
+                "summary": verdict.summary,
+                "evidence": verdict.evidence,
+            }),
+        );
+        Some(ProcessingOutcome::CompletedNoPr { reason })
+    }
+
     async fn run_verify(
         &self,
         issue: &Issue,
@@ -2653,6 +2703,7 @@ impl IssueProcessor {
                 root_cause: String::new(),
                 suggested_fix: String::new(),
                 evidence: e.to_string(),
+                triage: Default::default(),
             },
             Err(_) => VerifyResult {
                 reproduced: fail_open,
@@ -2664,6 +2715,7 @@ impl IssueProcessor {
                 root_cause: String::new(),
                 suggested_fix: String::new(),
                 evidence: String::new(),
+                triage: Default::default(),
             },
         };
 
@@ -2691,7 +2743,11 @@ impl IssueProcessor {
                     "not reproduced"
                 }
             ),
-            json!({ "reproduced": verdict.reproduced, "summary": verdict.summary }),
+            json!({
+                "reproduced": verdict.reproduced,
+                "summary": verdict.summary,
+                "triage": verdict.triage.as_str(),
+            }),
         );
         self.record_timeline_event(
             issue,
@@ -2930,7 +2986,7 @@ impl IssueProcessor {
             }
         }
         let (discord_ctx, discord_items, discord_refs) = self
-            .discord_grounding_context(issue, self.config.qa.max_context_chunks, attempt_id)
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks, 0.0, attempt_id)
             .await;
         if !discord_ctx.is_empty() {
             context = if context.is_empty() {
@@ -3118,13 +3174,23 @@ impl IssueProcessor {
         &self,
         issue: &Issue,
         limit: usize,
+        min_score: f64,
         attempt_id: Option<i64>,
     ) -> (String, Vec<RetrievedItem>, String) {
         let Some(ref discord_search) = self.discord_search_service else {
             return (String::new(), Vec::new(), String::new());
         };
         let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
-        match discord_search.search(&query, None, limit).await {
+        let results = discord_search
+            .search(&query, None, limit)
+            .await
+            .map(|results| {
+                results
+                    .into_iter()
+                    .filter(|r| r.score >= min_score)
+                    .collect::<Vec<_>>()
+            });
+        match results {
             Ok(results) if !results.is_empty() => {
                 let mut items: Vec<RetrievedItem> = Vec::with_capacity(results.len());
                 let mut rows: Vec<RetrievalUsageRecord> = Vec::with_capacity(results.len());
@@ -5783,6 +5849,93 @@ mod tests {
             llm_analyzer: None,
             intent_classifier: None,
         }
+    }
+
+    fn triage_verdict(triage: claudear_core::types::TriageVerdict, evidence: &str) -> VerifyResult {
+        VerifyResult {
+            summary: "ClickHouse returned 503 during an incident".to_string(),
+            evidence: evidence.to_string(),
+            triage,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_skip_after_triage_closes_out_an_infra_blip() {
+        use claudear_core::types::TriageVerdict;
+        let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("sentry", "S1", "CLOUD-1").unwrap();
+        let processor = make_reply_chain_processor(Arc::new(tracker));
+        let issue = Issue::new(
+            "S1",
+            "CLOUD-1",
+            "ClickHouse query failed with HTTP 503",
+            "u",
+            "sentry",
+        );
+
+        let outcome = processor.skip_after_triage(
+            &issue,
+            "sentry",
+            &triage_verdict(
+                TriageVerdict::InfraTransient,
+                "HTTP 503 from clickhouse:8123, no code path involved",
+            ),
+        );
+
+        assert!(matches!(
+            outcome,
+            Some(ProcessingOutcome::CompletedNoPr { .. })
+        ));
+        let attempt = processor
+            .tracker
+            .get_attempt("sentry", "S1")
+            .unwrap()
+            .unwrap();
+        // cannot_fix is neither retried nor reselected
+        assert_eq!(
+            attempt.status,
+            claudear_core::types::FixAttemptStatus::CannotFix
+        );
+        assert!(attempt
+            .error_message
+            .unwrap_or_default()
+            .starts_with("Triage: infra_transient"));
+    }
+
+    #[test]
+    fn test_skip_after_triage_requires_evidence_and_a_skip_verdict() {
+        use claudear_core::types::TriageVerdict;
+        let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("sentry", "S1", "CLOUD-1").unwrap();
+        let processor = make_reply_chain_processor(Arc::new(tracker));
+        let issue = Issue::new(
+            "S1",
+            "CLOUD-1",
+            "Queue delivery payload is missing",
+            "u",
+            "sentry",
+        );
+
+        for verdict in [
+            triage_verdict(TriageVerdict::Noise, "   "),
+            triage_verdict(TriageVerdict::Fix, "src/Queue/Broker/Redis.php:457"),
+            triage_verdict(TriageVerdict::UpstreamOwned, "vendor/utopia-php/queue"),
+            triage_verdict(TriageVerdict::Unspecified, "anything"),
+        ] {
+            assert!(processor
+                .skip_after_triage(&issue, "sentry", &verdict)
+                .is_none());
+        }
+        let attempt = processor
+            .tracker
+            .get_attempt("sentry", "S1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attempt.status,
+            claudear_core::types::FixAttemptStatus::Pending
+        );
     }
 
     #[tokio::test]

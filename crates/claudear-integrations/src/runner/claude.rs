@@ -2335,7 +2335,21 @@ fn issue_body(issue: &Issue) -> &str {
 ///
 /// The agent must NOT fix anything; it inspects the code (read-only) to decide
 /// whether the issue reproduces as described and returns a single JSON verdict.
+/// Triage rules applied to telemetry issues during verify.
+const SENTRY_TRIAGE_PLAYBOOK: &str = include_str!("../../../../playbooks/sentry_triage.md");
+
 fn build_verify_prompt(issue: &Issue, context: &str) -> String {
+    // Telemetry issues need a worth-fixing call, not just a reproduction
+    let (triage_section, triage_field) = if issue.source == "sentry" {
+        (
+            format!(
+                "\n\n{SENTRY_TRIAGE_PLAYBOOK}\nSet `triage` to one of: fix, expected, infra_transient, noise, upstream_owned, needs_human. Fill `summary` and `evidence` for every verdict.\n"
+            ),
+            r#", "triage": "<fix|expected|infra_transient|noise|upstream_owned|needs_human>""#,
+        )
+    } else {
+        (String::new(), "")
+    };
     format!(
         r#"You are a senior engineer triaging a reported issue from {source}.
 
@@ -2358,10 +2372,10 @@ Title: {title}
 
 When `reproduced=true`, also explain WHY it's a problem, the root cause you
 traced, and a proposed fix direction (do NOT apply it). Leave those fields as
-empty strings when `reproduced=false`.
+empty strings when `reproduced=false`.{triage_section}
 
 Respond with ONLY a single JSON object on its own, no prose:
-{{"reproduced": true|false, "summary": "<one sentence verdict>", "impact": "<user-facing impact / why it's an issue>", "root_cause": "<the underlying cause in the code>", "suggested_fix": "<proposed fix direction>", "evidence": "<files/line refs and the code path that confirms or refutes the report>"}}"#,
+{{"reproduced": true|false, "summary": "<one sentence verdict>", "impact": "<user-facing impact / why it's an issue>", "root_cause": "<the underlying cause in the code>", "suggested_fix": "<proposed fix direction>", "evidence": "<files/line refs and the code path that confirms or refutes the report>"{triage_field}}}"#,
         source = issue.source,
         context = context,
         title = issue.title,
@@ -2568,6 +2582,7 @@ fn parse_verify_result(output: &str) -> VerifyResult {
         root_cause: String::new(),
         suggested_fix: String::new(),
         evidence: trimmed.chars().take(2000).collect(),
+        triage: Default::default(),
     }
 }
 
@@ -2586,6 +2601,38 @@ mod tests {
 
     fn verify_issue() -> Issue {
         Issue::new("1", "HS-1", "Login crashes on submit", "url", "helpscout")
+    }
+
+    #[test]
+    fn test_parse_verify_result_reads_triage_verdict() {
+        let v = parse_verify_result(
+            r#"{"reproduced": false, "summary": "tenant state", "evidence": "app/controllers/api/projects.php:88", "triage": "expected"}"#,
+        );
+        assert_eq!(v.triage, claudear_core::types::TriageVerdict::Expected);
+    }
+
+    #[test]
+    fn test_parse_verify_result_tolerates_unknown_triage_value() {
+        let v = parse_verify_result(
+            r#"{"reproduced": true, "summary": "found it", "evidence": "src/a.rs:10", "triage": "definitely_fix"}"#,
+        );
+        assert!(
+            v.reproduced,
+            "an unknown verdict must not throw away the rest"
+        );
+        assert_eq!(v.triage, claudear_core::types::TriageVerdict::Unspecified);
+    }
+
+    #[test]
+    fn test_verify_prompt_carries_triage_playbook_for_sentry_only() {
+        let sentry = Issue::new("1", "CLOUD-1", "Boom", "url", "sentry");
+        let prompt = build_verify_prompt(&sentry, "ctx");
+        assert!(prompt.contains("# Sentry triage"));
+        assert!(prompt.contains(r#""triage":"#));
+
+        let helpscout = build_verify_prompt(&verify_issue(), "ctx");
+        assert!(!helpscout.contains("# Sentry triage"));
+        assert!(!helpscout.contains(r#""triage":"#));
     }
 
     #[test]

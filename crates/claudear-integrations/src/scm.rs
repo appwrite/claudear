@@ -32,6 +32,21 @@ pub fn is_skippable_bot(user: &ReviewUser, allowed_bots: &[String]) -> bool {
     })
 }
 
+/// True when `user` is the account claudear itself posts as. A PAT-authenticated
+/// bot reports `type: "User"`, so `is_skippable_bot` never catches its own replies.
+pub fn is_own_account(user: &ReviewUser, self_login: Option<&str>) -> bool {
+    self_login.is_some_and(|login| user.login.eq_ignore_ascii_case(login))
+}
+
+/// True when feedback from `user` must not trigger a rerun.
+pub fn is_ignored_author(
+    user: &ReviewUser,
+    allowed_bots: &[String],
+    self_login: Option<&str>,
+) -> bool {
+    is_own_account(user, self_login) || is_skippable_bot(user, allowed_bots)
+}
+
 // ScmProvider trait
 
 /// Trait abstracting a source-control management provider (GitHub, GitLab, ...).
@@ -51,6 +66,12 @@ pub trait ScmProvider: Send + Sync {
     /// Bot handles whose review comments should be processed instead of skipped.
     fn allowed_bots(&self) -> &[String] {
         &[]
+    }
+
+    /// Login of the account claudear authenticates as, used to ignore its own
+    /// review replies. `None` when unknown.
+    async fn self_login(&self) -> Option<String> {
+        None
     }
 
     /// Get the merge/close status of a PR/MR.
@@ -622,11 +643,21 @@ impl PrMonitor {
                     pr_number = pr_number,
                     "PR has been merged!"
                 );
-                self.tracker
-                    .mark_merged(&attempt.source, &attempt.issue_id)?;
+                // Updating the parent instead left the cascade row pending, so every
+                // poll saw the merge again and re-fired the cascade
+                if attempt.cascade_repo.is_some() {
+                    self.tracker.mark_cascade_pr_outcome(attempt.id, true)?;
+                } else {
+                    self.tracker
+                        .mark_merged(&attempt.source, &attempt.issue_id)?;
+                }
 
                 // Log activity event
                 let pr_url = attempt.pr_url.clone().unwrap_or_default();
+                // Only the webhook server kept `prs` in sync, so poll mode reported every PR as open
+                if let Err(e) = self.tracker.update_pr_status(&pr_url, "merged") {
+                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to update PR record status");
+                }
                 let activity = ActivityLogEntry::new("pr_merged", format!("PR merged: {}", pr_url))
                     .with_source(attempt.source.clone())
                     .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
@@ -717,11 +748,18 @@ impl PrMonitor {
                     pr_number = pr_number,
                     "PR was closed without merging"
                 );
-                self.tracker
-                    .mark_closed(&attempt.source, &attempt.issue_id)?;
+                if attempt.cascade_repo.is_some() {
+                    self.tracker.mark_cascade_pr_outcome(attempt.id, false)?;
+                } else {
+                    self.tracker
+                        .mark_closed(&attempt.source, &attempt.issue_id)?;
+                }
 
                 // Log activity event
                 let pr_url = attempt.pr_url.clone().unwrap_or_default();
+                if let Err(e) = self.tracker.update_pr_status(&pr_url, "closed") {
+                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to update PR record status");
+                }
                 let activity = ActivityLogEntry::new(
                     "pr_closed",
                     format!("PR closed without merge: {}", pr_url),
@@ -1045,6 +1083,8 @@ impl ReviewWatcher {
     /// Check a single PR for new reviews.
     async fn check_pr_reviews(&self, state: &PrReviewState) -> Result<Vec<ReviewEvent>> {
         let mut events = Vec::new();
+        let self_login = self.provider.self_login().await;
+        let self_login = self_login.as_deref();
 
         // Check for new reviews
         let mut reviews = self
@@ -1071,8 +1111,8 @@ impl ReviewWatcher {
                 }
             }
 
-            // Skip bot reviews (unless the bot is in the allowed list)
-            if is_skippable_bot(&review.user, self.provider.allowed_bots()) {
+            // Skip our own and bot reviews (unless the bot is in the allowed list)
+            if is_ignored_author(&review.user, self.provider.allowed_bots(), self_login) {
                 continue;
             }
 
@@ -1157,11 +1197,11 @@ impl ReviewWatcher {
         // Get the review trigger (e.g. "@claudear")
         let trigger = self.provider.review_trigger();
 
-        // Cursor comments: skip bots unless they are in the allowed list.
+        // Cursor comments: skip our own and bot comments unless the bot is allowed.
         let allowed_bots = self.provider.allowed_bots();
         let cursor_comments: Vec<_> = comments
             .into_iter()
-            .filter(|c| !is_skippable_bot(&c.user, allowed_bots))
+            .filter(|c| !is_ignored_author(&c.user, allowed_bots, self_login))
             .filter(|c| {
                 Self::comment_is_after_cursor(
                     c,
@@ -1325,7 +1365,7 @@ impl ReviewWatcher {
         {
             Ok(comments) => comments
                 .into_iter()
-                .filter(|c| !is_skippable_bot(&c.user, allowed_bots))
+                .filter(|c| !is_ignored_author(&c.user, allowed_bots, self_login))
                 .filter(|c| {
                     Self::comment_is_after_cursor(
                         c,
@@ -3040,6 +3080,7 @@ mod tests {
             enabled: bool,
             trigger: String,
             allowed_bots: Vec<String>,
+            self_login: Option<String>,
             reviews: Arc<Mutex<Vec<CodeReview>>>,
             comments: Arc<Mutex<Vec<ReviewComment>>>,
             conversation: Arc<Mutex<Vec<ReviewComment>>>,
@@ -3054,6 +3095,7 @@ mod tests {
                     enabled,
                     trigger: trigger.to_string(),
                     allowed_bots: Vec::new(),
+                    self_login: None,
                     reviews: Arc::new(Mutex::new(Vec::new())),
                     comments: Arc::new(Mutex::new(Vec::new())),
                     conversation: Arc::new(Mutex::new(Vec::new())),
@@ -3063,6 +3105,11 @@ mod tests {
 
             fn with_allowed_bots(mut self, bots: Vec<String>) -> Self {
                 self.allowed_bots = bots;
+                self
+            }
+
+            fn with_self_login(mut self, login: &str) -> Self {
+                self.self_login = Some(login.to_string());
                 self
             }
 
@@ -3099,6 +3146,10 @@ mod tests {
 
             fn allowed_bots(&self) -> &[String] {
                 &self.allowed_bots
+            }
+
+            async fn self_login(&self) -> Option<String> {
+                self.self_login.clone()
             }
 
             async fn get_pr_status(&self, _project: &str, _number: i64) -> Result<PrStatus> {
@@ -3520,6 +3571,62 @@ mod tests {
                 .filter(|e| matches!(e, ReviewEvent::ReviewSubmitted { .. }))
                 .count();
             assert_eq!(review_submitted_count, 0);
+        }
+
+        #[tokio::test]
+        async fn test_check_for_reviews_ignores_own_account_replies() {
+            // A PAT-authenticated claudear posts as type "User"; its own thread
+            // replies must not come back as review feedback and start another run
+            let mock =
+                MockScmProvider::new("github", true, "@claudear").with_self_login("Claudear");
+            mock.set_reviews(vec![
+                make_review(1, "COMMENTED", "claudear", "2025-01-01T00:00:00Z"),
+                make_review(2, "COMMENTED", "human-reviewer", "2025-01-01T00:01:00Z"),
+            ]);
+            let mut own_reply =
+                make_comment(10, "Fixed in abc123", "2025-01-01T00:02:00Z", Some(1));
+            own_reply.user.login = "claudear".to_string();
+            mock.set_comments(vec![own_reply]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let reviewers: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ReviewEvent::ReviewSubmitted { review, .. } => Some(review.user.login.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reviewers, vec!["human-reviewer"]);
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ReviewEvent::CommentsAdded { .. })),
+                "own inline reply must not surface as a comment event"
+            );
+        }
+
+        #[test]
+        fn test_is_ignored_author_matches_own_login_case_insensitively() {
+            let user = ReviewUser {
+                id: 1,
+                login: "ClaudeAr".to_string(),
+                user_type: Some("User".to_string()),
+            };
+            assert!(crate::scm::is_ignored_author(&user, &[], Some("claudear")));
+            assert!(!crate::scm::is_ignored_author(
+                &user,
+                &[],
+                Some("someone-else")
+            ));
+            assert!(!crate::scm::is_ignored_author(&user, &[], None));
         }
 
         #[tokio::test]

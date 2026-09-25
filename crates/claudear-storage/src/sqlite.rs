@@ -1100,6 +1100,26 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
+    fn mark_cascade_pr_outcome(&self, attempt_id: i64, merged: bool) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        let rows_affected = conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = CASE WHEN ?1 THEN 'merged' ELSE 'closed' END,
+                merged_at = CASE WHEN ?1 THEN datetime('now') ELSE merged_at END
+            WHERE id = ?2 AND cascade_repo IS NOT NULL
+            "#,
+            params![merged, attempt_id],
+        )?;
+        tracing::info!(
+            attempt_id,
+            merged,
+            rows_affected,
+            "Cascade attempt PR outcome recorded"
+        );
+        Ok(())
+    }
+
     fn mark_closed(&self, source: &str, issue_id: &str) -> Result<()> {
         tracing::info!(
             source = source,
@@ -1437,7 +1457,7 @@ impl AttemptTracker for SqliteTracker {
                    scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
-            WHERE (status = 'failed' OR status = 'closed')
+            WHERE status = 'failed'
               AND COALESCE(retry_count, 0) < ?
             ORDER BY attempted_at ASC
             "#,
@@ -1484,6 +1504,44 @@ impl AttemptTracker for SqliteTracker {
             )));
         }
         Ok(())
+    }
+
+    fn mark_failed_uncharged(
+        &self,
+        source: &str,
+        issue_id: &str,
+        error_message: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        // A retry run was charged by prepare_for_retry; give that charge back
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'failed',
+                error_message = ?,
+                retry_count = MAX(COALESCE(retry_count, 0) - 1, 0)
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL
+            "#,
+            params![error_message, source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn release_orphaned_pending_attempts(&self) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        // Older orphans are stale; retrying them now would spend runs on dead issues
+        let released = conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'failed',
+                error_message = 'Interrupted before completion (daemon restarted)',
+                retry_count = MAX(COALESCE(retry_count, 0) - 1, 0)
+            WHERE status = 'pending' AND reset_at IS NULL
+              AND attempted_at > datetime('now', '-3 days')
+            "#,
+            [],
+        )?;
+        Ok(released)
     }
 
     fn get_stats(&self) -> Result<FixAttemptStats> {
@@ -10747,7 +10805,7 @@ mod tests {
         tracker.increment_retry("linear", "2").unwrap();
         tracker.increment_retry("linear", "2").unwrap();
 
-        // Closed - retryable
+        // Closed - a human rejected the PR, not retryable
         tracker.record_attempt("linear", "3", "PROJ-3").unwrap();
         tracker
             .mark_success("linear", "3", "https://github.com/org/repo/pull/1")
@@ -10761,11 +10819,117 @@ mod tests {
             .unwrap();
 
         let retryable = tracker.get_retryable_issues(3).unwrap();
-        assert_eq!(retryable.len(), 3);
+        assert_eq!(retryable.len(), 2);
+        assert!(retryable.iter().all(|a| a.issue_id != "3"));
 
         // With max 2 retries, issue 2 should be excluded
         let retryable = tracker.get_retryable_issues(2).unwrap();
-        assert_eq!(retryable.len(), 2);
+        assert_eq!(retryable.len(), 1);
+    }
+
+    #[test]
+    fn test_mark_failed_uncharged_refunds_the_retry() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("sentry", "1", "CLOUD-1").unwrap();
+        tracker.mark_failed("sentry", "1", "boom").unwrap();
+        tracker.prepare_for_retry("sentry", "1").unwrap();
+
+        tracker
+            .mark_failed_uncharged("sentry", "1", "Claude rate limit hit")
+            .unwrap();
+
+        let attempt = tracker.get_attempt("sentry", "1").unwrap().unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Failed);
+        assert_eq!(attempt.retry_count, 0);
+        assert_eq!(
+            attempt.error_message.as_deref(),
+            Some("Claude rate limit hit")
+        );
+    }
+
+    #[test]
+    fn test_mark_failed_uncharged_never_goes_negative() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("sentry", "1", "CLOUD-1").unwrap();
+        tracker
+            .mark_failed_uncharged("sentry", "1", "rate limit")
+            .unwrap();
+
+        let attempt = tracker.get_attempt("sentry", "1").unwrap().unwrap();
+        assert_eq!(attempt.retry_count, 0);
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_frees_recent_rows_only() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "fresh", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "stale", "CLOUD-2")
+            .unwrap();
+        tracker.record_attempt("sentry", "done", "CLOUD-3").unwrap();
+        tracker
+            .mark_success("sentry", "done", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        {
+            let conn = tracker.acquire_lock().unwrap();
+            conn.execute(
+                "UPDATE fix_attempts SET attempted_at = datetime('now', '-30 days') WHERE issue_id = 'stale'",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(tracker.release_orphaned_pending_attempts().unwrap(), 1);
+
+        let fresh = tracker.get_attempt("sentry", "fresh").unwrap().unwrap();
+        assert_eq!(fresh.status, FixAttemptStatus::Failed);
+        assert_eq!(fresh.retry_count, 0);
+        let stale = tracker.get_attempt("sentry", "stale").unwrap().unwrap();
+        assert_eq!(stale.status, FixAttemptStatus::Pending);
+        let done = tracker.get_attempt("sentry", "done").unwrap().unwrap();
+        assert_eq!(done.status, FixAttemptStatus::Success);
+    }
+
+    #[test]
+    fn test_mark_cascade_pr_outcome_updates_the_cascade_row_not_the_parent() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("discord", "1", "D-1").unwrap();
+        tracker
+            .mark_success("discord", "1", "https://github.com/org/app/pull/1")
+            .unwrap();
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        let child_id = tracker
+            .record_cascade_attempt(
+                "discord",
+                "1",
+                "D-1",
+                parent.id,
+                "git@github.com:org/lib.git",
+            )
+            .unwrap();
+
+        tracker.mark_cascade_pr_outcome(child_id, true).unwrap();
+
+        let conn = tracker.acquire_lock().unwrap();
+        let (child_status, child_merged): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, merged_at FROM fix_attempts WHERE id = ?",
+                [child_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let parent_status: String = conn
+            .query_row(
+                "SELECT status FROM fix_attempts WHERE id = ?",
+                [parent.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_status, "merged");
+        assert!(child_merged.is_some());
+        assert_eq!(parent_status, "success");
     }
 
     #[test]

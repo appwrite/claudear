@@ -320,6 +320,9 @@ impl ScmProvider for InstrumentedScm {
     fn allowed_bots(&self) -> &[String] {
         self.inner.allowed_bots()
     }
+    async fn self_login(&self) -> Option<String> {
+        self.inner.self_login().await
+    }
     delegate!(fn pr_url_pattern(&self) -> &str);
     delegate!(fn parse_pr_number(&self, url: &str) -> Option<i64>);
 

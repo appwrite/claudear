@@ -45,7 +45,21 @@ type QueuedIssue = (Issue, MatchResult, Option<Intent>);
 /// on (marked handled) instead of re-triggering the fix agent every cycle.
 const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
 
+/// How many review-driven reruns a PR gets before claudear stops answering
+/// review feedback on it and leaves the PR to humans.
+const MAX_REVIEW_CYCLES: i32 = 3;
+
 const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
+
+/// Whether a retry that failed to start should get its retry back.
+fn retry_trigger_error_is_transient(e: &claudear_core::error::Error) -> bool {
+    use claudear_core::error::Error;
+    match e {
+        Error::Http(_) | Error::Network(_) => true,
+        Error::Source { message, .. } => message.contains("already being processed"),
+        _ => false,
+    }
+}
 
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
@@ -1016,6 +1030,22 @@ impl Watcher {
     pub async fn start(self: &Arc<Self>, interval_ms: Option<u64>) -> Result<()> {
         self.clear_rate_limit_pause().await;
 
+        // Runs killed by the last shutdown stay `pending`, which blocks the issue
+        // from ever being picked or retried again.
+        if !self.dry_run {
+            match self.tracker.release_orphaned_pending_attempts() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    component = "watcher",
+                    released = n,
+                    "Released attempts orphaned by the last shutdown"
+                ),
+                Err(e) => {
+                    tracing::warn!(component = "watcher", error = %e, "Failed to release orphaned attempts")
+                }
+            }
+        }
+
         let configured_poll_interval = interval_ms.unwrap_or(self.config.poll_interval_ms);
         let poll_interval = configured_poll_interval.max(1000);
         if configured_poll_interval < 1000 {
@@ -1440,6 +1470,32 @@ impl Watcher {
         if let Some(ref pr_url) = attempt.pr_url {
             // Update the PR record with incremented review_cycles
             if let Ok(Some(mut pr_record)) = self.tracker.get_pr(pr_url) {
+                if pr_record.review_cycles >= MAX_REVIEW_CYCLES {
+                    tracing::warn!(
+                        pr_url = %pr_url,
+                        short_id = %attempt.short_id,
+                        review_cycles = pr_record.review_cycles,
+                        "Review cycle cap reached; leaving PR to humans"
+                    );
+                    self.tracker
+                        .record_activity(
+                            &ActivityLogEntry::new(
+                                "review_cycle_cap_reached",
+                                format!(
+                                    "Stopped addressing review feedback for {} after {} cycles",
+                                    attempt.short_id, pr_record.review_cycles
+                                ),
+                            )
+                            .with_source(attempt.source.clone())
+                            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                            .with_metadata(json!({ "pr_url": pr_url })),
+                        )
+                        .ok();
+                    if let Some(rw) = &self.review_watcher {
+                        rw.unwatch_pr(pr_url);
+                    }
+                    return Ok(());
+                }
                 pr_record.review_cycles += 1;
                 pr_record.last_review_at = Some(chrono::Utc::now());
                 if let Err(e) = self.tracker.upsert_pr(&pr_record) {
@@ -2693,10 +2749,19 @@ Create a PR with your changes.{custom_instructions}"#,
                     );
                     retries_failed += 1;
                     let retry_error = format!("Retry trigger failed: {}", e);
-                    if let Err(mark_err) =
+                    // A network blip or in-flight clash says nothing about the issue, so
+                    // refund the retry; a permanent error like a deleted issue keeps its charge
+                    let marked = if retry_trigger_error_is_transient(&e) {
+                        self.tracker.mark_failed_uncharged(
+                            &attempt.source,
+                            &attempt.issue_id,
+                            &retry_error,
+                        )
+                    } else {
                         self.tracker
                             .mark_failed(&attempt.source, &attempt.issue_id, &retry_error)
-                    {
+                    };
+                    if let Err(mark_err) = marked {
                         tracing::warn!(
                             component = "watcher",
                             short_id = %attempt.short_id,
@@ -4170,9 +4235,29 @@ Create a PR with your changes.{custom_instructions}"#,
             self.link_deploy_qa_tip_attempt(tip, attempt_id);
         }
 
-        // Infer the target repository using the shared resolution function
-        let mut resolution =
-            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
+        // A review rerun must work in the repo the PR lives in; re-inferring
+        // lands on the same wrong repo a previous run already swapped away from.
+        let pr_repo = review_feedback
+            .as_ref()
+            .and_then(|_| {
+                self.tracker
+                    .get_attempt(source.name(), &issue.id)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|a| a.scm_repo);
+        let pinned = pr_repo.and_then(|repo| {
+            match resolve_repo_for_cascade(self.inferrer.as_ref(), &repo) {
+                r @ RepoResolution::Resolved { .. } => Some(r),
+                RepoResolution::Skip { reason } => {
+                    tracing::warn!(short_id = %issue.short_id, repo = %repo, reason = %reason, "PR repo not resolvable, falling back to inference");
+                    None
+                }
+            }
+        });
+        let mut resolution = pinned.unwrap_or_else(|| {
+            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker))
+        });
 
         // Log resolution decision (watcher-specific verbose logging)
         match &resolution {
@@ -4235,6 +4320,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // Save issue info before move for post-processing
         let issue_short_id = issue.short_id.clone();
+        let issue_id = issue.id.clone();
 
         // Build IssueProcessor and delegate to shared pipeline. The processor
         // internally routes pure questions to a read-only Q&A answer path and
@@ -4282,6 +4368,13 @@ Create a PR with your changes.{custom_instructions}"#,
         // Watcher-specific: check for rate limit errors and pause if needed
         if let ProcessingOutcome::Failed { ref error } = outcome {
             if runner::is_rate_limit_error(error) {
+                // Running out of quota says nothing about the issue, so it must not spend a retry
+                if let Err(e) = self
+                    .tracker
+                    .mark_failed_uncharged(source.name(), &issue_id, error)
+                {
+                    tracing::warn!(short_id = %issue_short_id, error = %e, "Failed to refund retry after rate limit");
+                }
                 let tmp_issue = Issue::new("", &issue_short_id, "", "", source.name());
                 self.pause_until_rate_limit_reset(&tmp_issue, error).await;
             }
@@ -14251,7 +14344,7 @@ mod tests {
     // --- process_ready_retries closed PR trigger reason ---
 
     #[tokio::test]
-    async fn test_process_ready_retries_closed_pr_builds_trigger_reason() {
+    async fn test_process_ready_retries_skips_human_closed_pr() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
@@ -14302,8 +14395,13 @@ mod tests {
         let result = watcher.process_ready_retries().await;
         assert!(result.is_ok());
 
+        // A human closing the PR is a verdict on the fix, not a failure to retry
         let attempt = tracker.get_attempt("mock", "closed-1").unwrap().unwrap();
-        assert_eq!(attempt.retry_count, 1);
+        assert_eq!(attempt.retry_count, 0);
+        assert_eq!(
+            attempt.status,
+            claudear_core::types::FixAttemptStatus::Closed
+        );
     }
 
     // --- Resolved status in fix attempt ---
