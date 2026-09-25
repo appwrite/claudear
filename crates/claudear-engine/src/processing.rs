@@ -58,6 +58,21 @@ const LIVE_QA_DIRECTORY_PREFIX_LENGTH: usize = 64;
 #[cfg(unix)]
 const LIVE_QA_DIRECTORY_MODE: u32 = 0o700;
 
+/// The permission bits of a Unix mode: read, write and execute for the owner,
+/// the group and everyone else.
+#[cfg(unix)]
+const PERMISSION_BITS: u32 = 0o777;
+
+/// Unix permission bit that lets a directory's group add, remove and rename
+/// what the directory holds.
+#[cfg(unix)]
+const GROUP_WRITE_PERMISSION: u32 = 0o020;
+
+/// Unix permission bit that lets everyone outside a directory's owner and
+/// group add, remove and rename what the directory holds.
+#[cfg(unix)]
+const OTHERS_WRITE_PERMISSION: u32 = 0o002;
+
 /// What [`IssueProcessor::answer_question_issue`] runs for an issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnswerRun {
@@ -156,62 +171,279 @@ pub(crate) fn qa_scratch_directory() -> std::path::PathBuf {
     directory
 }
 
-/// Create `directory`, owner-only on Unix. Its parent must exist.
+/// Create `directory`, owner-only on Unix, and return the metadata it was
+/// validated by. Its parent must exist.
 ///
-/// A `directory` that already exists must be a real directory, never a
-/// symbolic link that could lead anywhere, and on Unix is
+/// `directory`, whether just created or already there, must be a real
+/// directory, never a symbolic link that could lead anywhere, and on Unix is
 /// [restricted to its owner](restrict_to_owner), who must be the current user.
-fn create_private_directory(directory: &std::path::Path) -> std::io::Result<()> {
+fn create_private_directory(directory: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(LIVE_QA_DIRECTORY_MODE);
     }
-    match builder.create(directory) {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = std::fs::symlink_metadata(directory)?;
-            if metadata.file_type().is_symlink() {
-                return Err(std::io::Error::other(
-                    "it is a symbolic link, not a directory",
-                ));
-            }
-            if !metadata.is_dir() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotADirectory,
-                    "it is not a directory",
-                ));
-            }
-            #[cfg(unix)]
-            restrict_to_owner(directory, &metadata, current_user_id())?;
-            Ok(())
+    if let Err(error) = builder.create(directory) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error);
         }
-        result => result,
     }
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "it is a symbolic link, not a directory",
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "it is not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    restrict_to_owner(directory, &metadata, current_user_id())?;
+    Ok(metadata)
 }
 
 /// Restrict the existing `directory`, described by `metadata`, to its owner,
-/// refusing it unless that owner is `user`: any other owner could still swap
-/// out whatever it holds.
+/// refusing it unless [that owner is `user`](require_owner).
 #[cfg(unix)]
 fn restrict_to_owner(
     directory: &std::path::Path,
     metadata: &std::fs::Metadata,
     user: u32,
 ) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
-    let owner = metadata.uid();
-    if owner != user {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("it is owned by user {owner}, not by user {user} that Claudear runs as"),
-        ));
-    }
+    require_owner(directory, metadata, user)?;
     std::fs::set_permissions(
         directory,
         std::fs::Permissions::from_mode(LIVE_QA_DIRECTORY_MODE),
     )
+}
+
+/// Refuse `path`, described by `metadata`, unless `user` owns it: any other
+/// owner could swap out whatever it holds.
+#[cfg(unix)]
+fn require_owner(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+    user: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let owner = metadata.uid();
+    if owner == user {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "{} is owned by user {owner}, not by user {user} that Claudear runs as",
+            path.display()
+        ),
+    ))
+}
+
+/// `workspace` resolved to the real directory it names, refused unless it is
+/// a safe home for [`LIVE_QA_DIRECTORY`]: owned by `user` and writable by no
+/// other user, who could otherwise swap that directory for one of their own
+/// between Claudear's checks and the run.
+///
+/// Group write is allowed only when the directory's group is `group`, the
+/// primary group Claudear runs as, since that is a user-private group holding
+/// no one else wherever one is used, as on Ubuntu. Where that group has other
+/// members, the workspace must not be group-writable either.
+#[cfg(unix)]
+fn resolve_private_workspace(
+    workspace: &std::path::Path,
+    user: u32,
+    group: u32,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let resolved = std::fs::canonicalize(workspace)?;
+    let metadata = std::fs::metadata(&resolved)?;
+    require_owner(&resolved, &metadata, user)?;
+    let mode = metadata.permissions().mode() & PERMISSION_BITS;
+    if mode & OTHERS_WRITE_PERMISSION != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is writable by other users (mode {mode:04o}), who could redirect live QA; \
+                 remove their write access with chmod o-w",
+                resolved.display()
+            ),
+        ));
+    }
+    let owning_group = metadata.gid();
+    if mode & GROUP_WRITE_PERMISSION != 0 && owning_group != group {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is writable by group {owning_group} (mode {mode:04o}), not the group {group} \
+                 that Claudear runs as, whose members could redirect live QA; remove its write \
+                 access with chmod g-w",
+                resolved.display()
+            ),
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Which directory a path led to when it was checked: its device and inode. A
+/// directory keeps them when it is renamed, but another directory or a link
+/// put in its place never shares them.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl From<&std::fs::Metadata> for DirectoryIdentity {
+    fn from(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+/// A fresh owner-only run directory named after `prefix`, in
+/// [`LIVE_QA_DIRECTORY`] under `workspace`, at a path with no symbolic links.
+///
+/// The workspace must be [private](resolve_private_workspace), and the base
+/// directory in it is [validated](create_private_directory) and recorded
+/// before the run directory is created, so the run directory can then be
+/// [verified](verify_run_directory) as created there, not somewhere another
+/// local user redirected it to.
+#[cfg(unix)]
+fn create_run_directory(
+    workspace: &std::path::Path,
+    prefix: &str,
+) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let user = current_user_id();
+    let workspace = resolve_private_workspace(workspace, user, current_group_id())?;
+    let base = workspace.join(LIVE_QA_DIRECTORY);
+    let base_identity = DirectoryIdentity::from(&create_private_directory(&base)?);
+    let run = tempfile::Builder::new()
+        .prefix(prefix)
+        .permissions(std::fs::Permissions::from_mode(LIVE_QA_DIRECTORY_MODE))
+        .tempdir_in(&base)?;
+    verify_run_directory(run, base_identity, user)
+}
+
+/// A fresh run directory named after `prefix`, in [`LIVE_QA_DIRECTORY`] under
+/// `workspace`.
+#[cfg(not(unix))]
+fn create_run_directory(
+    workspace: &std::path::Path,
+    prefix: &str,
+) -> std::io::Result<tempfile::TempDir> {
+    let base = workspace.join(LIVE_QA_DIRECTORY);
+    create_private_directory(&base)?;
+    tempfile::Builder::new().prefix(prefix).tempdir_in(&base)
+}
+
+/// `run`, just created in the base directory recorded as `base`, once it
+/// [checks out](check_run_directory). Otherwise `run`, which nothing has used
+/// yet, is [discarded](discard_run_directory) and the error says what was
+/// wrong.
+#[cfg(unix)]
+fn verify_run_directory(
+    run: tempfile::TempDir,
+    base: DirectoryIdentity,
+    user: u32,
+) -> std::io::Result<tempfile::TempDir> {
+    match check_run_directory(run.path(), base, user) {
+        Ok(()) => Ok(run),
+        Err(error) => {
+            discard_run_directory(run);
+            Err(error)
+        }
+    }
+}
+
+/// Refuse `run` unless it is the run directory Claudear just created: its
+/// parent is still the base directory recorded as `base`, not another
+/// directory or a link put in its place, and `run` is a real directory that
+/// only `user`, its owner, can use, at a path with no symbolic links.
+#[cfg(unix)]
+fn check_run_directory(
+    run: &std::path::Path,
+    base: DirectoryIdentity,
+    user: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = run.parent().ok_or_else(|| {
+        std::io::Error::other(format!("{} has no parent directory", run.display()))
+    })?;
+    let replaced = || {
+        std::io::Error::other(format!(
+            "{} was replaced while a run directory was being created in it",
+            parent.display()
+        ))
+    };
+    let missing_as_replaced = |error: std::io::Error| match error.kind() {
+        std::io::ErrorKind::NotFound => replaced(),
+        _ => error,
+    };
+    let current_base = std::fs::symlink_metadata(parent).map_err(missing_as_replaced)?;
+    if current_base.file_type().is_symlink() || DirectoryIdentity::from(&current_base) != base {
+        return Err(replaced());
+    }
+    let metadata = std::fs::symlink_metadata(run).map_err(missing_as_replaced)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a directory",
+            run.display()
+        )));
+    }
+    require_owner(run, &metadata, user)?;
+    let mode = metadata.permissions().mode() & PERMISSION_BITS;
+    if mode != LIVE_QA_DIRECTORY_MODE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} has mode {mode:04o}, not {LIVE_QA_DIRECTORY_MODE:04o}",
+                run.display()
+            ),
+        ));
+    }
+    let parent_metadata = std::fs::metadata(parent).map_err(missing_as_replaced)?;
+    if DirectoryIdentity::from(&parent_metadata) != base {
+        return Err(replaced());
+    }
+    if std::fs::canonicalize(run).map_err(missing_as_replaced)? != run {
+        return Err(std::io::Error::other(format!(
+            "{} is reached through a symbolic link",
+            run.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Remove `run`, a run directory refused before anything used it. Only an
+/// empty directory is removed, and never through a link at its own path, so
+/// nothing another user put there can be reached.
+#[cfg(unix)]
+fn discard_run_directory(run: tempfile::TempDir) {
+    let path = run.keep();
+    if let Err(error) = std::fs::remove_dir(&path) {
+        tracing::warn!(
+            directory = %path.display(),
+            error = %error,
+            "Failed to remove a refused live-QA run directory"
+        );
+    }
 }
 
 /// The user id that owns what this process creates.
@@ -219,6 +451,13 @@ fn restrict_to_owner(
 fn current_user_id() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
+}
+
+/// The primary group id this process runs as.
+#[cfg(unix)]
+fn current_group_id() -> u32 {
+    // SAFETY: getegid has no preconditions and cannot fail.
+    unsafe { libc::getegid() }
 }
 
 /// `short_id` as the name prefix of a live-QA run directory. Anything but ASCII
@@ -2660,20 +2899,16 @@ impl IssueProcessor {
     /// [`LIVE_QA_DIRECTORY`] under the configured `workspace`, which is
     /// [private](create_private_directory) too whether or not it already
     /// existed, so neither another local user nor an earlier run can create it
-    /// first, redirect it, or plant files the agent would load.
+    /// first, redirect it, or plant files the agent would load. On Unix the
+    /// workspace must be private as well, and the directory is
+    /// [verified](create_run_directory) where it was created and handed over
+    /// by its resolved path.
     fn create_live_qa_directory(&self, issue: &Issue) -> std::io::Result<tempfile::TempDir> {
         std::fs::create_dir_all(&self.config.workspace)?;
-        let base = self.live_qa_base_directory();
-        create_private_directory(&base)?;
-        let prefix = live_qa_directory_prefix(&issue.short_id);
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(&prefix);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            builder.permissions(std::fs::Permissions::from_mode(LIVE_QA_DIRECTORY_MODE));
-        }
-        builder.tempdir_in(&base)
+        create_run_directory(
+            &self.config.workspace,
+            &live_qa_directory_prefix(&issue.short_id),
+        )
     }
 
     /// Run a single, explicitly-chosen action against a payload (for the manual
@@ -6210,7 +6445,8 @@ mod tests {
     const SLOW_AGENT_RUN: Duration = Duration::from_secs(10);
 
     /// An [`IssueProcessor`] answering through an [`AnsweringAgent`], with its
-    /// `workspace` in a temporary directory removed when the fixture drops.
+    /// `workspace` in a temporary directory removed when the fixture drops,
+    /// configured by its resolved path.
     struct AnsweringFixture {
         processor: IssueProcessor,
         agent: Arc<AnsweringAgent>,
@@ -6229,7 +6465,7 @@ mod tests {
             let mut processor = make_reply_chain_processor(tracker);
             processor.agent = Arc::clone(&agent) as Arc<dyn AgentRunner>;
             let workspace = tempfile::tempdir().unwrap();
-            processor.config.workspace = workspace.path().to_path_buf();
+            processor.config.workspace = std::fs::canonicalize(workspace.path()).unwrap();
             Self {
                 processor,
                 agent,
@@ -6237,10 +6473,16 @@ mod tests {
             }
         }
 
+        /// The workspace's path with every symbolic link resolved, as live QA
+        /// resolves it.
+        fn resolved_workspace(&self) -> std::path::PathBuf {
+            std::fs::canonicalize(self.workspace.path()).unwrap()
+        }
+
         /// The Claudear-owned directory each live-QA run gets its own
         /// directory in.
         fn live_qa_base(&self) -> std::path::PathBuf {
-            self.workspace.path().join(LIVE_QA_DIRECTORY)
+            self.resolved_workspace().join(LIVE_QA_DIRECTORY)
         }
 
         /// Record that Claudear answered [`PRIOR_QUESTION`] from Discord with
@@ -6767,6 +7009,248 @@ mod tests {
             permissions.mode() & 0o777,
             0o755,
             "a refused directory must be left as it was"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_deploy_qa_refuses_a_workspace_other_users_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = AnsweringFixture::new();
+        let workspace = fixture.resolved_workspace();
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let context = RecordingContextProvider::default();
+
+        let error = expect_failed(
+            fixture
+                .run(question_input(DEPLOY_QA_SOURCE), &context)
+                .await,
+        );
+
+        assert!(
+            error.contains(&workspace.display().to_string())
+                && error.contains("writable by other users"),
+            "the error must say other users can write to the workspace: {error}"
+        );
+        assert!(
+            fixture.agent.calls().is_empty(),
+            "live QA must never run where another local user could redirect it"
+        );
+        assert!(
+            !fixture.live_qa_base().exists(),
+            "nothing may be created in a workspace other users can write"
+        );
+        assert!(context.replies().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_deploy_qa_runs_at_the_resolved_path_of_a_linked_workspace() {
+        let mut fixture = AnsweringFixture::new();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("workspace");
+        std::os::unix::fs::symlink(fixture.resolved_workspace(), &link).unwrap();
+        fixture.processor.config.workspace = link;
+
+        assert_completed_no_pr(
+            fixture
+                .run(
+                    question_input(DEPLOY_QA_SOURCE),
+                    &RecordingContextProvider::default(),
+                )
+                .await,
+        );
+
+        let directories = fixture.agent.project_dirs();
+        assert_eq!(
+            directories.len(),
+            1,
+            "one run, one agent call: {directories:?}"
+        );
+        assert_eq!(
+            directories[0].parent(),
+            Some(fixture.live_qa_base().as_path()),
+            "live QA must run at its directory's resolved path, which no link can later redirect"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_workspace_another_user_owns_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let metadata = std::fs::metadata(workspace.path()).unwrap();
+        let another_user = metadata.uid().wrapping_add(1);
+
+        let error = resolve_private_workspace(workspace.path(), another_user, metadata.gid())
+            .expect_err("another owner could swap out the live-QA base directory");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_group_writable_workspace_is_refused_unless_its_group_is_claudears() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(workspace.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let metadata = std::fs::metadata(workspace.path()).unwrap();
+
+        assert_eq!(
+            resolve_private_workspace(workspace.path(), metadata.uid(), metadata.gid()).unwrap(),
+            std::fs::canonicalize(workspace.path()).unwrap(),
+            "the group Claudear runs as is its user-private group, which holds no one else"
+        );
+        let another_group = metadata.gid().wrapping_add(1);
+        let error = resolve_private_workspace(workspace.path(), metadata.uid(), another_group)
+            .expect_err("members of another group could swap out the live-QA base directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// A live-QA base directory in a fresh workspace, validated and recorded
+    /// as it is before a run directory is created in it.
+    #[cfg(unix)]
+    struct RecordedBase {
+        workspace: tempfile::TempDir,
+        path: std::path::PathBuf,
+        identity: DirectoryIdentity,
+    }
+
+    #[cfg(unix)]
+    impl RecordedBase {
+        fn new() -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            let path = std::fs::canonicalize(workspace.path())
+                .unwrap()
+                .join(LIVE_QA_DIRECTORY);
+            let identity = DirectoryIdentity::from(&create_private_directory(&path).unwrap());
+            Self {
+                workspace,
+                path,
+                identity,
+            }
+        }
+
+        /// Move the recorded base aside, as a local user who could write to
+        /// the workspace could, so its path leads somewhere else.
+        fn move_aside(&self) {
+            std::fs::rename(&self.path, self.workspace.path().join("recorded")).unwrap();
+        }
+
+        /// A run directory with `mode`, created wherever the base's path now
+        /// leads.
+        fn create_run(&self, mode: u32) -> tempfile::TempDir {
+            use std::os::unix::fs::PermissionsExt;
+
+            let run = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(LIVE_QA_DIRECTORY_MODE))
+                .tempdir_in(&self.path)
+                .unwrap();
+            std::fs::set_permissions(run.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            run
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_directory_in_a_base_swapped_for_another_directory_is_refused_and_removed() {
+        let base = RecordedBase::new();
+        base.move_aside();
+        std::fs::create_dir(&base.path).unwrap();
+        let run = base.create_run(LIVE_QA_DIRECTORY_MODE);
+        let run_path = run.path().to_path_buf();
+
+        let error = verify_run_directory(run, base.identity, current_user_id())
+            .expect_err("a run directory outside the recorded base must be refused");
+
+        assert!(
+            error.to_string().contains("replaced"),
+            "the error must say the base directory was replaced: {error}"
+        );
+        assert!(
+            !run_path.exists(),
+            "the refused run directory must be removed"
+        );
+        assert!(
+            base.path.exists(),
+            "only the refused run directory may be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_directory_behind_a_base_swapped_for_a_link_is_refused_and_removed() {
+        let base = RecordedBase::new();
+        let elsewhere = tempfile::tempdir().unwrap();
+        base.move_aside();
+        std::os::unix::fs::symlink(elsewhere.path(), &base.path).unwrap();
+        let run = base.create_run(LIVE_QA_DIRECTORY_MODE);
+
+        let error = verify_run_directory(run, base.identity, current_user_id())
+            .expect_err("a run directory behind a link must be refused");
+
+        assert!(
+            error.to_string().contains("replaced"),
+            "the error must say the base directory was replaced: {error}"
+        );
+        assert!(
+            std::fs::read_dir(elsewhere.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "the refused run directory must be removed from where the link led"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_directory_other_users_could_use_is_refused_and_removed() {
+        let base = RecordedBase::new();
+        let user = current_user_id();
+
+        for (mode, owner) in [
+            (0o755, user),
+            (LIVE_QA_DIRECTORY_MODE, user.wrapping_add(1)),
+        ] {
+            let run = base.create_run(mode);
+            let run_path = run.path().to_path_buf();
+
+            let error = verify_run_directory(run, base.identity, owner).expect_err(
+                "a run directory another user could read, or does not belong to Claudear, must be refused",
+            );
+
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "mode {mode:o}, owner {owner}: {error}"
+            );
+            assert!(
+                !run_path.exists(),
+                "the refused run directory must be removed: mode {mode:o}, owner {owner}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_refused_run_directory_is_removed_without_following_a_link_in_its_place() {
+        let base = RecordedBase::new();
+        let run = base.create_run(LIVE_QA_DIRECTORY_MODE);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let planted = elsewhere.path().join("planted");
+        std::fs::write(&planted, "kept").unwrap();
+        std::fs::remove_dir(run.path()).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), run.path()).unwrap();
+
+        verify_run_directory(run, base.identity, current_user_id())
+            .expect_err("a link in the run directory's place must be refused");
+
+        assert!(
+            planted.exists(),
+            "removing a refused run directory must never follow a link to what it points at"
         );
     }
 
