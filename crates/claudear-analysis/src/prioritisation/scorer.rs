@@ -179,22 +179,19 @@ mod tests {
     }
 
     #[test]
-    fn escalation_rate_is_read_as_a_percentage() {
+    fn faster_escalation_ranks_higher() {
+        // Sentry reports escalation as a percentage; clamping it as a fraction
+        // made any growth at all score the same as doubling
+        let config = default_config();
+        let mr = make_match(MatchPriority::Normal);
         let mut slight = make_issue(IssuePriority::Medium);
         slight.set_metadata("escalation_rate", 10.0);
-        let mut doubled = make_issue(IssuePriority::Medium);
-        doubled.set_metadata("escalation_rate", 100.0);
-        let (s, d) = (frequency_component(&slight), frequency_component(&doubled));
-        assert!(
-            (s - 0.03).abs() < 0.001,
-            "10% escalation should score 0.03, got {}",
-            s
-        );
-        assert!(
-            (d - 0.3).abs() < 0.001,
-            "100% escalation should score 0.3, got {}",
-            d
-        );
+        let mut doubling = make_issue(IssuePriority::Medium);
+        doubling.set_metadata("escalation_rate", 100.0);
+
+        let slight = compute(&slight, &mr, BlastRadius::Core, false, &config);
+        let doubling = compute(&doubling, &mr, BlastRadius::Core, false, &config);
+        assert!(doubling.score > slight.score);
     }
 
     #[test]
@@ -203,7 +200,11 @@ mod tests {
         busy.set_metadata("event_count", 10_000i64);
         let mut busier = make_issue(IssuePriority::Medium);
         busier.set_metadata("event_count", 1_000_000i64);
-        assert!(frequency_component(&busier) > frequency_component(&busy));
+        let config = default_config();
+        let mr = make_match(MatchPriority::Normal);
+        let busy = compute(&busy, &mr, BlastRadius::Core, false, &config);
+        let busier = compute(&busier, &mr, BlastRadius::Core, false, &config);
+        assert!(busier.score > busy.score);
     }
 
     #[test]

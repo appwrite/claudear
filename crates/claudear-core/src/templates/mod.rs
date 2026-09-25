@@ -12,17 +12,13 @@ mod renderer;
 pub use loader::TemplateLoader;
 pub use renderer::{TemplateContext, TemplateRenderer};
 
-/// Bundled Sentry triage playbook, used until an operator saves one in the DB.
-pub const DEFAULT_SENTRY_TRIAGE_PLAYBOOK: &str =
-    include_str!("../../../../playbooks/sentry_triage.md");
+/// Sentry triage rules, edited in `playbooks/sentry_triage.md`.
+pub const SENTRY_TRIAGE_PLAYBOOK: &str = include_str!("../../../../playbooks/sentry_triage.md");
 
-/// Issue metadata key carrying an operator-edited triage playbook into the verify prompt.
-pub const TRIAGE_PLAYBOOK_METADATA_KEY: &str = "triage_playbook";
-
-/// Bundled triage playbook for a source; `None` means the source is not triaged.
-pub fn default_triage_playbook(source: &str) -> Option<&'static str> {
+/// Triage playbook for a source; `None` means the source is not triaged.
+pub fn triage_playbook(source: &str) -> Option<&'static str> {
     match source {
-        "sentry" => Some(DEFAULT_SENTRY_TRIAGE_PLAYBOOK),
+        "sentry" => Some(SENTRY_TRIAGE_PLAYBOOK),
         _ => None,
     }
 }

@@ -18,8 +18,8 @@ use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, InstructionScope, Issue,
-    ProcessingMetric, QaKnowledgeEntry, ReplyKind, RetrievalUsageRecord, TimelineEventStatus,
+    ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
+    QaKnowledgeEntry, ReplyKind, RetrievalUsageRecord, TimelineEventStatus, TriageVerdict,
     VerifyResult,
 };
 use claudear_integrations::discord::DiscordClient;
@@ -335,6 +335,12 @@ impl IssueProcessor {
         // When disabled, fall through to the legacy routing below.
         if self.config.reply().enabled {
             return self.run_action_pipeline(input, context_provider).await;
+        }
+
+        // Triage must not depend on reply actions being enabled, or telemetry
+        // issues with nothing to fix still get a full fix run
+        if Self::needs_triage(&input) {
+            return self.triage_then_fix(input, context_provider).await;
         }
 
         // Q&A short-circuit: pure questions are answered with RAG-grounded context
@@ -2475,6 +2481,9 @@ impl IssueProcessor {
             Some(intent) => intent.is_bug_or_security(),
             None => self.classify_is_bug_or_security(&input.issue).await,
         };
+        if is_bug_or_security && Self::needs_triage(&input) {
+            return self.triage_then_fix(input, context_provider).await;
+        }
         if is_bug_or_security {
             // Verify before spending an expensive fix run.
             let verdict = self
@@ -2488,16 +2497,8 @@ impl IssueProcessor {
                 .await;
             // Telemetry sources (Sentry) ship a stacktrace that already pinpoints
             // the defect; an inability to reproduce at runtime is expected and must
-            // not deflect to a "share repro steps" reply. Always fix these, unless
-            // triage showed with evidence that there is nothing to fix.
+            // not deflect to a "share repro steps" reply. Always fix these.
             let always_fix = input.issue.source == "sentry";
-            if always_fix {
-                if let Some(outcome) =
-                    self.skip_after_triage(&input.issue, &input.source_name, &verdict)
-                {
-                    return outcome;
-                }
-            }
             if verdict.reproduced || always_fix {
                 // Carry the diagnosis into the fix run.
                 input.diagnosis = Some(verdict);
@@ -2624,65 +2625,109 @@ impl IssueProcessor {
     /// Attempt to reproduce a reported issue (read-only). On any failure, timeout,
     /// or lack of agent support, conservatively treats the issue as reproduced so
     /// the fix pipeline still runs (preserving the default issue-resolution path).
-    /// End the attempt without a fix run when triage calls the issue not worth
-    /// fixing. Recorded as cannot_fix so it is neither retried nor reselected.
-    fn skip_after_triage(
+    /// Whether this run goes through triage before a fix. Review reruns skip it:
+    /// the PR already exists and re-triaging could close the attempt under it.
+    fn needs_triage(input: &ProcessingInput) -> bool {
+        input.review_feedback.is_none()
+            && !matches!(input.intent, Some(Intent::Question))
+            && claudear_core::templates::triage_playbook(&input.source_name).is_some()
+    }
+
+    /// Verify and triage the issue, then fix it unless triage decided otherwise.
+    async fn triage_then_fix(
         &self,
-        issue: &Issue,
-        source_name: &str,
+        mut input: ProcessingInput,
+        context_provider: &dyn ContextProvider,
+    ) -> ProcessingOutcome {
+        let verdict = self
+            .run_verify(
+                &input.issue,
+                &input.resolution,
+                &input.source_name,
+                context_provider,
+                input.attempt_id,
+            )
+            .await;
+        if let Some(outcome) = self.apply_triage(&mut input, &verdict) {
+            return outcome;
+        }
+        input.diagnosis = Some(verdict);
+        match self.run_inner(input, context_provider).await {
+            Ok(ProcessingOutcome::WrongRepo {
+                original_repo,
+                suggested_repo,
+            }) => ProcessingOutcome::Failed {
+                error: format!(
+                    "Wrong repo detected (was: {}, suggested: {:?}), not retried",
+                    original_repo, suggested_repo
+                ),
+            },
+            Ok(outcome) => outcome,
+            Err(e) => ProcessingOutcome::Failed {
+                error: e.to_string(),
+            },
+        }
+    }
+
+    /// Act on the triage verdict. Returns an outcome when the attempt ends here;
+    /// `None` means go on to fix, possibly in the repo triage named as the owner.
+    fn apply_triage(
+        &self,
+        input: &mut ProcessingInput,
         verdict: &VerifyResult,
     ) -> Option<ProcessingOutcome> {
         // A skip must be argued; without evidence the fix run gets the benefit of the doubt
-        if !verdict.triage.skips_fix() || verdict.evidence.trim().is_empty() {
+        if verdict.evidence.trim().is_empty() {
             return None;
         }
+        if verdict.triage == TriageVerdict::UpstreamOwned {
+            let owner = verdict.owner_repo.trim();
+            if owner.is_empty() || input.resolution.repo_name() == Some(owner) {
+                return None;
+            }
+            match claudear_analysis::inference::resolve_repo_for_cascade(
+                self.inferrer.as_ref(),
+                owner,
+            ) {
+                resolved @ RepoResolution::Resolved { .. } => {
+                    self.record_issue_decision(
+                        &input.issue,
+                        "triage_redirected",
+                        format!("Triage moved {} to {}", input.issue.short_id, owner),
+                        json!({ "owner_repo": owner, "evidence": verdict.evidence }),
+                    );
+                    input.resolution = resolved;
+                    return None;
+                }
+                RepoResolution::Skip { .. } => {}
+            }
+        } else if !verdict.triage.skips_fix() {
+            return None;
+        }
+
         let reason = format!("Triage: {}: {}", verdict.triage.as_str(), verdict.summary);
         if let Err(e) = self
             .tracker
-            .mark_cannot_fix(source_name, &issue.id, &reason)
+            .mark_cannot_fix(&input.source_name, &input.issue.id, &reason)
         {
-            tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to record triage skip");
+            tracing::warn!(short_id = %input.issue.short_id, error = %e, "Failed to record triage skip");
         }
         self.record_issue_decision(
-            issue,
+            &input.issue,
             "triage_skipped",
             format!(
                 "Skipped {} after triage: {}",
-                issue.short_id,
+                input.issue.short_id,
                 verdict.triage.as_str()
             ),
             json!({
                 "triage": verdict.triage.as_str(),
                 "summary": verdict.summary,
                 "evidence": verdict.evidence,
+                "owner_repo": verdict.owner_repo,
             }),
         );
         Some(ProcessingOutcome::CompletedNoPr { reason })
-    }
-
-    /// Attach the operator-edited triage playbook for this issue's source, if one
-    /// is saved. Without one the prompt falls back to the bundled playbook.
-    fn with_triage_playbook(&self, issue: &Issue) -> Issue {
-        let mut issue = issue.clone();
-        if claudear_core::templates::default_triage_playbook(&issue.source).is_none() {
-            return issue;
-        }
-        match self
-            .tracker
-            .get_agent_instruction(InstructionScope::Triage, Some(&issue.source))
-        {
-            Ok(Some(saved)) if !saved.instruction_text.trim().is_empty() => {
-                issue.set_metadata(
-                    claudear_core::templates::TRIAGE_PLAYBOOK_METADATA_KEY,
-                    saved.instruction_text,
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to load triage playbook; using bundled one");
-            }
-        }
-        issue
     }
 
     async fn run_verify(
@@ -2713,11 +2758,9 @@ impl IssueProcessor {
 
         let timeout =
             std::time::Duration::from_secs(self.config.reply().verify_timeout_secs.max(1));
-        let verify_target = self.with_triage_playbook(issue);
         let result = tokio::time::timeout(
             timeout,
-            self.agent
-                .verify_issue(&verify_target, &context, &project_dir),
+            self.agent.verify_issue(issue, &context, &project_dir),
         )
         .await;
 
@@ -2731,7 +2774,7 @@ impl IssueProcessor {
                 root_cause: String::new(),
                 suggested_fix: String::new(),
                 evidence: e.to_string(),
-                triage: Default::default(),
+                ..Default::default()
             },
             Err(_) => VerifyResult {
                 reproduced: fail_open,
@@ -2743,7 +2786,7 @@ impl IssueProcessor {
                 root_cause: String::new(),
                 suggested_fix: String::new(),
                 evidence: String::new(),
-                triage: Default::default(),
+                ..Default::default()
             },
         };
 
@@ -5879,21 +5922,65 @@ mod tests {
         }
     }
 
-    fn triage_verdict(triage: claudear_core::types::TriageVerdict, evidence: &str) -> VerifyResult {
-        VerifyResult {
-            summary: "ClickHouse returned 503 during an incident".to_string(),
-            evidence: evidence.to_string(),
-            triage,
-            ..Default::default()
+    /// Agent whose verify step returns a fixed triage verdict.
+    struct TriagingAgent(VerifyResult);
+
+    #[async_trait]
+    impl claudear_integrations::runner::AgentRunner for TriagingAgent {
+        fn name(&self) -> &str {
+            "triaging"
+        }
+
+        fn capabilities(&self) -> claudear_integrations::runner::ProviderCapabilities {
+            claudear_integrations::runner::ProviderCapabilities::default()
+        }
+
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> String {
+            String::new()
+        }
+
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &std::path::Path,
+        ) -> claudear_core::error::Result<claudear_core::types::AgentResult> {
+            Err(claudear_core::error::Error::runner(
+                "fix runs are not expected here",
+            ))
+        }
+
+        async fn verify_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> claudear_core::error::Result<VerifyResult> {
+            Ok(self.0.clone())
         }
     }
 
-    #[test]
-    fn test_skip_after_triage_closes_out_an_infra_blip() {
-        use claudear_core::types::TriageVerdict;
+    /// Run a fresh Sentry attempt through the default pipeline (reply actions
+    /// off) with the given triage verdict, and return the attempt's final status.
+    async fn run_sentry_with_verdict(
+        verdict: VerifyResult,
+        review_feedback: Option<&str>,
+    ) -> claudear_core::types::FixAttemptStatus {
         let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
         tracker.record_attempt("sentry", "S1", "CLOUD-1").unwrap();
-        let processor = make_reply_chain_processor(Arc::new(tracker));
+        let mut processor = make_reply_chain_processor(Arc::new(tracker));
+        processor.agent = Arc::new(TriagingAgent(verdict));
+        assert!(
+            !processor.config.reply().enabled,
+            "the default config must be exercised"
+        );
+
         let issue = Issue::new(
             "S1",
             "CLOUD-1",
@@ -5901,107 +5988,108 @@ mod tests {
             "u",
             "sentry",
         );
-
-        let outcome = processor.skip_after_triage(
-            &issue,
-            "sentry",
-            &triage_verdict(
-                TriageVerdict::InfraTransient,
-                "HTTP 503 from clickhouse:8123, no code path involved",
+        let input = ProcessingInput {
+            issue,
+            source_name: "sentry".to_string(),
+            match_result: claudear_core::types::MatchResult::matched(
+                "escalating",
+                claudear_core::types::MatchPriority::Urgent,
             ),
-        );
-
-        assert!(matches!(
-            outcome,
-            Some(ProcessingOutcome::CompletedNoPr { .. })
-        ));
-        let attempt = processor
-            .tracker
-            .get_attempt("sentry", "S1")
-            .unwrap()
-            .unwrap();
-        // cannot_fix is neither retried nor reselected
-        assert_eq!(
-            attempt.status,
-            claudear_core::types::FixAttemptStatus::CannotFix
-        );
-        assert!(attempt
-            .error_message
-            .unwrap_or_default()
-            .starts_with("Triage: infra_transient"));
-    }
-
-    #[test]
-    fn test_with_triage_playbook_uses_the_saved_playbook() {
-        let key = claudear_core::templates::TRIAGE_PLAYBOOK_METADATA_KEY;
-        let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
-        let processor = make_reply_chain_processor(Arc::new(tracker));
-        let issue = Issue::new("S1", "CLOUD-1", "Boom", "u", "sentry");
-
-        // Nothing saved: the prompt falls back to the bundled playbook
-        assert!(processor
-            .with_triage_playbook(&issue)
-            .get_metadata::<String>(key)
-            .is_none());
-
+            resolution: RepoResolution::Skip {
+                reason: "no repo configured".to_string(),
+            },
+            attempt_id: None,
+            review_feedback: review_feedback.map(str::to_string),
+            existing_pr_branch: None,
+            intent: None,
+            diagnosis: None,
+        };
+        processor.run(input, &DummyContextProvider).await;
         processor
             .tracker
-            .upsert_agent_instruction(
-                InstructionScope::Triage,
-                Some("sentry"),
-                "# Ours",
-                Some("op"),
-            )
-            .unwrap();
-        assert_eq!(
-            processor
-                .with_triage_playbook(&issue)
-                .get_metadata::<String>(key)
-                .as_deref(),
-            Some("# Ours")
-        );
-
-        // Sources without triage never pick one up
-        let linear = Issue::new("L1", "ENG-1", "Boom", "u", "linear");
-        assert!(processor
-            .with_triage_playbook(&linear)
-            .get_metadata::<String>(key)
-            .is_none());
-    }
-
-    #[test]
-    fn test_skip_after_triage_requires_evidence_and_a_skip_verdict() {
-        use claudear_core::types::TriageVerdict;
-        let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
-        tracker.record_attempt("sentry", "S1", "CLOUD-1").unwrap();
-        let processor = make_reply_chain_processor(Arc::new(tracker));
-        let issue = Issue::new(
-            "S1",
-            "CLOUD-1",
-            "Queue delivery payload is missing",
-            "u",
-            "sentry",
-        );
-
-        for verdict in [
-            triage_verdict(TriageVerdict::Noise, "   "),
-            triage_verdict(TriageVerdict::Fix, "src/Queue/Broker/Redis.php:457"),
-            triage_verdict(TriageVerdict::UpstreamOwned, "vendor/utopia-php/queue"),
-            triage_verdict(TriageVerdict::Unspecified, "anything"),
-        ] {
-            assert!(processor
-                .skip_after_triage(&issue, "sentry", &verdict)
-                .is_none());
-        }
-        let attempt = processor
-            .tracker
             .get_attempt("sentry", "S1")
             .unwrap()
-            .unwrap();
-        assert_eq!(
-            attempt.status,
-            claudear_core::types::FixAttemptStatus::Pending
+            .unwrap()
+            .status
+    }
+
+    fn verdict(triage: claudear_core::types::TriageVerdict, evidence: &str) -> VerifyResult {
+        VerifyResult {
+            summary: "triaged".to_string(),
+            evidence: evidence.to_string(),
+            triage,
+            ..Default::default()
+        }
+    }
+
+    // A fix run in these tests fails on repo resolution, so `Failed` means "went on to
+    // fix" and `CannotFix` means triage closed the attempt without one.
+
+    #[tokio::test]
+    async fn test_sentry_triage_closes_issues_not_worth_fixing_by_default() {
+        use claudear_core::types::{FixAttemptStatus, TriageVerdict};
+        for triage in [
+            TriageVerdict::InfraTransient,
+            TriageVerdict::Expected,
+            TriageVerdict::Noise,
+            TriageVerdict::NeedsHuman,
+        ] {
+            let status =
+                run_sentry_with_verdict(verdict(triage, "clickhouse:8123 returned 503"), None)
+                    .await;
+            assert_eq!(
+                status,
+                FixAttemptStatus::CannotFix,
+                "{triage:?} should not start a fix run"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sentry_triage_still_fixes_real_or_unargued_defects() {
+        use claudear_core::types::{FixAttemptStatus, TriageVerdict};
+        for v in [
+            verdict(TriageVerdict::Fix, "src/Queue/Broker/Redis.php:457"),
+            verdict(TriageVerdict::Unspecified, "src/Queue/Broker/Redis.php:457"),
+            // A skip without evidence gets the benefit of the doubt
+            verdict(TriageVerdict::InfraTransient, "  "),
+            // Upstream owner not named: nothing to redirect to, so fix here
+            verdict(TriageVerdict::UpstreamOwned, "vendor/utopia-php/queue"),
+        ] {
+            let status = run_sentry_with_verdict(v.clone(), None).await;
+            assert_eq!(
+                status,
+                FixAttemptStatus::Failed,
+                "{:?} should go on to a fix run",
+                v.triage
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sentry_triage_closes_upstream_issue_when_owner_repo_is_unknown() {
+        use claudear_core::types::{FixAttemptStatus, TriageVerdict};
+        let mut v = verdict(
+            TriageVerdict::UpstreamOwned,
+            "vendor/acme/lib/src/Client.php:12",
         );
+        v.owner_repo = "acme/lib".to_string();
+        let status = run_sentry_with_verdict(v, None).await;
+        assert_eq!(status, FixAttemptStatus::CannotFix);
+    }
+
+    #[tokio::test]
+    async fn test_review_rerun_is_not_closed_by_triage() {
+        use claudear_core::types::{FixAttemptStatus, TriageVerdict};
+        let status = run_sentry_with_verdict(
+            verdict(
+                TriageVerdict::InfraTransient,
+                "clickhouse:8123 returned 503",
+            ),
+            Some("Please add a test"),
+        )
+        .await;
+        assert_eq!(status, FixAttemptStatus::Failed);
     }
 
     #[tokio::test]

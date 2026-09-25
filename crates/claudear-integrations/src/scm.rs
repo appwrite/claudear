@@ -668,8 +668,10 @@ impl PrMonitor {
                     }));
                 let _ = self.tracker.record_activity(&activity);
 
-                // Determine if we should start regression tracking instead of auto-resolving
-                let is_bug = self.is_bug_type(attempt);
+                // Determine if we should start regression tracking instead of auto-resolving.
+                // A downstream cascade merge does not fix the parent issue.
+                let is_cascade = attempt.cascade_repo.is_some();
+                let is_bug = !is_cascade && self.is_bug_type(attempt);
                 let regression_watch_id = if is_bug {
                     if let Some(ref regression_tracker) = self.regression_tracker {
                         // Create a regression watch for bug-type issues
@@ -725,7 +727,7 @@ impl PrMonitor {
 
                 // For bugs with regression tracking, don't auto-resolve yet.
                 // The issue will be resolved after 24 hours of no regressions.
-                let should_resolve = if regression_watch_id.is_some() {
+                let should_resolve = if is_cascade || regression_watch_id.is_some() {
                     false
                 } else {
                     self.auto_resolve

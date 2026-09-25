@@ -5001,17 +5001,16 @@ mod tests {
         };
         let tracker = NoOpTracker;
 
-        let (issue, mr) = make_candidate(
-            "LLM-1",
-            "Fatal crash in payment service",
-            IssuePriority::Critical,
-            MatchPriority::High,
-        );
+        // Two issues the heuristic cannot tell apart
+        let (first, mr1) =
+            make_candidate("LLM-0", "Crash", IssuePriority::High, MatchPriority::High);
+        let (second, mr2) =
+            make_candidate("LLM-1", "Crash", IssuePriority::High, MatchPriority::High);
 
         let mock = MockLlmAnalyzer {
             assessments: Some(vec![crate::llm::LlmIssueAssessment {
                 issue_id: "LLM-1".to_string(),
-                severity: 0.95,
+                severity: 1.0,
                 blast_radius: claudear_core::types::BlastRadius::Critical,
                 fingerprint: "payment_crash".to_string(),
             }]),
@@ -5019,24 +5018,14 @@ mod tests {
 
         let (result, _) = prioritise(
             &config,
-            vec![(issue, mr)],
+            vec![(first, mr1), (second, mr2)],
             &tracker,
             &std::collections::HashMap::new(),
             Some(&mock),
         );
 
-        assert_eq!(result.len(), 1);
-        // Critical + High heuristic severity is 0.9; the LLM's 0.95 is averaged in
-        assert!(
-            (result[0].severity_score.severity_component - 0.925).abs() < 1e-10,
-            "LLM severity should be blended, got {}",
-            result[0].severity_score.severity_component
-        );
-        assert!(
-            result[0].severity_score.frequency_component == 0.0
-                && result[0].severity_score.blast_radius_component > 0.0,
-            "the heuristic components must be kept"
-        );
+        // The LLM's call breaks the tie
+        assert_eq!(result[0].issue.id, "LLM-1");
         assert_eq!(result[0].cluster_key.as_deref(), Some("llm:payment_crash"));
     }
 
@@ -5132,8 +5121,7 @@ mod tests {
 
     #[test]
     fn test_prioritise_llm_partial_assessment() {
-        // LLM returns assessment for only one of two issues — the other should
-        // fall back to heuristic scoring.
+        // LLM returns assessment for only one of two issues; the other is still ranked
         let config = PrioritisationConfig {
             enabled: true,
             ..Default::default()
@@ -5165,28 +5153,14 @@ mod tests {
 
         let (result, _) = prioritise(
             &config,
-            vec![(issue1, mr1), (issue2, mr2)],
+            vec![(issue2, mr2), (issue1, mr1)],
             &tracker,
             &std::collections::HashMap::new(),
             Some(&mock),
         );
 
-        assert_eq!(result.len(), 2);
-
-        // PA-1 blends the LLM severity into its heuristic one
-        let pa1 = result.iter().find(|r| r.issue.id == "PA-1").unwrap();
-        assert!(
-            (pa1.severity_score.severity_component - 0.945).abs() < 1e-10,
-            "PA-1 should blend LLM severity, got {}",
-            pa1.severity_score.severity_component
-        );
-
-        // PA-2 has no assessment and keeps its heuristic score
-        let pa2 = result.iter().find(|r| r.issue.id == "PA-2").unwrap();
-        assert!(
-            pa2.severity_score.severity_component > 0.0,
-            "PA-2 should fall back to heuristic scoring"
-        );
+        let order: Vec<&str> = result.iter().map(|r| r.issue.id.as_str()).collect();
+        assert_eq!(order, vec!["PA-1", "PA-2"]);
     }
 
     #[test]

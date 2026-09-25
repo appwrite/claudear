@@ -1468,8 +1468,26 @@ impl Watcher {
 
         // Increment the review_cycles count
         if let Some(ref pr_url) = attempt.pr_url {
+            // Cascade PRs are watched without a PR record; create one so the cap counts them too
+            let pr_record = match self.tracker.get_pr(pr_url) {
+                Ok(Some(record)) => Some(record),
+                Ok(None) => match (&attempt.scm_repo, attempt.scm_pr_number) {
+                    (Some(repo), Some(number)) => {
+                        let mut record = claudear_core::types::PrRecord::new(pr_url, repo, number);
+                        record.attempt_id = Some(attempt.id);
+                        record.issue_id = Some(attempt.issue_id.clone());
+                        record.issue_source = Some(attempt.source.clone());
+                        Some(record)
+                    }
+                    _ => None,
+                },
+                Err(e) => {
+                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to load PR record for review cycle cap");
+                    None
+                }
+            };
             // Update the PR record with incremented review_cycles
-            if let Ok(Some(mut pr_record)) = self.tracker.get_pr(pr_url) {
+            if let Some(mut pr_record) = pr_record {
                 if pr_record.review_cycles >= MAX_REVIEW_CYCLES {
                     tracing::warn!(
                         pr_url = %pr_url,
@@ -2928,8 +2946,16 @@ Create a PR with your changes.{custom_instructions}"#,
             match pr_status {
                 Ok(PrStatus::Merged) => {
                     pr_status_merged += 1;
-                    self.tracker
-                        .mark_merged(&attempt.source, &attempt.issue_id)?;
+                    // A cascade row shares the parent's issue id: marking by issue id
+                    // updated the parent and left this row pending, so every poll saw
+                    // the merge again and re-fired the cascade
+                    let is_cascade = attempt.cascade_repo.is_some();
+                    if is_cascade {
+                        self.tracker.mark_cascade_pr_outcome(attempt.id, true)?;
+                    } else {
+                        self.tracker
+                            .mark_merged(&attempt.source, &attempt.issue_id)?;
+                    }
                     // Timeline: PR merged.
                     self.tracker
                         .record_activity(
@@ -2958,7 +2984,9 @@ Create a PR with your changes.{custom_instructions}"#,
                     }
 
                     // For bug-type issues, create a regression watch instead of immediate auto-resolve.
-                    let regression_watch_id = if attempt.is_bug() {
+                    // A downstream cascade merge does not fix the parent issue, so it
+                    // neither watches for regressions nor resolves it.
+                    let regression_watch_id = if !is_cascade && attempt.is_bug() {
                         let issue_type = match attempt.source.as_str() {
                             "sentry" => IssueType::SentryIssue,
                             "linear" => IssueType::LinearBug,
@@ -2998,8 +3026,9 @@ Create a PR with your changes.{custom_instructions}"#,
                     };
 
                     // Auto-resolve only when enabled and no regression watch is active.
-                    let should_resolve =
-                        regression_watch_id.is_none() && self.config.github().auto_resolve_on_merge;
+                    let should_resolve = !is_cascade
+                        && regression_watch_id.is_none()
+                        && self.config.github().auto_resolve_on_merge;
                     if should_resolve {
                         if let Some(source) =
                             self.sources.iter().find(|s| s.name() == attempt.source)
@@ -3035,7 +3064,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
                     // Action pipeline: once the fix is live, post a human-sounding
                     // "fix shipped" reply back to the originating ticket.
-                    self.maybe_send_fix_shipped_reply(attempt).await;
+                    if !is_cascade {
+                        self.maybe_send_fix_shipped_reply(attempt).await;
+                    }
 
                     // Record feedback outcome
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
@@ -3077,8 +3108,12 @@ Create a PR with your changes.{custom_instructions}"#,
                 }
                 Ok(PrStatus::Closed) => {
                     pr_status_closed += 1;
-                    self.tracker
-                        .mark_closed(&attempt.source, &attempt.issue_id)?;
+                    if attempt.cascade_repo.is_some() {
+                        self.tracker.mark_cascade_pr_outcome(attempt.id, false)?;
+                    } else {
+                        self.tracker
+                            .mark_closed(&attempt.source, &attempt.issue_id)?;
+                    }
                     // Timeline: PR closed without merging.
                     self.tracker
                         .record_activity(
@@ -6917,6 +6952,61 @@ mod tests {
             updated_attempt.status,
             claudear_core::types::FixAttemptStatus::Failed,
             "review rerun should execute after lock release (repo resolution fails in test setup, marking failed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_feedback_stops_triggering_reruns_after_the_cycle_cap() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let pr_url = "https://github.com/org/repo/pull/1";
+        // No PR record exists, like a cascade PR that is watched without one
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker.mark_success("mock", "1", pr_url).unwrap();
+
+        let source = Arc::new(MockSource::with_issues(
+            "mock",
+            vec![Issue::new(
+                "1",
+                "MOCK-1",
+                "Mock issue",
+                "http://example.com/mock/1",
+                "mock",
+            )],
+        )) as Arc<dyn IssueSource>;
+        let watcher = Arc::new(create_test_watcher(
+            notifier,
+            tracker.clone(),
+            vec![source],
+            false,
+        ));
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        // Each allowed rerun fails on repo resolution in this setup; reset to the
+        // open-PR state before the next round of feedback arrives
+        for _ in 0..MAX_REVIEW_CYCLES {
+            let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+            watcher
+                .process_review_action(&attempt, "Please add a test")
+                .await
+                .unwrap();
+            assert_eq!(
+                tracker.get_attempt("mock", "1").unwrap().unwrap().status,
+                claudear_core::types::FixAttemptStatus::Failed,
+                "a rerun under the cap should run"
+            );
+            tracker.mark_success("mock", "1", pr_url).unwrap();
+        }
+
+        let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+        watcher
+            .process_review_action(&attempt, "Please add a test")
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.get_attempt("mock", "1").unwrap().unwrap().status,
+            claudear_core::types::FixAttemptStatus::Success,
+            "feedback past the cap must not start another run"
         );
     }
 
@@ -11561,6 +11651,142 @@ mod tests {
 
         let result = watcher.poll_source(&source).await;
         assert!(result.is_ok());
+    }
+
+    /// SCM stub that reports the given PR numbers as merged and the rest as open.
+    struct MergedPrs(Vec<i64>);
+
+    #[async_trait::async_trait]
+    impl claudear_integrations::scm::ScmProvider for MergedPrs {
+        fn name(&self) -> &str {
+            "github"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        fn review_trigger(&self) -> &str {
+            "@claudear"
+        }
+        async fn get_pr_status(
+            &self,
+            _project: &str,
+            number: i64,
+        ) -> claudear_core::error::Result<PrStatus> {
+            Ok(if self.0.contains(&number) {
+                PrStatus::Merged
+            } else {
+                PrStatus::Open
+            })
+        }
+        async fn get_pr_info(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<claudear_integrations::scm::PrInfo> {
+            Ok(claudear_integrations::scm::PrInfo {
+                head_branch: None,
+                base_branch: None,
+                title: None,
+                author: None,
+            })
+        }
+        async fn get_pr_diff(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<String> {
+            Ok(String::new())
+        }
+        async fn get_reviews(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<Vec<claudear_integrations::scm::CodeReview>> {
+            Ok(Vec::new())
+        }
+        async fn get_review_comments(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<Vec<claudear_integrations::scm::ReviewComment>> {
+            Ok(Vec::new())
+        }
+        async fn list_repos(
+            &self,
+            _org: &str,
+        ) -> claudear_core::error::Result<Vec<claudear_integrations::scm::RemoteRepo>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merged_cascade_pr_is_handled_once_and_leaves_the_parent_alone() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        tracker.record_attempt("discord", "1", "D-1").unwrap();
+        tracker
+            .mark_success("discord", "1", "https://github.com/org/app/pull/1")
+            .unwrap();
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        let child = tracker
+            .record_cascade_attempt(
+                "discord",
+                "1",
+                "D-1",
+                parent.id,
+                "git@github.com:org/lib.git",
+            )
+            .unwrap();
+        tracker
+            .update_attempt_pr(child, "https://github.com/org/lib/pull/120", "org/lib", 120)
+            .unwrap();
+
+        let mut config = test_config();
+        config.cascade.enabled = false;
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: Some(Arc::new(MergedPrs(vec![120]))),
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(claudear_integrations::runner::ClaudeAgentRunner::new(
+                claudear_integrations::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: false,
+            llm_engine: None,
+        });
+
+        watcher.check_pr_merges_and_cascade().await.unwrap();
+        watcher.check_pr_merges_and_cascade().await.unwrap();
+
+        // Before, the parent was marked merged and the cascade row stayed pending,
+        // so every poll saw the merge again
+        let merged_per_poll: Vec<f64> = tracker
+            .get_metrics("pr_status_merged", None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.metric_value)
+            .collect();
+        assert_eq!(merged_per_poll.iter().sum::<f64>(), 1.0);
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        assert_eq!(
+            parent.status,
+            claudear_core::types::FixAttemptStatus::Success
+        );
     }
 
     #[tokio::test]

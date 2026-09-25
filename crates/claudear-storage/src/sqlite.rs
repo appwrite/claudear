@@ -1528,20 +1528,34 @@ impl AttemptTracker for SqliteTracker {
     }
 
     fn release_orphaned_pending_attempts(&self) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-        // Older orphans are stale; retrying them now would spend runs on dead issues
-        let released = conn.execute(
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction()?;
+        // Cascade rows are resumed by record_cascade_attempt, so they stay pending
+        let released = tx.execute(
             r#"
             UPDATE fix_attempts
             SET status = 'failed',
                 error_message = 'Interrupted before completion (daemon restarted)',
                 retry_count = MAX(COALESCE(retry_count, 0) - 1, 0)
-            WHERE status = 'pending' AND reset_at IS NULL
+            WHERE status = 'pending' AND reset_at IS NULL AND cascade_repo IS NULL
               AND attempted_at > datetime('now', '-3 days')
             "#,
             [],
         )?;
-        Ok(released)
+        // Older orphans are stale; retrying them would spend runs on dead issues,
+        // so give them a terminal state that a manual reset can still undo
+        let closed = tx.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'cannot_fix',
+                error_message = 'Interrupted before completion; too old to retry automatically'
+            WHERE status = 'pending' AND reset_at IS NULL AND cascade_repo IS NULL
+              AND attempted_at <= datetime('now', '-3 days')
+            "#,
+            [],
+        )?;
+        tx.commit()?;
+        Ok(released + closed)
     }
 
     fn get_stats(&self) -> Result<FixAttemptStats> {
@@ -10345,26 +10359,6 @@ mod tests {
     use chrono::{Datelike, Timelike, Utc};
 
     #[test]
-    fn test_triage_playbook_is_not_injected_as_operator_instructions() {
-        use claudear_core::types::InstructionScope;
-        let tracker = SqliteTracker::in_memory().unwrap();
-        tracker
-            .upsert_agent_instruction(InstructionScope::Triage, Some("sentry"), "# Triage", None)
-            .unwrap();
-
-        assert!(tracker
-            .resolve_agent_instructions(Some("sentry"))
-            .unwrap()
-            .is_none());
-        let saved = tracker
-            .get_agent_instruction(InstructionScope::Triage, Some("sentry"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(saved.scope, InstructionScope::Triage);
-        assert_eq!(saved.instruction_text, "# Triage");
-    }
-
-    #[test]
     fn test_agent_instructions_scope_and_resolve() {
         use claudear_core::types::InstructionScope;
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -10901,15 +10895,52 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(tracker.release_orphaned_pending_attempts().unwrap(), 1);
+        tracker.release_orphaned_pending_attempts().unwrap();
 
-        let fresh = tracker.get_attempt("sentry", "fresh").unwrap().unwrap();
-        assert_eq!(fresh.status, FixAttemptStatus::Failed);
-        assert_eq!(fresh.retry_count, 0);
+        // A recent orphan goes back into the retry queue
+        let retryable: Vec<String> = tracker
+            .get_retryable_issues(2)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.issue_id)
+            .collect();
+        assert_eq!(retryable, vec!["fresh".to_string()]);
+        // A stale one is closed out instead of staying pending forever
         let stale = tracker.get_attempt("sentry", "stale").unwrap().unwrap();
-        assert_eq!(stale.status, FixAttemptStatus::Pending);
+        assert_eq!(stale.status, FixAttemptStatus::CannotFix);
         let done = tracker.get_attempt("sentry", "done").unwrap().unwrap();
         assert_eq!(done.status, FixAttemptStatus::Success);
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_leaves_cascades_resumable() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("discord", "1", "D-1").unwrap();
+        tracker
+            .mark_success("discord", "1", "https://github.com/org/app/pull/1")
+            .unwrap();
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        let cascade = "git@github.com:org/lib.git";
+        let child = tracker
+            .record_cascade_attempt("discord", "1", "D-1", parent.id, cascade)
+            .unwrap();
+
+        tracker.release_orphaned_pending_attempts().unwrap();
+
+        // The next cascade trigger resumes the same row, which must still be pending
+        let resumed = tracker
+            .record_cascade_attempt("discord", "1", "D-1", parent.id, cascade)
+            .unwrap();
+        assert_eq!(resumed, child);
+        let conn = tracker.acquire_lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM fix_attempts WHERE id = ?",
+                [child],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
     }
 
     #[test]

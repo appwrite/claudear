@@ -2336,21 +2336,14 @@ fn issue_body(issue: &Issue) -> &str {
 /// The agent must NOT fix anything; it inspects the code (read-only) to decide
 /// whether the issue reproduces as described and returns a single JSON verdict.
 fn build_verify_prompt(issue: &Issue, context: &str) -> String {
-    // Telemetry issues need a worth-fixing call, not just a reproduction.
-    // An operator-edited playbook from the DB wins over the bundled one.
-    let playbook =
-        claudear_core::templates::default_triage_playbook(&issue.source).map(|default| {
-            issue
-                .get_metadata::<String>(claudear_core::templates::TRIAGE_PLAYBOOK_METADATA_KEY)
-                .filter(|p| !p.trim().is_empty())
-                .unwrap_or_else(|| default.to_string())
-        });
+    // Telemetry issues need a worth-fixing call, not just a reproduction
+    let playbook = claudear_core::templates::triage_playbook(&issue.source);
     let (triage_section, triage_field) = if let Some(playbook) = playbook {
         (
             format!(
                 "\n\n{playbook}\nSet `triage` to one of: fix, expected, infra_transient, noise, upstream_owned, needs_human. Fill `summary` and `evidence` for every verdict.\n"
             ),
-            r#", "triage": "<fix|expected|infra_transient|noise|upstream_owned|needs_human>""#,
+            r#", "triage": "<fix|expected|infra_transient|noise|upstream_owned|needs_human>", "owner_repo": "<org/repo that owns the defect when triage is upstream_owned, else empty>""#,
         )
     } else {
         (String::new(), "")
@@ -2587,7 +2580,7 @@ fn parse_verify_result(output: &str) -> VerifyResult {
         root_cause: String::new(),
         suggested_fix: String::new(),
         evidence: trimmed.chars().take(2000).collect(),
-        triage: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -2630,26 +2623,10 @@ mod tests {
 
     #[test]
     fn test_verify_prompt_carries_triage_playbook_for_sentry_only() {
+        let playbook = claudear_core::templates::SENTRY_TRIAGE_PLAYBOOK;
         let sentry = Issue::new("1", "CLOUD-1", "Boom", "url", "sentry");
-        let prompt = build_verify_prompt(&sentry, "ctx");
-        assert!(prompt.contains("# Sentry triage"));
-        assert!(prompt.contains(r#""triage":"#));
-
-        let helpscout = build_verify_prompt(&verify_issue(), "ctx");
-        assert!(!helpscout.contains("# Sentry triage"));
-        assert!(!helpscout.contains(r#""triage":"#));
-    }
-
-    #[test]
-    fn test_verify_prompt_prefers_operator_playbook() {
-        let mut sentry = Issue::new("1", "CLOUD-1", "Boom", "url", "sentry");
-        sentry.set_metadata(
-            claudear_core::templates::TRIAGE_PLAYBOOK_METADATA_KEY,
-            "# Our rules\nClickHouse 503s are always infra_transient.",
-        );
-        let prompt = build_verify_prompt(&sentry, "ctx");
-        assert!(prompt.contains("# Our rules"));
-        assert!(!prompt.contains("# Sentry triage"));
+        assert!(build_verify_prompt(&sentry, "ctx").contains(playbook));
+        assert!(!build_verify_prompt(&verify_issue(), "ctx").contains(playbook));
     }
 
     #[test]
