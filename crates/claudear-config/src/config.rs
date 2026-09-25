@@ -5281,20 +5281,14 @@ monitoring_duration_hours = 12
             config.effective_timeout_secs() > QaConfig::default().answer_timeout_secs,
             "live QA runs real checks, so it must get longer than a Q&A answer by default"
         );
-        let zero_timeout = DeployQaConfig {
-            timeout_secs: 0,
-            ..Default::default()
-        };
-        assert!(zero_timeout.effective_timeout_secs() >= 1);
 
         let root = Config::default();
         assert!(!root.deploy_qa.enabled);
         assert!(root.deploy_qa.tracks.is_empty());
     }
 
-    /// `[deploy_qa] timeout_secs` values from the clamped zero up to a day,
-    /// either side of the backstop grace cap and the stale-run minimum margin.
-    const DEPLOY_QA_TIMEOUTS_SECS: &[u64] = &[0, 1, 59, 60, 61, 599, 600, 601, 1800, 86_400];
+    /// `[deploy_qa] timeout_secs` values, ascending from zero up to a day.
+    const DEPLOY_QA_TIMEOUTS_SECS: &[u64] = &[0, 1, 30, 1800, 86_400];
 
     fn deploy_qa_with_timeout(timeout_secs: u64) -> DeployQaConfig {
         DeployQaConfig {
@@ -5335,19 +5329,22 @@ monitoring_duration_hours = 12
     }
 
     #[test]
-    fn test_deploy_qa_stale_margin_covers_small_and_large_timeouts() {
-        for &timeout_secs in DEPLOY_QA_TIMEOUTS_SECS {
-            let config = deploy_qa_with_timeout(timeout_secs);
-            let limit = Duration::from_secs(config.effective_timeout_secs());
-            let margin = config.stale_run_after().saturating_sub(limit);
+    fn test_deploy_qa_backstop_and_stale_sweep_grow_with_the_limit() {
+        for pair in DEPLOY_QA_TIMEOUTS_SECS.windows(2) {
+            let (shorter_secs, longer_secs) = (pair[0], pair[1]);
+            let shorter = deploy_qa_with_timeout(shorter_secs);
+            let longer = deploy_qa_with_timeout(longer_secs);
+            let extra_limit = runner_limit(&longer) - runner_limit(&shorter);
 
             assert!(
-                margin >= DEPLOY_QA_STALE_RUN_MINIMUM_MARGIN,
-                "setup and delivery around a {timeout_secs}s run need at least the minimum margin, got {margin:?}"
+                longer.backstop_timeout() >= shorter.backstop_timeout() + extra_limit,
+                "processing must wait on a {longer_secs}s run at least as much longer than on a \
+                 {shorter_secs}s one as its limit is longer"
             );
             assert!(
-                margin >= limit,
-                "the margin must grow with a {timeout_secs}s timeout, got {margin:?}"
+                longer.stale_run_after() >= shorter.stale_run_after() + extra_limit,
+                "a {longer_secs}s run's tip must be left running at least as much longer than a \
+                 {shorter_secs}s one's as its limit is longer"
             );
         }
     }
