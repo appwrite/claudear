@@ -1027,28 +1027,36 @@ mod tests {
 
     #[tokio::test]
     async fn report_is_redacted_before_it_is_truncated() {
-        let store = MemoryStore::new(tip());
-        let (discord, requests) = reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
-        let footer = format!("\n{VERDICT_PREFIX} {VERDICT_ALL_VERIFIED}");
-        let secret_tail = &KNOWN_SECRET[KNOWN_SECRET.len() / 2..];
-        let filler = REPORT_CHARACTER_LIMIT - 1 - secret_tail.len() - footer.chars().count();
-        let leaky_report = format!(
-            "{}{KNOWN_SECRET}{}{footer}",
-            "x".repeat(REPORT_CHARACTER_LIMIT),
-            "y".repeat(filler)
-        );
+        const FRAGMENT_LENGTH: usize = 8;
+        let fragments: Vec<&str> = (0..=KNOWN_SECRET.len() - FRAGMENT_LENGTH)
+            .map(|start| &KNOWN_SECRET[start..start + FRAGMENT_LENGTH])
+            .collect();
+        let check = format!("- #42 check LIVE PASS token={KNOWN_SECRET}\n");
+        let checks = check.repeat(1_000);
+        let footer = format!("{VERDICT_PREFIX} {VERDICT_ALL_VERIFIED}");
+        for shift in 0..check.len() {
+            let store = MemoryStore::new(tip());
+            let (discord, requests) =
+                reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+            let leaky_report = format!("{checks}{}\n{footer}", " ".repeat(shift));
 
-        report(&store, &discord, &leaky_report).await;
+            report(&store, &discord, &leaky_report).await;
 
-        let description = description(&posts(&requests)[0]);
-        assert!(
-            !description.contains(secret_tail),
-            "truncating first would cut the secret and post its tail"
-        );
-        assert!(
-            description.ends_with(&footer),
-            "the truncated report must keep its verdict line"
-        );
+            let posted = posted_text(&requests);
+            assert!(
+                !fragments.iter().any(|fragment| posted.contains(fragment)),
+                "shifted {shift}: part of the configured bot token reached the posted report"
+            );
+            let description = description(&posts(&requests)[0]);
+            assert!(
+                description.contains(MASK),
+                "shifted {shift}: the report must show where the token was masked"
+            );
+            assert!(
+                description.ends_with(&footer),
+                "shifted {shift}: the truncated report must keep its verdict line"
+            );
+        }
     }
 
     #[tokio::test]
