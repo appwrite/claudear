@@ -7211,9 +7211,13 @@ mod tests {
         let base = RecordedBase::new();
         let user = current_user_id();
 
-        for (mode, owner) in [
-            (0o755, user),
-            (LIVE_QA_DIRECTORY_MODE, user.wrapping_add(1)),
+        for (case, mode, owner) in [
+            ("a run directory other users can read", 0o755, user),
+            (
+                "a run directory Claudear's user does not own",
+                LIVE_QA_DIRECTORY_MODE,
+                user.wrapping_add(1),
+            ),
         ] {
             let run = base.create_run(mode);
             let run_path = run.path().to_path_buf();
@@ -7225,12 +7229,9 @@ mod tests {
             assert_eq!(
                 error.kind(),
                 std::io::ErrorKind::PermissionDenied,
-                "mode {mode:o}, owner {owner}: {error}"
+                "{case} must be refused: {error}"
             );
-            assert!(
-                !run_path.exists(),
-                "the refused run directory must be removed: mode {mode:o}, owner {owner}"
-            );
+            assert!(!run_path.exists(), "{case} must be removed once refused");
         }
     }
 
