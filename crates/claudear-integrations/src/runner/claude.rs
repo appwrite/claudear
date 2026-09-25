@@ -18,9 +18,11 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
+use tokio::task::JoinHandle;
 
 const DEFAULT_LOG_DIR: &str = "./logs";
 const CLAUDE_LOG_SUBDIR: &str = "claude";
@@ -52,6 +54,11 @@ const NESTED_SESSION_VARIABLE: &str = "CLAUDECODE";
 /// Timeout for read-only structured queries (classification-scale, not the long
 /// fix-run timeout).
 const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
+
+/// How long a run waits, once its CLI has exited or been killed, for the
+/// CLI's stdout and stderr to close before it stops reading them. A command
+/// the CLI started can hold them open long after the CLI is gone.
+const OUTPUT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Issue source whose ticket system renders reply bodies as HTML, not Markdown.
 const HELPSCOUT_SOURCE: &str = "helpscout";
@@ -115,6 +122,19 @@ fn claudear_variables(env: &HashMap<String, String>) -> BTreeSet<OsString> {
         .chain(std::env::vars_os().map(|(name, _)| name))
         .filter(|name| name.to_string_lossy().starts_with(CLAUDEAR_VARIABLE_PREFIX))
         .collect()
+}
+
+/// The next line of a CLI's output, or `None` once `stop` is set or its
+/// sender is gone, even while more output is on its way.
+async fn next_output_line<R: AsyncBufRead + Unpin>(
+    lines: &mut Lines<R>,
+    stop: &mut watch::Receiver<bool>,
+) -> std::io::Result<Option<String>> {
+    tokio::select! {
+        biased;
+        _ = stop.wait_for(|stopped| *stopped) => Ok(None),
+        line = lines.next_line() => line,
+    }
 }
 
 /// Which shell commands `--allowedTools` permissions let a run execute,
@@ -737,6 +757,53 @@ The PR title should include the issue ID: {}
                 "Failed to terminate execution event payload line"
             );
         }
+    }
+
+    /// What the `stdout` and `stderr` readers collected. They finish once the
+    /// CLI's output closes, but a command the CLI started can hold it open
+    /// after the CLI is gone, so readers still waiting after
+    /// [`OUTPUT_GRACE_PERIOD`] are stopped at the output they have read.
+    async fn finish_reading(
+        stdout: JoinHandle<StdoutParseResult>,
+        stderr: JoinHandle<String>,
+        stop: watch::Sender<bool>,
+        event_writer: &Option<Arc<Mutex<tokio::fs::File>>>,
+        label: &str,
+    ) -> (StdoutParseResult, String) {
+        let readers = async { tokio::join!(stdout, stderr) };
+        tokio::pin!(readers);
+        let (stdout, stderr) = match tokio::time::timeout(OUTPUT_GRACE_PERIOD, &mut readers).await {
+            Ok(finished) => finished,
+            Err(_) => {
+                tracing::warn!(
+                    component = "claude",
+                    label = label,
+                    grace_secs = OUTPUT_GRACE_PERIOD.as_secs(),
+                    "A process the CLI started still holds its output pipes open; continuing with the output read so far"
+                );
+                Self::append_execution_event(
+                    event_writer,
+                    label,
+                    "output_held_open",
+                    json!({
+                        "grace_secs": OUTPUT_GRACE_PERIOD.as_secs(),
+                    }),
+                )
+                .await;
+                stop.send_replace(true);
+                readers.await
+            }
+        };
+        let stdout = stdout.unwrap_or_else(|error| {
+            tracing::error!(
+                component = "claude",
+                label = label,
+                error = %error,
+                "stdout reader task failed"
+            );
+            StdoutParseResult::default()
+        });
+        (stdout, stderr.unwrap_or_default())
     }
 
     /// Build the per-invocation environment and derive a human-readable label
@@ -1486,6 +1553,9 @@ The PR title should include the issue ID: {}
         let stdout_early_failure_tx = early_failure_tx.clone();
         let stderr_early_failure_tx = early_failure_tx.clone();
         drop(early_failure_tx);
+        let (stop_readers, reader_stop) = watch::channel(false);
+        let mut stdout_stop = reader_stop.clone();
+        let mut stderr_stop = reader_stop;
 
         let stdout_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -1526,7 +1596,7 @@ The PR title should include the issue ID: {}
             let mut signaled_rate_limit = false;
 
             loop {
-                let next_line = lines.next_line().await;
+                let next_line = next_output_line(&mut lines, &mut stdout_stop).await;
                 let line = match next_line {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
@@ -1775,7 +1845,7 @@ The PR title should include the issue ID: {}
             let mut signaled_rate_limit = false;
 
             loop {
-                let next_line = lines.next_line().await;
+                let next_line = next_output_line(&mut lines, &mut stderr_stop).await;
                 let line = match next_line {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
@@ -2094,18 +2164,14 @@ The PR title should include the issue ID: {}
             }
         };
 
-        let stdout_result = match stdout_handle.await {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::error!(
-                    component = "claude",
-                    label = label,
-                    error = %e,
-                    "stdout reader task failed"
-                );
-                StdoutParseResult::default()
-            }
-        };
+        let (stdout_result, stderr_output) = Self::finish_reading(
+            stdout_handle,
+            stderr_handle,
+            stop_readers,
+            &event_writer,
+            label,
+        )
+        .await;
         let StdoutParseResult {
             text_output,
             final_result,
@@ -2119,7 +2185,6 @@ The PR title should include the issue ID: {}
             cache_read_input_tokens: result_cache_read_tokens,
             cache_creation_input_tokens: result_cache_creation_tokens,
         } = stdout_result;
-        let stderr_output = stderr_handle.await.unwrap_or_default();
 
         let exit_code = status.code().unwrap_or(-1);
         tracing::info!(
@@ -3004,6 +3069,16 @@ mod tests {
     #[cfg(unix)]
     const FAKE_CLI_PID_FILE: &str = "pid";
 
+    /// File, beside a stub CLI, that it records the PIDs of the processes it
+    /// leaves running to, one per line, for its [`FakeCli`] to kill.
+    #[cfg(unix)]
+    const FAKE_CLI_LEFTOVER_PIDS_FILE: &str = "leftover-pids";
+
+    /// How long a process a stub CLI leaves running lives, far longer than
+    /// any test waits.
+    #[cfg(unix)]
+    const LEFTOVER_PROCESS_SECS: u64 = 300;
+
     /// How long a test waits for a stub CLI to start or to exit. Generous
     /// because CI runs tests under `cargo tarpaulin`'s ptrace.
     #[cfg(unix)]
@@ -3033,6 +3108,19 @@ mod tests {
     fn hanging_cli_script() -> String {
         format!(
             "#!/bin/sh\ndirectory=\"$(dirname \"$0\")\"\necho $$ > \"$directory/{FAKE_CLI_PID_FILE}.partial\"\nmv \"$directory/{FAKE_CLI_PID_FILE}.partial\" \"$directory/{FAKE_CLI_PID_FILE}\"\ncat > /dev/null\nexec sleep 30\n"
+        )
+    }
+
+    /// A stub `claude` binary that drains the prompt, leaves a command running
+    /// in the background that holds the stub's stdout and stderr open, records
+    /// that command's PID, then prints `events` as stream-json lines and
+    /// exits 0.
+    #[cfg(unix)]
+    fn leftover_process_cli_script(events: &[serde_json::Value]) -> String {
+        let lines: Vec<String> = events.iter().map(|event| event.to_string()).collect();
+        format!(
+            "#!/bin/sh\ncat > /dev/null\nsleep {LEFTOVER_PROCESS_SECS} &\necho $! >> \"$(dirname \"$0\")/{FAKE_CLI_LEFTOVER_PIDS_FILE}\"\ncat <<'EVENTS'\n{}\nEVENTS\n",
+            lines.join("\n")
         )
     }
 
@@ -3165,9 +3253,22 @@ mod tests {
             .collect()
     }
 
+    /// Kill the process `pid`, whether or not it is still running.
+    #[cfg(unix)]
+    fn kill_process(pid: u32) {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+
     #[cfg(unix)]
     impl Drop for FakeCli {
         fn drop(&mut self) {
+            std::fs::read_to_string(self.directory().join(FAKE_CLI_LEFTOVER_PIDS_FILE))
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|pid| pid.parse().ok())
+                .for_each(kill_process);
             for (name, previous) in self.replaced_variables.drain(..).rev() {
                 match previous {
                     Some(value) => std::env::set_var(name, value),
@@ -3631,9 +3732,7 @@ mod tests {
         let deadline = std::time::Instant::now() + FAKE_CLI_DEADLINE;
         while process_is_running(pid) {
             if std::time::Instant::now() >= deadline {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .status();
+                kill_process(pid);
                 panic!("{failure} (pid {pid})");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -3736,6 +3835,44 @@ mod tests {
         .expect("a customer reply runs until `timeout_secs`, not the live-QA timeout");
 
         assert_eq!(reply, "Thanks for reaching out!");
+    }
+
+    /// How long a test waits for runs whose stub CLI left a process holding
+    /// its output open: long enough for the runs to stop waiting on that
+    /// output, far shorter than [`LEFTOVER_PROCESS_SECS`].
+    #[cfg(unix)]
+    const LEFTOVER_OUTPUT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    #[cfg(unix)]
+    #[test]
+    fn test_runs_finish_while_a_leftover_process_holds_the_cli_output() {
+        let cli = FakeCli::install(&leftover_process_cli_script(&[
+            assistant_text_event(REPLY_FINAL_ANSWER),
+            result_event(REPLY_FINAL_ANSWER, false),
+        ]));
+        let runner = cli.runner(ClaudeRunnerConfig::default());
+        let live_qa = deploy_qa_issue(DEPLOY_QA_SOURCE);
+        let fix = Issue::new("1", "SENTRY-1", "Crash on login", "url", "sentry");
+
+        let (report, fix_result) = block_on(async {
+            let runs = async {
+                tokio::join!(
+                    runner.run_reply(&live_qa, "ctx", None, ReplyKind::Answer, cli.directory()),
+                    runner.execute_with_attempt("Fix it", Some(&fix), None, cli.directory()),
+                )
+            };
+            tokio::time::timeout(LEFTOVER_OUTPUT_DEADLINE, runs)
+                .await
+                .expect("a process the CLI left running kept its runs waiting on its output")
+        });
+
+        assert_eq!(
+            report.expect("the live QA run succeeds"),
+            REPLY_FINAL_ANSWER
+        );
+        let fix_result = fix_result.expect("the fix run succeeds");
+        assert!(fix_result.success, "got: {fix_result:?}");
+        assert_eq!(fix_result.output, REPLY_FINAL_ANSWER);
     }
 
     /// A fake credential held in Claudear's own variables.
