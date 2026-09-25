@@ -85,11 +85,15 @@ impl TemplateLoader {
         let agent_md = self.load_agent_md();
         let base_template = self.get_default_template(&issue.source);
 
-        Ok(if let Some(ref md) = agent_md {
-            format!("{}\n\n---\n\n{}", md.trim(), base_template)
-        } else {
-            base_template.to_string()
-        })
+        // Templates that render `{{agent_md}}` themselves would get it twice
+        let renders_agent_md = base_template.contains("{{#if has_agent_md}}");
+        Ok(
+            if let Some(md) = agent_md.as_ref().filter(|_| !renders_agent_md) {
+                format!("{}\n\n---\n\n{}", md.trim(), base_template)
+            } else {
+                base_template.to_string()
+            },
+        )
     }
 
     /// Get the default template for a source type.
@@ -179,12 +183,32 @@ mod tests {
             "PROJ-123",
             "Fix bug",
             "https://example.com",
-            "linear",
+            "github",
         );
         let template = loader.get_template(&issue).unwrap();
 
         assert!(template.contains("# Custom Agent Rules"));
         assert!(template.contains("---")); // Separator
+    }
+
+    #[test]
+    fn test_rendered_prompt_includes_agent_md_exactly_once() {
+        use crate::templates::{TemplateContext, TemplateRenderer};
+        let (loader, temp) = create_test_loader();
+        std::fs::write(temp.path().join("AGENT.md"), "# Custom Agent Rules").unwrap();
+
+        for source in ["sentry", "linear", "github"] {
+            let issue = Issue::new("123", "PROJ-123", "Fix bug", "https://example.com", source);
+            let template = loader.get_template(&issue).unwrap();
+            let context = TemplateContext::new(issue, "ctx".to_string())
+                .with_agent_md(loader.load_agent_md());
+            let prompt = TemplateRenderer::new().render(&template, &context);
+            assert_eq!(
+                prompt.matches("# Custom Agent Rules").count(),
+                1,
+                "{source} prompt should carry AGENT.md once"
+            );
+        }
     }
 
     #[test]

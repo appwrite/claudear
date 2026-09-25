@@ -12,6 +12,17 @@ mod renderer;
 pub use loader::TemplateLoader;
 pub use renderer::{TemplateContext, TemplateRenderer};
 
+/// Sentry triage rules, edited in `playbooks/sentry_triage.md`.
+pub const SENTRY_TRIAGE_PLAYBOOK: &str = include_str!("../../../../playbooks/sentry_triage.md");
+
+/// Triage playbook for a source; `None` means the source is not triaged.
+pub fn triage_playbook(source: &str) -> Option<&'static str> {
+    match source {
+        "sentry" => Some(SENTRY_TRIAGE_PLAYBOOK),
+        _ => None,
+    }
+}
+
 /// Default template for issue fixing when no custom template is found.
 pub const DEFAULT_FIX_TEMPLATE: &str = r#"You are fixing an issue from {{source}}. Here is the issue context:
 
@@ -89,11 +100,19 @@ Event count: {{event_count}}
 
 Analyze the stack trace and error context to identify the root cause.
 
+Fix the root cause, not the symptom. Changing a status code, catching and swallowing the exception, or silencing the log is not a fix unless the error really is a misreported client error. Keep the change to the smallest set of files that removes the defect; do not refactor surrounding code.
+
 IMPORTANT: Use a test-driven development (TDD) approach. Before changing any application code, write a failing test that reproduces the error. Then implement the minimal fix to make the test pass and verify all existing tests still pass.
 
 Ensure all checks pass on the PR.
 
-Create a PR that fixes this error.
+Create a PR that fixes this error. The PR title must include "{{short_id}}". Keep the PR body short and use exactly these sections:
+- Root cause: one or two sentences, with the file and line.
+- Fix: what changed and why it removes the error.
+- Test: the test that failed before and passes now.
+- Risk: what else this change can affect.
+
+Never reopen a PR that someone closed, and never open a second PR for this issue while one is open.
 "#;
 
 #[cfg(test)]

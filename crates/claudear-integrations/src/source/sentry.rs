@@ -223,10 +223,13 @@ impl<H: SentryHttpClient> SentrySource<H> {
         }
 
         let query = query_parts.join(" ");
+        // Same window as the top-issues query, or `min_event_count` is compared
+        // against Sentry's 14d default for escalating issues only
         let endpoint = format!(
-            "/organizations/{}/issues/?query={}&sort=date&limit=100",
+            "/organizations/{}/issues/?query={}&sort=date&limit=100&statsPeriod={}",
             self.config.org_slug,
-            urlencoding::encode(&query)
+            urlencoding::encode(&query),
+            self.config.top_issues_period.to_stats_period()
         );
 
         self.fetch(&endpoint).await
@@ -762,7 +765,10 @@ mod tests {
                 .unwrap()
                 .push(("GET".to_string(), url.to_string()));
             let responses = self.get_responses.lock().unwrap();
-            if let Some(response) = responses.get(url) {
+            // Fixtures that only need data register the URL without a stats window;
+            // tests about the window register the windowed URL explicitly
+            let unwindowed = url.split("&statsPeriod=").next().unwrap_or(url);
+            if let Some(response) = responses.get(url).or_else(|| responses.get(unwindowed)) {
                 Ok(HttpResponse {
                     status: response.status,
                     body: response.body.clone(),
@@ -833,7 +839,7 @@ mod tests {
             "[]",
         );
         mock.mock_get(
-            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100",
             200,
             r#"[{
                 "id": "123",
@@ -869,7 +875,7 @@ mod tests {
             "[]",
         );
         mock.mock_get(
-            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100",
             500,
             "Internal Server Error",
         );
@@ -1133,7 +1139,7 @@ mod tests {
             }]"#,
         );
         mock.mock_get(
-            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100",
             200,
             "[]",
         );
@@ -1171,7 +1177,7 @@ mod tests {
             }]"#,
         );
         mock.mock_get(
-            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100",
             200,
             r#"[{
                 "id": "dupe-1",
@@ -2602,7 +2608,7 @@ mod tests {
             "[]",
         );
         mock.mock_get(
-            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved%20project%3Afrontend%20OR%20project%3Abackend&sort=freq&limit=100&statsPeriod=24h",
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved%20project%3Afrontend%20OR%20project%3Abackend&sort=freq&limit=100",
             200,
             "[]",
         );
@@ -3173,7 +3179,7 @@ mod tests {
         );
         // Top issues endpoint returns valid data
         mock.mock_get(
-            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100",
             200,
             r#"[{
                 "id": "top-1",
@@ -3219,7 +3225,7 @@ mod tests {
             }]"#,
         );
         mock.mock_get(
-            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100",
             200,
             r#"[{
                 "id": "top-2",
@@ -4347,6 +4353,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_escalating_issue_is_held_to_the_same_event_window() {
+        let config = SentryConfig {
+            min_event_count: 100,
+            ..test_config()
+        };
+        let mock = MockSentryClient::new();
+        let escalating = |count: &str| {
+            serde_json::json!([{
+                "id": "esc-1",
+                "shortId": "ESC-1",
+                "title": "Escalating Issue",
+                "culprit": null,
+                "permalink": "url",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": count,
+                "userCount": null,
+                "project": { "name": "Test", "slug": "test" },
+                "status": "unresolved",
+                "level": "error",
+                "isUnhandled": null,
+                "metadata": null,
+                "stats": null
+            }])
+            .to_string()
+        };
+        let base = format!(
+            "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=date&limit=100",
+            config.org_slug,
+            urlencoding::encode("is:unresolved is:escalating"),
+        );
+        // Sentry counts over its 14d default without a window, and over the day with one
+        mock.mock_get(base.clone(), 200, escalating("5000"));
+        mock.mock_get(format!("{base}&statsPeriod=24h"), 200, escalating("40"));
+        mock.mock_get(
+            format!(
+                "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=freq&limit={}",
+                config.org_slug,
+                urlencoding::encode("is:unresolved"),
+                config.top_issues_count,
+            ),
+            200,
+            "[]".to_string(),
+        );
+
+        let source = SentrySource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+
+        // 40 events today is under the 100 threshold, whatever its 14 day total
+        assert_eq!(issues.len(), 1);
+        assert!(!source.matches_criteria(&issues[0]).matches);
+    }
+
+    #[tokio::test]
     async fn test_fetch_issues_dedup_and_escalating_tracking() {
         let config = test_config();
         let mock = MockSentryClient::new();
@@ -4375,7 +4435,7 @@ mod tests {
             format!(
                 "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=date&limit=100",
                 config.org_slug,
-                urlencoding::encode("is:unresolved is:escalating")
+                urlencoding::encode("is:unresolved is:escalating"),
             ),
             200,
             escalating_issue.to_string(),
@@ -4403,11 +4463,10 @@ mod tests {
         ]);
         mock.mock_get(
             format!(
-                "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=freq&limit={}&statsPeriod={}",
+                "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=freq&limit={}",
                 config.org_slug,
                 urlencoding::encode("is:unresolved"),
                 config.top_issues_count,
-                config.top_issues_period.to_stats_period()
             ),
             200,
             top_issues.to_string(),
@@ -4472,7 +4531,7 @@ mod tests {
         );
         // Mock top issues with one issue
         mock.mock_get(
-            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100",
             200,
             r#"[{
                 "id": "st-1",
@@ -4536,7 +4595,7 @@ mod tests {
             "[]",
         );
         mock.mock_get(
-            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100",
             200,
             r#"[{
                 "id": "st-2",
@@ -4579,7 +4638,7 @@ mod tests {
             "[]",
         );
         mock.mock_get(
-            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100",
             200,
             r#"[{
                 "id": "st-3",

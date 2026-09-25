@@ -162,6 +162,13 @@ pub trait AttemptTracker: Send + Sync {
     /// Mark a fix attempt as closed (PR was closed without merging).
     fn mark_closed(&self, source: &str, issue_id: &str) -> Result<()>;
 
+    /// Record a cascade attempt's PR as merged or closed. `mark_merged` and
+    /// `mark_closed` only touch the original attempt, so cascade rows need their id.
+    fn mark_cascade_pr_outcome(&self, attempt_id: i64, merged: bool) -> Result<()> {
+        let _ = (attempt_id, merged);
+        Ok(())
+    }
+
     /// Mark the issue as resolved on the remote source.
     fn mark_resolved(&self, source: &str, issue_id: &str) -> Result<()>;
 
@@ -239,6 +246,23 @@ pub trait AttemptTracker: Send + Sync {
 
     /// Prepare an issue for retry (reset status to pending, clear PR info).
     fn prepare_for_retry(&self, source: &str, issue_id: &str) -> Result<()>;
+
+    /// Mark an attempt failed without spending a retry, for failures that say
+    /// nothing about the issue (rate limits, API outages, restarts).
+    fn mark_failed_uncharged(
+        &self,
+        source: &str,
+        issue_id: &str,
+        error_message: &str,
+    ) -> Result<()> {
+        self.mark_failed(source, issue_id, error_message)
+    }
+
+    /// Fail recent `pending` attempts left behind by a previous process, without
+    /// spending a retry. Only safe at startup, before any run is in flight.
+    fn release_orphaned_pending_attempts(&self) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// Activity logging, execution tracking, metrics, analytics, PR review,

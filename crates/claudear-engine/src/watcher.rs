@@ -47,7 +47,24 @@ type QueuedIssue = (Issue, MatchResult, Option<Intent>);
 /// on (marked handled) instead of re-triggering the fix agent every cycle.
 const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
 
+/// Issue metadata carrying the reviewed PR's repo into a review rerun.
+const REVIEW_PR_REPO_KEY: &str = "review_pr_repo";
+
+/// How many review-driven reruns a PR gets before claudear stops answering
+/// review feedback on it and leaves the PR to humans.
+const MAX_REVIEW_CYCLES: i32 = 3;
+
 const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
+
+/// Whether a retry that failed to start should get its retry back.
+fn retry_trigger_error_is_transient(e: &claudear_core::error::Error) -> bool {
+    use claudear_core::error::Error;
+    match e {
+        Error::Http(_) | Error::Network(_) => true,
+        Error::Source { message, .. } => message.contains("already being processed"),
+        _ => false,
+    }
+}
 
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
@@ -1018,6 +1035,22 @@ impl Watcher {
     pub async fn start(self: &Arc<Self>, interval_ms: Option<u64>) -> Result<()> {
         self.clear_rate_limit_pause().await;
 
+        // Runs killed by the last shutdown stay `pending`, which blocks the issue
+        // from ever being picked or retried again.
+        if !self.dry_run {
+            match self.tracker.release_orphaned_pending_attempts() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    component = "watcher",
+                    released = n,
+                    "Released attempts orphaned by the last shutdown"
+                ),
+                Err(e) => {
+                    tracing::warn!(component = "watcher", error = %e, "Failed to release orphaned attempts")
+                }
+            }
+        }
+
         let configured_poll_interval = interval_ms.unwrap_or(self.config.poll_interval_ms);
         let poll_interval = configured_poll_interval.max(1000);
         if configured_poll_interval < 1000 {
@@ -1442,8 +1475,52 @@ impl Watcher {
 
         // Increment the review_cycles count
         if let Some(ref pr_url) = attempt.pr_url {
+            // Cascade PRs are watched without a PR record; create one so the cap counts them too
+            let pr_record = match self.tracker.get_pr(pr_url) {
+                Ok(Some(record)) => Some(record),
+                Ok(None) => match (&attempt.scm_repo, attempt.scm_pr_number) {
+                    (Some(repo), Some(number)) => {
+                        let mut record = claudear_core::types::PrRecord::new(pr_url, repo, number);
+                        record.attempt_id = Some(attempt.id);
+                        record.issue_id = Some(attempt.issue_id.clone());
+                        record.issue_source = Some(attempt.source.clone());
+                        Some(record)
+                    }
+                    _ => None,
+                },
+                Err(e) => {
+                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to load PR record for review cycle cap");
+                    None
+                }
+            };
             // Update the PR record with incremented review_cycles
-            if let Ok(Some(mut pr_record)) = self.tracker.get_pr(pr_url) {
+            if let Some(mut pr_record) = pr_record {
+                if pr_record.review_cycles >= MAX_REVIEW_CYCLES {
+                    tracing::warn!(
+                        pr_url = %pr_url,
+                        short_id = %attempt.short_id,
+                        review_cycles = pr_record.review_cycles,
+                        "Review cycle cap reached; leaving PR to humans"
+                    );
+                    self.tracker
+                        .record_activity(
+                            &ActivityLogEntry::new(
+                                "review_cycle_cap_reached",
+                                format!(
+                                    "Stopped addressing review feedback for {} after {} cycles",
+                                    attempt.short_id, pr_record.review_cycles
+                                ),
+                            )
+                            .with_source(attempt.source.clone())
+                            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                            .with_metadata(json!({ "pr_url": pr_url })),
+                        )
+                        .ok();
+                    if let Some(rw) = &self.review_watcher {
+                        rw.unwatch_pr(pr_url);
+                    }
+                    return Ok(());
+                }
                 pr_record.review_cycles += 1;
                 pr_record.last_review_at = Some(chrono::Utc::now());
                 if let Err(e) = self.tracker.upsert_pr(&pr_record) {
@@ -1599,12 +1676,13 @@ impl Watcher {
             }
 
             match self
-                .trigger_issue_with_feedback(
+                .trigger_issue_inner(
                     &attempt.source,
                     &attempt.issue_id,
                     Some(feedback.to_string()),
                     existing_pr_branch.clone(),
                     Some("Review feedback received".into()),
+                    attempt.scm_repo.as_deref(),
                 )
                 .await
             {
@@ -2670,6 +2748,27 @@ Create a PR with your changes.{custom_instructions}"#,
                 .await
             {
                 Ok(()) => {
+                    // Only this path charges a retry, so only it refunds one: running
+                    // out of quota says nothing about the issue
+                    if let Ok(Some(after)) =
+                        self.tracker.get_attempt(&attempt.source, &attempt.issue_id)
+                    {
+                        let hit_rate_limit = after.status == FixAttemptStatus::Failed
+                            && after
+                                .error_message
+                                .as_deref()
+                                .is_some_and(runner::is_rate_limit_error);
+                        if hit_rate_limit {
+                            let error = after.error_message.unwrap_or_default();
+                            if let Err(e) = self.tracker.mark_failed_uncharged(
+                                &attempt.source,
+                                &attempt.issue_id,
+                                &error,
+                            ) {
+                                tracing::warn!(short_id = %attempt.short_id, error = %e, "Failed to refund retry after rate limit");
+                            }
+                        }
+                    }
                     self.record_source_decision(
                         &attempt.source,
                         "ready_retry_triggered",
@@ -2701,10 +2800,19 @@ Create a PR with your changes.{custom_instructions}"#,
                     );
                     retries_failed += 1;
                     let retry_error = format!("Retry trigger failed: {}", e);
-                    if let Err(mark_err) =
+                    // A network blip or in-flight clash says nothing about the issue, so
+                    // refund the retry; a permanent error like a deleted issue keeps its charge
+                    let marked = if retry_trigger_error_is_transient(&e) {
+                        self.tracker.mark_failed_uncharged(
+                            &attempt.source,
+                            &attempt.issue_id,
+                            &retry_error,
+                        )
+                    } else {
                         self.tracker
                             .mark_failed(&attempt.source, &attempt.issue_id, &retry_error)
-                    {
+                    };
+                    if let Err(mark_err) = marked {
                         tracing::warn!(
                             component = "watcher",
                             short_id = %attempt.short_id,
@@ -2871,8 +2979,16 @@ Create a PR with your changes.{custom_instructions}"#,
             match pr_status {
                 Ok(PrStatus::Merged) => {
                     pr_status_merged += 1;
-                    self.tracker
-                        .mark_merged(&attempt.source, &attempt.issue_id)?;
+                    // A cascade row shares the parent's issue id: marking by issue id
+                    // updated the parent and left this row pending, so every poll saw
+                    // the merge again and re-fired the cascade
+                    let is_cascade = attempt.cascade_repo.is_some();
+                    if is_cascade {
+                        self.tracker.mark_cascade_pr_outcome(attempt.id, true)?;
+                    } else {
+                        self.tracker
+                            .mark_merged(&attempt.source, &attempt.issue_id)?;
+                    }
                     // Timeline: PR merged.
                     self.tracker
                         .record_activity(
@@ -2901,7 +3017,9 @@ Create a PR with your changes.{custom_instructions}"#,
                     }
 
                     // For bug-type issues, create a regression watch instead of immediate auto-resolve.
-                    let regression_watch_id = if attempt.is_bug() {
+                    // A downstream cascade merge does not fix the parent issue, so it
+                    // neither watches for regressions nor resolves it.
+                    let regression_watch_id = if !is_cascade && attempt.is_bug() {
                         let issue_type = match attempt.source.as_str() {
                             "sentry" => IssueType::SentryIssue,
                             "linear" => IssueType::LinearBug,
@@ -2941,8 +3059,9 @@ Create a PR with your changes.{custom_instructions}"#,
                     };
 
                     // Auto-resolve only when enabled and no regression watch is active.
-                    let should_resolve =
-                        regression_watch_id.is_none() && self.config.github().auto_resolve_on_merge;
+                    let should_resolve = !is_cascade
+                        && regression_watch_id.is_none()
+                        && self.config.github().auto_resolve_on_merge;
                     if should_resolve {
                         if let Some(source) =
                             self.sources.iter().find(|s| s.name() == attempt.source)
@@ -2978,7 +3097,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
                     // Action pipeline: once the fix is live, post a human-sounding
                     // "fix shipped" reply back to the originating ticket.
-                    self.maybe_send_fix_shipped_reply(attempt).await;
+                    if !is_cascade {
+                        self.maybe_send_fix_shipped_reply(attempt).await;
+                    }
 
                     // Record feedback outcome
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
@@ -3020,8 +3141,12 @@ Create a PR with your changes.{custom_instructions}"#,
                 }
                 Ok(PrStatus::Closed) => {
                     pr_status_closed += 1;
-                    self.tracker
-                        .mark_closed(&attempt.source, &attempt.issue_id)?;
+                    if attempt.cascade_repo.is_some() {
+                        self.tracker.mark_cascade_pr_outcome(attempt.id, false)?;
+                    } else {
+                        self.tracker
+                            .mark_closed(&attempt.source, &attempt.issue_id)?;
+                    }
                     // Timeline: PR closed without merging.
                     self.tracker
                         .record_activity(
@@ -4190,9 +4315,23 @@ Create a PR with your changes.{custom_instructions}"#,
             self.link_deploy_qa_tip_attempt(tip, attempt_id);
         }
 
-        // Infer the target repository using the shared resolution function
-        let mut resolution =
-            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
+        // A review rerun must work in the repo the PR lives in; re-inferring
+        // lands on the same wrong repo a previous run already swapped away from.
+        let pr_repo = review_feedback
+            .as_ref()
+            .and_then(|_| issue.get_metadata::<String>(REVIEW_PR_REPO_KEY));
+        let pinned = pr_repo.and_then(|repo| {
+            match resolve_repo_for_cascade(self.inferrer.as_ref(), &repo) {
+                r @ RepoResolution::Resolved { .. } => Some(r),
+                RepoResolution::Skip { reason } => {
+                    tracing::warn!(short_id = %issue.short_id, repo = %repo, reason = %reason, "PR repo not resolvable, falling back to inference");
+                    None
+                }
+            }
+        });
+        let mut resolution = pinned.unwrap_or_else(|| {
+            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker))
+        });
 
         // Log resolution decision (watcher-specific verbose logging)
         match &resolution {
@@ -4912,6 +5051,28 @@ Create a PR with your changes.{custom_instructions}"#,
         existing_pr_branch: Option<String>,
         trigger_reason: Option<String>,
     ) -> Result<()> {
+        self.trigger_issue_inner(
+            source_name,
+            issue_id,
+            review_feedback,
+            existing_pr_branch,
+            trigger_reason,
+            None,
+        )
+        .await
+    }
+
+    /// `pr_repo` pins a review rerun to the repo of the PR under review. It must
+    /// come from the reviewed attempt: a cascade row shares its parent's issue id.
+    async fn trigger_issue_inner(
+        &self,
+        source_name: &str,
+        issue_id: &str,
+        review_feedback: Option<String>,
+        existing_pr_branch: Option<String>,
+        trigger_reason: Option<String>,
+        pr_repo: Option<&str>,
+    ) -> Result<()> {
         let source = self
             .sources
             .iter()
@@ -4930,6 +5091,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
         if let Some(reason) = trigger_reason {
             issue.set_metadata("trigger_reason", reason);
+        }
+        if let Some(repo) = pr_repo {
+            issue.set_metadata(REVIEW_PR_REPO_KEY, repo);
         }
 
         let started = self
@@ -6896,6 +7060,61 @@ mod tests {
             updated_attempt.status,
             claudear_core::types::FixAttemptStatus::Failed,
             "review rerun should execute after lock release (repo resolution fails in test setup, marking failed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_feedback_stops_triggering_reruns_after_the_cycle_cap() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let pr_url = "https://github.com/org/repo/pull/1";
+        // No PR record exists, like a cascade PR that is watched without one
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker.mark_success("mock", "1", pr_url).unwrap();
+
+        let source = Arc::new(MockSource::with_issues(
+            "mock",
+            vec![Issue::new(
+                "1",
+                "MOCK-1",
+                "Mock issue",
+                "http://example.com/mock/1",
+                "mock",
+            )],
+        )) as Arc<dyn IssueSource>;
+        let watcher = Arc::new(create_test_watcher(
+            notifier,
+            tracker.clone(),
+            vec![source],
+            false,
+        ));
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        // Each allowed rerun fails on repo resolution in this setup; reset to the
+        // open-PR state before the next round of feedback arrives
+        for _ in 0..MAX_REVIEW_CYCLES {
+            let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+            watcher
+                .process_review_action(&attempt, "Please add a test")
+                .await
+                .unwrap();
+            assert_eq!(
+                tracker.get_attempt("mock", "1").unwrap().unwrap().status,
+                claudear_core::types::FixAttemptStatus::Failed,
+                "a rerun under the cap should run"
+            );
+            tracker.mark_success("mock", "1", pr_url).unwrap();
+        }
+
+        let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+        watcher
+            .process_review_action(&attempt, "Please add a test")
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.get_attempt("mock", "1").unwrap().unwrap().status,
+            claudear_core::types::FixAttemptStatus::Success,
+            "feedback past the cap must not start another run"
         );
     }
 
@@ -11542,6 +11761,142 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// SCM stub that reports the given PR numbers as merged and the rest as open.
+    struct MergedPrs(Vec<i64>);
+
+    #[async_trait::async_trait]
+    impl claudear_integrations::scm::ScmProvider for MergedPrs {
+        fn name(&self) -> &str {
+            "github"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        fn review_trigger(&self) -> &str {
+            "@claudear"
+        }
+        async fn get_pr_status(
+            &self,
+            _project: &str,
+            number: i64,
+        ) -> claudear_core::error::Result<PrStatus> {
+            Ok(if self.0.contains(&number) {
+                PrStatus::Merged
+            } else {
+                PrStatus::Open
+            })
+        }
+        async fn get_pr_info(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<claudear_integrations::scm::PrInfo> {
+            Ok(claudear_integrations::scm::PrInfo {
+                head_branch: None,
+                base_branch: None,
+                title: None,
+                author: None,
+            })
+        }
+        async fn get_pr_diff(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<String> {
+            Ok(String::new())
+        }
+        async fn get_reviews(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<Vec<claudear_integrations::scm::CodeReview>> {
+            Ok(Vec::new())
+        }
+        async fn get_review_comments(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<Vec<claudear_integrations::scm::ReviewComment>> {
+            Ok(Vec::new())
+        }
+        async fn list_repos(
+            &self,
+            _org: &str,
+        ) -> claudear_core::error::Result<Vec<claudear_integrations::scm::RemoteRepo>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merged_cascade_pr_is_handled_once_and_leaves_the_parent_alone() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        tracker.record_attempt("discord", "1", "D-1").unwrap();
+        tracker
+            .mark_success("discord", "1", "https://github.com/org/app/pull/1")
+            .unwrap();
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        let child = tracker
+            .record_cascade_attempt(
+                "discord",
+                "1",
+                "D-1",
+                parent.id,
+                "git@github.com:org/lib.git",
+            )
+            .unwrap();
+        tracker
+            .update_attempt_pr(child, "https://github.com/org/lib/pull/120", "org/lib", 120)
+            .unwrap();
+
+        let mut config = test_config();
+        config.cascade.enabled = false;
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: Some(Arc::new(MergedPrs(vec![120]))),
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(claudear_integrations::runner::ClaudeAgentRunner::new(
+                claudear_integrations::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: false,
+            llm_engine: None,
+        });
+
+        watcher.check_pr_merges_and_cascade().await.unwrap();
+        watcher.check_pr_merges_and_cascade().await.unwrap();
+
+        // Before, the parent was marked merged and the cascade row stayed pending,
+        // so every poll saw the merge again
+        let merged_per_poll: Vec<f64> = tracker
+            .get_metrics("pr_status_merged", None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.metric_value)
+            .collect();
+        assert_eq!(merged_per_poll.iter().sum::<f64>(), 1.0);
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        assert_eq!(
+            parent.status,
+            claudear_core::types::FixAttemptStatus::Success
+        );
+    }
+
     #[tokio::test]
     async fn test_check_pr_merges_records_all_lifecycle_metrics() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14323,7 +14678,7 @@ mod tests {
     // --- process_ready_retries closed PR trigger reason ---
 
     #[tokio::test]
-    async fn test_process_ready_retries_closed_pr_builds_trigger_reason() {
+    async fn test_process_ready_retries_skips_human_closed_pr() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
@@ -14374,8 +14729,13 @@ mod tests {
         let result = watcher.process_ready_retries().await;
         assert!(result.is_ok());
 
+        // A human closing the PR is a verdict on the fix, not a failure to retry
         let attempt = tracker.get_attempt("mock", "closed-1").unwrap().unwrap();
-        assert_eq!(attempt.retry_count, 1);
+        assert_eq!(attempt.retry_count, 0);
+        assert_eq!(
+            attempt.status,
+            claudear_core::types::FixAttemptStatus::Closed
+        );
     }
 
     // --- Resolved status in fix attempt ---

@@ -194,8 +194,9 @@ fn build_assessment_prompt(candidates: &[(Issue, MatchResult)]) -> String {
             "error_type",
             "culprit",
             "level",
-            "events",
-            "users",
+            "event_count",
+            "user_count",
+            "is_escalating",
             "stacktrace",
         ];
         let mut meta_parts = Vec::new();

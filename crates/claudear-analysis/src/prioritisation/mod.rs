@@ -11,7 +11,8 @@ pub mod suppression;
 use crate::llm::LlmAnalyzer;
 use claudear_config::config::PrioritisationConfig;
 use claudear_core::types::{
-    ContentCluster, Issue, MatchResult, PrioritisedIssue, SeverityScore, SuppressionResult,
+    BlastRadius, ContentCluster, Issue, MatchResult, PrioritisedIssue, SeverityScore,
+    SuppressionResult,
 };
 use claudear_storage::FixAttemptTracker;
 
@@ -56,14 +57,6 @@ pub fn prioritise(
         })
         .collect();
 
-    // LLM batch assessment (severity + blast radius + fingerprint)
-    let llm_assessments: std::collections::HashMap<String, crate::llm::LlmIssueAssessment> = llm
-        .and_then(|l| l.assess_issues(&kept))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|a| (a.issue_id.clone(), a))
-        .collect();
-
     // Step 2 + 3: Detect content clusters (needs full candidate list for grouping)
     let clusters = if config.content_clustering {
         content_cluster::detect(&kept, config, embeddings)
@@ -82,6 +75,30 @@ pub fn prioritise(
         })
         .collect();
 
+    // Step 4: Heuristic score for every issue, so frequency and escalation always count
+    let mut scored: Vec<(Issue, MatchResult, BlastRadius, SeverityScore)> = kept
+        .drain(..)
+        .map(|(issue, match_result)| {
+            let br = blast_radius::classify(&issue, config);
+            let in_cluster = clustered_ids.contains(&issue.id);
+            let score = scorer::compute(&issue, &match_result, br, in_cluster, config);
+            (issue, match_result, br, score)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.3.score.total_cmp(&a.3.score));
+
+    // The LLM only sees a small batch, so hand it the heuristic front-runners
+    let llm_batch: Vec<(Issue, MatchResult)> = scored
+        .iter()
+        .map(|(issue, mr, _, _)| (issue.clone(), mr.clone()))
+        .collect();
+    let llm_assessments: std::collections::HashMap<String, crate::llm::LlmIssueAssessment> = llm
+        .and_then(|l| l.assess_issues(&llm_batch))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| (a.issue_id.clone(), a))
+        .collect();
+
     // Merge LLM fingerprint-based clusters: issues sharing a fingerprint get the same cluster_key
     for (issue_id, assessment) in &llm_assessments {
         if !cluster_key_map.contains_key(issue_id) && !assessment.fingerprint.is_empty() {
@@ -89,30 +106,19 @@ pub fn prioritise(
         }
     }
 
-    // Step 4: Classify and score each issue
-    let mut prioritised: Vec<PrioritisedIssue> = kept
-        .drain(..)
-        .map(|(issue, match_result)| {
-            let (br, severity_score, cluster_key) =
-                if let Some(assessment) = llm_assessments.get(&issue.id) {
-                    // Use LLM assessment with meaningful component breakdown
-                    let br_component = blast_radius::blast_radius_score(assessment.blast_radius);
-                    let score = SeverityScore {
-                        score: assessment.severity,
-                        severity_component: assessment.severity,
-                        blast_radius_component: br_component,
-                        ..SeverityScore::default()
-                    };
-                    let ck = cluster_key_map.get(&issue.id).cloned();
-                    (assessment.blast_radius, score, ck)
-                } else {
-                    // Heuristic fallback
-                    let br = blast_radius::classify(&issue, config);
-                    let in_cluster = clustered_ids.contains(&issue.id);
-                    let score = scorer::compute(&issue, &match_result, br, in_cluster, config);
-                    let ck = cluster_key_map.get(&issue.id).cloned();
-                    (br, score, ck)
-                };
+    let mut prioritised: Vec<PrioritisedIssue> = scored
+        .into_iter()
+        .map(|(issue, match_result, br, mut severity_score)| {
+            // The LLM only refines severity; replacing the whole score let an
+            // 8-issue batch outrank everything regardless of frequency
+            if let Some(assessment) = llm_assessments.get(&issue.id) {
+                let blended =
+                    (severity_score.severity_component + assessment.severity.clamp(0.0, 1.0)) / 2.0;
+                severity_score.score +=
+                    config.severity_weight * (blended - severity_score.severity_component);
+                severity_score.severity_component = blended;
+            }
+            let cluster_key = cluster_key_map.get(&issue.id).cloned();
 
             PrioritisedIssue {
                 issue,
@@ -1708,7 +1714,7 @@ mod tests {
         // Max frequency signals
         issue.set_metadata("event_count", 10_000_000i64);
         issue.set_metadata("user_count", 1_000_000i64);
-        issue.set_metadata("escalation_rate", 1.0);
+        issue.set_metadata("escalation_rate", 100.0);
         // Max regression signals
         issue.set_metadata("is_unhandled", true);
         issue.set_metadata("level", "fatal");
@@ -1728,7 +1734,7 @@ mod tests {
         issue2.set_metadata("culprit", "auth.login");
         issue2.set_metadata("event_count", 10_000_000i64);
         issue2.set_metadata("user_count", 1_000_000i64);
-        issue2.set_metadata("escalation_rate", 1.0);
+        issue2.set_metadata("escalation_rate", 100.0);
         issue2.set_metadata("is_unhandled", true);
         issue2.set_metadata("level", "fatal");
         issue2.set_metadata("filename", "src/auth/login.rs");
@@ -4995,17 +5001,16 @@ mod tests {
         };
         let tracker = NoOpTracker;
 
-        let (issue, mr) = make_candidate(
-            "LLM-1",
-            "Fatal crash in payment service",
-            IssuePriority::Critical,
-            MatchPriority::High,
-        );
+        // Two issues the heuristic cannot tell apart
+        let (first, mr1) =
+            make_candidate("LLM-0", "Crash", IssuePriority::High, MatchPriority::High);
+        let (second, mr2) =
+            make_candidate("LLM-1", "Crash", IssuePriority::High, MatchPriority::High);
 
         let mock = MockLlmAnalyzer {
             assessments: Some(vec![crate::llm::LlmIssueAssessment {
                 issue_id: "LLM-1".to_string(),
-                severity: 0.95,
+                severity: 1.0,
                 blast_radius: claudear_core::types::BlastRadius::Critical,
                 fingerprint: "payment_crash".to_string(),
             }]),
@@ -5013,22 +5018,14 @@ mod tests {
 
         let (result, _) = prioritise(
             &config,
-            vec![(issue, mr)],
+            vec![(first, mr1), (second, mr2)],
             &tracker,
             &std::collections::HashMap::new(),
             Some(&mock),
         );
 
-        assert_eq!(result.len(), 1);
-        assert!(
-            (result[0].severity_score.score - 0.95).abs() < 1e-10,
-            "LLM severity should be used, got {}",
-            result[0].severity_score.score
-        );
-        assert_eq!(
-            result[0].blast_radius,
-            claudear_core::types::BlastRadius::Critical
-        );
+        // The LLM's call breaks the tie
+        assert_eq!(result[0].issue.id, "LLM-1");
         assert_eq!(result[0].cluster_key.as_deref(), Some("llm:payment_crash"));
     }
 
@@ -5124,8 +5121,7 @@ mod tests {
 
     #[test]
     fn test_prioritise_llm_partial_assessment() {
-        // LLM returns assessment for only one of two issues — the other should
-        // fall back to heuristic scoring.
+        // LLM returns assessment for only one of two issues; the other is still ranked
         let config = PrioritisationConfig {
             enabled: true,
             ..Default::default()
@@ -5157,30 +5153,58 @@ mod tests {
 
         let (result, _) = prioritise(
             &config,
-            vec![(issue1, mr1), (issue2, mr2)],
+            vec![(issue2, mr2), (issue1, mr1)],
             &tracker,
             &std::collections::HashMap::new(),
             Some(&mock),
         );
 
-        assert_eq!(result.len(), 2);
+        let order: Vec<&str> = result.iter().map(|r| r.issue.id.as_str()).collect();
+        assert_eq!(order, vec!["PA-1", "PA-2"]);
+    }
 
-        // PA-1 should use LLM score
-        let pa1 = result.iter().find(|r| r.issue.id == "PA-1").unwrap();
-        assert!(
-            (pa1.severity_score.score - 0.99).abs() < 1e-10,
-            "PA-1 should use LLM severity"
+    #[test]
+    fn test_llm_assessment_cannot_bury_a_busier_issue() {
+        let config = PrioritisationConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tracker = NoOpTracker;
+
+        let (mut quiet, mr1) = make_candidate(
+            "Q-1",
+            "Rare warning",
+            IssuePriority::High,
+            MatchPriority::Urgent,
         );
-        assert_eq!(
-            pa1.blast_radius,
-            claudear_core::types::BlastRadius::Critical
+        quiet.set_metadata("event_count", 120i64);
+        let (mut busy, mr2) = make_candidate(
+            "B-1",
+            "Hot error",
+            IssuePriority::High,
+            MatchPriority::Urgent,
+        );
+        busy.set_metadata("event_count", 500_000i64);
+        busy.set_metadata("user_count", 5_000i64);
+
+        // Before, a lone LLM score of 1.0 replaced the whole score and won outright
+        let mock = MockLlmAnalyzer {
+            assessments: Some(vec![crate::llm::LlmIssueAssessment {
+                issue_id: "Q-1".to_string(),
+                severity: 1.0,
+                blast_radius: claudear_core::types::BlastRadius::Critical,
+                fingerprint: String::new(),
+            }]),
+        };
+
+        let (result, _) = prioritise(
+            &config,
+            vec![(quiet, mr1), (busy, mr2)],
+            &tracker,
+            &std::collections::HashMap::new(),
+            Some(&mock),
         );
 
-        // PA-2 should use heuristic score (severity_component > 0)
-        let pa2 = result.iter().find(|r| r.issue.id == "PA-2").unwrap();
-        assert!(
-            pa2.severity_score.severity_component > 0.0,
-            "PA-2 should fall back to heuristic scoring"
-        );
+        assert_eq!(result[0].issue.id, "B-1");
     }
 }

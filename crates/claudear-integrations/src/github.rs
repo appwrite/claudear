@@ -24,6 +24,8 @@ pub use claudear_core::http::{HttpClient, ReqwestHttpClient};
 pub struct GitHubClient<H: HttpClient = ReqwestHttpClient> {
     config: GitHubConfig,
     http: H,
+    // Cached only on success so a transient /user failure is retried next poll
+    self_login: std::sync::OnceLock<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +83,7 @@ impl GitHubClient<ReqwestHttpClient> {
         Self {
             config,
             http: ReqwestHttpClient::new(),
+            self_login: std::sync::OnceLock::new(),
         }
     }
 }
@@ -88,7 +91,11 @@ impl GitHubClient<ReqwestHttpClient> {
 impl<H: HttpClient> GitHubClient<H> {
     /// Create a new GitHub client with a custom HTTP client.
     pub fn with_http_client(config: GitHubConfig, http: H) -> Self {
-        Self { config, http }
+        Self {
+            config,
+            http,
+            self_login: std::sync::OnceLock::new(),
+        }
     }
 
     /// Check if configured (has token).
@@ -104,6 +111,32 @@ impl<H: HttpClient> GitHubClient<H> {
     /// Get the list of bot handles whose review comments should be processed.
     pub fn allowed_bots(&self) -> &[String] {
         &self.config.allowed_bots
+    }
+
+    /// Login of the authenticated account, fetched once from `GET /user`.
+    pub async fn self_login(&self) -> Option<String> {
+        if let Some(login) = self.self_login.get() {
+            return Some(login.clone());
+        }
+        let token = self.config.token.as_ref()?.expose();
+        let headers = self.build_headers(token);
+        let response = match self.http.get("https://api.github.com/user", headers).await {
+            Ok(r) if r.is_success() => r,
+            Ok(r) => {
+                tracing::warn!(
+                    component = "github",
+                    status = r.status,
+                    "Failed to resolve authenticated login"
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(component = "github", error = %e, "Failed to resolve authenticated login");
+                return None;
+            }
+        };
+        let user: ReviewUser = response.json().ok()?;
+        Some(self.self_login.get_or_init(|| user.login).clone())
     }
 
     /// Build standard GitHub API headers.
@@ -1021,6 +1054,10 @@ impl<H: HttpClient> ScmProvider for GitHubClient<H> {
 
     fn allowed_bots(&self) -> &[String] {
         self.allowed_bots()
+    }
+
+    async fn self_login(&self) -> Option<String> {
+        GitHubClient::self_login(self).await
     }
 
     async fn get_pr_status(&self, project: &str, number: i64) -> Result<PrStatus> {
