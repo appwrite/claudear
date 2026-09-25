@@ -4350,6 +4350,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_escalating_issue_is_held_to_the_same_event_window() {
+        let config = SentryConfig {
+            min_event_count: 100,
+            ..test_config()
+        };
+        let mock = MockSentryClient::new();
+        let escalating = |count: &str| {
+            serde_json::json!([{
+                "id": "esc-1",
+                "shortId": "ESC-1",
+                "title": "Escalating Issue",
+                "culprit": null,
+                "permalink": "url",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": count,
+                "userCount": null,
+                "project": { "name": "Test", "slug": "test" },
+                "status": "unresolved",
+                "level": "error",
+                "isUnhandled": null,
+                "metadata": null,
+                "stats": null
+            }])
+            .to_string()
+        };
+        let base = format!(
+            "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=date&limit=100",
+            config.org_slug,
+            urlencoding::encode("is:unresolved is:escalating"),
+        );
+        // Sentry counts over its 14d default without a window, and over the day with one
+        mock.mock_get(base.clone(), 200, escalating("5000"));
+        mock.mock_get(format!("{base}&statsPeriod=24h"), 200, escalating("40"));
+        mock.mock_get(
+            format!(
+                "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=freq&limit={}&statsPeriod=24h",
+                config.org_slug,
+                urlencoding::encode("is:unresolved"),
+                config.top_issues_count,
+            ),
+            200,
+            "[]".to_string(),
+        );
+
+        let source = SentrySource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+
+        // 40 events today is under the 100 threshold, whatever its 14 day total
+        assert_eq!(issues.len(), 1);
+        assert!(!source.matches_criteria(&issues[0]).matches);
+    }
+
+    #[tokio::test]
     async fn test_fetch_issues_dedup_and_escalating_tracking() {
         let config = test_config();
         let mock = MockSentryClient::new();

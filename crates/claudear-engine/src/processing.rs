@@ -5966,20 +5966,29 @@ mod tests {
         }
     }
 
-    /// Run a fresh Sentry attempt through the default pipeline (reply actions
-    /// off) with the given triage verdict, and return the attempt's final status.
+    /// Run a fresh Sentry attempt with the given triage verdict, once with reply
+    /// actions off and once on, and return the attempt's final status. Both
+    /// routes must agree.
     async fn run_sentry_with_verdict(
         verdict: VerifyResult,
         review_feedback: Option<&str>,
+    ) -> claudear_core::types::FixAttemptStatus {
+        let off = run_sentry_with_verdict_in(verdict.clone(), review_feedback, false).await;
+        let on = run_sentry_with_verdict_in(verdict, review_feedback, true).await;
+        assert_eq!(off, on, "triage must not depend on reply actions");
+        off
+    }
+
+    async fn run_sentry_with_verdict_in(
+        verdict: VerifyResult,
+        review_feedback: Option<&str>,
+        reply_actions: bool,
     ) -> claudear_core::types::FixAttemptStatus {
         let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
         tracker.record_attempt("sentry", "S1", "CLOUD-1").unwrap();
         let mut processor = make_reply_chain_processor(Arc::new(tracker));
         processor.agent = Arc::new(TriagingAgent(verdict));
-        assert!(
-            !processor.config.reply().enabled,
-            "the default config must be exercised"
-        );
+        processor.config.notifiers.helpscout.enabled = reply_actions;
 
         let issue = Issue::new(
             "S1",
@@ -6026,7 +6035,7 @@ mod tests {
     // fix" and `CannotFix` means triage closed the attempt without one.
 
     #[tokio::test]
-    async fn test_sentry_triage_closes_issues_not_worth_fixing_by_default() {
+    async fn test_sentry_triage_closes_issues_not_worth_fixing() {
         use claudear_core::types::{FixAttemptStatus, TriageVerdict};
         for triage in [
             TriageVerdict::InfraTransient,

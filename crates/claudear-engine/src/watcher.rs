@@ -45,6 +45,9 @@ type QueuedIssue = (Issue, MatchResult, Option<Intent>);
 /// on (marked handled) instead of re-triggering the fix agent every cycle.
 const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
 
+/// Issue metadata carrying the reviewed PR's repo into a review rerun.
+const REVIEW_PR_REPO_KEY: &str = "review_pr_repo";
+
 /// How many review-driven reruns a PR gets before claudear stops answering
 /// review feedback on it and leaves the PR to humans.
 const MAX_REVIEW_CYCLES: i32 = 3;
@@ -1669,12 +1672,13 @@ impl Watcher {
             }
 
             match self
-                .trigger_issue_with_feedback(
+                .trigger_issue_inner(
                     &attempt.source,
                     &attempt.issue_id,
                     Some(feedback.to_string()),
                     existing_pr_branch.clone(),
                     Some("Review feedback received".into()),
+                    attempt.scm_repo.as_deref(),
                 )
                 .await
             {
@@ -2736,6 +2740,27 @@ Create a PR with your changes.{custom_instructions}"#,
                 .await
             {
                 Ok(()) => {
+                    // Only this path charges a retry, so only it refunds one: running
+                    // out of quota says nothing about the issue
+                    if let Ok(Some(after)) =
+                        self.tracker.get_attempt(&attempt.source, &attempt.issue_id)
+                    {
+                        let hit_rate_limit = after.status == FixAttemptStatus::Failed
+                            && after
+                                .error_message
+                                .as_deref()
+                                .is_some_and(runner::is_rate_limit_error);
+                        if hit_rate_limit {
+                            let error = after.error_message.unwrap_or_default();
+                            if let Err(e) = self.tracker.mark_failed_uncharged(
+                                &attempt.source,
+                                &attempt.issue_id,
+                                &error,
+                            ) {
+                                tracing::warn!(short_id = %attempt.short_id, error = %e, "Failed to refund retry after rate limit");
+                            }
+                        }
+                    }
                     self.record_source_decision(
                         &attempt.source,
                         "ready_retry_triggered",
@@ -4274,13 +4299,7 @@ Create a PR with your changes.{custom_instructions}"#,
         // lands on the same wrong repo a previous run already swapped away from.
         let pr_repo = review_feedback
             .as_ref()
-            .and_then(|_| {
-                self.tracker
-                    .get_attempt(source.name(), &issue.id)
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|a| a.scm_repo);
+            .and_then(|_| issue.get_metadata::<String>(REVIEW_PR_REPO_KEY));
         let pinned = pr_repo.and_then(|repo| {
             match resolve_repo_for_cascade(self.inferrer.as_ref(), &repo) {
                 r @ RepoResolution::Resolved { .. } => Some(r),
@@ -4355,7 +4374,6 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // Save issue info before move for post-processing
         let issue_short_id = issue.short_id.clone();
-        let issue_id = issue.id.clone();
 
         // Build IssueProcessor and delegate to shared pipeline. The processor
         // internally routes pure questions to a read-only Q&A answer path and
@@ -4403,13 +4421,6 @@ Create a PR with your changes.{custom_instructions}"#,
         // Watcher-specific: check for rate limit errors and pause if needed
         if let ProcessingOutcome::Failed { ref error } = outcome {
             if runner::is_rate_limit_error(error) {
-                // Running out of quota says nothing about the issue, so it must not spend a retry
-                if let Err(e) = self
-                    .tracker
-                    .mark_failed_uncharged(source.name(), &issue_id, error)
-                {
-                    tracing::warn!(short_id = %issue_short_id, error = %e, "Failed to refund retry after rate limit");
-                }
                 let tmp_issue = Issue::new("", &issue_short_id, "", "", source.name());
                 self.pause_until_rate_limit_reset(&tmp_issue, error).await;
             }
@@ -5020,6 +5031,28 @@ Create a PR with your changes.{custom_instructions}"#,
         existing_pr_branch: Option<String>,
         trigger_reason: Option<String>,
     ) -> Result<()> {
+        self.trigger_issue_inner(
+            source_name,
+            issue_id,
+            review_feedback,
+            existing_pr_branch,
+            trigger_reason,
+            None,
+        )
+        .await
+    }
+
+    /// `pr_repo` pins a review rerun to the repo of the PR under review. It must
+    /// come from the reviewed attempt: a cascade row shares its parent's issue id.
+    async fn trigger_issue_inner(
+        &self,
+        source_name: &str,
+        issue_id: &str,
+        review_feedback: Option<String>,
+        existing_pr_branch: Option<String>,
+        trigger_reason: Option<String>,
+        pr_repo: Option<&str>,
+    ) -> Result<()> {
         let source = self
             .sources
             .iter()
@@ -5038,6 +5071,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
         if let Some(reason) = trigger_reason {
             issue.set_metadata("trigger_reason", reason);
+        }
+        if let Some(repo) = pr_repo {
+            issue.set_metadata(REVIEW_PR_REPO_KEY, repo);
         }
 
         let started = self

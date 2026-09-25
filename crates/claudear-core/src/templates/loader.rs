@@ -192,16 +192,21 @@ mod tests {
     }
 
     #[test]
-    fn test_get_template_leaves_agent_md_to_templates_that_render_it() {
+    fn test_rendered_prompt_includes_agent_md_exactly_once() {
+        use crate::templates::{TemplateContext, TemplateRenderer};
         let (loader, temp) = create_test_loader();
         std::fs::write(temp.path().join("AGENT.md"), "# Custom Agent Rules").unwrap();
 
-        for source in ["sentry", "linear"] {
+        for source in ["sentry", "linear", "github"] {
             let issue = Issue::new("123", "PROJ-123", "Fix bug", "https://example.com", source);
             let template = loader.get_template(&issue).unwrap();
-            assert!(
-                !template.contains("# Custom Agent Rules"),
-                "{source} template renders AGENT.md itself and must not also get it prepended"
+            let context = TemplateContext::new(issue, "ctx".to_string())
+                .with_agent_md(loader.load_agent_md());
+            let prompt = TemplateRenderer::new().render(&template, &context);
+            assert_eq!(
+                prompt.matches("# Custom Agent Rules").count(),
+                1,
+                "{source} prompt should carry AGENT.md once"
             );
         }
     }
