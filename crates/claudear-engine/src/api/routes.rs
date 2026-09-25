@@ -2833,7 +2833,7 @@ struct TriagePlaybookResponse {
     updated_at: Option<String>,
 }
 
-/// GET /api/instructions/triage/{source} — read the triage playbook for a source.
+/// GET /api/instructions/triage/{source}: read the triage playbook for a source.
 async fn get_triage_playbook_handler(
     _user: AdminUser,
     State(state): State<ApiState>,
@@ -2871,7 +2871,7 @@ async fn get_triage_playbook_handler(
     }))
 }
 
-/// PUT /api/instructions/triage/{source} — save the triage playbook; empty text
+/// PUT /api/instructions/triage/{source}: save the triage playbook; empty text
 /// resets to the bundled default. Applies to the next verify run, no restart.
 async fn put_triage_playbook_handler(
     _user: AdminUser,

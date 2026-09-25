@@ -5933,7 +5933,6 @@ mod tests {
 
     #[test]
     fn test_with_triage_playbook_uses_the_saved_playbook() {
-        use claudear_storage::KnowledgeStore;
         let key = claudear_core::templates::TRIAGE_PLAYBOOK_METADATA_KEY;
         let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
         let processor = make_reply_chain_processor(Arc::new(tracker));
