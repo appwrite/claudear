@@ -6,6 +6,9 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
+#[cfg(unix)]
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// The process group an agent CLI leads, killed with everything left running in
 /// it once the CLI exits ([`Self::wait`]), on [`Self::kill`] or on drop.
 /// Processes in the group inherit the CLI's stdout and stderr, so until they die
@@ -84,7 +87,12 @@ impl Guard<'_> {
         let mut child_exits =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
         while !Self::has_exited(id)? {
-            child_exits.recv().await;
+            // Polling covers a SIGCHLD that never arrives, e.g. one swallowed by a
+            // ptrace-based tool such as cargo-tarpaulin.
+            tokio::select! {
+                _ = child_exits.recv() => {}
+                () = tokio::time::sleep(EXIT_POLL_INTERVAL) => {}
+            }
         }
         Ok(())
     }
