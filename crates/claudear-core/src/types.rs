@@ -2121,6 +2121,9 @@ pub enum InstructionScope {
     Global,
     /// Applies to a single repo (keyed by `org/name`).
     Repo,
+    /// Triage playbook for one issue source, keyed by source name (e.g. `sentry`)
+    /// in the `repo` column. Never injected as operator instructions.
+    Triage,
 }
 
 impl std::fmt::Display for InstructionScope {
@@ -2128,6 +2131,7 @@ impl std::fmt::Display for InstructionScope {
         match self {
             Self::Global => write!(f, "global"),
             Self::Repo => write!(f, "repo"),
+            Self::Triage => write!(f, "triage"),
         }
     }
 }
@@ -2139,6 +2143,7 @@ impl std::str::FromStr for InstructionScope {
         match s.to_lowercase().as_str() {
             "global" => Ok(Self::Global),
             "repo" => Ok(Self::Repo),
+            "triage" => Ok(Self::Triage),
             _ => Err(format!("Unknown instruction scope: {}", s)),
         }
     }

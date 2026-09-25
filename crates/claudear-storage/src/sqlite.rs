@@ -10345,6 +10345,26 @@ mod tests {
     use chrono::{Datelike, Timelike, Utc};
 
     #[test]
+    fn test_triage_playbook_is_not_injected_as_operator_instructions() {
+        use claudear_core::types::InstructionScope;
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .upsert_agent_instruction(InstructionScope::Triage, Some("sentry"), "# Triage", None)
+            .unwrap();
+
+        assert!(tracker
+            .resolve_agent_instructions(Some("sentry"))
+            .unwrap()
+            .is_none());
+        let saved = tracker
+            .get_agent_instruction(InstructionScope::Triage, Some("sentry"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.scope, InstructionScope::Triage);
+        assert_eq!(saved.instruction_text, "# Triage");
+    }
+
+    #[test]
     fn test_agent_instructions_scope_and_resolve() {
         use claudear_core::types::InstructionScope;
         let tracker = SqliteTracker::in_memory().unwrap();

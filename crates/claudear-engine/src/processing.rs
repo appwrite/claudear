@@ -18,8 +18,9 @@ use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
-    QaKnowledgeEntry, ReplyKind, RetrievalUsageRecord, TimelineEventStatus, VerifyResult,
+    ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, InstructionScope, Issue,
+    ProcessingMetric, QaKnowledgeEntry, ReplyKind, RetrievalUsageRecord, TimelineEventStatus,
+    VerifyResult,
 };
 use claudear_integrations::discord::DiscordClient;
 use claudear_integrations::github::GitHubClient;
@@ -2659,6 +2660,31 @@ impl IssueProcessor {
         Some(ProcessingOutcome::CompletedNoPr { reason })
     }
 
+    /// Attach the operator-edited triage playbook for this issue's source, if one
+    /// is saved. Without one the prompt falls back to the bundled playbook.
+    fn with_triage_playbook(&self, issue: &Issue) -> Issue {
+        let mut issue = issue.clone();
+        if claudear_core::templates::default_triage_playbook(&issue.source).is_none() {
+            return issue;
+        }
+        match self
+            .tracker
+            .get_agent_instruction(InstructionScope::Triage, Some(&issue.source))
+        {
+            Ok(Some(saved)) if !saved.instruction_text.trim().is_empty() => {
+                issue.set_metadata(
+                    claudear_core::templates::TRIAGE_PLAYBOOK_METADATA_KEY,
+                    saved.instruction_text,
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to load triage playbook; using bundled one");
+            }
+        }
+        issue
+    }
+
     async fn run_verify(
         &self,
         issue: &Issue,
@@ -2687,9 +2713,11 @@ impl IssueProcessor {
 
         let timeout =
             std::time::Duration::from_secs(self.config.reply().verify_timeout_secs.max(1));
+        let verify_target = self.with_triage_playbook(issue);
         let result = tokio::time::timeout(
             timeout,
-            self.agent.verify_issue(issue, &context, &project_dir),
+            self.agent
+                .verify_issue(&verify_target, &context, &project_dir),
         )
         .await;
 
@@ -5901,6 +5929,45 @@ mod tests {
             .error_message
             .unwrap_or_default()
             .starts_with("Triage: infra_transient"));
+    }
+
+    #[test]
+    fn test_with_triage_playbook_uses_the_saved_playbook() {
+        use claudear_storage::KnowledgeStore;
+        let key = claudear_core::templates::TRIAGE_PLAYBOOK_METADATA_KEY;
+        let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
+        let processor = make_reply_chain_processor(Arc::new(tracker));
+        let issue = Issue::new("S1", "CLOUD-1", "Boom", "u", "sentry");
+
+        // Nothing saved: the prompt falls back to the bundled playbook
+        assert!(processor
+            .with_triage_playbook(&issue)
+            .get_metadata::<String>(key)
+            .is_none());
+
+        processor
+            .tracker
+            .upsert_agent_instruction(
+                InstructionScope::Triage,
+                Some("sentry"),
+                "# Ours",
+                Some("op"),
+            )
+            .unwrap();
+        assert_eq!(
+            processor
+                .with_triage_playbook(&issue)
+                .get_metadata::<String>(key)
+                .as_deref(),
+            Some("# Ours")
+        );
+
+        // Sources without triage never pick one up
+        let linear = Issue::new("L1", "ENG-1", "Boom", "u", "linear");
+        assert!(processor
+            .with_triage_playbook(&linear)
+            .get_metadata::<String>(key)
+            .is_none());
     }
 
     #[test]

@@ -12,6 +12,21 @@ mod renderer;
 pub use loader::TemplateLoader;
 pub use renderer::{TemplateContext, TemplateRenderer};
 
+/// Bundled Sentry triage playbook, used until an operator saves one in the DB.
+pub const DEFAULT_SENTRY_TRIAGE_PLAYBOOK: &str =
+    include_str!("../../../../playbooks/sentry_triage.md");
+
+/// Issue metadata key carrying an operator-edited triage playbook into the verify prompt.
+pub const TRIAGE_PLAYBOOK_METADATA_KEY: &str = "triage_playbook";
+
+/// Bundled triage playbook for a source; `None` means the source is not triaged.
+pub fn default_triage_playbook(source: &str) -> Option<&'static str> {
+    match source {
+        "sentry" => Some(DEFAULT_SENTRY_TRIAGE_PLAYBOOK),
+        _ => None,
+    }
+}
+
 /// Default template for issue fixing when no custom template is found.
 pub const DEFAULT_FIX_TEMPLATE: &str = r#"You are fixing an issue from {{source}}. Here is the issue context:
 

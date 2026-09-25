@@ -1154,6 +1154,23 @@ export async function saveGlobalInstruction(text: string): Promise<{ ok: boolean
   return putJson(`${API_BASE}/instructions/global`, { text })
 }
 
+export interface TriagePlaybookResponse {
+  source: string
+  text: string
+  default_text: string
+  is_default: boolean
+  updated_at: string | null
+}
+
+export async function fetchTriagePlaybook(source: string): Promise<TriagePlaybookResponse> {
+  return fetchJson(`${API_BASE}/instructions/triage/${encodeURIComponent(source)}`)
+}
+
+// Saving an empty string resets the source to the bundled playbook
+export async function saveTriagePlaybook(source: string, text: string): Promise<{ ok: boolean }> {
+  return putJson(`${API_BASE}/instructions/triage/${encodeURIComponent(source)}`, { text })
+}
+
 export async function fetchRepoInstruction(repo: string): Promise<InstructionResponse> {
   return fetchJson(`${API_BASE}/repos/${encodeURIComponent(repo)}/instructions`)
 }

@@ -193,6 +193,10 @@ pub fn create_api_router_full(
             "/api/instructions/global",
             axum::routing::get(get_global_instruction_handler).put(put_global_instruction_handler),
         )
+        .route(
+            "/api/instructions/triage/{source}",
+            axum::routing::get(get_triage_playbook_handler).put(put_triage_playbook_handler),
+        )
         // User CRUD routes
         .route(
             "/api/users",
@@ -2813,6 +2817,84 @@ async fn put_global_instruction_handler(
         )
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to save global instruction");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Serialize)]
+struct TriagePlaybookResponse {
+    source: String,
+    /// The playbook verify runs with: the saved one, or the bundled default.
+    text: String,
+    default_text: String,
+    is_default: bool,
+    updated_at: Option<String>,
+}
+
+/// GET /api/instructions/triage/{source} — read the triage playbook for a source.
+async fn get_triage_playbook_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Path(source): Path<String>,
+) -> Result<Json<TriagePlaybookResponse>, StatusCode> {
+    let default_text =
+        claudear_core::templates::default_triage_playbook(&source).ok_or(StatusCode::NOT_FOUND)?;
+    let saved = state
+        .tracker
+        .get_agent_instruction(
+            claudear_core::types::InstructionScope::Triage,
+            Some(&source),
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to read triage playbook");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .filter(|i| !i.instruction_text.trim().is_empty());
+    Ok(Json(match saved {
+        Some(i) => TriagePlaybookResponse {
+            source,
+            text: i.instruction_text,
+            default_text: default_text.to_string(),
+            is_default: false,
+            updated_at: Some(i.updated_at.to_rfc3339()),
+        },
+        None => TriagePlaybookResponse {
+            source,
+            text: default_text.to_string(),
+            default_text: default_text.to_string(),
+            is_default: true,
+            updated_at: None,
+        },
+    }))
+}
+
+/// PUT /api/instructions/triage/{source} — save the triage playbook; empty text
+/// resets to the bundled default. Applies to the next verify run, no restart.
+async fn put_triage_playbook_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Path(source): Path<String>,
+    Json(body): Json<InstructionUpdateRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !check_api_rate_limit(_user.0.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if claudear_core::templates::default_triage_playbook(&source).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    state
+        .tracker
+        .upsert_agent_instruction(
+            claudear_core::types::InstructionScope::Triage,
+            Some(&source),
+            &body.text,
+            Some(&_user.0.name),
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to save triage playbook");
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
