@@ -3,7 +3,6 @@ import useSWR from 'swr'
 import {
   fetchConfig, saveConfig, type ConfigResponse,
   fetchGlobalInstruction, saveGlobalInstruction, type InstructionResponse,
-  fetchTriagePlaybook, saveTriagePlaybook, type TriagePlaybookResponse,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
 import { CardStackSkeleton } from '../components/shared/page-skeletons'
@@ -373,113 +372,6 @@ function SectionFormCard({
   )
 }
 
-function TriagePlaybookCard({ source, title }: { source: string; title: string }) {
-  const { data, error, isLoading, mutate } = useSWR<TriagePlaybookResponse>(
-    `triage-playbook-${source}`,
-    () => fetchTriagePlaybook(source),
-  )
-  const [draft, setDraft] = useState<string | null>(null)
-  const [saving, setSaving] = useState(false)
-  const [saved, setSaved] = useState(false)
-  const [saveError, setSaveError] = useState<string | null>(null)
-
-  const serverText = data?.text ?? ''
-  const text = draft ?? serverText
-  const dirty = text !== serverText
-
-  const persist = useCallback(async (value: string) => {
-    setSaving(true)
-    setSaveError(null)
-    try {
-      await saveTriagePlaybook(source, value)
-    } catch (e: any) {
-      setSaveError(e?.message || 'Failed to save playbook')
-      return
-    } finally {
-      setSaving(false)
-    }
-    // An empty save falls back to the bundled playbook on the server
-    const effective = value.trim() ? value : (data?.default_text ?? '')
-    setDraft(prev => (prev === value ? null : prev))
-    setSaved(true)
-    setTimeout(() => setSaved(false), 3000)
-    mutate(
-      prev => (prev ? { ...prev, text: effective, is_default: !value.trim() } : prev),
-      { revalidate: false },
-    )
-  }, [source, data?.default_text, mutate])
-
-  const handleReset = useCallback(async () => {
-    setDraft(null)
-    await persist('')
-  }, [persist])
-
-  return (
-    <Card>
-      <CardHeader className="pb-3">
-        <div className="flex items-center gap-2">
-          <ShieldAlert className="h-4 w-4 text-muted-foreground" />
-          <CardTitle className="text-base">{title}</CardTitle>
-          {data?.is_default && (
-            <span className="text-[10px] uppercase tracking-wide text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-              Default
-            </span>
-          )}
-        </div>
-        <CardDescription>
-          Rules the verify step uses to decide whether an issue is worth a fix run. Issues triaged as
-          noise, expected or infra_transient (with evidence) are closed without a fix. Applies to the
-          next run, no restart needed.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {error ? (
-          <div className="flex items-center gap-2 text-sm text-red-600">
-            <AlertTriangle className="h-4 w-4" />
-            <span>Failed to load playbook: {error.message}. Editing is disabled to avoid overwriting.</span>
-          </div>
-        ) : (
-          <textarea
-            value={text}
-            onChange={e => setDraft(e.target.value)}
-            disabled={isLoading}
-            className="w-full font-mono text-xs bg-muted/50 border rounded-md p-4 min-h-[240px] resize-y focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-50"
-            spellCheck={false}
-          />
-        )}
-        <div className="flex items-center gap-3">
-          <button
-            onClick={() => persist(text)}
-            disabled={saving || !dirty || !!error}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-green-600 text-white hover:bg-green-700 disabled:opacity-40 disabled:pointer-events-none transition-colors"
-          >
-            <Save className="h-3.5 w-3.5" />
-            {saving ? 'Saving...' : 'Save Playbook'}
-          </button>
-          <button
-            onClick={handleReset}
-            disabled={saving || !!error || (data?.is_default && !dirty)}
-            className="px-3 py-1.5 rounded-md text-xs font-medium border hover:bg-muted disabled:opacity-40 disabled:pointer-events-none transition-colors"
-          >
-            Reset to default
-          </button>
-          {saved && !dirty && (
-            <span className="text-xs text-green-600 flex items-center gap-1">
-              <CheckCircle2 className="h-3.5 w-3.5" /> Saved
-            </span>
-          )}
-          {dirty && !saveError && <span className="text-xs text-amber-600">Unsaved changes</span>}
-          {saveError && (
-            <span className="text-xs text-red-600 flex items-center gap-1">
-              <AlertTriangle className="h-3.5 w-3.5" /> {saveError}
-            </span>
-          )}
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
-
 function GlobalInstructionsCard() {
   const { data, error, isLoading, mutate } = useSWR<InstructionResponse>('global-instruction', fetchGlobalInstruction)
   const [draft, setDraft] = useState<string | null>(null)
@@ -642,8 +534,6 @@ export default function ConfigPage() {
       <PageHeader title="Configuration" description="View and edit your claudear.toml config file" />
 
       <GlobalInstructionsCard />
-
-      <TriagePlaybookCard source="sentry" title="Sentry Triage Playbook" />
 
       {/* Toolbar */}
       <div className="flex items-center gap-3 flex-wrap">
