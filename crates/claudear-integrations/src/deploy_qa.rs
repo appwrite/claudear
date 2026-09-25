@@ -954,16 +954,29 @@ mod tests {
         assert_eq!(verdict, DeployQaVerdict::Fail);
         assert_eq!(store.tip().status, DeployQaTipStatus::Failed);
         let posted = posted_text(&requests);
-        for secret in [BEARER_TOKEN, GITHUB_TOKEN, KNOWN_SECRET] {
-            assert!(!posted.contains(secret), "{secret} was posted: {posted}");
+        for (kind, value) in [
+            ("bearer token", BEARER_TOKEN),
+            ("GitHub token", GITHUB_TOKEN),
+            ("configured bot token", KNOWN_SECRET),
+        ] {
+            assert!(
+                !posted.contains(value),
+                "the {kind} reached the posted report"
+            );
         }
         let fail_post = posts(&requests)
             .pop()
             .expect("the FAIL report should be posted");
         assert!(fail_post.is_post_to(&format!("/channels/{CREATED_THREAD}/messages")));
         let description = description(&fail_post);
-        assert!(description.contains(REDACTED), "{description}");
-        assert!(description.contains("#42 login LIVE FAIL"), "{description}");
+        assert!(
+            description.contains(REDACTED),
+            "the FAIL report must show where a credential was masked"
+        );
+        assert!(
+            description.contains("#42 login LIVE FAIL"),
+            "the FAIL report must keep its failing result"
+        );
     }
 
     #[tokio::test]
@@ -985,19 +998,29 @@ mod tests {
 
             assert_eq!(verdict, expected, "{result}");
             let posts = posts(&requests);
-            assert_eq!(posts.len(), 1, "{result}: {posts:?}");
+            assert_eq!(
+                posts.len(),
+                1,
+                "{result}: the report must be posted as one reply"
+            );
             assert_reply_without_mention(&posts[0]);
             let description = description(&posts[0]);
-            for secret in [BEARER_TOKEN, KNOWN_SECRET] {
+            for (kind, value) in [
+                ("X-Appwrite-Key value", BEARER_TOKEN),
+                ("configured bot token", KNOWN_SECRET),
+            ] {
                 assert!(
-                    !description.contains(secret),
-                    "{result}: {secret} was posted: {description}"
+                    !description.contains(value),
+                    "{result}: the {kind} reached the posted reply"
                 );
             }
-            assert!(description.contains(REDACTED), "{result}: {description}");
+            assert!(
+                description.contains(REDACTED),
+                "{result}: the reply must show where a credential was masked"
+            );
             assert!(
                 description.contains(&format!("{VERDICT_PREFIX} {VERDICT_ALL_VERIFIED}")),
-                "{result}: {description}"
+                "{result}: the reply must keep its verdict line"
             );
         }
     }
@@ -1020,9 +1043,12 @@ mod tests {
         let description = description(&posts(&requests)[0]);
         assert!(
             !description.contains(secret_tail),
-            "truncating first would cut the secret and post its tail: {description}"
+            "truncating first would cut the secret and post its tail"
         );
-        assert!(description.ends_with(&footer), "{description}");
+        assert!(
+            description.ends_with(&footer),
+            "the truncated report must keep its verdict line"
+        );
     }
 
     #[tokio::test]
@@ -1046,7 +1072,10 @@ mod tests {
             .expect("the FAIL report should be posted");
         assert_eq!(fail_post.body["embeds"][0]["title"], format!("FAIL {TAG}"));
         let description = description(&fail_post);
-        assert!(!description.contains(BEARER_TOKEN), "{description}");
+        assert!(
+            !description.contains(BEARER_TOKEN),
+            "the bearer token reached the posted report"
+        );
     }
 
     #[tokio::test]
