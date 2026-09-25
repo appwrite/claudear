@@ -1,16 +1,20 @@
 //! Agent CLIs lead process groups of their own, so a run can kill whatever it
 //! leaves behind and claudear can reach every CLI when it shuts down.
 
+mod drain;
 mod guard;
 mod registry;
 mod signal;
 
+pub use drain::Drain;
 pub use guard::Guard;
 pub use registry::Registry;
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -19,7 +23,82 @@ pub(crate) mod tests {
     /// Generous, because CI runs the tests under `cargo tarpaulin`'s ptrace.
     pub(crate) const EXIT_DEADLINE: Duration = Duration::from_secs(30);
 
+    /// Generous, because CI runs the tests under `cargo tarpaulin`'s ptrace.
+    pub(crate) const RUN_DEADLINE: Duration = Duration::from_secs(60);
+
     pub(crate) const BACKGROUND_SLEEP: &str = "sleep 300 & echo $!; exec sleep 300";
+
+    /// Stub CLI setup that leaves `sleep 300` running in the background,
+    /// holding the stub's stdout, and records "<background pid> <stub pid>" in
+    /// `pids`.
+    pub(crate) const BACKGROUND_PROCESS: &str = "sleep 300 &\necho \"$! $$\" > pids\n";
+
+    /// Stub CLI setup that leaves `sleep 300` running in a session of its own,
+    /// beyond the reach of a process group kill, holding the stub's stdout. It
+    /// records its pid in `escaped` once it has left the group.
+    pub(crate) const ESCAPED_PROCESS: &str = concat!(
+        r#"perl -e 'use POSIX; setsid(); open(my $f, ">", "escaped") or die; "#,
+        r#"print $f "$$\n"; close $f; sleep 300' &"#,
+        "\nwhile [ ! -s escaped ]; do sleep 0.1; done\n",
+    );
+
+    const STUB_PROBE: &str = "--probe";
+
+    /// Write `binary` as a stub CLI running `script` with `sh`, returning once
+    /// it can be executed.
+    pub(crate) fn install_stub(binary: &Path, script: &str) {
+        let stub = format!("#!/bin/sh\n[ \"$1\" = {STUB_PROBE} ] && exit 0\n{script}");
+        std::fs::write(binary, stub).unwrap();
+        std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(binary);
+    }
+
+    /// Exec `binary` until the kernel stops refusing it with ETXTBSY: a process
+    /// a concurrent test forks can briefly inherit the descriptor it was
+    /// written through.
+    fn wait_until_executable(binary: &Path) {
+        let start = Instant::now();
+        loop {
+            let probe = std::process::Command::new(binary)
+                .arg(STUB_PROBE)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            match probe {
+                Ok(_) => return,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && start.elapsed() < RUN_DEADLINE =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("the stub CLI must be executable: {error}"),
+            }
+        }
+    }
+
+    /// The `(background, stub)` pids [`BACKGROUND_PROCESS`] recorded.
+    pub(crate) fn recorded_pids(directory: &Path) -> Option<(u32, u32)> {
+        let contents = std::fs::read_to_string(directory.join("pids")).ok()?;
+        let (background, stub) = contents.strip_suffix('\n')?.split_once(' ')?;
+        Some((background.parse().ok()?, stub.parse().ok()?))
+    }
+
+    pub(crate) async fn wait_for_recorded_pids(directory: &Path) -> (u32, u32) {
+        loop {
+            if let Some(pids) = recorded_pids(directory) {
+                return pids;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The pid [`ESCAPED_PROCESS`] recorded.
+    pub(crate) fn recorded_escaped_pid(directory: &Path) -> Option<u32> {
+        let contents = std::fs::read_to_string(directory.join("escaped")).ok()?;
+        contents.strip_suffix('\n')?.parse().ok()
+    }
 
     /// Like [`BACKGROUND_SLEEP`], but the leader exits with status 7 on SIGINT
     /// while its background process ignores it. Perl, because a shell cannot

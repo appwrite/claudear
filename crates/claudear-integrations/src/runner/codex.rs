@@ -1,6 +1,6 @@
 //! Codex CLI agent runner.
 
-use super::{AgentRunner, ProviderCapabilities};
+use super::{process_group, AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
 use claudear_core::error::{Error, Result};
 use claudear_core::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
@@ -10,7 +10,21 @@ use serde_json::json;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::Command;
+
+/// How long to keep waiting for the CLI's output after its process group is
+/// killed. Its own output is already buffered by then, so this only bounds the
+/// wait on processes that escaped the group while holding the pipes.
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// When to stop reading the CLI's output after its process group is killed,
+/// even while a process that escaped the group keeps writing to the pipes.
+const OUTPUT_DRAIN_CUTOFF: Duration = Duration::from_secs(10);
+
+const OUTPUT_HELD_OPEN_MESSAGE: &str =
+    "Stopped reading Codex output held open by a process outside its process group";
 
 /// Configuration for the Codex agent runner.
 #[derive(Debug, Clone)]
@@ -104,6 +118,36 @@ The PR title should include the issue ID: {}
         }
         None
     }
+
+    /// Every line the CLI writes to `pipe` until EOF or the end of `drain`.
+    async fn read_output(
+        pipe: impl AsyncRead + Unpin,
+        mut drain: process_group::Drain,
+        label: String,
+        stream: &'static str,
+    ) -> String {
+        let mut lines = BufReader::new(pipe).lines();
+        let mut output = String::new();
+        loop {
+            match drain.next_line(&mut lines).await {
+                Some(Ok(Some(line))) => {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+                Some(_) => break,
+                None => {
+                    tracing::warn!(
+                        component = "codex",
+                        label,
+                        stream,
+                        "{OUTPUT_HELD_OPEN_MESSAGE}"
+                    );
+                    break;
+                }
+            }
+        }
+        output
+    }
 }
 
 #[async_trait]
@@ -172,21 +216,17 @@ impl AgentRunner for CodexAgentRunner {
         args.push("--full-auto".to_string());
         args.push(prompt.to_string());
 
-        let mut child = match tokio::process::Command::new(&self.config.binary)
+        let mut command = Command::new(&self.config.binary);
+        command
             .args(&args)
             .current_dir(project_dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                return Err(Error::runner(format!(
-                    "Failed to spawn {}: {}",
-                    self.config.binary, e
-                )));
-            }
-        };
+            .stderr(Stdio::piped());
+        let (mut child, mut group) =
+            process_group::Guard::spawn(&mut command, process_group::Registry::global()).map_err(
+                |error| Error::runner(format!("Failed to spawn {}: {}", self.config.binary, error)),
+            )?;
 
         let stdout = child
             .stdout
@@ -197,27 +237,20 @@ impl AgentRunner for CodexAgentRunner {
             .take()
             .ok_or_else(|| Error::runner("Failed to capture stderr"))?;
 
-        let stdout_handle = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            let mut output = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
-                output.push_str(&line);
-                output.push('\n');
-            }
-            output
-        });
+        let stdout_handle = tokio::spawn(Self::read_output(
+            stdout,
+            group.drain(OUTPUT_DRAIN_TIMEOUT, OUTPUT_DRAIN_CUTOFF),
+            label.to_string(),
+            "stdout",
+        ));
+        let stderr_handle = tokio::spawn(Self::read_output(
+            stderr,
+            group.drain(OUTPUT_DRAIN_TIMEOUT, OUTPUT_DRAIN_CUTOFF),
+            label.to_string(),
+            "stderr",
+        ));
 
-        let stderr_handle = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            let mut output = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
-                output.push_str(&line);
-                output.push('\n');
-            }
-            output
-        });
-
-        let timeout_duration = std::time::Duration::from_secs(self.config.timeout_secs);
+        let timeout_duration = Duration::from_secs(self.config.timeout_secs);
 
         enum WaitOutcome {
             Exited(std::result::Result<std::process::ExitStatus, std::io::Error>),
@@ -225,9 +258,10 @@ impl AgentRunner for CodexAgentRunner {
         }
 
         let outcome = tokio::select! {
-            result = child.wait() => WaitOutcome::Exited(result),
+            result = group.wait(&mut child) => WaitOutcome::Exited(result),
             _ = tokio::time::sleep(timeout_duration) => WaitOutcome::TimedOut,
         };
+        group.kill();
 
         let (status, timed_out) = match outcome {
             WaitOutcome::Exited(Ok(status)) => (status, false),
@@ -335,6 +369,19 @@ impl AgentRunner for CodexAgentRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::runner::process_group::tests::{
+        exits_within, install_stub, is_running, kill, recorded_escaped_pid, recorded_pids,
+        wait_for_recorded_pids, BACKGROUND_PROCESS, ESCAPED_PROCESS, RUN_DEADLINE,
+    };
+
+    #[cfg(unix)]
+    const PR_URL: &str = "https://github.com/org/repo/pull/1";
+
+    /// The project directory, when a test re-runs itself in a child process
+    /// whose stdin the parent holds open.
+    #[cfg(unix)]
+    const STDIN_HELD_OPEN_PROJECT: &str = "CLAUDEAR_TEST_STDIN_HELD_OPEN_PROJECT";
 
     #[test]
     fn test_codex_runner_config_default() {
@@ -515,5 +562,158 @@ mod tests {
         let p1 = runner.build_prompt(&issue, "ctx", Path::new("/tmp"));
         let p2 = runner.build_prompt_for_issue(&issue, "ctx", Path::new("/tmp"));
         assert_eq!(p1, p2);
+    }
+
+    /// A temp project directory, and a runner whose `codex` binary is a stub in
+    /// it running `script`.
+    #[cfg(unix)]
+    fn stub_runner(script: &str) -> (tempfile::TempDir, CodexAgentRunner) {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = runner_with_stub_in(directory.path(), script);
+        (directory, runner)
+    }
+
+    /// A runner whose `codex` binary is a stub in `directory` running `script`.
+    #[cfg(unix)]
+    fn runner_with_stub_in(directory: &Path, script: &str) -> CodexAgentRunner {
+        let binary = directory.join("codex");
+        install_stub(&binary, script);
+        let config = CodexRunnerConfig {
+            binary: binary.display().to_string(),
+            ..CodexRunnerConfig::default()
+        };
+        CodexAgentRunner::new(config, Arc::new(claudear_storage::NoopTracker))
+    }
+
+    /// A stub `codex` binary that runs `setup`, then prints [`PR_URL`] and exits.
+    #[cfg(unix)]
+    fn pull_request_script(setup: &str) -> String {
+        format!("{setup}echo {PR_URL}\n")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_returns_while_a_background_process_holds_stdout() {
+        let (directory, runner) = stub_runner(&pull_request_script(BACKGROUND_PROCESS));
+
+        let result = tokio::time::timeout(
+            RUN_DEADLINE,
+            runner.execute_with_attempt("fix", None, None, directory.path()),
+        )
+        .await;
+        let (background, _) = recorded_pids(directory.path()).expect("the stub records its pids");
+
+        let result = result
+            .expect("the run must not wait for background processes to close stdout")
+            .unwrap();
+        assert!(result.success, "the run failed: {:?}", result.error);
+        assert_eq!(result.pr_url.as_deref(), Some(PR_URL));
+        assert!(
+            exits_within(background),
+            "background process {background} outlived the run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dropping_a_run_kills_the_cli_and_its_background_processes() {
+        let (directory, runner) = stub_runner(&format!("{BACKGROUND_PROCESS}exec sleep 300\n"));
+        let recorded = async {
+            let (background, cli) = wait_for_recorded_pids(directory.path()).await;
+            (background, cli, is_running(background) && is_running(cli))
+        };
+
+        let pids = tokio::select! {
+            _ = runner.execute_with_attempt("fix", None, None, directory.path()) => None,
+            recorded = tokio::time::timeout(RUN_DEADLINE, recorded) => recorded.ok(),
+        };
+        let (background, cli, running) = pids.expect("the stub records its pids and keeps running");
+
+        assert!(
+            running,
+            "the stub's processes must be running when the run is dropped"
+        );
+        assert!(exits_within(cli), "CLI {cli} outlived its dropped run");
+        assert!(
+            exits_within(background),
+            "background process {background} outlived the dropped run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_stops_reading_output_held_open_outside_the_process_group() {
+        let (directory, runner) = stub_runner(&pull_request_script(ESCAPED_PROCESS));
+
+        let result = tokio::time::timeout(
+            RUN_DEADLINE,
+            runner.execute_with_attempt("fix", None, None, directory.path()),
+        )
+        .await;
+        let escaped =
+            recorded_escaped_pid(directory.path()).expect("the stub records the escaped pid");
+        let escaped_running = is_running(escaped);
+        kill(escaped);
+
+        let result = result
+            .expect("the run must not wait on output held open outside its group")
+            .unwrap();
+        assert!(result.success, "the run failed: {:?}", result.error);
+        assert_eq!(result.pr_url.as_deref(), Some(PR_URL));
+        assert!(
+            escaped_running,
+            "the process must survive the group kill for this test to reach the drain deadline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_finishes_when_the_cli_reads_stdin_claudear_holds_open() {
+        if let Some(project) = std::env::var_os(STDIN_HELD_OPEN_PROJECT) {
+            let project = Path::new(&project);
+            let runner = runner_with_stub_in(
+                project,
+                &pull_request_script("cat > /dev/null\ntouch stdin-read\n"),
+            );
+            let result = tokio::time::timeout(
+                RUN_DEADLINE,
+                runner.execute_with_attempt("fix", None, None, project),
+            )
+            .await
+            .expect("the CLI must not wait for input on claudear's stdin")
+            .unwrap();
+            assert_eq!(result.pr_url.as_deref(), Some(PR_URL));
+            return;
+        }
+
+        let project = tempfile::tempdir().unwrap();
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let test =
+            format!("{module}::test_execute_finishes_when_the_cli_reads_stdin_claudear_holds_open");
+        let mut rerun = Command::new(std::env::current_exe().unwrap())
+            .args([test.as_str(), "--exact"])
+            .env(STDIN_HELD_OPEN_PROJECT, project.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let _held_open = rerun.stdin.take();
+        let output = tokio::time::timeout(2 * RUN_DEADLINE, rerun.wait_with_output())
+            .await
+            .expect("the re-run test must finish")
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "the re-run test failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            project.path().join("stdin-read").exists(),
+            "the stub CLI never got past reading its stdin"
+        );
     }
 }

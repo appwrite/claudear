@@ -33,10 +33,14 @@ const DEFAULT_READONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebFetch", "W
 /// fix-run timeout).
 const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
 
-/// How long to keep reading the CLI's output after its process group is killed.
-/// Its own output is already buffered by then, so this only bounds the wait on
-/// processes that escaped the group while holding the pipes.
+/// How long to keep waiting for the CLI's output after its process group is
+/// killed. Its own output is already buffered by then, so this only bounds the
+/// wait on processes that escaped the group while holding the pipes.
 const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// When to stop reading the CLI's output after its process group is killed,
+/// even while a process that escaped the group keeps writing to the pipes.
+const OUTPUT_DRAIN_CUTOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
 const OUTPUT_HELD_OPEN_MESSAGE: &str =
     "Stopped reading Claude output held open by a process outside its process group";
@@ -673,21 +677,24 @@ The PR title should include the issue ID: {}
         command
     }
 
-    /// The next line of the CLI's `stream`, or `None` once `drain_deadline`
-    /// passes with the pipe still held open.
+    /// The next line of the CLI's `stream`, or `None` once `drain` is over with
+    /// the pipe still held open.
     async fn next_output_line<R: tokio::io::AsyncBufRead + Unpin>(
         lines: &mut tokio::io::Lines<R>,
-        drain_deadline: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+        drain: &mut process_group::Drain,
         label: &str,
         stream: &str,
     ) -> Option<std::io::Result<Option<String>>> {
-        tokio::select! {
-            line = lines.next_line() => Some(line),
-            () = drain_deadline => {
-                tracing::warn!(component = "claude", label, stream, "{OUTPUT_HELD_OPEN_MESSAGE}");
-                None
-            }
+        let line = drain.next_line(lines).await;
+        if line.is_none() {
+            tracing::warn!(
+                component = "claude",
+                label,
+                stream,
+                "{OUTPUT_HELD_OPEN_MESSAGE}"
+            );
         }
+        line
     }
 
     async fn execute(
@@ -794,15 +801,13 @@ The PR title should include the issue ID: {}
             .take()
             .ok_or_else(|| Error::runner("Failed to capture stdout"))?;
 
-        let drain_deadline = group.drain_deadline(OUTPUT_DRAIN_TIMEOUT);
+        let mut drain = group.drain(OUTPUT_DRAIN_TIMEOUT, OUTPUT_DRAIN_CUTOFF);
         let collect = async {
-            tokio::pin!(drain_deadline);
             let mut lines = BufReader::new(stdout).lines();
             let mut structured: Option<serde_json::Value> = None;
             loop {
                 let Some(Ok(Some(line))) =
-                    Self::next_output_line(&mut lines, drain_deadline.as_mut(), label, "stdout")
-                        .await
+                    Self::next_output_line(&mut lines, &mut drain, label, "stdout").await
                 else {
                     break;
                 };
@@ -1297,8 +1302,8 @@ The PR title should include the issue ID: {}
 
         let label_stdout = label.to_string();
         let label_stderr = label.to_string();
-        let stdout_drain_deadline = group.drain_deadline(OUTPUT_DRAIN_TIMEOUT);
-        let stderr_drain_deadline = group.drain_deadline(OUTPUT_DRAIN_TIMEOUT);
+        let mut stdout_drain = group.drain(OUTPUT_DRAIN_TIMEOUT, OUTPUT_DRAIN_CUTOFF);
+        let mut stderr_drain = group.drain(OUTPUT_DRAIN_TIMEOUT, OUTPUT_DRAIN_CUTOFF);
         let stdout_log_path = log_files.as_ref().map(|f| f.stdout.clone());
         let stderr_log_path = log_files.as_ref().map(|f| f.stderr.clone());
         let stdout_event_writer = event_writer.clone();
@@ -1309,7 +1314,6 @@ The PR title should include the issue ID: {}
         drop(early_failure_tx);
 
         let stdout_handle = tokio::spawn(async move {
-            tokio::pin!(stdout_drain_deadline);
             let mut lines = BufReader::new(stdout).lines();
             let mut text_output = String::new();
             let mut final_result = FinalResult::default();
@@ -1350,7 +1354,7 @@ The PR title should include the issue ID: {}
             loop {
                 let Some(next_line) = ClaudeAgentRunner::next_output_line(
                     &mut lines,
-                    stdout_drain_deadline.as_mut(),
+                    &mut stdout_drain,
                     label_stdout.as_str(),
                     "stdout",
                 )
@@ -1580,7 +1584,6 @@ The PR title should include the issue ID: {}
 
         // Stream stderr
         let stderr_handle = tokio::spawn(async move {
-            tokio::pin!(stderr_drain_deadline);
             let mut lines = BufReader::new(stderr).lines();
             let mut output = String::new();
             let mut line_number: u64 = 0;
@@ -1611,7 +1614,7 @@ The PR title should include the issue ID: {}
             loop {
                 let Some(next_line) = ClaudeAgentRunner::next_output_line(
                     &mut lines,
-                    stderr_drain_deadline.as_mut(),
+                    &mut stderr_drain,
                     label_stderr.as_str(),
                     "stderr",
                 )
@@ -2638,7 +2641,10 @@ fn parse_verify_result(output: &str) -> VerifyResult {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use crate::runner::process_group::tests::{exits_within, is_running, kill};
+    use crate::runner::process_group::tests::{
+        exits_within, install_stub, is_running, kill, recorded_escaped_pid, recorded_pids,
+        wait_for_recorded_pids, BACKGROUND_PROCESS, ESCAPED_PROCESS, RUN_DEADLINE,
+    };
 
     /// Create a runner with a no-op tracker for tests that don't need persistence.
     fn new_simple(config: ClaudeRunnerConfig) -> ClaudeAgentRunner {
@@ -2823,10 +2829,9 @@ mod tests {
         })
     }
 
-    /// Start of every stub `claude` binary: answers [`wait_until_executable`]'s
-    /// probe, then drains the prompt from stdin.
+    /// Start of every stub `claude` binary: drains the prompt from stdin.
     #[cfg(unix)]
-    const STUB_HEADER: &str = "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\ncat > /dev/null\n";
+    const STUB_HEADER: &str = "cat > /dev/null\n";
 
     /// A stub `claude` binary that runs `setup`, prints `events` as stream-json
     /// lines and exits with `exit_code`.
@@ -2852,75 +2857,6 @@ mod tests {
         ]
     }
 
-    /// Stub setup that leaves `sleep 300` running in the background, holding
-    /// the stub's stdout, and records "<background pid> <stub pid>" in `pids`.
-    #[cfg(unix)]
-    const BACKGROUND_PROCESS: &str = "sleep 300 &\necho \"$! $$\" > pids\n";
-
-    /// Stub setup that leaves `sleep 300` running in a session of its own,
-    /// beyond the reach of a process group kill, holding the stub's stdout. It
-    /// records its pid in `escaped` once it has left the group.
-    #[cfg(unix)]
-    const ESCAPED_PROCESS: &str = concat!(
-        r#"perl -e 'use POSIX; setsid(); open(my $f, ">", "escaped") or die; "#,
-        r#"print $f "$$\n"; close $f; sleep 300' &"#,
-        "\nwhile [ ! -s escaped ]; do sleep 0.1; done\n",
-    );
-
-    /// Generous, because CI runs the tests under `cargo tarpaulin`'s ptrace.
-    #[cfg(unix)]
-    const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-
-    #[cfg(unix)]
-    fn recorded_escaped_pid(directory: &Path) -> Option<u32> {
-        let contents = std::fs::read_to_string(directory.join("escaped")).ok()?;
-        contents.strip_suffix('\n')?.parse().ok()
-    }
-
-    /// The `(background, stub)` pids [`BACKGROUND_PROCESS`] recorded.
-    #[cfg(unix)]
-    fn recorded_pids(directory: &Path) -> Option<(u32, u32)> {
-        let contents = std::fs::read_to_string(directory.join("pids")).ok()?;
-        let (background, stub) = contents.strip_suffix('\n')?.split_once(' ')?;
-        Some((background.parse().ok()?, stub.parse().ok()?))
-    }
-
-    #[cfg(unix)]
-    async fn wait_for_recorded_pids(directory: &Path) -> (u32, u32) {
-        loop {
-            if let Some(pids) = recorded_pids(directory) {
-                return pids;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    /// Exec `binary` until the kernel stops refusing it with ETXTBSY: a process
-    /// a concurrent test forks can briefly inherit the descriptor it was
-    /// written through.
-    #[cfg(unix)]
-    fn wait_until_executable(binary: &Path) {
-        let start = std::time::Instant::now();
-        loop {
-            let probe = std::process::Command::new(binary)
-                .arg("--probe")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            match probe {
-                Ok(_) => return,
-                Err(error)
-                    if error.raw_os_error() == Some(libc::ETXTBSY)
-                        && start.elapsed() < RUN_DEADLINE =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("the stub CLI must be executable: {error}"),
-            }
-        }
-    }
-
     #[cfg(unix)]
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
@@ -2935,14 +2871,10 @@ mod tests {
     /// logs.
     #[cfg(unix)]
     fn with_fake_cli<T>(script: &str, run: impl FnOnce(&ClaudeAgentRunner, &Path) -> T) -> T {
-        use std::os::unix::fs::PermissionsExt;
-
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let binary = directory.path().join("claude");
-        std::fs::write(&binary, script).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        wait_until_executable(&binary);
+        install_stub(&binary, script);
         let previous_log_dir = std::env::var("CLAUDEAR_LOG_DIR").ok();
         std::env::set_var("CLAUDEAR_LOG_DIR", directory.path().join("logs"));
 

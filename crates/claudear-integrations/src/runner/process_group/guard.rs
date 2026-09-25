@@ -1,4 +1,4 @@
-use super::Registry;
+use super::{Drain, Registry};
 use std::future::Future;
 use std::io;
 use std::process::ExitStatus;
@@ -66,14 +66,17 @@ impl<'a> Guard<'a> {
         self.killed.send_replace(true);
     }
 
-    /// Resolves `grace` after the group is killed or dropped, when readers of
-    /// the CLI's output should stop waiting for EOF: a process that moved to a
-    /// session of its own escaped the kill and can hold the pipes open forever.
-    pub fn drain_deadline(&self, grace: Duration) -> impl Future<Output = ()> + Send + 'static {
+    /// A [`Drain`] for a reader of the CLI's output, whose grace and cutoff
+    /// start when the group is killed or dropped.
+    pub fn drain(&self, grace: Duration, cutoff: Duration) -> Drain {
+        Drain::new(self.after_kill(grace), self.after_kill(cutoff))
+    }
+
+    fn after_kill(&self, delay: Duration) -> impl Future<Output = ()> + Send + 'static {
         let mut killed = self.killed.subscribe();
         async move {
             let _ = killed.wait_for(|killed| *killed).await;
-            tokio::time::sleep(grace).await;
+            tokio::time::sleep(delay).await;
         }
     }
 }
