@@ -6473,9 +6473,10 @@ mod tests {
         let issue = Issue::new("1", "T-1", "Test Issue", "http://example.com/1", "mock");
         let source =
             Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let watcher = create_test_watcher(
             Arc::new(MockNotifier::new(true)),
-            Arc::new(SqliteTracker::in_memory().unwrap()),
+            tracker.clone(),
             vec![source.clone()],
             true,
         );
@@ -6512,12 +6513,11 @@ mod tests {
             dispatched.is_ok(),
             "a slot freed while the lane checks for a rate-limit pause must wake the lane"
         );
-        assert_eq!(
-            watcher.spawn_handles.lock().await.len(),
-            1,
-            "the lane should dispatch its issue into the freed slot"
-        );
         watcher.drain_spawned_tasks().await;
+        assert!(
+            tracker.get_attempt("mock", "1").unwrap().is_some(),
+            "the lane should process its issue in the freed slot"
+        );
     }
 
     #[tokio::test]
