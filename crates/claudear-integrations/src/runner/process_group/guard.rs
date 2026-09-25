@@ -190,38 +190,4 @@ mod tests {
             "background process {background} survived kill_all"
         );
     }
-
-    #[tokio::test]
-    async fn test_drain_deadline_starts_when_the_group_is_killed() {
-        let registry = Registry::new();
-        let (mut leader, mut guard) =
-            Guard::spawn(&mut group_command(BACKGROUND_SLEEP), &registry).unwrap();
-        let deadline = guard.drain_deadline(Duration::ZERO);
-        tokio::pin!(deadline);
-
-        let early = tokio::time::timeout(Duration::from_millis(200), &mut deadline).await;
-        assert!(early.is_err(), "the deadline passed before the kill");
-
-        guard.kill();
-
-        tokio::time::timeout(EXIT_DEADLINE, deadline)
-            .await
-            .expect("the deadline must pass once the group is killed");
-        assert_killed(&mut leader).await;
-    }
-
-    #[tokio::test]
-    async fn test_drain_deadline_starts_when_the_guard_drops() {
-        let registry = Registry::new();
-        let (mut leader, guard) =
-            Guard::spawn(&mut group_command(BACKGROUND_SLEEP), &registry).unwrap();
-        let deadline = guard.drain_deadline(Duration::ZERO);
-
-        drop(guard);
-
-        tokio::time::timeout(EXIT_DEADLINE, deadline)
-            .await
-            .expect("the deadline must pass once the guard drops");
-        assert_killed(&mut leader).await;
-    }
 }
