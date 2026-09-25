@@ -4,6 +4,7 @@ ARG BUN_VERSION=1.3
 ARG DEBIAN_VERSION=trixie
 ARG ONNXRUNTIME_VERSION=1.24.2
 ARG VECTORLITE_VERSION=16a01af79add
+ARG MCP_GRAFANA_VERSION=v1.3.0
 
 ARG GIT_USER_NAME="Claudear"
 ARG GIT_USER_EMAIL="claudear@noreply.local"
@@ -109,6 +110,7 @@ RUN touch src/main.rs src/lib.rs \
 FROM debian:${DEBIAN_VERSION}-slim AS final
 ARG GIT_USER_NAME
 ARG GIT_USER_EMAIL
+ARG MCP_GRAFANA_VERSION
 
 WORKDIR /app
 
@@ -128,6 +130,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
        > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
+
+# Grafana MCP server, so agents can query Prometheus metrics and Loki logs while
+# triaging. A single static Go binary: no extra language runtime, and nothing is
+# downloaded on first use the way `uvx mcp-grafana` would. Attached to runs only
+# when [agent.providers.claude.mcp.grafana] is configured.
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "${ARCH}" in \
+         amd64) MCP_ARCH=x86_64 ;; \
+         arm64) MCP_ARCH=arm64 ;; \
+         *) echo "unsupported arch: ${ARCH}" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/grafana/mcp-grafana/releases/download/${MCP_GRAFANA_VERSION}/mcp-grafana_Linux_${MCP_ARCH}.tar.gz" \
+       | tar -xz -C /usr/local/bin mcp-grafana \
+    && chmod 755 /usr/local/bin/mcp-grafana
 
 COPY --from=vectorlite /build/build/release/vectorlite/vectorlite.so /usr/local/lib/vectorlite.so
 COPY --from=builder /app/target/release/claudear /usr/local/bin/claudear

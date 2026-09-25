@@ -207,6 +207,36 @@ to_addresses = ["team@company.com"]</code></pre>
         <p>SMS (Twilio) and Push (Pushover) send notifications but cannot receive replies. Use these alongside a reply-capable channel for full coverage.</p>
         <p><strong>Telegram</strong> and <strong>WhatsApp</strong> are notification channels that can also double as issue sources (see <a href="#messaging-sources">Messaging sources</a> above).</p>
 
+        <!-- ─── Telemetry ─── -->
+        <h2 id="telemetry"><a class="anchor-link" href="#telemetry" aria-label="Link to Telemetry">#</a>Telemetry</h2>
+        <p>An issue payload tells the agent what broke, not what the service was doing at the time. Attaching an <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">MCP</a> server lets it pull live telemetry while triaging, so it can tell a code bug from a load, config, or deploy problem.</p>
+
+        <h3 id="grafana"><a class="anchor-link" href="#grafana" aria-label="Link to Grafana">#</a>Grafana</h3>
+        <p>Grafana reaches Prometheus metrics and Loki logs through its own datasources, so one server and one credential cover all three:</p>
+        <pre><code class="language-toml">[agent.providers.claude.mcp.grafana]
+command = "mcp-grafana"
+args    = ["--disable-write"]
+sources = ["sentry"]
+tools   = ["list_datasources", "query_prometheus", "query_loki_logs"]
+instructions = """
+Bound every query to the issue's First Seen / Last Seen window.
+Call list_datasources once to find datasource UIDs.
+"""
+
+[agent.providers.claude.mcp.grafana.env]
+GRAFANA_URL                   = "https://grafana.example.com/"
+GRAFANA_SERVICE_ACCOUNT_TOKEN = "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"</code></pre>
+        <p>A Viewer-role service account is enough. The Docker image ships the <code>mcp-grafana</code> binary; for other installs take it from the <a href="https://github.com/grafana/mcp-grafana/releases" target="_blank" rel="noopener">mcp-grafana releases</a> and put it on <code>PATH</code>.</p>
+
+        <h3 id="mcp-options"><a class="anchor-link" href="#mcp-options" aria-label="Link to MCP server options">#</a>MCP server options</h3>
+        <p><code>command</code> and <code>args</code> spawn a stdio server; <code>url</code>, <code>headers</code>, and <code>type</code> are the HTTP/SSE alternative. Beyond transport:</p>
+        <ul>
+          <li><strong><code>sources</code></strong> gates on the issue's source, not the kind of run &mdash; a server listed for <code>sentry</code> attaches to Sentry fix, verify, and reply runs alike. Classification runs never attach MCP servers. Leave it empty to attach everywhere.</li>
+          <li><strong><code>tools</code></strong> allowlists tool names; empty grants every tool the server exposes.</li>
+          <li><strong><code>instructions</code></strong> is added to the agent's prompt whenever the server attaches. Without it the agent holds the tools but is never told they exist, so it will usually ignore them. Per-repo detail belongs in that repo's <code>AGENT.md</code>, which is already prepended to every prompt.</li>
+          <li><strong><code>env</code></strong> values are expanded at run time, so keep secrets out of <code>claudear.toml</code> and reference them as <code>${VAR}</code>. The rendered config goes to a private temp file (mode 0600) deleted when the run ends, and the target repo's own <code>.mcp.json</code> is ignored.</li>
+        </ul>
+
         <!-- ─── User mapping ─── -->
         <h2 id="user-mapping"><a class="anchor-link" href="#user-mapping" aria-label="Link to User mapping">#</a>User mapping</h2>
         <p>Link identities across platforms so notifications route to the right person:</p>
@@ -262,6 +292,9 @@ email = "jake@company.com"</code></pre>
           <li class="toc-item" data-toc-text="notifications"><a class="toc-link" data-toc-link href="#notifications" data-target-id="notifications"><span class="toc-link-label">Notifications</span></a></li>
           <li class="toc-item" data-toc-text="reply-capable recommended"><a class="toc-link toc-link-sub" data-toc-link href="#reply-capable" data-target-id="reply-capable"><span class="toc-link-label">Reply-capable (recommended)</span></a></li>
           <li class="toc-item" data-toc-text="delivery-only"><a class="toc-link toc-link-sub" data-toc-link href="#delivery-only" data-target-id="delivery-only"><span class="toc-link-label">Delivery-only</span></a></li>
+          <li class="toc-item" data-toc-text="telemetry"><a class="toc-link" data-toc-link href="#telemetry" data-target-id="telemetry"><span class="toc-link-label">Telemetry</span></a></li>
+          <li class="toc-item" data-toc-text="grafana"><a class="toc-link toc-link-sub" data-toc-link href="#grafana" data-target-id="grafana"><span class="toc-link-label">Grafana</span></a></li>
+          <li class="toc-item" data-toc-text="mcp server options"><a class="toc-link toc-link-sub" data-toc-link href="#mcp-options" data-target-id="mcp-options"><span class="toc-link-label">MCP server options</span></a></li>
           <li class="toc-item" data-toc-text="user mapping"><a class="toc-link" data-toc-link href="#user-mapping" data-target-id="user-mapping"><span class="toc-link-label">User mapping</span></a></li>
           <li class="toc-item" data-toc-text="webhooks"><a class="toc-link" data-toc-link href="#webhooks" data-target-id="webhooks"><span class="toc-link-label">Webhooks</span></a></li>
         </ul>

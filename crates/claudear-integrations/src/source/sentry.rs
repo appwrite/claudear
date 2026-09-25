@@ -328,6 +328,21 @@ fn format_sentry_context(issue: &Issue) -> String {
     if let Some(user_count) = issue.get_metadata::<i64>("user_count") {
         context.push_str(&format!("**User Count:** {}\n", user_count));
     }
+    // Sentry's firstSeen/lastSeen, mapped in `map_issue`. These bound the window an
+    // agent should look at when correlating against metrics or logs; without them it
+    // has to guess, and unbounded range queries are slow and drown out the signal.
+    if let Some(first_seen) = issue.created_at {
+        context.push_str(&format!(
+            "**First Seen:** {}\n",
+            first_seen.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ));
+    }
+    if let Some(last_seen) = issue.updated_at {
+        context.push_str(&format!(
+            "**Last Seen:** {}\n",
+            last_seen.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ));
+    }
     if let Some(project) = issue.get_metadata::<String>("project") {
         context.push_str(&format!("**Project:** {}\n\n", project));
     }
@@ -3432,6 +3447,37 @@ mod tests {
         assert!(!context.contains("**Project:**"));
         assert!(!context.contains("**Culprit:**"));
         assert!(!context.contains("## Error Details"));
+        // No timestamps on the issue, so no misleading empty window.
+        assert!(!context.contains("**First Seen:**"));
+        assert!(!context.contains("**Last Seen:**"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_includes_seen_window() {
+        let mut issue = Issue::new(
+            "300",
+            "SENTRY-300",
+            "Windowed Error",
+            "https://sentry.io/issue/300",
+            "sentry",
+        );
+        // As mapped from Sentry's firstSeen/lastSeen in `map_issue`. The agent needs
+        // these to bound metric and log queries when correlating against telemetry.
+        issue.created_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        issue.updated_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2024-01-02T12:30:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+
+        let context = format_sentry_context(&issue);
+
+        assert!(context.contains("**First Seen:** 2024-01-01T00:00:00Z"));
+        assert!(context.contains("**Last Seen:** 2024-01-02T12:30:00Z"));
     }
 
     #[test]

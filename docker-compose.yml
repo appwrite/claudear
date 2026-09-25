@@ -47,6 +47,14 @@ services:
       # Claude Code authentication (if unset, container will prompt OAuth login on first start)
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
 
+      # Grafana telemetry for agent runs. Referenced as ${VAR} from the
+      # [agent.providers.claude.mcp.grafana] block in claudear.toml, so the values
+      # stay out of the config file. Unset unless that block is configured.
+      GRAFANA_URL: ${GRAFANA_URL:-}
+      GRAFANA_SERVICE_ACCOUNT_TOKEN: ${GRAFANA_SERVICE_ACCOUNT_TOKEN:-}
+      # JSON object of extra headers, e.g. Cloudflare Access service-token pairs.
+      GRAFANA_EXTRA_HEADERS: ${GRAFANA_EXTRA_HEADERS:-}
+
       # Notifications
       CLAUDEAR_DISCORD_WEBHOOK_URL: ${CLAUDEAR_DISCORD_WEBHOOK_URL:-}
       CLAUDEAR_DISCORD_USER_ID: ${CLAUDEAR_DISCORD_USER_ID:-}
