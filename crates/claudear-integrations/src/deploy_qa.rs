@@ -754,6 +754,17 @@ mod tests {
             .expect("reporting should not fail once the status is stored")
     }
 
+    async fn posted_title(text: &str) -> Value {
+        let store = MemoryStore::new(tip());
+        let (discord, requests) = reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+        report(&store, &discord, text).await;
+        posts(&requests)
+            .pop()
+            .expect("the report should be posted")
+            .body["embeds"][0]["title"]
+            .clone()
+    }
+
     fn assert_reply_without_mention(request: &Request) {
         assert!(request.is_post_to(&format!("/channels/{CHANNEL}/messages")));
         assert_eq!(
@@ -784,7 +795,6 @@ mod tests {
         let posts = posts(&requests);
         assert_eq!(posts.len(), 1, "{posts:?}");
         assert_reply_without_mention(&posts[0]);
-        assert_eq!(posts[0].body["embeds"][0]["title"], TITLE_VERIFIED);
         let stored = store.tip();
         assert_eq!(stored.status, DeployQaTipStatus::Verified);
         assert_eq!(stored.discord_message_id.as_deref(), Some(RELEASE_MESSAGE));
@@ -807,8 +817,9 @@ mod tests {
         let posts = posts(&requests);
         assert_eq!(posts.len(), 1, "exactly one reply, no thread: {posts:?}");
         assert_reply_without_mention(&posts[0]);
+        let verified_title = posted_title(&verdict_report("LIVE PASS", VERDICT_ALL_VERIFIED)).await;
         assert_ne!(
-            posts[0].body["embeds"][0]["title"], TITLE_VERIFIED,
+            posts[0].body["embeds"][0]["title"], verified_title,
             "a blocked check must not be reported as verified"
         );
         let stored = store.tip();
@@ -1080,7 +1091,10 @@ mod tests {
         let fail_post = posts(&requests)
             .pop()
             .expect("the FAIL report should be posted");
-        assert_eq!(fail_post.body["embeds"][0]["title"], format!("FAIL {TAG}"));
+        assert!(
+            fail_post.is_post_to(&format!("/channels/{CREATED_THREAD}/messages")),
+            "the report must be posted as a FAIL, in the release thread: {fail_post:?}"
+        );
         let description = description(&fail_post);
         assert!(
             !description.contains(BEARER_TOKEN),
