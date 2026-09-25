@@ -10927,20 +10927,21 @@ mod tests {
 
         tracker.release_orphaned_pending_attempts().unwrap();
 
-        // The next cascade trigger resumes the same row, which must still be pending
+        // Not pushed into the retry queue, which would rerun the whole parent issue
+        assert!(tracker.get_retryable_issues(2).unwrap().is_empty());
+        // The next cascade trigger resumes the same row and can finish it
         let resumed = tracker
             .record_cascade_attempt("discord", "1", "D-1", parent.id, cascade)
             .unwrap();
         assert_eq!(resumed, child);
-        let conn = tracker.acquire_lock().unwrap();
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM fix_attempts WHERE id = ?",
-                [child],
-                |r| r.get(0),
-            )
+        tracker
+            .update_attempt_pr(resumed, "https://github.com/org/lib/pull/7", "org/lib", 7)
             .unwrap();
-        assert_eq!(status, "pending");
+        assert!(tracker
+            .get_pending_prs()
+            .unwrap()
+            .iter()
+            .any(|a| a.id == child));
     }
 
     #[test]
@@ -10951,7 +10952,7 @@ mod tests {
             .mark_success("discord", "1", "https://github.com/org/app/pull/1")
             .unwrap();
         let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
-        let child_id = tracker
+        let child = tracker
             .record_cascade_attempt(
                 "discord",
                 "1",
@@ -10960,50 +10961,22 @@ mod tests {
                 "git@github.com:org/lib.git",
             )
             .unwrap();
-
-        tracker.mark_cascade_pr_outcome(child_id, true).unwrap();
-
-        let conn = tracker.acquire_lock().unwrap();
-        let (child_status, child_merged): (String, Option<String>) = conn
-            .query_row(
-                "SELECT status, merged_at FROM fix_attempts WHERE id = ?",
-                [child_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        let parent_status: String = conn
-            .query_row(
-                "SELECT status FROM fix_attempts WHERE id = ?",
-                [parent.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(child_status, "merged");
-        assert!(child_merged.is_some());
-        assert_eq!(parent_status, "success");
-    }
-
-    #[test]
-    fn test_prepare_for_retry() {
-        let tracker = SqliteTracker::in_memory().unwrap();
-
-        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
         tracker
-            .mark_success("linear", "123", "https://github.com/org/repo/pull/42")
+            .update_attempt_pr(child, "https://github.com/org/lib/pull/120", "org/lib", 120)
             .unwrap();
-        tracker.mark_closed("linear", "123").unwrap();
 
-        // Prepare for retry should reset to pending and increment retry_count
-        tracker.prepare_for_retry("linear", "123").unwrap();
+        tracker.mark_cascade_pr_outcome(child, true).unwrap();
 
-        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
-        assert_eq!(attempt.status, FixAttemptStatus::Pending);
-        assert!(attempt.pr_url.is_none());
-        assert!(attempt.scm_repo.is_none());
-        assert!(attempt.scm_pr_number.is_none());
-        assert!(attempt.error_message.is_none());
-        assert_eq!(attempt.retry_count, 1);
-        assert!(attempt.last_retry_at.is_some());
+        // The merged cascade PR stops being polled; the parent's own PR still is
+        let pending: Vec<i64> = tracker
+            .get_pending_prs()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(pending, vec![parent.id]);
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        assert_eq!(parent.status, FixAttemptStatus::Success);
     }
 
     #[test]

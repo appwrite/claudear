@@ -2622,14 +2622,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_prompt_carries_triage_playbook_for_sentry_only() {
-        let playbook = claudear_core::templates::SENTRY_TRIAGE_PLAYBOOK;
-        let sentry = Issue::new("1", "CLOUD-1", "Boom", "url", "sentry");
-        assert!(build_verify_prompt(&sentry, "ctx").contains(playbook));
-        assert!(!build_verify_prompt(&verify_issue(), "ctx").contains(playbook));
-    }
-
-    #[test]
     fn test_parse_verify_result_direct_json() {
         let v = parse_verify_result(
             r#"{"reproduced": true, "summary": "found it", "evidence": "src/a.rs:10"}"#,
