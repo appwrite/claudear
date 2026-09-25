@@ -6480,10 +6480,11 @@ mod tests {
             std::fs::canonicalize(self.workspace.path()).unwrap()
         }
 
-        /// The Claudear-owned directory each live-QA run gets its own
-        /// directory in.
-        fn live_qa_base(&self) -> std::path::PathBuf {
-            self.resolved_workspace().join(LIVE_QA_DIRECTORY)
+        fn workspace_entries(&self) -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(self.workspace.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect()
         }
 
         /// Record that Claudear answered [`PRIOR_QUESTION`] from Discord with
@@ -6694,16 +6695,10 @@ mod tests {
             vec![(issue_id, QA_REPORT.to_string())],
             "release QA must bypass the reply pipeline and deliver the QA answer"
         );
-        let directories = fixture.agent.project_dirs();
         assert_eq!(
-            directories.len(),
-            1,
-            "release QA must run once, never as a customer reply: {directories:?}"
-        );
-        assert_eq!(
-            directories[0].parent(),
-            Some(fixture.live_qa_base().as_path()),
-            "release QA must bypass the reply pipeline and run as live QA: {directories:?}"
+            fixture.agent.entry_points(),
+            vec![EntryPoint::Answer],
+            "release QA must run live QA once, never generate a customer reply"
         );
     }
 
@@ -6724,17 +6719,11 @@ mod tests {
                 vec![(issue_id, QA_REPORT.to_string())],
                 "a deploy_qa issue marked {intent:?} must deliver its QA report, not a fix"
             );
-            let directories = fixture.agent.project_dirs();
             assert_eq!(
-                directories.len(),
-                1,
+                fixture.agent.entry_points(),
+                vec![EntryPoint::Answer],
                 "a deploy_qa issue marked {intent:?} must run live QA once, never verify it \
-                 for a fix: {directories:?}"
-            );
-            assert_eq!(
-                directories[0].parent(),
-                Some(fixture.live_qa_base().as_path()),
-                "a deploy_qa issue marked {intent:?} must run as live QA: {directories:?}"
+                 for a fix or run one"
             );
         }
     }
@@ -6828,23 +6817,23 @@ mod tests {
 
         let calls = fixture.agent.calls();
         assert_eq!(calls.len(), 1, "one run, one agent call: {calls:?}");
-        let directory = &calls[0].project_dir;
-        assert_ne!(
-            directory,
-            checkout.path(),
-            "live QA must never run inside a resolved repo checkout"
-        );
-        assert_eq!(
-            directory.parent(),
-            Some(fixture.live_qa_base().as_path()),
-            "live QA must run in its own directory under the Claudear-owned base"
+        let call = &calls[0];
+        assert!(
+            !call.project_dir.starts_with(checkout.path()),
+            "live QA must never run inside a resolved repo checkout: {call:?}"
         );
         assert!(
-            calls[0].permissions.is_some(),
+            call.permissions.is_some(),
             "the run directory must exist while the agent works in it"
         );
+        #[cfg(unix)]
+        assert_eq!(
+            call.mode(),
+            Some(0o700),
+            "no other local user may use the run directory while the agent works in it"
+        );
         assert!(
-            !directory.exists(),
+            !call.project_dir.exists(),
             "the run directory must be removed once the report is delivered"
         );
     }
@@ -6943,29 +6932,36 @@ mod tests {
                 .await,
         );
 
-        let permissions = fixture.agent.calls()[0]
-            .permissions
-            .clone()
-            .expect("the run directory must exist while the agent works in it");
         assert_eq!(
-            permissions.mode() & 0o777,
-            0o700,
+            fixture.agent.calls()[0].mode(),
+            Some(0o700),
             "no other local user may read or plant files in a live-QA run directory"
         );
-        let base_permissions = std::fs::metadata(fixture.live_qa_base())
-            .unwrap()
-            .permissions();
-        assert_eq!(
-            base_permissions.mode() & 0o777,
-            0o700,
-            "the base Claudear creates for live-QA runs must be owner-only too"
+        let exposed: Vec<String> = fixture
+            .workspace_entries()
+            .into_iter()
+            .filter_map(|entry| {
+                let mode = std::fs::symlink_metadata(&entry)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                (mode != 0o700).then(|| format!("{} ({mode:04o})", entry.display()))
+            })
+            .collect();
+        assert!(
+            exposed.is_empty(),
+            "whatever live QA creates in the workspace must be owner-only too: {exposed:?}"
         );
     }
+
+    const DOCUMENTED_LIVE_QA_BASE: &str = ".claudear-deploy-qa";
 
     #[tokio::test]
     async fn test_deploy_qa_fails_clearly_when_its_directory_cannot_be_created() {
         let fixture = AnsweringFixture::new();
-        std::fs::write(fixture.live_qa_base(), "not a directory").unwrap();
+        let base = fixture.resolved_workspace().join(DOCUMENTED_LIVE_QA_BASE);
+        std::fs::write(&base, "not a directory").unwrap();
         let context = RecordingContextProvider::default();
 
         let error = expect_failed(
@@ -6975,7 +6971,7 @@ mod tests {
         );
 
         assert!(
-            error.contains(&fixture.live_qa_base().display().to_string()),
+            error.contains(&base.display().to_string()),
             "the error must name the directory live QA could not create: {error}"
         );
         assert!(
@@ -6989,8 +6985,9 @@ mod tests {
     #[tokio::test]
     async fn test_deploy_qa_refuses_a_base_directory_that_is_a_symbolic_link() {
         let fixture = AnsweringFixture::new();
+        let base = fixture.resolved_workspace().join(DOCUMENTED_LIVE_QA_BASE);
         let elsewhere = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(elsewhere.path(), fixture.live_qa_base()).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), &base).unwrap();
         let context = RecordingContextProvider::default();
 
         let error = expect_failed(
@@ -7000,8 +6997,7 @@ mod tests {
         );
 
         assert!(
-            error.contains(&fixture.live_qa_base().display().to_string())
-                && error.contains("symbolic link"),
+            error.contains(&base.display().to_string()) && error.contains("symbolic link"),
             "the error must say the base directory is a symbolic link: {error}"
         );
         assert!(
@@ -7024,12 +7020,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let fixture = AnsweringFixture::new();
-        std::fs::create_dir(fixture.live_qa_base()).unwrap();
-        std::fs::set_permissions(
-            fixture.live_qa_base(),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        let base = fixture.resolved_workspace().join(DOCUMENTED_LIVE_QA_BASE);
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_completed_no_pr(
             fixture
@@ -7040,9 +7033,7 @@ mod tests {
                 .await,
         );
 
-        let permissions = std::fs::metadata(fixture.live_qa_base())
-            .unwrap()
-            .permissions();
+        let permissions = std::fs::metadata(&base).unwrap().permissions();
         assert_eq!(
             permissions.mode() & 0o777,
             0o700,
@@ -7097,9 +7088,10 @@ mod tests {
             fixture.agent.calls().is_empty(),
             "live QA must never run where another local user could redirect it"
         );
+        let entries = fixture.workspace_entries();
         assert!(
-            !fixture.live_qa_base().exists(),
-            "nothing may be created in a workspace other users can write"
+            entries.is_empty(),
+            "nothing may be created in a workspace other users can write: {entries:?}"
         );
         assert!(context.replies().is_empty());
     }
@@ -7122,15 +7114,16 @@ mod tests {
                 .await,
         );
 
-        let directories = fixture.agent.project_dirs();
-        assert_eq!(
-            directories.len(),
-            1,
-            "one run, one agent call: {directories:?}"
+        let calls = fixture.agent.calls();
+        assert_eq!(calls.len(), 1, "one run, one agent call: {calls:?}");
+        let call = &calls[0];
+        assert!(
+            call.project_dir.starts_with(fixture.resolved_workspace()),
+            "live QA must run inside the workspace the link leads to: {call:?}"
         );
         assert_eq!(
-            directories[0].parent(),
-            Some(fixture.live_qa_base().as_path()),
+            call.resolved_path.as_ref(),
+            Some(&call.project_dir),
             "live QA must run at its directory's resolved path, which no link can later redirect"
         );
     }
@@ -7316,27 +7309,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deploy_qa_directory_stays_inside_the_base_whatever_the_short_id() {
+    async fn test_deploy_qa_short_id_never_moves_the_run_directory() {
         let fixture = AnsweringFixture::new();
-        let mut input = question_input(DEPLOY_QA_SOURCE);
-        input.issue.short_id = format!("../../{}/tag v1", "x".repeat(300));
+        let mut hostile = question_input(DEPLOY_QA_SOURCE);
+        hostile.issue.short_id = format!("../../{}/tag v1", "x".repeat(300));
 
-        assert_completed_no_pr(
-            fixture
-                .run(input, &RecordingContextProvider::default())
-                .await,
-        );
-        assert_eq!(
-            fixture.agent.calls().len(),
-            1,
-            "a short id longer than a file name allows must still get a run directory"
-        );
+        for input in [question_input(DEPLOY_QA_SOURCE), hostile] {
+            assert_completed_no_pr(
+                fixture
+                    .run(input, &RecordingContextProvider::default())
+                    .await,
+            );
+        }
 
         let directories = fixture.agent.project_dirs();
+        let [ordinary, hostile] = directories.as_slice() else {
+            panic!(
+                "a short id longer than a file name allows must still get a run directory: \
+                 {directories:?}"
+            );
+        };
         assert_eq!(
-            directories[0].parent(),
-            Some(fixture.live_qa_base().as_path()),
-            "a short id with path separators must not move the run directory: {directories:?}"
+            hostile.parent(),
+            ordinary.parent(),
+            "a short id with path separators must leave its run directory beside an ordinary \
+             run's: {directories:?}"
         );
     }
 
@@ -7352,16 +7349,21 @@ mod tests {
 
         assert_completed_no_pr(fixture.run(input, &context).await);
 
-        let directories = fixture.agent.project_dirs();
         assert_eq!(
-            directories.len(),
-            1,
+            fixture.agent.entry_points(),
+            vec![EntryPoint::Answer],
             "a deploy_qa issue must take the live-QA path, never the fix pipeline"
         );
-        assert_eq!(
-            directories[0].parent(),
-            Some(fixture.live_qa_base().as_path()),
-            "a deploy_qa issue must get live-QA containment whichever source name delivers it"
+        let directory = &fixture.agent.project_dirs()[0];
+        assert!(
+            !directory.starts_with(checkout.path()),
+            "a deploy_qa issue must never run in the resolved checkout, whichever source name \
+             delivers it: {directory:?}"
+        );
+        assert!(
+            !directory.exists(),
+            "a deploy_qa issue's run directory must be removed once the run ends, whichever \
+             source name delivers it: {directory:?}"
         );
         assert_eq!(context.replies(), vec![(issue_id, QA_REPORT.to_string())]);
     }
@@ -7500,9 +7502,10 @@ mod tests {
             claudear_core::types::FixAttemptStatus::Pending,
             "a refused action must leave the attempt untouched"
         );
+        let entries = fixture.workspace_entries();
         assert!(
-            !fixture.live_qa_base().exists(),
-            "a refused action must not start a live-QA run"
+            entries.is_empty(),
+            "a refused action must not start a live-QA run: {entries:?}"
         );
     }
 
@@ -7658,8 +7661,7 @@ mod tests {
     const FAILED_ANSWER_ERROR: &str = "the agent CLI crashed";
 
     /// Agent runner whose `answer_question` returns [`QA_REPORT`] after
-    /// `delay`, recording every directory it is asked to answer, reply or
-    /// verify in, with the context it is given.
+    /// `delay`, recording every call a processor makes through it.
     #[derive(Default)]
     struct AnsweringAgent {
         delay: Duration,
@@ -7667,14 +7669,38 @@ mod tests {
         calls: std::sync::Mutex<Vec<AgentCall>>,
     }
 
-    /// A directory an [`AnsweringAgent`] was asked to work in, as it found it,
-    /// and the context it was given.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EntryPoint {
+        Answer,
+        Reply,
+        Verify,
+        Execute,
+        Query,
+    }
+
+    /// A call an [`AnsweringAgent`] received: the entry point it came through,
+    /// the directory it was asked to work in, as it found it, and the context
+    /// it was given.
     #[derive(Debug, Clone)]
     struct AgentCall {
+        entry_point: EntryPoint,
         project_dir: std::path::PathBuf,
         /// `None` when the directory did not exist.
         permissions: Option<std::fs::Permissions>,
+        #[cfg(unix)]
+        resolved_path: Option<std::path::PathBuf>,
         context: String,
+    }
+
+    #[cfg(unix)]
+    impl AgentCall {
+        fn mode(&self) -> Option<u32> {
+            use std::os::unix::fs::PermissionsExt;
+
+            self.permissions
+                .as_ref()
+                .map(|permissions| permissions.mode() & 0o777)
+        }
     }
 
     impl AnsweringAgent {
@@ -7693,19 +7719,29 @@ mod tests {
             }
         }
 
-        fn record(&self, project_dir: &std::path::Path, context: &str) {
+        fn record(&self, entry_point: EntryPoint, project_dir: &std::path::Path, context: &str) {
             let permissions = std::fs::metadata(project_dir)
                 .ok()
                 .map(|metadata| metadata.permissions());
             self.calls.lock().unwrap().push(AgentCall {
+                entry_point,
                 project_dir: project_dir.to_path_buf(),
                 permissions,
+                #[cfg(unix)]
+                resolved_path: std::fs::canonicalize(project_dir).ok(),
                 context: context.to_string(),
             });
         }
 
         fn calls(&self) -> Vec<AgentCall> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn entry_points(&self) -> Vec<EntryPoint> {
+            self.calls()
+                .into_iter()
+                .map(|call| call.entry_point)
+                .collect()
         }
 
         fn project_dirs(&self) -> Vec<std::path::PathBuf> {
@@ -7748,11 +7784,12 @@ mod tests {
 
         async fn execute_with_attempt(
             &self,
-            _prompt: &str,
+            prompt: &str,
             _issue: Option<&Issue>,
             _attempt_id: Option<i64>,
-            _project_dir: &std::path::Path,
+            project_dir: &std::path::Path,
         ) -> claudear_core::error::Result<claudear_core::types::AgentResult> {
+            self.record(EntryPoint::Execute, project_dir, prompt);
             Err(claudear_core::error::Error::runner(
                 "execute is not supported by the answering agent",
             ))
@@ -7764,7 +7801,7 @@ mod tests {
             context: &str,
             project_dir: &std::path::Path,
         ) -> claudear_core::error::Result<String> {
-            self.record(project_dir, context);
+            self.record(EntryPoint::Answer, project_dir, context);
             tokio::time::sleep(self.delay).await;
             if self.fails {
                 return Err(claudear_core::error::Error::runner(FAILED_ANSWER_ERROR));
@@ -7780,7 +7817,7 @@ mod tests {
             _kind: ReplyKind,
             project_dir: &std::path::Path,
         ) -> claudear_core::error::Result<String> {
-            self.record(project_dir, context);
+            self.record(EntryPoint::Reply, project_dir, context);
             Ok(QA_REPORT.to_string())
         }
 
@@ -7790,9 +7827,21 @@ mod tests {
             context: &str,
             project_dir: &std::path::Path,
         ) -> claudear_core::error::Result<VerifyResult> {
-            self.record(project_dir, context);
+            self.record(EntryPoint::Verify, project_dir, context);
             Err(claudear_core::error::Error::runner(
                 "verify is not supported by the answering agent",
+            ))
+        }
+
+        async fn structured_query(
+            &self,
+            prompt: &str,
+            _json_schema: &str,
+            project_dir: &std::path::Path,
+        ) -> claudear_core::error::Result<serde_json::Value> {
+            self.record(EntryPoint::Query, project_dir, prompt);
+            Err(claudear_core::error::Error::runner(
+                "structured queries are not supported by the answering agent",
             ))
         }
     }
