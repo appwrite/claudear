@@ -155,7 +155,24 @@
             <li><code>skip_permissions</code>: skip all interactive permission prompts (default: <code>true</code>).</li>
             <li><code>binary</code>: CLI binary name or absolute path (default: <code>"claude"</code>). Set the full path when the daemon cannot find the binary via PATH.</li>
             <li><code>env</code>: extra environment variables for the agent process. Useful when running as a systemd service where PATH is limited (e.g. <code>env = { PATH = "/home/user/.local/bin:..." }</code>).</li>
+            <li><code>mcp</code>: MCP servers to attach to agent runs, keyed by server name &mdash; see <a href="#mcp-servers">MCP servers</a> below.</li>
             </ul>
+          </div>
+        </details>
+
+        <details id="mcp-servers">
+          <summary>MCP servers (<code>[agent.providers.claude.mcp.&lt;name&gt;]</code>) <span class="summary-desc">give the agent live context</span></summary>
+          <div class="details-content">
+            <p>An issue payload says what broke, not what the service was doing at the time. MCP servers let the agent reach systems the payload does not describe &mdash; production telemetry, a database, an internal API &mdash; while it is triaging.</p>
+            <ul>
+            <li><code>command</code>, <code>args</code>: the server process to spawn (stdio transport).</li>
+            <li><code>url</code>, <code>headers</code>, <code>type</code>: HTTP or SSE transport, as an alternative to <code>command</code>. Set exactly one of <code>command</code> or <code>url</code>.</li>
+            <li><code>env</code>: environment for the server process. <code>${VAR}</code> is expanded at run time, so keep secrets out of the config file and set them in the daemon environment instead.</li>
+            <li><code>sources</code>: issue sources this server attaches for; empty means all. This gates on the issue's source, not the kind of run, so a server listed for <code>sentry</code> attaches to Sentry fix, verify, and reply runs alike. Classification runs never attach MCP servers.</li>
+            <li><code>tools</code>: tool names to allow; empty grants every tool the server exposes.</li>
+            <li><code>instructions</code>: guidance added to the agent's prompt whenever this server attaches. Without it the agent holds the tools but is never told they exist, so it will usually ignore them.</li>
+            </ul>
+            <p>The rendered server config is written to a private temp file (mode 0600) that is deleted when the run ends, and the target repository's own <code>.mcp.json</code> is ignored. See <a href="./integrations.html#telemetry">Telemetry</a> for a worked Grafana example.</p>
           </div>
         </details>
 
@@ -1483,6 +1500,7 @@ enabled = false
         <li class="toc-item" data-toc-text="core settings"><a class="toc-link" data-toc-link href="#core-settings" data-target-id="core-settings"><span class="toc-link-label">Core settings</span></a></li>
         <li class="toc-item" data-toc-text="retries ([retry])"><a class="toc-link" data-toc-link href="#retries" data-target-id="retries"><span class="toc-link-label">Retries ([retry])</span></a></li>
         <li class="toc-item" data-toc-text="ai agent ([agent])"><a class="toc-link" data-toc-link href="#ai-agent" data-target-id="ai-agent"><span class="toc-link-label">AI agent ([agent])</span></a></li>
+        <li class="toc-item" data-toc-text="mcp servers ([agent.providers.claude.mcp.&lt;name&gt;])"><a class="toc-link" data-toc-link href="#mcp-servers" data-target-id="mcp-servers"><span class="toc-link-label">MCP servers ([agent.providers.claude.mcp.&lt;name&gt;])</span></a></li>
         <li class="toc-item" data-toc-text="user mapping ([users.&lt;slug&gt;])"><a class="toc-link" data-toc-link href="#user-mapping" data-target-id="user-mapping"><span class="toc-link-label">User mapping ([users.&lt;slug&gt;])</span></a></li>
         <li class="toc-item" data-toc-text="questions ([ask])"><a class="toc-link" data-toc-link href="#questions" data-target-id="questions"><span class="toc-link-label">Questions ([ask])</span></a></li>
         <li class="toc-item" data-toc-text="source control ([scm.*])"><a class="toc-link" data-toc-link href="#source-control" data-target-id="source-control"><span class="toc-link-label">Source control ([scm.*])</span></a></li>
