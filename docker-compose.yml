@@ -11,7 +11,7 @@ services:
         CLAUDEAR_SENTRY_ENVIRONMENT: ${CLAUDEAR_SENTRY_ENVIRONMENT:-production}
     container_name: claudear-app
     restart: unless-stopped
-    stop_grace_period: 40s
+    stop_grace_period: 50s
     environment:
       # Data directory (SQLite database stored here)
       CLAUDEAR_DB_PATH: /app/data/claudear.db

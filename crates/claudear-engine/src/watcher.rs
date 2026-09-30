@@ -4,6 +4,7 @@ use crate::intent::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
+use crate::shutdown::DRAIN_TIMEOUT;
 use chrono::{DateTime, Utc};
 use claudear_analysis::deploy_qa::DEPLOY_QA_SOURCE;
 use claudear_analysis::feedback::{FeedbackAnalyzer, IssueEmbeddingService, Outcome};
@@ -37,7 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, RwLock};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval_at, Duration};
 
 /// A candidate issue ready for dispatch: the issue, its match result, and the
 /// decided routing `Intent` (`None` for non-QA-eligible / QA-disabled sources).
@@ -55,6 +56,62 @@ const REVIEW_PR_REPO_KEY: &str = "review_pr_repo";
 const MAX_REVIEW_CYCLES: i32 = 3;
 
 const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
+
+/// How often a drain re-reads the in-flight count, so a missed wake-up delays
+/// shutdown by at most this long.
+const DRAIN_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Shortest wait between passes of the source polling loop, so sources with
+/// shorter intervals cannot make it busy-loop.
+const MIN_SOURCE_POLL_PERIOD: Duration = Duration::from_secs(1);
+
+/// Why a trigger is refused once [`Watcher::stop`] has been called.
+const STOPPING_REFUSAL: &str = "Watcher is stopping; not starting new runs";
+
+/// Why an issue triggered outside a poll is processed.
+pub const MANUAL_TRIGGER: &str = "Manual trigger";
+
+/// Prefix of the error recorded on an attempt whose retry could not run.
+pub(crate) const RETRY_TRIGGER_FAILED: &str = "Retry trigger failed";
+
+/// How [`Watcher::process_issue`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssueRun {
+    /// The issue went through the processing pipeline.
+    Processed,
+    /// The issue was skipped, such as a `deploy_qa` tip that already has a
+    /// verdict or a run its [`Admission`] refused.
+    Skipped,
+    /// The issue is already being processed, so no run started.
+    Busy,
+    /// The watcher is stopping, so no run started.
+    Stopping,
+    /// The watcher is paused for a rate limit, so no run started.
+    Paused,
+}
+
+/// Decides whether a run [`Watcher::process_issue`] admitted may start. It is
+/// called at most once, after the issue is claimed and the watcher is found
+/// not stopping, and before anything is recorded for the run.
+type Admission<'a> = Box<dyn FnOnce() -> bool + Send + 'a>;
+
+/// How [`Watcher::retry`] ended.
+#[derive(Debug)]
+pub enum RetryOutcome {
+    /// The issue went through the processing pipeline.
+    Ran,
+    /// The watcher is stopping, so the attempt is left as it was for the next
+    /// start.
+    Stopping,
+    /// The issue is already being processed, so the attempt is left as it was
+    /// for a later retry.
+    Busy,
+    /// The retry could not run. A transient error, such as a network error or
+    /// a pause for a rate limit, leaves the attempt as it was; any other error
+    /// spent the attempt's retry and marked it failed, unless the retry itself
+    /// could not be spent.
+    Failed(claudear_core::error::Error),
+}
 
 /// Whether a retry that failed to start should get its retry back.
 fn retry_trigger_error_is_transient(e: &claudear_core::error::Error) -> bool {
@@ -216,9 +273,10 @@ impl Drop for DeployQaTipClaim {
     }
 }
 
-/// An issue's hold on its processing key and concurrency slot, released on
-/// drop so a run that panics or is aborted frees them instead of refusing the
-/// issue as in-flight and consuming the slot until restart.
+/// An issue's hold on its processing key, its concurrency slot and the
+/// shutdown drain, released on drop so a run that panics or is aborted frees
+/// them instead of refusing the issue as in-flight, consuming the slot until
+/// restart and stalling shutdown.
 struct ProcessingClaim<'a> {
     watcher: &'a Watcher,
     key: String,
@@ -230,6 +288,26 @@ impl Drop for ProcessingClaim<'_> {
         self.watcher
             .active_processing
             .fetch_sub(1, Ordering::SeqCst);
+        self.watcher.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.watcher.slot_available.notify_waiters();
+    }
+}
+
+/// A retry's or housekeeping run's hold on the shutdown drain, released on
+/// drop. It takes no processing slot, so [`Watcher::active_count`] leaves it
+/// out.
+///
+/// Take it before checking whether the watcher stopped: [`Watcher::stop`]
+/// sets `stopped` and clears `is_running` before the drain reads
+/// [`Watcher::in_flight`], so either the check sees the stop or the drain sees
+/// the claim.
+struct RunClaim<'a> {
+    watcher: &'a Watcher,
+}
+
+impl Drop for RunClaim<'_> {
+    fn drop(&mut self) {
+        self.watcher.in_flight.fetch_sub(1, Ordering::SeqCst);
         self.watcher.slot_available.notify_waiters();
     }
 }
@@ -291,10 +369,16 @@ pub struct Watcher {
     qa_agent: Option<Arc<dyn AgentRunner>>,
     dry_run: bool,
     is_running: AtomicBool,
+    /// Set for good by [`Self::stop`] before it clears `is_running`, so a
+    /// concurrent [`Self::mark_running`] cannot leave a stopped watcher running.
+    stopped: AtomicBool,
     /// Keys of the issues being processed. Each key is held by a
     /// [`ProcessingClaim`], whose `Drop` needs a synchronous lock.
     processing: Mutex<ProcessingState>,
     active_processing: AtomicUsize,
+    /// Runs the shutdown drain waits for, one per [`ProcessingClaim`] and
+    /// [`RunClaim`].
+    in_flight: AtomicUsize,
     /// Feedback analyzer for learning from past outcomes
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
     /// Last seen release tag per upstream repo (for release-triggered cascades).
@@ -397,8 +481,10 @@ impl Watcher {
             user_registry: options.user_registry,
             dry_run: options.dry_run,
             is_running: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             processing: Mutex::new(ProcessingState::new()),
             active_processing: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
             last_seen_releases: RwLock::new(HashMap::new()),
             rate_limit_pause_until: RwLock::new(HashMap::new()),
@@ -1026,12 +1112,37 @@ impl Watcher {
         Ok(())
     }
 
-    /// Set the running state of the watcher.
+    /// Set the running state of the watcher, even after [`Self::stop`].
+    #[cfg(test)]
     pub fn set_running(&self, running: bool) {
         self.is_running.store(running, Ordering::SeqCst);
     }
 
+    /// Mark the watcher as running, unless it has been stopped.
+    ///
+    /// Returns `false`, leaving the watcher stopped, when [`Self::stop`] came
+    /// first, such as a stop requested while warm start was still running.
+    pub(crate) fn mark_running(&self) -> bool {
+        self.is_running.store(true, Ordering::SeqCst);
+        if self.is_stopped() {
+            self.is_running.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// Whether [`Self::stop`] has been called. Unlike a watcher that is not
+    /// [running](Self::is_running), one that was never started is not stopped.
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
     /// Start the watcher with polling.
+    ///
+    /// Returns once both the polling and housekeeping loops have stopped, so a
+    /// housekeeping cycle still running at [`Self::stop`] finishes first. The
+    /// loops log their failures and carry on, so only warm start and the
+    /// initial poll can fail.
     pub async fn start(self: &Arc<Self>, interval_ms: Option<u64>) -> Result<()> {
         self.clear_rate_limit_pause().await;
 
@@ -1125,60 +1236,50 @@ impl Watcher {
         tracing::info!("");
 
         self.warm_start().await?;
-        self.is_running.store(true, Ordering::SeqCst);
+        if !self.mark_running() {
+            return Ok(());
+        }
 
-        // Initial poll of all sources
         self.poll().await?;
 
-        // Source polling loop
-        let poll_future = self.run_source_poll_loop(poll_interval);
-
-        // Housekeeping loop (retries, cascades, auto-close, reviews, learning, deps)
-        let housekeeping =
-            crate::housekeeping::HousekeepingWorker::new(Arc::clone(self), poll_interval);
-        let housekeeping_future = housekeeping.run_loop();
-
-        tokio::select! {
-            result = poll_future => result,
-            result = housekeeping_future => result.map_err(|e| claudear_core::error::Error::Config(e.to_string())),
-        }
+        let worker = crate::housekeeping::HousekeepingWorker::new(Arc::clone(self), poll_interval);
+        tokio::join!(self.run_source_poll_loop(poll_interval), worker.run_loop());
+        Ok(())
     }
 
-    /// Run the source polling loop.
+    /// Run the source polling loop until the watcher stops.
     ///
-    /// Polls each source at its configured interval. Housekeeping is handled
-    /// separately by [`HousekeepingWorker`].
-    async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64) -> Result<()> {
-        // Build per-source timer state: (source index, interval_ms, last_poll)
+    /// Polls each source at its configured interval, logging failed polls.
+    /// Housekeeping is handled separately by
+    /// [`HousekeepingWorker`](crate::housekeeping::HousekeepingWorker).
+    async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64) {
         let now = std::time::Instant::now();
-        let mut source_timers: Vec<(usize, u64, std::time::Instant)> = self
+        let mut schedule: Vec<_> = self
             .sources
             .iter()
-            .enumerate()
-            .map(|(i, source)| {
-                let src_interval = self.config.poll_interval_ms_for(source.name()).max(1);
+            .map(|source| {
+                let interval_ms = self.config.poll_interval_ms_for(source.name()).max(1);
                 tracing::info!(
                     source = source.name(),
-                    interval_ms = src_interval,
+                    interval_ms,
                     "Per-source poll interval"
                 );
-                (i, src_interval, now)
+                (source, Duration::from_millis(interval_ms), now)
             })
             .collect();
 
-        // Determine the base tick: minimum source interval or global, whichever is smallest.
-        // Cap at 1s to avoid busy-looping when all intervals are large.
-        let min_source_interval = source_timers
+        let poll_interval = Duration::from_millis(poll_interval);
+        let period = schedule
             .iter()
-            .map(|(_, ms, _)| *ms)
+            .map(|(_, interval, _)| *interval)
             .min()
-            .unwrap_or(poll_interval);
-        let base_tick_ms = min_source_interval.min(poll_interval).max(1000);
-        let mut base_timer = interval(Duration::from_millis(base_tick_ms));
-        base_timer.tick().await; // Skip immediate first tick
+            .unwrap_or(poll_interval)
+            .min(poll_interval)
+            .max(MIN_SOURCE_POLL_PERIOD);
+        let mut timer = interval_at(tokio::time::Instant::now() + period, period);
 
         while self.is_running.load(Ordering::SeqCst) {
-            base_timer.tick().await;
+            timer.tick().await;
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
@@ -1186,16 +1287,13 @@ impl Watcher {
                 continue;
             }
 
-            // Poll each source whose interval has elapsed
-            for (src_idx, src_interval_ms, last_poll) in &mut source_timers {
-                let src_interval = Duration::from_millis(*src_interval_ms);
-                if last_poll.elapsed() >= src_interval {
-                    let source = &self.sources[*src_idx];
-                    if let Err(e) = self.poll_source(source).await {
+            for (source, interval, last_poll) in &mut schedule {
+                if last_poll.elapsed() >= *interval {
+                    if let Err(error) = self.poll_source(source).await {
                         tracing::error!(
                             component = "watcher",
                             source = source.name(),
-                            error = %e,
+                            error = %error,
                             "Error polling source"
                         );
                     }
@@ -1203,59 +1301,66 @@ impl Watcher {
                 }
             }
         }
-
-        Ok(())
     }
 
-    /// Stop the watcher.
+    /// Stop the watcher for good.
     ///
-    /// This sets the running flag to false, which will cause the polling loop to exit
-    /// after the current cycle completes. The poll() method already waits for active
-    /// processing to complete before returning.
+    /// Stops taking new work: the polling and housekeeping loops exit after
+    /// their current cycle, and a `start` still warming up returns without
+    /// polling. Runs already in flight carry on; [`Self::stop_and_drain`] waits
+    /// for them. Safe to call more than once.
     pub fn stop(&self) {
+        let already_stopped = self.stopped.swap(true, Ordering::SeqCst);
+        self.is_running.store(false, Ordering::SeqCst);
+        if already_stopped {
+            return;
+        }
         tracing::info!(
-            active_count = self.active_processing.load(Ordering::SeqCst),
+            in_flight = self.in_flight(),
             "Stopping Claude Watcher, waiting for active tasks to complete..."
         );
-        self.is_running.store(false, Ordering::SeqCst);
         // Wake any tasks blocked on slot_available so they re-check is_running and exit.
         self.slot_available.notify_waiters();
     }
 
-    /// Stop the watcher and wait for all active processing to drain.
+    /// Stop the watcher and wait up to [`DRAIN_TIMEOUT`] for in-flight runs to
+    /// finish.
     ///
-    /// This is useful for graceful shutdown scenarios where you want to ensure
-    /// all in-progress work completes before the application exits.
-    pub async fn stop_and_drain(&self) {
+    /// Returns `true` once no run is [in flight](Self::in_flight), or `false`
+    /// when the timeout elapses first.
+    pub async fn stop_and_drain(&self) -> bool {
         self.stop();
 
-        // Wait for any active processing to complete (up to 30 seconds).
-        // Uses slot_available to wake immediately when a task finishes rather
-        // than polling on a fixed interval.
-        let max_wait = std::time::Duration::from_secs(30);
-        let start = std::time::Instant::now();
+        if tokio::time::timeout(DRAIN_TIMEOUT, self.wait_until_idle())
+            .await
+            .is_ok()
+        {
+            tracing::info!("Claude Watcher stopped gracefully");
+            return true;
+        }
+        tracing::warn!(
+            remaining = self.in_flight(),
+            "Graceful shutdown timeout reached, some tasks may not have completed"
+        );
+        false
+    }
 
+    /// Wait until no run is [in flight](Self::in_flight), waking on each
+    /// release and re-checking at a short interval in case a wake-up is missed.
+    pub async fn wait_until_idle(&self) {
+        let mut reported = 0;
         loop {
             let released = self.next_slot_release();
-            if self.active_processing.load(Ordering::SeqCst) == 0 {
-                break;
+            let in_flight = self.in_flight();
+            if in_flight == 0 {
+                return;
             }
-            if start.elapsed() > max_wait {
-                tracing::warn!(
-                    remaining = self.active_processing.load(Ordering::SeqCst),
-                    "Graceful shutdown timeout reached, some tasks may not have completed"
-                );
-                break;
+            if in_flight != reported {
+                tracing::info!(in_flight, "Waiting for active tasks to complete...");
+                reported = in_flight;
             }
-            tracing::info!(
-                active_count = self.active_processing.load(Ordering::SeqCst),
-                "Waiting for active tasks to complete..."
-            );
-            let remaining = max_wait.saturating_sub(start.elapsed());
-            let _ = tokio::time::timeout(remaining, released).await;
+            let _ = tokio::time::timeout(DRAIN_RECHECK_INTERVAL, released).await;
         }
-
-        tracing::info!("Claude Watcher stopped gracefully");
     }
 
     /// Check if the watcher is currently running.
@@ -1263,9 +1368,16 @@ impl Watcher {
         self.is_running.load(Ordering::SeqCst)
     }
 
-    /// Get the count of currently active processing tasks.
+    /// Number of issues being processed, the `active_processing` metric.
     pub fn active_count(&self) -> usize {
         self.active_processing.load(Ordering::SeqCst)
+    }
+
+    /// Number of holds [`Self::stop_and_drain`] waits for: one per issue being
+    /// processed, and one per retry, review run, merge follow-up or release
+    /// cascade in progress.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     /// Check if the watcher is in dry-run mode.
@@ -1323,8 +1435,10 @@ impl Watcher {
             Some(rw) => rw,
             None => return Ok(()),
         };
+        if !self.is_running() {
+            return Ok(());
+        }
 
-        // Check for new reviews
         let events = review_watcher.check_for_reviews().await?;
         for (pr_url, feedback_summary, feedback_count, comment_refs) in
             Self::group_review_feedback_by_pr(events)
@@ -1335,7 +1449,6 @@ impl Watcher {
                 "Review feedback received, processing..."
             );
 
-            // Find the original issue for this PR
             if let Some(attempt) = self.tracker.get_attempt_by_pr_url(&pr_url)? {
                 if Self::is_terminal_attempt_status(attempt.status) {
                     tracing::info!(
@@ -1352,6 +1465,10 @@ impl Watcher {
                     }
                     review_watcher.unwatch_pr(&pr_url);
                     continue;
+                }
+                let _claim = self.claim_run();
+                if !self.is_running() {
+                    break;
                 }
                 match self
                     .process_review_action(&attempt, &feedback_summary)
@@ -1376,12 +1493,14 @@ impl Watcher {
                         );
                         // Leave the batch's comments unhandled so they retry, but
                         // count the failure so a poison comment eventually gives up.
-                        if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
-                            &pr_url,
-                            &comment_refs,
-                            MAX_REVIEW_COMMENT_ATTEMPTS,
-                        ) {
-                            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                        if self.is_running() {
+                            if let Err(error) = self.tracker.note_pr_review_comment_failure_by_ids(
+                                &pr_url,
+                                &comment_refs,
+                                MAX_REVIEW_COMMENT_ATTEMPTS,
+                            ) {
+                                tracing::warn!(pr_url = %pr_url, %error, "Failed to record review-comment failure");
+                            }
                         }
                     }
                 }
@@ -1922,14 +2041,15 @@ impl Watcher {
             return Ok(());
         }
 
-        // Need an SCM provider or GitHub client for release polling
         let has_scm = self.scm_provider.is_some() || self.github_client.is_some();
         if !has_scm {
             return Ok(());
         }
 
         for upstream in upstreams {
-            // Use generic SCM provider when available, fall back to GitHub client
+            if !self.is_running() {
+                break;
+            }
             let release_result = if let Some(ref provider) = self.scm_provider {
                 provider.get_latest_release(upstream).await
             } else if let Some(ref gh) = self.github_client {
@@ -1951,12 +2071,16 @@ impl Watcher {
                 }
             };
 
-            // Check if we've already processed this release
             {
                 let seen = self.last_seen_releases.read().await;
                 if seen.get(upstream).map(|t| t.as_str()) == Some(&release.tag) {
                     continue;
                 }
+            }
+
+            let _claim = self.claim_run();
+            if !self.is_running() {
+                break;
             }
 
             tracing::info!(
@@ -1971,7 +2095,6 @@ impl Watcher {
                 seen.insert(upstream.to_string(), release.tag.clone());
             }
 
-            // Find the most recently merged attempt for this upstream repo
             let merged_attempt = self
                 .tracker
                 .get_most_recent_merged_attempt_for_repo(upstream)
@@ -2657,34 +2780,16 @@ Create a PR with your changes.{custom_instructions}"#,
         let mut retries_failed = 0usize;
 
         for (i, attempt) in ready.into_iter().enumerate() {
-            // Check if we're still running
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
 
-            // Check if this issue is already being processed
             let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
             if self.lock_processing().contains(&processing_key) {
-                self.record_source_decision(
-                    &attempt.source,
-                    "ready_retry_skipped_inflight",
-                    format!(
-                        "Retry skipped because {} is already in-flight",
-                        attempt.short_id
-                    ),
-                    json!({
-                        "issue_id": attempt.issue_id.clone(),
-                        "short_id": attempt.short_id.clone(),
-                    }),
-                );
-                tracing::debug!(
-                    short_id = %attempt.short_id,
-                    "Issue already being processed, skipping retry"
-                );
+                self.skip_inflight_retry(&attempt);
                 continue;
             }
 
-            // Wait for concurrency slot (per-source limit, clamped to 1 to avoid deadlock).
             let configured_retry_max_concurrent = self.config.max_concurrent_for(&attempt.source);
             let retry_max_concurrent = configured_retry_max_concurrent.max(1);
             if configured_retry_max_concurrent == 0 {
@@ -2704,71 +2809,23 @@ Create a PR with your changes.{custom_instructions}"#,
                 released.await;
             }
 
-            tracing::info!(
-                component = "watcher",
-                source = %attempt.source,
-                short_id = %attempt.short_id,
-                retry_count = attempt.retry_count,
-                "Retrying issue"
-            );
-
-            // Prepare for retry (resets status to pending, clears PR info)
-            retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
-
-            // Build trigger reason from attempt context
-            let trigger_reason = {
-                let reason_detail = if attempt.status == FixAttemptStatus::Closed {
+            let reason = {
+                let detail = if attempt.status == FixAttemptStatus::Closed {
                     "PR closed without merge".to_string()
-                } else if let Some(ref err) = attempt.error_message {
-                    let truncated = if err.len() > 80 {
-                        format!("{}...", &err[..err.floor_char_boundary(77)])
+                } else if let Some(ref error) = attempt.error_message {
+                    if error.len() > 80 {
+                        format!("{}...", &error[..error.floor_char_boundary(77)])
                     } else {
-                        err.clone()
-                    };
-                    truncated
+                        error.clone()
+                    }
                 } else {
                     "previous failure".to_string()
                 };
-                format!(
-                    "Retry attempt {}: {}",
-                    attempt.retry_count + 1,
-                    reason_detail
-                )
+                format!("Retry attempt {}: {}", attempt.retry_count + 1, detail)
             };
 
-            // Trigger the issue processing
-            match self
-                .trigger_issue_with_feedback(
-                    &attempt.source,
-                    &attempt.issue_id,
-                    None,
-                    None,
-                    Some(trigger_reason),
-                )
-                .await
-            {
-                Ok(()) => {
-                    // Only this path charges a retry, so only it refunds one: running
-                    // out of quota says nothing about the issue
-                    if let Ok(Some(after)) =
-                        self.tracker.get_attempt(&attempt.source, &attempt.issue_id)
-                    {
-                        let hit_rate_limit = after.status == FixAttemptStatus::Failed
-                            && after
-                                .error_message
-                                .as_deref()
-                                .is_some_and(runner::is_rate_limit_error);
-                        if hit_rate_limit {
-                            let error = after.error_message.unwrap_or_default();
-                            if let Err(e) = self.tracker.mark_failed_uncharged(
-                                &attempt.source,
-                                &attempt.issue_id,
-                                &error,
-                            ) {
-                                tracing::warn!(short_id = %attempt.short_id, error = %e, "Failed to refund retry after rate limit");
-                            }
-                        }
-                    }
+            match self.retry(&attempt, &reason).await {
+                RetryOutcome::Ran => {
                     self.record_source_decision(
                         &attempt.source,
                         "ready_retry_triggered",
@@ -2782,11 +2839,13 @@ Create a PR with your changes.{custom_instructions}"#,
                     retries_executed += 1;
                     let metric = ProcessingMetric::new("ready_retry_executed", 1.0)
                         .with_source(attempt.source.clone());
-                    if let Err(e) = self.tracker.record_metric(&metric) {
-                        tracing::debug!(error = %e, "Failed to record ready_retry_executed metric");
+                    if let Err(error) = self.tracker.record_metric(&metric) {
+                        tracing::debug!(error = %error, "Failed to record ready_retry_executed metric");
                     }
                 }
-                Err(e) => {
+                RetryOutcome::Busy => self.skip_inflight_retry(&attempt),
+                RetryOutcome::Stopping => break,
+                RetryOutcome::Failed(error) => {
                     self.record_source_decision(
                         &attempt.source,
                         "ready_retry_trigger_failed",
@@ -2795,49 +2854,27 @@ Create a PR with your changes.{custom_instructions}"#,
                             "issue_id": attempt.issue_id.clone(),
                             "short_id": attempt.short_id.clone(),
                             "retry_count": attempt.retry_count,
-                            "error": e.to_string(),
+                            "error": error.to_string(),
                         }),
                     );
                     retries_failed += 1;
-                    let retry_error = format!("Retry trigger failed: {}", e);
-                    // A network blip or in-flight clash says nothing about the issue, so
-                    // refund the retry; a permanent error like a deleted issue keeps its charge
-                    let marked = if retry_trigger_error_is_transient(&e) {
-                        self.tracker.mark_failed_uncharged(
-                            &attempt.source,
-                            &attempt.issue_id,
-                            &retry_error,
-                        )
-                    } else {
-                        self.tracker
-                            .mark_failed(&attempt.source, &attempt.issue_id, &retry_error)
-                    };
-                    if let Err(mark_err) = marked {
-                        tracing::warn!(
-                            component = "watcher",
-                            short_id = %attempt.short_id,
-                            error = %mark_err,
-                            "Failed to restore retry attempt state after trigger error"
-                        );
-                    }
                     let metric = ProcessingMetric::new("ready_retry_failed", 1.0)
                         .with_source(attempt.source.clone());
-                    if let Err(record_err) = self.tracker.record_metric(&metric) {
+                    if let Err(record_error) = self.tracker.record_metric(&metric) {
                         tracing::debug!(
-                            error = %record_err,
+                            error = %record_error,
                             "Failed to record ready_retry_failed metric"
                         );
                     }
                     tracing::error!(
                         component = "watcher",
                         short_id = %attempt.short_id,
-                        error = %e,
+                        error = %error,
                         "Failed to trigger retry"
                     );
                 }
             }
 
-            // Add delay between retries (skip trailing delay after the last item)
             if i + 1 < ready_count && self.config.processing_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
             }
@@ -2858,7 +2895,184 @@ Create a PR with your changes.{custom_instructions}"#,
         Ok(())
     }
 
-    /// Check for merged PRs and trigger cascade processing.
+    /// Record that `attempt` was not retried because its issue is already
+    /// being processed.
+    fn skip_inflight_retry(&self, attempt: &FixAttempt) {
+        self.record_source_decision(
+            &attempt.source,
+            "ready_retry_skipped_inflight",
+            format!(
+                "Retry skipped because {} is already in-flight",
+                attempt.short_id
+            ),
+            json!({
+                "issue_id": attempt.issue_id.clone(),
+                "short_id": attempt.short_id.clone(),
+            }),
+        );
+        tracing::debug!(
+            short_id = %attempt.short_id,
+            "Issue already being processed, skipping retry"
+        );
+    }
+
+    /// Retry `attempt`'s issue now, recording `reason` as why it runs again.
+    ///
+    /// The shutdown drain waits for the whole retry. The retry is spent once
+    /// its run is admitted, or when its issue cannot be loaded or run, so an
+    /// issue that keeps failing still runs out of retries. A failure that says
+    /// nothing about the issue costs no retry: a retry refused because the
+    /// watcher is stopping or paused for a rate limit, because the issue is
+    /// already being processed, or because loading it failed transiently, such
+    /// as on a network error, leaves the attempt as it was, and a run that ends
+    /// on a rate limit gets its retry back.
+    pub async fn retry(&self, attempt: &FixAttempt, reason: &str) -> RetryOutcome {
+        let _claim = self.claim_run();
+        if self.is_stopped() {
+            tracing::info!(
+                component = "watcher",
+                short_id = %attempt.short_id,
+                "Not retrying because the watcher is stopping"
+            );
+            return RetryOutcome::Stopping;
+        }
+        tracing::info!(
+            component = "watcher",
+            source = %attempt.source,
+            short_id = %attempt.short_id,
+            retry_count = attempt.retry_count,
+            "Retrying issue"
+        );
+
+        let retry_manager = RetryManager::new(self.config.retry.clone(), Arc::clone(&self.tracker));
+        let Some(source) = self
+            .sources
+            .iter()
+            .find(|source| source.name() == attempt.source)
+        else {
+            let error = claudear_core::error::Error::source(&attempt.source, "Unknown source");
+            return self.fail_retry(&retry_manager, attempt, error);
+        };
+        let mut issue = match source.get_issue(&attempt.issue_id).await {
+            Ok(issue) => issue,
+            Err(error) if retry_trigger_error_is_transient(&error) => {
+                return RetryOutcome::Failed(error)
+            }
+            Err(error) => return self.fail_retry(&retry_manager, attempt, error),
+        };
+        issue.set_metadata("trigger_reason", reason);
+
+        let mut spend = None;
+        let run = self
+            .process_issue(
+                Arc::clone(source),
+                issue,
+                MatchResult::matched(MANUAL_TRIGGER, MatchPriority::Urgent),
+                None,
+                None,
+                None,
+                // Spent only here, once admitted, so a stop or a busy issue costs no retry.
+                Some(Box::new(|| {
+                    spend
+                        .insert(retry_manager.prepare_retry(&attempt.source, &attempt.issue_id))
+                        .is_ok()
+                })),
+            )
+            .await;
+        let skipped =
+            || claudear_core::error::Error::Other(format!("{} was skipped", attempt.short_id));
+        match (run, spend) {
+            (IssueRun::Processed, Some(Ok(()))) => {
+                self.refund_rate_limited_retry(attempt);
+                RetryOutcome::Ran
+            }
+            (IssueRun::Processed, _) => RetryOutcome::Ran,
+            (IssueRun::Stopping, _) => RetryOutcome::Stopping,
+            (IssueRun::Busy, _) => RetryOutcome::Busy,
+            (IssueRun::Paused, _) => {
+                RetryOutcome::Failed(claudear_core::error::Error::Other(format!(
+                    "{} was not run while paused for a rate limit",
+                    attempt.short_id
+                )))
+            }
+            (IssueRun::Skipped, Some(Err(error))) => RetryOutcome::Failed(error),
+            (IssueRun::Skipped, Some(Ok(()))) => self.mark_retry_failed(attempt, skipped()),
+            (IssueRun::Skipped, None) => self.fail_retry(&retry_manager, attempt, skipped()),
+        }
+    }
+
+    /// Spend the retry of `attempt`, whose issue could not run, and mark it
+    /// failed with `error`, so an issue that keeps failing still runs out of
+    /// retries.
+    fn fail_retry(
+        &self,
+        retry_manager: &RetryManager,
+        attempt: &FixAttempt,
+        error: claudear_core::error::Error,
+    ) -> RetryOutcome {
+        if let Err(spend_error) = retry_manager.prepare_retry(&attempt.source, &attempt.issue_id) {
+            tracing::warn!(
+                component = "watcher",
+                short_id = %attempt.short_id,
+                error = %spend_error,
+                "Failed to spend the retry of an issue that could not run"
+            );
+            return RetryOutcome::Failed(error);
+        }
+        self.mark_retry_failed(attempt, error)
+    }
+
+    /// Mark `attempt`, whose retry was spent without a run, failed with
+    /// `error`: retries pick up only failed attempts, so it would otherwise
+    /// stay pending until the watcher next starts.
+    fn mark_retry_failed(
+        &self,
+        attempt: &FixAttempt,
+        error: claudear_core::error::Error,
+    ) -> RetryOutcome {
+        let message = format!("{RETRY_TRIGGER_FAILED}: {error}");
+        if let Err(mark_error) =
+            self.tracker
+                .mark_failed(&attempt.source, &attempt.issue_id, &message)
+        {
+            tracing::warn!(
+                component = "watcher",
+                short_id = %attempt.short_id,
+                error = %mark_error,
+                "Failed to restore retry attempt state after trigger error"
+            );
+        }
+        RetryOutcome::Failed(error)
+    }
+
+    /// Give back the retry `attempt` spent on a run that ended on a rate
+    /// limit: running out of quota says nothing about the issue.
+    fn refund_rate_limited_retry(&self, attempt: &FixAttempt) {
+        let Ok(Some(after)) = self.tracker.get_attempt(&attempt.source, &attempt.issue_id) else {
+            return;
+        };
+        let hit_rate_limit = after.status == FixAttemptStatus::Failed
+            && after
+                .error_message
+                .as_deref()
+                .is_some_and(runner::is_rate_limit_error);
+        if !hit_rate_limit {
+            return;
+        }
+        let error = after.error_message.unwrap_or_default();
+        if let Err(refund_error) =
+            self.tracker
+                .mark_failed_uncharged(&attempt.source, &attempt.issue_id, &error)
+        {
+            tracing::warn!(
+                component = "watcher",
+                short_id = %attempt.short_id,
+                error = %refund_error,
+                "Failed to refund retry after rate limit"
+            );
+        }
+    }
+
     /// After a fix merges, post a human-sounding "fix shipped" reply back to the
     /// originating ticket. Opt-in via `[reply]`; only tracker-style sources receive
     /// a ticket comment (conversational sources are notified via their channel).
@@ -2934,11 +3148,10 @@ Create a PR with your changes.{custom_instructions}"#,
         );
     }
 
+    /// Check for merged PRs and trigger cascade processing.
     async fn check_pr_merges_and_cascade(&self) -> Result<()> {
         let github_client = self.github_client.as_ref();
         let scm_provider = self.scm_provider.as_ref();
-        // Get all successful attempts with PRs that haven't been merged yet.
-        // Need either a GitHub client or a generic SCM provider for merge detection.
         let has_scm = github_client.is_some() || scm_provider.is_some();
         let pending_prs = if has_scm {
             self.tracker.get_pending_prs()?
@@ -2955,6 +3168,9 @@ Create a PR with your changes.{custom_instructions}"#,
         let mut cascade_failed = 0usize;
 
         for attempt in &pending_prs {
+            if !self.is_running() {
+                break;
+            }
             let repo = match &attempt.scm_repo {
                 Some(r) => r,
                 None => continue,
@@ -2968,7 +3184,6 @@ Create a PR with your changes.{custom_instructions}"#,
             }
 
             pr_status_checks += 1;
-            // Use generic SCM provider when available, fall back to GitHub client
             let pr_status = if let Some(provider) = scm_provider {
                 provider.get_pr_status(repo, pr_number).await
             } else if let Some(gh) = github_client {
@@ -2978,6 +3193,10 @@ Create a PR with your changes.{custom_instructions}"#,
             };
             match pr_status {
                 Ok(PrStatus::Merged) => {
+                    let _claim = self.claim_run();
+                    if !self.is_running() {
+                        break;
+                    }
                     pr_status_merged += 1;
                     // A cascade row shares the parent's issue id: marking by issue id
                     // updated the parent and left this row pending, so every poll saw
@@ -2989,7 +3208,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         self.tracker
                             .mark_merged(&attempt.source, &attempt.issue_id)?;
                     }
-                    // Timeline: PR merged.
                     self.tracker
                         .record_activity(
                             &ActivityLogEntry::new(
@@ -3005,7 +3223,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         .tracker
                         .update_qa_outcome_stats_for_attempt(attempt.id, true);
 
-                    // Update prs record to merged
                     if let Some(ref pr_url) = attempt.pr_url {
                         if let Ok(Some(mut pr_record)) = self.tracker.get_pr(pr_url) {
                             pr_record.status = "merged".to_string();
@@ -3058,7 +3275,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         None
                     };
 
-                    // Auto-resolve only when enabled and no regression watch is active.
                     let should_resolve = !is_cascade
                         && regression_watch_id.is_none()
                         && self.config.github().auto_resolve_on_merge;
@@ -3095,19 +3311,15 @@ Create a PR with your changes.{custom_instructions}"#,
                         }
                     }
 
-                    // Action pipeline: once the fix is live, post a human-sounding
-                    // "fix shipped" reply back to the originating ticket.
                     if !is_cascade {
                         self.maybe_send_fix_shipped_reply(attempt).await;
                     }
 
-                    // Record feedback outcome
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
                         .await;
 
                     self.run_post_merge_learning(attempt).await;
 
-                    // Stop review polling for merged PRs.
                     if let (Some(review_watcher), Some(pr_url)) =
                         (self.review_watcher.as_ref(), attempt.pr_url.as_ref())
                     {
@@ -3140,6 +3352,10 @@ Create a PR with your changes.{custom_instructions}"#,
                     }
                 }
                 Ok(PrStatus::Closed) => {
+                    let _claim = self.claim_run();
+                    if !self.is_running() {
+                        break;
+                    }
                     pr_status_closed += 1;
                     if attempt.cascade_repo.is_some() {
                         self.tracker.mark_cascade_pr_outcome(attempt.id, false)?;
@@ -3147,7 +3363,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         self.tracker
                             .mark_closed(&attempt.source, &attempt.issue_id)?;
                     }
-                    // Timeline: PR closed without merging.
                     self.tracker
                         .record_activity(
                             &ActivityLogEntry::new(
@@ -3170,7 +3385,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         review_watcher.unwatch_pr(pr_url);
                     }
 
-                    // Notify PR closed
                     if let Some(pr_url) = &attempt.pr_url {
                         let issue = Issue::new(
                             &attempt.issue_id,
@@ -3696,7 +3910,13 @@ Create a PR with your changes.{custom_instructions}"#,
             return None;
         }
         self.active_processing.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
         Some(ProcessingClaim { watcher: self, key })
+    }
+
+    fn claim_run(&self) -> RunClaim<'_> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        RunClaim { watcher: self }
     }
 
     /// Dispatch one concurrency lane: spawn a processing task per item, gating on the
@@ -3764,7 +3984,7 @@ Create a PR with your changes.{custom_instructions}"#,
             let source_clone = Arc::clone(source);
             let handle = tokio::spawn(async move {
                 watcher
-                    .process_issue(source_clone, issue, match_result, None, None, intent)
+                    .process_issue(source_clone, issue, match_result, None, None, intent, None)
                     .await;
             });
             self.spawn_handles.lock().await.push(handle);
@@ -4044,6 +4264,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     None,
                     None,
                     Some(Intent::Question),
+                    None,
                 )
                 .await;
             }
@@ -4166,6 +4387,12 @@ Create a PR with your changes.{custom_instructions}"#,
     /// [is runnable](DeployQaTipStatus::is_runnable) and this process
     /// [claims](Self::claim_deploy_qa_tip) it, so no retry, trigger or other
     /// daemon re-runs a tip that is running or already has a verdict.
+    ///
+    /// Once [`Self::stop`] has been called no run starts and nothing is
+    /// recorded, so a run dispatched or triggered before the stop cannot
+    /// start after the shutdown drain has finished. A run its `admission`
+    /// refuses does not start or record anything either.
+    #[expect(clippy::too_many_arguments)]
     async fn process_issue(
         &self,
         source: Arc<dyn IssueSource>,
@@ -4174,7 +4401,8 @@ Create a PR with your changes.{custom_instructions}"#,
         review_feedback: Option<String>,
         existing_pr_branch: Option<String>,
         intent: Option<Intent>,
-    ) -> bool {
+        admission: Option<Admission<'_>>,
+    ) -> IssueRun {
         use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
 
         // Retries, IPC and review-feedback triggers pass no intent, and a
@@ -4195,9 +4423,9 @@ Create a PR with your changes.{custom_instructions}"#,
                         status = %tip.status,
                         "Skipping deploy_qa tip that is running or has a verdict"
                     );
-                    return false;
+                    return IssueRun::Skipped;
                 }
-                None => return false,
+                None => return IssueRun::Skipped,
             }
         } else {
             None
@@ -4208,7 +4436,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 short_id = %issue.short_id,
                 "Skipping issue processing while watcher is paused for Claude rate limit"
             );
-            return false;
+            return IssueRun::Paused;
         }
 
         let processing_key = format!("{}:{}", source.name(), issue.id);
@@ -4221,12 +4449,23 @@ Create a PR with your changes.{custom_instructions}"#,
                 short_id = %issue.short_id,
                 "Issue already being processed, skipping"
             );
-            return false;
+            return IssueRun::Busy;
         };
+        // Checked only once claimed, so either this sees the stop or the drain sees the claim.
+        if self.is_stopped() {
+            tracing::info!(
+                short_id = %issue.short_id,
+                "Not starting issue processing because the watcher is stopping"
+            );
+            return IssueRun::Stopping;
+        }
+        if admission.is_some_and(|admit| !admit()) {
+            return IssueRun::Skipped;
+        }
 
         if let Some(ref tip) = deploy_qa_tip {
             if !self.claim_deploy_qa_tip(tip, &issue.short_id) {
-                return false;
+                return IssueRun::Skipped;
             }
         }
 
@@ -4268,7 +4507,6 @@ Create a PR with your changes.{custom_instructions}"#,
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
 
-        // Timeline: attempt created (pending).
         self.tracker
             .record_activity(
                 &ActivityLogEntry::new(
@@ -4303,7 +4541,6 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
-        // Get the attempt ID for the processing pipeline
         let attempt_id = self
             .tracker
             .get_attempt(source.name(), &issue.id)
@@ -4333,7 +4570,6 @@ Create a PR with your changes.{custom_instructions}"#,
             resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker))
         });
 
-        // Log resolution decision (watcher-specific verbose logging)
         match &resolution {
             RepoResolution::Resolved { project_dir, .. } => {
                 self.record_issue_decision(
@@ -4347,7 +4583,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         "project_dir": project_dir.display().to_string(),
                     }),
                 );
-                // Timeline: repository resolved.
                 self.tracker
                     .record_activity(
                         &ActivityLogEntry::new(
@@ -4363,7 +4598,6 @@ Create a PR with your changes.{custom_instructions}"#,
             RepoResolution::Skip { .. } => {}
         }
 
-        // Confidence-aware approval gate
         if !is_deploy_qa && self.should_request_approval(&resolution) {
             match self
                 .request_approval(source.name(), &issue, &resolution)
@@ -4385,19 +4619,17 @@ Create a PR with your changes.{custom_instructions}"#,
                             repo = %repo_name,
                             "Redirect repo not found, skipping issue"
                         );
-                        return false;
+                        return IssueRun::Skipped;
                     }
                 }
-                ApprovalDecision::Denied | ApprovalDecision::Unrecognized => return false,
+                ApprovalDecision::Denied | ApprovalDecision::Unrecognized => {
+                    return IssueRun::Skipped
+                }
             }
         }
 
-        // Save issue info before move for post-processing
         let issue_short_id = issue.short_id.clone();
 
-        // Build IssueProcessor and delegate to shared pipeline. The processor
-        // internally routes pure questions to a read-only Q&A answer path and
-        // everything else to the fix pipeline.
         let processor = IssueProcessor {
             config: self.config.clone(),
             tracker: Arc::clone(&self.tracker),
@@ -4438,7 +4670,6 @@ Create a PR with your changes.{custom_instructions}"#,
             self.release_unfinished_deploy_qa_tip(tip);
         }
 
-        // Watcher-specific: check for rate limit errors and pause if needed
         if let ProcessingOutcome::Failed { ref error } = outcome {
             if runner::is_rate_limit_error(error) {
                 let tmp_issue = Issue::new("", &issue_short_id, "", "", source.name());
@@ -4446,10 +4677,13 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
-        // Return false for semantic duplicate skips (don't count as processed),
-        // true for everything else
-        !matches!(&outcome, ProcessingOutcome::Failed { error }
+        if matches!(&outcome, ProcessingOutcome::Failed { error }
             if error.contains("Semantic duplicate of"))
+        {
+            IssueRun::Skipped
+        } else {
+            IssueRun::Processed
+        }
     }
 
     async fn clear_rate_limit_pause(&self) {
@@ -5037,12 +5271,15 @@ Create a PR with your changes.{custom_instructions}"#,
             issue_id,
             None,
             None,
-            Some("Manual trigger".into()),
+            Some(MANUAL_TRIGGER.into()),
         )
         .await
     }
 
     /// Manually trigger processing for a specific issue with optional review feedback context.
+    ///
+    /// Refused with [`STOPPING_REFUSAL`] once [`Self::stop`] has been called,
+    /// including when the stop comes while the issue is being loaded.
     pub async fn trigger_issue_with_feedback(
         &self,
         source_name: &str,
@@ -5078,6 +5315,11 @@ Create a PR with your changes.{custom_instructions}"#,
             .iter()
             .find(|s| s.name() == source_name)
             .ok_or_else(|| claudear_core::error::Error::source(source_name, "Unknown source"))?;
+        if self.is_stopped() {
+            return Err(claudear_core::error::Error::Other(
+                STOPPING_REFUSAL.to_string(),
+            ));
+        }
 
         tracing::info!(
             component = "watcher",
@@ -5087,7 +5329,7 @@ Create a PR with your changes.{custom_instructions}"#,
         );
 
         let mut issue = source.get_issue(issue_id).await?;
-        let match_result = MatchResult::matched("Manual trigger", MatchPriority::Urgent);
+        let match_result = MatchResult::matched(MANUAL_TRIGGER, MatchPriority::Urgent);
 
         if let Some(reason) = trigger_reason {
             issue.set_metadata("trigger_reason", reason);
@@ -5096,7 +5338,7 @@ Create a PR with your changes.{custom_instructions}"#,
             issue.set_metadata(REVIEW_PR_REPO_KEY, repo);
         }
 
-        let started = self
+        let run = self
             .process_issue(
                 Arc::clone(source),
                 issue,
@@ -5104,19 +5346,24 @@ Create a PR with your changes.{custom_instructions}"#,
                 review_feedback,
                 existing_pr_branch,
                 None,
+                None,
             )
             .await;
-        if !started {
-            return Err(claudear_core::error::Error::source(
-                source_name,
-                format!(
-                    "Issue {} is already being processed; trigger deferred",
-                    issue_id
-                ),
-            ));
+        match run {
+            IssueRun::Processed => Ok(()),
+            IssueRun::Skipped | IssueRun::Busy | IssueRun::Paused => {
+                Err(claudear_core::error::Error::source(
+                    source_name,
+                    format!(
+                        "Issue {} is already being processed; trigger deferred",
+                        issue_id
+                    ),
+                ))
+            }
+            IssueRun::Stopping => Err(claudear_core::error::Error::Other(
+                STOPPING_REFUSAL.to_string(),
+            )),
         }
-
-        Ok(())
     }
 
     /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
@@ -5224,17 +5471,24 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Check for PRs that should be auto-closed due to issue state changes.
     ///
     /// This checks all pending PRs and closes any whose source issue has been
-    /// resolved, cancelled, or otherwise moved to a terminal state.
+    /// resolved, cancelled, or otherwise moved to a terminal state. Once
+    /// [`Self::stop`] has been called, the remaining PRs are left for the next
+    /// start.
     pub async fn check_and_auto_close_prs(&self) -> Result<Vec<String>> {
         let pending_prs = self.tracker.get_pending_prs()?;
         let mut auto_closed = Vec::new();
 
         for attempt in pending_prs {
-            // Find the source for this attempt
+            if self.is_stopped() {
+                break;
+            }
             if let Some(source) = self.sources.iter().find(|s| s.name() == attempt.source) {
-                // Check if issue is still active
                 match source.get_issue_status(&attempt.issue_id).await {
                     Ok(status) if source.is_terminal_status(&status) => {
+                        let _claim = self.claim_run();
+                        if self.is_stopped() {
+                            break;
+                        }
                         tracing::info!(
                             source = %attempt.source,
                             issue_id = %attempt.issue_id,
@@ -5243,7 +5497,6 @@ Create a PR with your changes.{custom_instructions}"#,
                             "Auto-closing PR: issue reached terminal state"
                         );
 
-                        // Log activity
                         let activity = ActivityLogEntry::new(
                             "pr_auto_closed",
                             format!(
@@ -5260,7 +5513,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         }));
                         let _ = self.tracker.record_activity(&activity);
 
-                        // Mark as closed in tracker
                         if let Err(e) = self.tracker.mark_closed(&attempt.source, &attempt.issue_id)
                         {
                             tracing::warn!(
@@ -5272,7 +5524,6 @@ Create a PR with your changes.{custom_instructions}"#,
                             .tracker
                             .update_qa_outcome_stats_for_attempt(attempt.id, false);
 
-                        // Notify about the auto-close
                         let issue = Issue::new(
                             &attempt.issue_id,
                             &attempt.short_id,
@@ -5288,11 +5539,9 @@ Create a PR with your changes.{custom_instructions}"#,
                             )
                             .await;
 
-                        // Record feedback outcome
                         self.record_feedback_outcome_from_attempt(&attempt, Outcome::Closed)
                             .await;
 
-                        // Stop review polling for auto-closed PRs.
                         if let (Some(review_watcher), Some(pr_url)) =
                             (self.review_watcher.as_ref(), attempt.pr_url.as_ref())
                         {
@@ -5372,10 +5621,15 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use claudear_analysis::deploy_qa::{VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX};
-    use claudear_config::config::{DeployQaConfig, DeployQaTrackConfig};
-    use claudear_core::types::IssuePriority;
+    use claudear_config::config::{
+        CascadeRule, CascadeTrigger, DeployQaConfig, DeployQaTrackConfig,
+    };
+    use claudear_core::types::{IndexedRepo, IssuePriority, RepoIndex};
     use claudear_integrations::notifier::Notifier;
     use claudear_integrations::reports::Report;
+    use claudear_integrations::scm::{
+        CodeReview, PrInfo, RemoteRepo, ReviewComment, ReviewUser, ScmRelease,
+    };
     use claudear_integrations::source::{DeployQaSource, IssueSource};
     use claudear_storage::{ActivityStore, AttemptTracker, SqliteTracker};
     use futures::FutureExt;
@@ -5484,25 +5738,16 @@ mod tests {
         issues: Vec<Issue>,
         match_priority: MatchPriority,
         issue_status_calls: AtomicUsize,
+        fetch_calls: AtomicUsize,
     }
 
     impl MockSource {
         fn new(name: &str) -> Self {
-            Self {
-                name: name.to_string(),
-                issues: vec![],
-                match_priority: MatchPriority::Normal,
-                issue_status_calls: AtomicUsize::new(0),
-            }
+            Self::with_issues(name, vec![])
         }
 
         fn with_issues(name: &str, issues: Vec<Issue>) -> Self {
-            Self {
-                name: name.to_string(),
-                issues,
-                match_priority: MatchPriority::Normal,
-                issue_status_calls: AtomicUsize::new(0),
-            }
+            Self::with_priority(name, issues, MatchPriority::Normal)
         }
 
         fn with_priority(name: &str, issues: Vec<Issue>, match_priority: MatchPriority) -> Self {
@@ -5511,11 +5756,16 @@ mod tests {
                 issues,
                 match_priority,
                 issue_status_calls: AtomicUsize::new(0),
+                fetch_calls: AtomicUsize::new(0),
             }
         }
 
         fn issue_status_call_count(&self) -> usize {
             self.issue_status_calls.load(AtomicOrdering::SeqCst)
+        }
+
+        fn fetch_call_count(&self) -> usize {
+            self.fetch_calls.load(AtomicOrdering::SeqCst)
         }
     }
 
@@ -5528,6 +5778,7 @@ mod tests {
             &self.name
         }
         async fn fetch_issues(&self) -> Result<Vec<Issue>> {
+            self.fetch_calls.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(self.issues.clone())
         }
         fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
@@ -6892,6 +7143,1800 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_start_after_stop_stays_stopped_without_polling() {
+        let source = Arc::new(MockSource::new("mock"));
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            vec![Arc::clone(&source) as Arc<dyn IssueSource>],
+            false,
+        );
+
+        watcher.stop();
+        let started = tokio::time::timeout(Duration::from_secs(5), watcher.start(Some(50))).await;
+
+        assert!(
+            matches!(started, Ok(Ok(()))),
+            "start after a stop must return instead of polling: {started:?}"
+        );
+        assert!(
+            !watcher.is_running(),
+            "a stop that came first must keep the watcher stopped"
+        );
+        assert_eq!(
+            source.fetch_call_count(),
+            0,
+            "a stopped watcher must not poll its sources"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_housekeeping_start_after_stop_stays_stopped_without_a_cycle() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            tracker.clone(),
+            vec![],
+            false,
+        );
+        let worker = crate::housekeeping::HousekeepingWorker::new(Arc::clone(&watcher), 50);
+
+        watcher.stop();
+        let started = tokio::time::timeout(Duration::from_secs(5), worker.start()).await;
+
+        assert!(
+            matches!(started, Ok(Ok(()))),
+            "housekeeping start after a stop must return instead of looping: {started:?}"
+        );
+        assert!(
+            !watcher.is_running(),
+            "a stop that came first must keep the watcher stopped"
+        );
+        assert!(
+            tracker
+                .get_metrics("housekeeping_cycle_duration_secs", None, 10)
+                .unwrap()
+                .is_empty(),
+            "a stopped watcher must not run a housekeeping cycle"
+        );
+    }
+
+    /// Holds each caller of [`Gate::pass`] until [`Gate::open`], signalling its
+    /// arrival and recording whether a held caller was dropped instead.
+    #[derive(Default)]
+    struct Gate {
+        arrived: Notify,
+        opened: Notify,
+        cancelled: AtomicBool,
+    }
+
+    impl Gate {
+        async fn pass(&self) {
+            let held = HeldAtGate(self);
+            self.arrived.notify_one();
+            self.opened.notified().await;
+            std::mem::forget(held);
+        }
+
+        async fn arrival(&self) {
+            self.arrived.notified().await;
+        }
+
+        /// Wait for a caller to arrive, failing instead of hanging when `task`
+        /// ends without reaching the gate.
+        async fn arrival_during<T: std::fmt::Debug>(&self, task: &mut tokio::task::JoinHandle<T>) {
+            tokio::select! {
+                () = self.arrival() => {}
+                ended = task => panic!("the task ended before reaching the gate: {ended:?}"),
+            }
+        }
+
+        fn open(&self) {
+            self.opened.notify_one();
+        }
+
+        fn was_cancelled(&self) -> bool {
+            self.cancelled.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// Marks its gate cancelled when the caller held there is dropped.
+    struct HeldAtGate<'a>(&'a Gate);
+
+    impl Drop for HeldAtGate<'_> {
+        fn drop(&mut self) {
+            self.0.cancelled.store(true, AtomicOrdering::SeqCst);
+        }
+    }
+
+    const GATED_SOURCE: &str = "gated";
+
+    /// Source named [`GATED_SOURCE`] unless given another name, that lists no
+    /// issues and holds every `get_issue` at its gate before returning its
+    /// issue, or reporting the issue missing when it has none.
+    struct GatedSource {
+        name: &'static str,
+        gate: Gate,
+        issue: Option<Issue>,
+    }
+
+    impl Default for GatedSource {
+        fn default() -> Self {
+            Self {
+                name: GATED_SOURCE,
+                gate: Gate::default(),
+                issue: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl IssueSource for GatedSource {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn display_name(&self) -> &str {
+            self.name
+        }
+        async fn fetch_issues(&self) -> Result<Vec<Issue>> {
+            Ok(vec![])
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("Gated match", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
+            Ok(format!("Context for {}", issue.short_id))
+        }
+        async fn get_issue(&self, id: &str) -> Result<Issue> {
+            self.gate.pass().await;
+            self.issue
+                .clone()
+                .filter(|issue| issue.id == id)
+                .ok_or_else(|| {
+                    claudear_core::error::Error::source(self.name, format!("Issue {id} not found"))
+                })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_start_after_stop_waits_for_the_housekeeping_retry_in_flight() {
+        let source = Arc::new(GatedSource::default());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        let watcher = watcher_with_agent(
+            config,
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::new(AtomicUsize::new(0)),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        let start = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.start(Some(50)).await }
+        });
+
+        // The initial poll runs ready retries inline, so seed the retry only
+        // once that poll has finished; the housekeeping loop must run it.
+        while tracker
+            .get_metrics("poll_cycle_duration_secs", None, 1)
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tracker
+            .record_attempt(GATED_SOURCE, "retry-1", "GATED-1")
+            .unwrap();
+        tracker
+            .mark_failed(GATED_SOURCE, "retry-1", "initial failure")
+            .unwrap();
+
+        source.gate.arrival().await;
+        watcher.stop();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        assert!(
+            !start.is_finished(),
+            "start must not return while a housekeeping retry is still running"
+        );
+
+        source.gate.open();
+        let finished = tokio::time::timeout(Duration::from_secs(5), start).await;
+
+        assert!(
+            matches!(finished, Ok(Ok(Ok(())))),
+            "start should return once the retry finishes: {finished:?}"
+        );
+        assert!(
+            !source.gate.was_cancelled(),
+            "stopping must not cancel the housekeeping retry mid-run"
+        );
+    }
+
+    const SCM_REPO: &str = "org/repo";
+    const PR_NUMBER: i64 = 7;
+    const PR_URL: &str = "https://github.com/org/repo/pull/7";
+    const REVIEW_TRIGGER: &str = "@claudear";
+    const FIX_REQUEST_ID: i64 = 70;
+    const FIX_REQUEST_TIME: &str = "2026-01-01T00:00:00Z";
+
+    /// A PR conversation comment that asks for a fix with [`REVIEW_TRIGGER`].
+    fn fix_request() -> ReviewComment {
+        ReviewComment {
+            id: FIX_REQUEST_ID,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: format!("{REVIEW_TRIGGER} please handle an empty list"),
+            user: ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            created_at: FIX_REQUEST_TIME.to_string(),
+            updated_at: FIX_REQUEST_TIME.to_string(),
+            html_url: String::new(),
+            pull_request_review_id: None,
+            line: None,
+            start_line: None,
+            side: None,
+        }
+    }
+
+    /// SCM provider that reports every PR as `status` with a [`fix_request`]
+    /// on it, and [`RELEASE_TAG`] as every repo's latest release, holding each
+    /// status, comment and release lookup at its gate when `gated`.
+    struct MockScm {
+        status: PrStatus,
+        gated: bool,
+        gate: Gate,
+        status_checks: AtomicUsize,
+        release_checks: AtomicUsize,
+    }
+
+    impl MockScm {
+        fn reporting(status: PrStatus) -> Self {
+            Self {
+                status,
+                gated: false,
+                gate: Gate::default(),
+                status_checks: AtomicUsize::new(0),
+                release_checks: AtomicUsize::new(0),
+            }
+        }
+
+        fn gated(status: PrStatus) -> Self {
+            Self {
+                gated: true,
+                ..Self::reporting(status)
+            }
+        }
+
+        fn status_check_count(&self) -> usize {
+            self.status_checks.load(AtomicOrdering::SeqCst)
+        }
+
+        fn release_check_count(&self) -> usize {
+            self.release_checks.load(AtomicOrdering::SeqCst)
+        }
+
+        async fn hold(&self) {
+            if self.gated {
+                self.gate.pass().await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ScmProvider for MockScm {
+        fn name(&self) -> &str {
+            "mock-scm"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        fn review_trigger(&self) -> &str {
+            REVIEW_TRIGGER
+        }
+        async fn get_pr_status(&self, _project: &str, _number: i64) -> Result<PrStatus> {
+            self.status_checks.fetch_add(1, AtomicOrdering::SeqCst);
+            self.hold().await;
+            Ok(self.status)
+        }
+        async fn get_pr_info(&self, _project: &str, _number: i64) -> Result<PrInfo> {
+            Ok(PrInfo {
+                head_branch: None,
+                base_branch: None,
+                title: None,
+                author: None,
+            })
+        }
+        async fn get_pr_diff(&self, _project: &str, _number: i64) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn get_reviews(&self, _project: &str, _number: i64) -> Result<Vec<CodeReview>> {
+            Ok(Vec::new())
+        }
+        async fn get_review_comments(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> Result<Vec<ReviewComment>> {
+            Ok(Vec::new())
+        }
+        async fn get_pr_conversation_comments(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> Result<Vec<ReviewComment>> {
+            self.hold().await;
+            Ok(vec![fix_request()])
+        }
+        async fn list_repos(&self, _org_or_group: &str) -> Result<Vec<RemoteRepo>> {
+            Ok(Vec::new())
+        }
+        async fn get_latest_release(&self, _project: &str) -> Result<Option<ScmRelease>> {
+            self.release_checks.fetch_add(1, AtomicOrdering::SeqCst);
+            self.hold().await;
+            Ok(Some(ScmRelease {
+                tag: RELEASE_TAG.to_string(),
+                name: None,
+                url: String::new(),
+                published_at: None,
+            }))
+        }
+    }
+
+    fn crashing_agent() -> Arc<dyn AgentRunner> {
+        Arc::new(ScriptedQaAgent {
+            calls: Arc::new(AtomicUsize::new(0)),
+            answer: QaAnswer::Crash,
+        })
+    }
+
+    /// Options for a watcher over `source` that follows PRs and their reviews
+    /// through `scm`.
+    fn scm_watcher_options(
+        config: Config,
+        source: Arc<dyn IssueSource>,
+        tracker: Arc<SqliteTracker>,
+        agent: Arc<dyn AgentRunner>,
+        scm: Arc<MockScm>,
+    ) -> WatcherOptions {
+        let provider: Arc<dyn ScmProvider> = scm;
+        WatcherOptions {
+            config,
+            sources: vec![source],
+            notifier: Arc::new(MockNotifier::new(true)),
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: Some(Arc::new(ReviewWatcher::with_tracker(
+                Arc::clone(&provider),
+                tracker,
+            ))),
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: Some(provider),
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent,
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: false,
+            llm_engine: None,
+        }
+    }
+
+    fn watcher_with_scm(
+        config: Config,
+        source: Arc<dyn IssueSource>,
+        tracker: Arc<SqliteTracker>,
+        agent: Arc<dyn AgentRunner>,
+        scm: Arc<MockScm>,
+    ) -> Arc<Watcher> {
+        Arc::new(Watcher::new(scm_watcher_options(
+            config, source, tracker, agent, scm,
+        )))
+    }
+
+    /// Record `issue`'s successful attempt as the author of [`PR_URL`].
+    fn record_pr(tracker: &SqliteTracker, issue: &Issue) {
+        tracker
+            .record_attempt(&issue.source, &issue.id, &issue.short_id)
+            .unwrap();
+        tracker
+            .mark_success(&issue.source, &issue.id, PR_URL)
+            .unwrap();
+    }
+
+    /// [Record](record_pr) `issue`'s PR, and have `watcher` follow its reviews.
+    fn open_pr(watcher: &Watcher, tracker: &SqliteTracker, issue: &Issue) {
+        record_pr(tracker, issue);
+        watcher
+            .review_watcher
+            .as_ref()
+            .expect("the watcher should follow PR reviews")
+            .watch_pr(PrReviewState::new(
+                PR_URL,
+                SCM_REPO,
+                PR_NUMBER,
+                &issue.id,
+                &issue.source,
+            ));
+    }
+
+    fn attempt_for(tracker: &SqliteTracker, issue: &Issue) -> FixAttempt {
+        tracker
+            .get_attempt(&issue.source, &issue.id)
+            .unwrap()
+            .expect("the issue's attempt should be recorded")
+    }
+
+    fn fixed_issue(source: &str) -> Issue {
+        Issue::new(
+            "review-1",
+            "REVIEW-1",
+            "Crash on an empty list",
+            "https://example.com/issues/review-1",
+            source,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_check_reviews_on_a_stopped_watcher_leaves_review_feedback_untouched() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::new(MockScm::reporting(PrStatus::Open)),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.stop();
+
+        watcher.check_reviews().await.unwrap();
+
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a stopped watcher must not start a run for review feedback"
+        );
+        let state = watcher
+            .review_watcher
+            .as_ref()
+            .and_then(|review_watcher| review_watcher.get_state(PR_URL))
+            .expect("the PR should still be followed");
+        assert_eq!(
+            state.last_issue_comment_id, None,
+            "a stopped watcher must not move the review cursor"
+        );
+        assert!(
+            tracker
+                .get_unhandled_pr_review_comments(PR_URL)
+                .unwrap()
+                .is_empty(),
+            "a stopped watcher must not fetch review feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_reviews_stopped_while_fetching_starts_no_run() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let scm = Arc::new(MockScm::gated(PrStatus::Open));
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::clone(&scm),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+
+        let mut reviews = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_reviews().await }
+        });
+        scm.gate.arrival_during(&mut reviews).await;
+        watcher.stop();
+        scm.gate.open();
+        let checked = reviews.await;
+
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the review check should finish: {checked:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "review feedback fetched after the stop must not start a run"
+        );
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(PR_URL)
+                .unwrap()
+                .len(),
+            1,
+            "the fix request must stay unhandled for the next start"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_runs_refused_by_a_stop_do_not_count_toward_giving_up() {
+        let issue = fixed_issue(GATED_SOURCE);
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::new(MockScm::reporting(PrStatus::Open)),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher
+            .lock_processing()
+            .insert(format!("{GATED_SOURCE}:{}", issue.id));
+
+        for _ in 0..MAX_REVIEW_COMMENT_ATTEMPTS {
+            watcher.set_running(true);
+            let mut reviews = tokio::spawn({
+                let watcher = Arc::clone(&watcher);
+                async move { watcher.check_reviews().await }
+            });
+            source.gate.arrival_during(&mut reviews).await;
+            watcher.stop();
+            source.gate.open();
+            let checked = reviews.await;
+            assert!(
+                matches!(checked, Ok(Ok(()))),
+                "the review check should finish: {checked:?}"
+            );
+        }
+
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(PR_URL)
+                .unwrap()
+                .len(),
+            1,
+            "review runs refused by a stop must not give up on the fix request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_pr_merges_on_a_stopped_watcher_checks_no_pr() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let scm = Arc::new(MockScm::reporting(PrStatus::Merged));
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::clone(&scm),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.stop();
+
+        watcher.check_pr_merges_and_cascade().await.unwrap();
+
+        assert_eq!(
+            scm.status_check_count(),
+            0,
+            "a stopped watcher must not check its PRs"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a stopped watcher must leave a merged PR for the next start"
+        );
+        let checks = tracker.get_metrics("pr_status_checks", None, 10).unwrap();
+        assert_eq!(
+            checks.len(),
+            1,
+            "a cycle cut short by a stop must still record its metrics"
+        );
+        assert_eq!(checks[0].metric_value, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_check_pr_merges_stopped_while_checking_leaves_the_pr_unmerged() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let scm = Arc::new(MockScm::gated(PrStatus::Merged));
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::clone(&scm),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+
+        let mut merges = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_pr_merges_and_cascade().await }
+        });
+        scm.gate.arrival_during(&mut merges).await;
+        watcher.stop();
+        scm.gate.open();
+        let checked = merges.await;
+
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the merge check should finish: {checked:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a PR found merged after the stop must be left for the next start"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_pr_merges_stopped_while_checking_leaves_the_pr_open() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let scm = Arc::new(MockScm::gated(PrStatus::Closed));
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::clone(&scm),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+
+        let mut merges = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_pr_merges_and_cascade().await }
+        });
+        scm.gate.arrival_during(&mut merges).await;
+        watcher.stop();
+        scm.gate.open();
+        let checked = merges.await;
+
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the merge check should finish: {checked:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a PR found closed after the stop must be left for the next start"
+        );
+    }
+
+    /// Wait until `issue`'s attempt is closed, failing instead of hanging when
+    /// `task` ends first.
+    async fn closed_during<T: std::fmt::Debug>(
+        tracker: &SqliteTracker,
+        issue: &Issue,
+        task: &mut tokio::task::JoinHandle<T>,
+    ) {
+        let closed = async {
+            while attempt_for(tracker, issue).status != FixAttemptStatus::Closed {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            () = closed => {}
+            ended = task => panic!("the task ended before closing the PR: {ended:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_the_follow_up_to_a_closed_pr() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::new(MockScm::reporting(PrStatus::Closed)),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+        let feedback = watcher.feedback_analyzer.lock().await;
+        let mut merges = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_pr_merges_and_cascade().await }
+        });
+        closed_during(&tracker, &issue, &mut merges).await;
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_following_up =
+            tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_following_up.is_err(),
+            "the drain must wait while the closed PR's follow-up is in flight"
+        );
+        assert_eq!(
+            watcher.in_flight(),
+            1,
+            "the closed PR's follow-up must count as a run in flight"
+        );
+
+        drop(feedback);
+
+        assert!(
+            drain.await,
+            "the drain must end once the closed PR's follow-up finishes"
+        );
+        let checked = merges.await;
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the merge check should finish: {checked:?}"
+        );
+    }
+
+    fn resolved_issue(source: &str) -> Issue {
+        let mut issue = fixed_issue(source);
+        issue.status = claudear_core::types::IssueStatus::Resolved;
+        issue
+    }
+
+    #[tokio::test]
+    async fn test_auto_close_on_a_stopped_watcher_checks_no_issue() {
+        let issue = resolved_issue("mock");
+        let source = Arc::new(MockSource::with_issues("mock", vec![issue.clone()]));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_agent(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        record_pr(&tracker, &issue);
+        watcher.stop();
+
+        let closed = watcher.check_and_auto_close_prs().await.unwrap();
+
+        assert!(closed.is_empty(), "a stopped watcher must not close PRs");
+        assert_eq!(
+            source.issue_status_call_count(),
+            0,
+            "a stopped watcher must not check issue statuses"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_close_stopped_while_checking_leaves_the_pr_open() {
+        let issue = resolved_issue(GATED_SOURCE);
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_agent(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        record_pr(&tracker, &issue);
+        watcher.set_running(true);
+
+        let mut closing = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_and_auto_close_prs().await }
+        });
+        source.gate.arrival_during(&mut closing).await;
+        watcher.stop();
+        source.gate.open();
+        let closed = closing.await;
+
+        assert!(
+            matches!(&closed, Ok(Ok(urls)) if urls.is_empty()),
+            "no PR must be auto-closed after the stop: {closed:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a PR whose issue is found terminal after the stop must be left for the next start"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_the_follow_up_to_an_auto_closed_pr() {
+        let issue = resolved_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_agent(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        record_pr(&tracker, &issue);
+        watcher.set_running(true);
+        let feedback = watcher.feedback_analyzer.lock().await;
+        let mut closing = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_and_auto_close_prs().await }
+        });
+        closed_during(&tracker, &issue, &mut closing).await;
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_following_up =
+            tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_following_up.is_err(),
+            "the drain must wait while the auto-closed PR's follow-up is in flight"
+        );
+        assert_eq!(
+            watcher.in_flight(),
+            1,
+            "the auto-closed PR's follow-up must count as a run in flight"
+        );
+
+        drop(feedback);
+
+        assert!(
+            drain.await,
+            "the drain must end once the auto-closed PR's follow-up finishes"
+        );
+        let closed = closing.await;
+        assert!(
+            matches!(&closed, Ok(Ok(urls)) if *urls == [PR_URL]),
+            "the auto-close should finish closing the PR: {closed:?}"
+        );
+    }
+
+    /// Agent that holds each fix run and reply at its gate, then fails the run
+    /// and replies with [`CUSTOMER_REPLY`].
+    struct GatedAgent {
+        gate: Arc<Gate>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for GatedAgent {
+        fn name(&self) -> &str {
+            "gated-agent"
+        }
+        fn capabilities(&self) -> claudear_integrations::runner::ProviderCapabilities {
+            claudear_integrations::runner::ProviderCapabilities::default()
+        }
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> String {
+            String::new()
+        }
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &std::path::Path,
+        ) -> Result<claudear_core::types::AgentResult> {
+            self.gate.pass().await;
+            Err(claudear_core::error::Error::runner("gated run failed"))
+        }
+        async fn generate_reply(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _guideline: Option<&str>,
+            _kind: ReplyKind,
+            _project_dir: &std::path::Path,
+        ) -> Result<String> {
+            self.gate.pass().await;
+            Ok(CUSTOMER_REPLY.to_string())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_the_reply_to_a_merged_fix() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let gate = Arc::new(Gate::default());
+        let mut config = test_config();
+        config.notifiers.helpscout.enabled = true;
+        let watcher = watcher_with_scm(
+            config,
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            Arc::new(GatedAgent {
+                gate: Arc::clone(&gate),
+            }),
+            Arc::new(MockScm::reporting(PrStatus::Merged)),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+        let mut merges = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_pr_merges_and_cascade().await }
+        });
+        gate.arrival_during(&mut merges).await;
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_replying = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_replying.is_err(),
+            "the drain must wait while the merged fix's reply is in flight"
+        );
+        assert_eq!(
+            watcher.in_flight(),
+            1,
+            "the merge follow-up must count as a run in flight"
+        );
+
+        gate.open();
+        let drained = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the merge follow-up finishes"
+        );
+        let checked = merges.await;
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the merge check should finish: {checked:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Merged
+        );
+        assert!(!gate.was_cancelled(), "draining must not cancel the reply");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_a_review_run_in_flight() {
+        let issue = fixed_issue(GATED_SOURCE);
+        let source = Arc::new(GatedSource::default());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::new(MockScm::reporting(PrStatus::Open)),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+        let mut reviews = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_reviews().await }
+        });
+        source.gate.arrival_during(&mut reviews).await;
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_reviewing =
+            tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_reviewing.is_err(),
+            "the drain must wait while the review run is still in flight"
+        );
+        assert_eq!(
+            watcher.in_flight(),
+            1,
+            "the review run must count as a run in flight"
+        );
+
+        source.gate.open();
+        let drained = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the review run finishes"
+        );
+        let checked = reviews.await;
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the review check should finish: {checked:?}"
+        );
+        assert!(
+            !source.gate.was_cancelled(),
+            "draining must not cancel the review run"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_a_retry_in_flight() {
+        let source = Arc::new(GatedSource::default());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        let watcher = watcher_with_agent(
+            config,
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        tracker
+            .record_attempt(GATED_SOURCE, "retry-1", "GATED-1")
+            .unwrap();
+        tracker
+            .mark_failed(GATED_SOURCE, "retry-1", "initial failure")
+            .unwrap();
+        watcher.set_running(true);
+        let mut retries = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.process_ready_retries().await }
+        });
+        source.gate.arrival_during(&mut retries).await;
+        let retry_state = || {
+            let attempt = tracker
+                .get_attempt(GATED_SOURCE, "retry-1")
+                .unwrap()
+                .expect("the retried attempt should be recorded");
+            (attempt.status, attempt.retry_count)
+        };
+
+        assert_eq!(
+            retry_state(),
+            (FixAttemptStatus::Failed, 0),
+            "the retry must not spend its attempt while loading the issue"
+        );
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_retrying = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_retrying.is_err(),
+            "the drain must wait while the retry is still in flight"
+        );
+        assert_eq!(
+            watcher.in_flight(),
+            1,
+            "the retry must count as a run in flight"
+        );
+
+        source.gate.open();
+        let drained = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the retry finishes"
+        );
+        assert_eq!(
+            retry_state(),
+            (FixAttemptStatus::Failed, 1),
+            "the drain must not end before the retry settles its attempt"
+        );
+        let retried = retries.await;
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_retry_waiting_for_a_slot_does_not_start_once_stopped() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.max_concurrent = 1;
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        let watcher = watcher_with_agent(
+            config,
+            Arc::new(MockSource::new("mock")),
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        tracker.record_attempt("mock", "retry-1", "MOCK-1").unwrap();
+        tracker
+            .mark_failed("mock", "retry-1", "initial failure")
+            .unwrap();
+        watcher.set_running(true);
+        let busy = watcher
+            .claim_processing("mock:busy".to_string(), false)
+            .expect("the source's only slot should be free");
+        let retries = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.process_ready_retries().await }
+        });
+        while tracker
+            .get_metrics("ready_retries_found", None, 1)
+            .unwrap()
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        watcher.stop();
+        drop(busy);
+        let retried = retries.await;
+
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+        assert_eq!(
+            tracker
+                .get_attempt("mock", "retry-1")
+                .unwrap()
+                .expect("the retry's attempt should be recorded")
+                .retry_count,
+            0,
+            "a retry whose slot frees after the stop must not start"
+        );
+    }
+
+    fn retried_issue() -> Issue {
+        Issue::new(
+            "retry-1",
+            "RETRY-1",
+            "Crash on an empty list",
+            "https://example.com/issues/retry-1",
+            GATED_SOURCE,
+        )
+    }
+
+    /// A config that retries a failed attempt at once, and only once.
+    fn single_retry_config() -> Config {
+        let mut config = test_config();
+        config.retry.max_retries = 1;
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        config
+    }
+
+    fn record_failed_attempt(tracker: &SqliteTracker, issue: &Issue) {
+        tracker
+            .record_attempt(&issue.source, &issue.id, &issue.short_id)
+            .unwrap();
+        tracker
+            .mark_failed(&issue.source, &issue.id, "initial failure")
+            .unwrap();
+    }
+
+    /// Every field of `issue`'s attempt, to tell whether a retry changed it.
+    fn attempt_snapshot(tracker: &SqliteTracker, issue: &Issue) -> serde_json::Value {
+        serde_json::to_value(attempt_for(tracker, issue)).unwrap()
+    }
+
+    fn is_ready_to_retry(tracker: &Arc<SqliteTracker>, issue: &Issue) -> bool {
+        RetryManager::new(
+            single_retry_config().retry,
+            Arc::clone(tracker) as Arc<dyn FixAttemptTracker>,
+        )
+        .get_ready_retries()
+        .unwrap()
+        .iter()
+        .any(|attempt| attempt.issue_id == issue.id)
+    }
+
+    /// The decisions `tracker` recorded, most recent first.
+    fn decisions(tracker: &SqliteTracker) -> Vec<String> {
+        tracker
+            .get_recent_activities(100, None)
+            .unwrap()
+            .into_iter()
+            .filter_map(|activity| Some(activity.metadata?["decision"].as_str()?.to_string()))
+            .collect()
+    }
+
+    fn spawn_ready_retries(watcher: &Arc<Watcher>) -> tokio::task::JoinHandle<Result<()>> {
+        let watcher = Arc::clone(watcher);
+        tokio::spawn(async move { watcher.process_ready_retries().await })
+    }
+
+    #[tokio::test]
+    async fn test_retry_loading_its_issue_across_a_stop_keeps_its_attempt() {
+        let issue = retried_issue();
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            single_retry_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        record_failed_attempt(&tracker, &issue);
+        let before = attempt_snapshot(&tracker, &issue);
+        watcher.set_running(true);
+        let mut retries = spawn_ready_retries(&watcher);
+        source.gate.arrival_during(&mut retries).await;
+
+        watcher.stop();
+        source.gate.open();
+        let retried = retries.await;
+
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+        assert_eq!(
+            attempt_snapshot(&tracker, &issue),
+            before,
+            "a retry the stop refused must leave its attempt untouched"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a retry the stop refused must not run the agent"
+        );
+        assert!(
+            is_ready_to_retry(&tracker, &issue),
+            "a retry the stop refused must keep the attempt's only retry"
+        );
+        assert!(
+            tracker
+                .get_metrics("ready_retry_failed", None, 10)
+                .unwrap()
+                .is_empty(),
+            "a retry the stop refused must not count as a failed retry"
+        );
+        assert!(
+            !decisions(&tracker).contains(&"ready_retry_trigger_failed".to_string()),
+            "a retry the stop refused must not be recorded as a failed trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_spends_its_retry_only_once_its_issue_fails_to_load() {
+        let issue = retried_issue();
+        let source = Arc::new(GatedSource::default());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_agent(
+            single_retry_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        record_failed_attempt(&tracker, &issue);
+        let before = attempt_snapshot(&tracker, &issue);
+        watcher.set_running(true);
+        let mut retries = spawn_ready_retries(&watcher);
+        source.gate.arrival_during(&mut retries).await;
+
+        assert_eq!(
+            attempt_snapshot(&tracker, &issue),
+            before,
+            "a retry must not be spent while its issue is loading"
+        );
+
+        source.gate.open();
+        let retried = retries.await;
+
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+        let attempt = attempt_for(&tracker, &issue);
+        assert_eq!(
+            (attempt.status, attempt.retry_count),
+            (FixAttemptStatus::Failed, 1),
+            "an issue that fails to load must spend its retry and stay failed"
+        );
+        assert!(
+            attempt
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with(RETRY_TRIGGER_FAILED)),
+            "unexpected error message: {:?}",
+            attempt.error_message
+        );
+        assert!(
+            !is_ready_to_retry(&tracker, &issue),
+            "an issue that keeps failing to load must run out of retries"
+        );
+        assert_eq!(
+            tracker
+                .get_metrics("ready_retry_failed", None, 10)
+                .unwrap()
+                .len(),
+            1,
+            "an issue that fails to load is a failed retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_of_an_issue_already_being_processed_keeps_its_attempt() {
+        let issue = retried_issue();
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            single_retry_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        record_failed_attempt(&tracker, &issue);
+        let before = attempt_snapshot(&tracker, &issue);
+        watcher.set_running(true);
+        let mut retries = spawn_ready_retries(&watcher);
+        source.gate.arrival_during(&mut retries).await;
+
+        let processing = watcher
+            .claim_processing(format!("{GATED_SOURCE}:{}", issue.id), false)
+            .expect("nothing else should be processing the issue yet");
+        source.gate.open();
+        let retried = retries.await;
+        drop(processing);
+
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+        assert_eq!(
+            attempt_snapshot(&tracker, &issue),
+            before,
+            "a retry of an issue already being processed must leave its attempt untouched"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a retry of an issue already being processed must not run the agent"
+        );
+        assert!(
+            is_ready_to_retry(&tracker, &issue),
+            "a retry of an issue already being processed must keep the attempt's only retry"
+        );
+        assert!(
+            decisions(&tracker).contains(&"ready_retry_skipped_inflight".to_string()),
+            "the retry should be recorded as skipped for an issue in flight"
+        );
+    }
+
+    /// Source named [`GATED_SOURCE`] that cannot be reached, so none of its
+    /// issues load.
+    struct UnreachableSource;
+
+    #[async_trait]
+    impl IssueSource for UnreachableSource {
+        fn name(&self) -> &str {
+            GATED_SOURCE
+        }
+        fn display_name(&self) -> &str {
+            GATED_SOURCE
+        }
+        async fn fetch_issues(&self) -> Result<Vec<Issue>> {
+            Ok(vec![])
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("Unreachable match", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
+            Ok(format!("Context for {}", issue.short_id))
+        }
+        async fn get_issue(&self, _id: &str) -> Result<Issue> {
+            Err(claudear_core::error::Error::network("connection refused"))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_keeps_its_retry_when_its_source_cannot_be_reached() {
+        let issue = retried_issue();
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_agent(
+            single_retry_config(),
+            Arc::new(UnreachableSource) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        record_failed_attempt(&tracker, &issue);
+        let before = attempt_snapshot(&tracker, &issue);
+        watcher.set_running(true);
+
+        watcher.process_ready_retries().await.unwrap();
+
+        assert_eq!(
+            attempt_snapshot(&tracker, &issue),
+            before,
+            "a retry whose source cannot be reached must leave its attempt untouched"
+        );
+        assert!(
+            is_ready_to_retry(&tracker, &issue),
+            "a retry whose source cannot be reached must keep the attempt's only retry"
+        );
+        assert_eq!(
+            tracker
+                .get_metrics("ready_retry_failed", None, 10)
+                .unwrap()
+                .len(),
+            1,
+            "a retry whose source cannot be reached is still a failed retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_keeps_its_retry_while_paused_for_a_rate_limit() {
+        let issue = Issue::new(
+            "paused-1",
+            "PAUSED-1",
+            "Crash on an empty list",
+            "https://example.com/issues/paused-1",
+            "mock",
+        );
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            single_retry_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        record_failed_attempt(&tracker, &issue);
+        let before = attempt_snapshot(&tracker, &issue);
+        watcher.set_running(true);
+        watcher.rate_limit_pause_until.write().await.insert(
+            "claude".to_string(),
+            Utc::now() + chrono::Duration::hours(1),
+        );
+
+        let outcome = watcher
+            .retry(&attempt_for(&tracker, &issue), "Retry attempt 1")
+            .await;
+
+        assert!(
+            matches!(outcome, RetryOutcome::Failed(_)),
+            "a retry refused while paused should report why it did not run: {outcome:?}"
+        );
+        assert_eq!(
+            attempt_snapshot(&tracker, &issue),
+            before,
+            "a retry refused while paused for a rate limit must leave its attempt untouched"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a retry refused while paused for a rate limit must not run the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_that_ends_on_a_rate_limit_gets_its_retry_back() {
+        let mut config = single_retry_config();
+        config.agent.default_provider = SCRIPTED_QA_PROVIDER.to_string();
+        let harness = DeployQaHarness::answering(
+            config,
+            QaAnswer::Fail("Claude rate limit hit: some error".to_string()),
+        );
+        let issue = harness.issue();
+        record_failed_attempt(&harness.tracker, &issue);
+        harness.watcher.set_running(true);
+
+        harness.watcher.process_ready_retries().await.unwrap();
+
+        assert_eq!(harness.agent_calls(), 1, "the retry should have run");
+        let attempt = attempt_for(&harness.tracker, &issue);
+        assert_eq!(
+            (attempt.status, attempt.retry_count),
+            (FixAttemptStatus::Failed, 0),
+            "a retry that ends on a rate limit must get its retry back"
+        );
+    }
+
+    fn triggered_issue() -> Issue {
+        Issue::new(
+            "trigger-1",
+            "TRIGGER-1",
+            "Crash on an empty list",
+            "https://example.com/issues/trigger-1",
+            GATED_SOURCE,
+        )
+    }
+
+    fn is_stopping_refusal(triggered: &Result<()>) -> bool {
+        matches!(triggered, Err(error) if error.to_string() == STOPPING_REFUSAL)
+    }
+
+    #[tokio::test]
+    async fn test_trigger_on_a_stopped_watcher_refuses_without_loading_the_issue() {
+        let issue = triggered_issue();
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let watcher = watcher_with_agent(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            crashing_agent(),
+        );
+        watcher.stop();
+
+        let mut trigger = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.trigger_issue(GATED_SOURCE, &issue.id).await }
+        });
+        let triggered = tokio::select! {
+            () = source.gate.arrival() => panic!("a stopped watcher must not load the issue"),
+            triggered = &mut trigger => triggered.expect("the trigger should not panic"),
+        };
+
+        assert!(
+            is_stopping_refusal(&triggered),
+            "a trigger on a stopped watcher must be refused as stopping: {triggered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trigger_loading_its_issue_across_a_stop_starts_no_run() {
+        let issue = triggered_issue();
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        watcher.set_running(true);
+        let mut trigger = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            let issue_id = issue.id.clone();
+            async move { watcher.trigger_issue(GATED_SOURCE, &issue_id).await }
+        });
+        source.gate.arrival_during(&mut trigger).await;
+
+        watcher.stop();
+        source.gate.open();
+        let triggered = trigger.await.expect("the trigger should not panic");
+
+        assert!(
+            is_stopping_refusal(&triggered),
+            "a trigger whose issue loads after the stop must be refused as stopping: {triggered:?}"
+        );
+        assert!(
+            !tracker.has_attempted(GATED_SOURCE, &issue.id).unwrap(),
+            "a trigger refused by the stop must not record an attempt"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a trigger refused by the stop must not run the agent"
+        );
+    }
+
+    const UPSTREAM_REPO: &str = "org/lib";
+    const UPSTREAM_PR_URL: &str = "https://github.com/org/lib/pull/3";
+    const DOWNSTREAM_REPO: &str = "app";
+    const RELEASE_TAG: &str = "v1.0.0";
+
+    fn run_git(directory: &std::path::Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(directory)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A clone of [`DOWNSTREAM_REPO`] under `root` whose origin has one commit
+    /// on `main`.
+    fn downstream_clone(root: &std::path::Path) -> std::path::PathBuf {
+        let origin = format!("{DOWNSTREAM_REPO}.git");
+        run_git(root, &["init", "--bare", "--initial-branch=main", &origin]);
+        run_git(root, &["clone", &origin, DOWNSTREAM_REPO]);
+        let clone = root.join(DOWNSTREAM_REPO);
+        run_git(
+            &clone,
+            &[
+                "-c",
+                "user.name=claudear",
+                "-c",
+                "user.email=claudear@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "--no-verify",
+                "-m",
+                "Initial commit",
+            ],
+        );
+        run_git(&clone, &["push", "--no-verify", "origin", "HEAD:main"]);
+        clone
+    }
+
+    /// A watcher whose merged fix in [`UPSTREAM_REPO`] cascades to a local
+    /// clone of [`DOWNSTREAM_REPO`] once `scm` reports a release.
+    struct ReleaseHarness {
+        watcher: Arc<Watcher>,
+        scm: Arc<MockScm>,
+        _root: tempfile::TempDir,
+    }
+
+    impl ReleaseHarness {
+        fn new(scm: MockScm, agent: Arc<dyn AgentRunner>) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let mut index = RepoIndex::new();
+            index.add_repo(IndexedRepo::new(
+                DOWNSTREAM_REPO,
+                downstream_clone(root.path()),
+            ));
+            let mut config = test_config();
+            config.workspace = root.path().join("workspace");
+            config.cascade.enabled = true;
+            config.cascade.rules = vec![CascadeRule {
+                upstream: UPSTREAM_REPO.to_string(),
+                downstream: DOWNSTREAM_REPO.to_string(),
+                trigger: CascadeTrigger::Release,
+                target_branch: None,
+                version_update: true,
+                instructions: None,
+            }];
+            let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+            tracker.record_attempt("mock", "lib-1", "LIB-1").unwrap();
+            tracker
+                .mark_success("mock", "lib-1", UPSTREAM_PR_URL)
+                .unwrap();
+            tracker.mark_merged("mock", "lib-1").unwrap();
+            let scm = Arc::new(scm);
+            let watcher = Arc::new(Watcher::new(WatcherOptions {
+                inferrer: Some(RepoInferrer::new(index)),
+                relationships: Some(RepoRelationships::new()),
+                ..scm_watcher_options(
+                    config,
+                    Arc::new(MockSource::new("mock")),
+                    tracker,
+                    agent,
+                    Arc::clone(&scm),
+                )
+            }));
+            Self {
+                watcher,
+                scm,
+                _root: root,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_releases_on_a_stopped_watcher_checks_no_release() {
+        let harness = ReleaseHarness::new(MockScm::reporting(PrStatus::Open), crashing_agent());
+        harness.watcher.stop();
+
+        harness.watcher.check_releases_and_cascade().await.unwrap();
+
+        assert_eq!(
+            harness.scm.release_check_count(),
+            0,
+            "a stopped watcher must not look up releases"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_releases_stopped_while_checking_starts_no_cascade() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = ReleaseHarness::new(
+            MockScm::gated(PrStatus::Open),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        harness.watcher.set_running(true);
+        let mut releases = tokio::spawn({
+            let watcher = Arc::clone(&harness.watcher);
+            async move { watcher.check_releases_and_cascade().await }
+        });
+        harness.scm.gate.arrival_during(&mut releases).await;
+        harness.watcher.stop();
+        harness.scm.gate.open();
+        let checked = releases.await;
+
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the release check should finish: {checked:?}"
+        );
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a release found after the stop must not start a cascade run"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_a_release_cascade_in_flight() {
+        let gate = Arc::new(Gate::default());
+        let harness = ReleaseHarness::new(
+            MockScm::reporting(PrStatus::Open),
+            Arc::new(GatedAgent {
+                gate: Arc::clone(&gate),
+            }),
+        );
+        harness.watcher.set_running(true);
+        let mut releases = tokio::spawn({
+            let watcher = Arc::clone(&harness.watcher);
+            async move { watcher.check_releases_and_cascade().await }
+        });
+        gate.arrival_during(&mut releases).await;
+
+        let drain = harness.watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_cascading =
+            tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_cascading.is_err(),
+            "the drain must wait while the release cascade is still in flight"
+        );
+        assert_eq!(
+            harness.watcher.in_flight(),
+            1,
+            "the release cascade must count as a run in flight"
+        );
+
+        gate.open();
+        let drained = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the release cascade finishes"
+        );
+        let checked = releases.await;
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the release check should finish: {checked:?}"
+        );
+        assert!(
+            !gate.was_cancelled(),
+            "draining must not cancel the release cascade"
+        );
+    }
+
     #[test]
     fn test_group_review_feedback_by_pr_batches_same_pr() {
         let review1 = claudear_integrations::scm::CodeReview {
@@ -8091,13 +10136,13 @@ mod tests {
 
         let watcher = Arc::new(create_test_watcher(notifier, tracker, sources, false));
         watcher.is_running.store(true, Ordering::SeqCst);
-        watcher.active_processing.fetch_add(1, Ordering::SeqCst);
+        watcher.in_flight.fetch_add(1, Ordering::SeqCst);
 
         // Simulate task finishing after a short delay
         let release = Arc::clone(&watcher);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            release.active_processing.fetch_sub(1, Ordering::SeqCst);
+            release.in_flight.fetch_sub(1, Ordering::SeqCst);
             release.slot_available.notify_waiters();
         });
 
@@ -8105,7 +10150,71 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), watcher.stop_and_drain()).await;
         assert!(result.is_ok(), "stop_and_drain timed out");
         assert!(!watcher.is_running());
-        assert_eq!(watcher.active_count(), 0);
+        assert_eq!(watcher.in_flight(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_rechecks_a_release_that_sends_no_wake_up() {
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            vec![],
+            false,
+        );
+        watcher.in_flight.store(1, Ordering::SeqCst);
+
+        let release = Arc::clone(&watcher);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            release.in_flight.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        let drained =
+            tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, watcher.stop_and_drain()).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "a release whose wake-up is missed must still end the drain"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_housekeeping_run_holds_the_drain_without_counting_as_active_processing() {
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            vec![],
+            false,
+        );
+        let claim = watcher.claim_run();
+
+        assert_eq!(
+            watcher.active_count(),
+            0,
+            "a housekeeping run processes no issue, so it must not count as active processing"
+        );
+        assert_eq!(
+            watcher.in_flight(),
+            1,
+            "a housekeeping run must count as a run in flight"
+        );
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_claimed = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_claimed.is_err(),
+            "the drain must wait for the housekeeping run"
+        );
+
+        drop(claim);
+
+        assert!(
+            drain.await,
+            "the drain must end once the housekeeping run finishes"
+        );
     }
 
     #[test]
@@ -9189,11 +11298,12 @@ mod tests {
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
 
         let result = watcher
-            .process_issue(source, issue, match_result, None, None, None)
+            .process_issue(source, issue, match_result, None, None, None, None)
             .await;
-        assert!(
-            !result,
-            "process_issue should return false when issue already in-flight"
+        assert_eq!(
+            result,
+            IssueRun::Busy,
+            "process_issue should report an issue already in-flight as busy"
         );
     }
 
@@ -9208,6 +11318,8 @@ mod tests {
         Panic,
         /// Panics on the first question, then answers with the report.
         PanicOnce(String),
+        /// Waits at the gate, then answers with [`CUSTOMER_REPLY`].
+        Gated(Arc<Gate>),
     }
 
     /// Agent that counts every invocation, answers QA as its [`QaAnswer`]
@@ -9270,6 +11382,10 @@ mod tests {
                         panic!("first QA probe panicked");
                     }
                     Ok(report.clone())
+                }
+                QaAnswer::Gated(gate) => {
+                    gate.pass().await;
+                    Ok(CUSTOMER_REPLY.to_string())
                 }
             }
         }
@@ -9473,8 +11589,17 @@ mod tests {
                 .expect("the seeded tip's issue should load");
             let match_result = self.source.matches_criteria(&issue);
             watcher
-                .process_issue(self.source.clone(), issue, match_result, None, None, None)
+                .process_issue(
+                    self.source.clone(),
+                    issue,
+                    match_result,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await
+                == IssueRun::Processed
         }
 
         fn assert_processing_released(&self, watcher: &Watcher) {
@@ -9520,7 +11645,15 @@ mod tests {
             let issue = pending.remove(0);
             let match_result = self.source.matches_criteria(&issue);
             self.watcher
-                .process_issue(self.source.clone(), issue, match_result, None, None, None)
+                .process_issue(
+                    self.source.clone(),
+                    issue,
+                    match_result,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await;
         }
 
@@ -9581,6 +11714,7 @@ mod tests {
                 None,
                 None,
                 Some(Intent::Question),
+                None,
             )
             .await;
 
@@ -9614,6 +11748,7 @@ mod tests {
                     None,
                     None,
                     Some(Intent::Question),
+                    None,
                 )
                 .await;
         }
@@ -9785,6 +11920,7 @@ mod tests {
                 None,
                 None,
                 Some(Intent::Question),
+                None,
             )
             .await;
 
@@ -10320,6 +12456,7 @@ mod tests {
                         None,
                         None,
                         Some(Intent::Question),
+                        None,
                     )
                     .await
             })
@@ -10343,6 +12480,11 @@ mod tests {
             0,
             "a run that panicked must give back its processing slot"
         );
+        assert_eq!(
+            watcher.in_flight(),
+            0,
+            "a run that panicked must not hold the shutdown drain"
+        );
         assert!(
             slot_freed.now_or_never().is_some(),
             "a run that panicked must wake tasks waiting for a free slot"
@@ -10352,14 +12494,137 @@ mod tests {
             .await
             .expect("the retried run should not panic");
 
-        assert!(
+        assert_eq!(
             retried,
+            IssueRun::Processed,
             "the issue must not be refused as already being processed"
         );
         assert_eq!(
             agent_calls.load(AtomicOrdering::SeqCst),
             2,
             "the retried run should reach the QA agent"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_an_in_flight_qa_run() {
+        let issue = Issue::new(
+            "drain-1",
+            "DRAIN-1",
+            "How do I rotate my API key?",
+            "http://example.com/drain/1",
+            "mock",
+        );
+        let source =
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>;
+        let gate = Arc::new(Gate::default());
+        let watcher = watcher_with_agent(
+            test_config(),
+            source.clone(),
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::new(AtomicUsize::new(0)),
+                answer: QaAnswer::Gated(Arc::clone(&gate)),
+            }),
+        );
+        watcher.set_running(true);
+        let run = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move {
+                let match_result = source.matches_criteria(&issue);
+                watcher
+                    .process_issue(
+                        source,
+                        issue,
+                        match_result,
+                        None,
+                        None,
+                        Some(Intent::Question),
+                        None,
+                    )
+                    .await
+            }
+        });
+        gate.arrival().await;
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_running = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_running.is_err(),
+            "the drain must wait while the QA run is still in flight"
+        );
+        assert_eq!(
+            watcher.active_count(),
+            1,
+            "the QA run must hold its processing slot until it finishes"
+        );
+
+        gate.open();
+        let drained = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the QA run finishes"
+        );
+        assert_eq!(
+            run.await.expect("the QA run should not panic"),
+            IssueRun::Processed,
+            "the QA run should have been processed"
+        );
+        assert!(!gate.was_cancelled(), "draining must not cancel the QA run");
+    }
+
+    #[tokio::test]
+    async fn test_run_dispatched_before_a_stop_does_not_start_after_it() {
+        let issue = Issue::new(
+            "dispatch-1",
+            "DISPATCH-1",
+            "How do I rotate my API key?",
+            "http://example.com/dispatch/1",
+            "mock",
+        );
+        let source =
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            test_config(),
+            source.clone(),
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        watcher.set_running(true);
+        let match_result = source.matches_criteria(&issue);
+        watcher
+            .dispatch_lane(
+                &source,
+                vec![(issue.clone(), match_result, Some(Intent::Question))],
+                1,
+                true,
+            )
+            .await;
+        assert!(
+            !tracker.has_attempted("mock", &issue.id).unwrap(),
+            "the dispatched run must not have started before the stop"
+        );
+
+        watcher.stop();
+        watcher.drain_spawned_tasks().await;
+
+        assert!(
+            !tracker.has_attempted("mock", &issue.id).unwrap(),
+            "a run dispatched before the stop must not start after it"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a run dispatched before the stop must not reach the agent"
         );
     }
 
@@ -10388,6 +12653,89 @@ mod tests {
             harness.stored_status(),
             DeployQaTipStatus::Pending,
             "an undispatched tip must stay pending for a later dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_tip_loaded_across_a_stop_stays_pending() {
+        let mut gated = None;
+        let harness = DeployQaHarness::build(test_config(), QaAnswer::Crash, |_, tip| {
+            let source = Arc::new(GatedSource {
+                name: DEPLOY_QA_SOURCE,
+                issue: Some(deploy_qa_issue(tip)),
+                ..GatedSource::default()
+            });
+            gated = Some(Arc::clone(&source));
+            source
+        });
+        let source = gated.expect("the harness should build its source");
+        harness.watcher.set_running(true);
+        let mut runs = harness.dispatch_pending_tips().await;
+        assert_eq!(runs.len(), 1, "the pending tip should be dispatched");
+        source.gate.arrival_during(&mut runs[0]).await;
+
+        harness.watcher.stop();
+        source.gate.open();
+        for run in runs {
+            run.await.expect("the dispatched run should not panic");
+        }
+
+        assert_eq!(
+            harness.agent_calls(),
+            0,
+            "a tip loaded after the stop must not reach the QA agent"
+        );
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Pending,
+            "a tip loaded after the stop must stay pending for the next start"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_processing_its_issue_counts_once_as_active_processing() {
+        let gate = Arc::new(Gate::default());
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        let harness = DeployQaHarness::answering(config, QaAnswer::Gated(Arc::clone(&gate)));
+        harness
+            .tracker
+            .record_attempt(DEPLOY_QA_SOURCE, &harness.tip.issue_id, &harness.tip.tag)
+            .unwrap();
+        harness
+            .tracker
+            .mark_failed(DEPLOY_QA_SOURCE, &harness.tip.issue_id, "initial failure")
+            .unwrap();
+        harness.watcher.set_running(true);
+        let mut retries = tokio::spawn({
+            let watcher = Arc::clone(&harness.watcher);
+            async move { watcher.process_ready_retries().await }
+        });
+        gate.arrival_during(&mut retries).await;
+
+        assert_eq!(
+            harness.watcher.active_count(),
+            1,
+            "a retry processing its issue must count once as active processing"
+        );
+        assert_eq!(
+            harness.watcher.in_flight(),
+            2,
+            "the drain must wait for both the retry and the issue it processes"
+        );
+
+        gate.open();
+        let retried = retries.await;
+
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+        assert_eq!(
+            harness.agent_calls(),
+            1,
+            "the retry should reach the QA agent"
         );
     }
 
@@ -11632,9 +13980,13 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         let started = watcher
-            .process_issue(source, issue, match_result, None, None, None)
+            .process_issue(source, issue, match_result, None, None, None, None)
             .await;
-        assert!(started); // true because it processed (even though it failed)
+        assert_eq!(
+            started,
+            IssueRun::Processed,
+            "a run that fails to resolve its repository still went through processing"
+        );
 
         // Verify processing set was cleaned up
         assert!(!watcher.lock_processing().contains("mock:cleanup-1"));
@@ -11692,30 +14044,28 @@ mod tests {
         assert!(result.is_char_boundary(result.len()));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_stop_and_drain_does_not_hang_forever() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let watcher = Arc::new(create_test_watcher(notifier, tracker, vec![], false));
         watcher.is_running.store(true, Ordering::SeqCst);
+        watcher.in_flight.store(1, Ordering::SeqCst);
 
-        // Simulate a task that never completes (active count stays > 0)
-        watcher.active_processing.store(1, Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+        let drained = tokio::time::timeout(DRAIN_TIMEOUT * 2, watcher.stop_and_drain()).await;
 
-        // stop_and_drain has a 5-minute internal timeout, but we use an outer timeout
-        // We just verify it eventually returns (the internal max_wait breaks the loop)
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), watcher.stop_and_drain())
-                .await;
-        // In test the internal max_wait is 300s which we can't wait for,
-        // so this test verifies the method was called correctly and stop was set
-        // The timeout will trigger because 300s > 10s, but that's fine
-        if result.is_err() {
-            // Timed out externally - that's expected since internal timeout is 300s
-            assert!(!watcher.is_running());
-        } else {
-            assert!(!watcher.is_running());
-        }
+        assert_eq!(
+            drained,
+            Ok(false),
+            "a drain that runs out of time must give up and report it"
+        );
+        assert_eq!(
+            started.elapsed(),
+            DRAIN_TIMEOUT,
+            "the drain must give up exactly when its budget runs out"
+        );
+        assert!(!watcher.is_running());
     }
 
     #[tokio::test]
@@ -11877,6 +14227,7 @@ mod tests {
             dry_run: false,
             llm_engine: None,
         });
+        watcher.set_running(true);
 
         watcher.check_pr_merges_and_cascade().await.unwrap();
         watcher.check_pr_merges_and_cascade().await.unwrap();
@@ -12270,7 +14621,7 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         watcher
-            .process_issue(source, issue, match_result, None, None, None)
+            .process_issue(source, issue, match_result, None, None, None, None)
             .await;
 
         // Verify the attempt was recorded
@@ -13572,12 +15923,6 @@ mod tests {
         assert!(watcher.config.workspace.to_str().is_some());
     }
 
-    // ========================================================================
-    // Additional coverage tests
-    // ========================================================================
-
-    // --- source_from_processing_key ---
-
     #[test]
     fn test_source_from_processing_key_with_colon() {
         assert_eq!(source_from_processing_key("sentry:ISSUE-42"), "sentry");
@@ -13609,8 +15954,6 @@ mod tests {
     fn test_source_from_processing_key_colon_at_end() {
         assert_eq!(source_from_processing_key("source:"), "source");
     }
-
-    // --- ProcessingState ---
 
     #[test]
     fn test_processing_state_new() {
@@ -13782,8 +16125,6 @@ mod tests {
         assert!(state.contains("nocolon"));
     }
 
-    // --- is_dry_run accessor ---
-
     #[test]
     fn test_is_dry_run_true() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -13799,8 +16140,6 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, vec![], false);
         assert!(!watcher.is_dry_run());
     }
-
-    // --- set_running ---
 
     #[test]
     fn test_set_running_true() {
@@ -13821,8 +16160,6 @@ mod tests {
         watcher.set_running(false);
         assert!(!watcher.is_running());
     }
-
-    // --- reindex_interval ---
 
     #[test]
     fn test_reindex_interval_disabled() {
@@ -14016,8 +16353,6 @@ mod tests {
         assert_eq!(interval, std::time::Duration::from_secs(1800));
     }
 
-    // --- Rate limit extraction: banner with PM ---
-
     #[test]
     fn test_extract_rate_limit_reset_from_banner_utc_pm() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
@@ -14110,8 +16445,6 @@ mod tests {
         assert!(parsed.is_none());
     }
 
-    // --- Rate limit extraction: retry-after ---
-
     #[test]
     fn test_extract_rate_limit_reset_from_retry_after() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
@@ -14153,8 +16486,6 @@ mod tests {
         assert!(parsed.is_none());
     }
 
-    // --- extract_rate_limit_reset_time combined ---
-
     #[test]
     fn test_extract_rate_limit_reset_time_prefers_resets_at() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
@@ -14195,8 +16526,6 @@ mod tests {
         let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
         assert!(parsed.is_none());
     }
-
-    // --- is_rate_limit_paused / clear_rate_limit_pause ---
 
     #[tokio::test]
     async fn test_is_rate_limit_paused_when_not_paused() {
@@ -14280,8 +16609,6 @@ mod tests {
         assert!(pauses.is_empty());
     }
 
-    // --- pause_until_rate_limit_reset ---
-
     #[tokio::test]
     async fn test_pause_until_rate_limit_reset_sets_pause() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14338,8 +16665,6 @@ mod tests {
         let pauses = watcher.rate_limit_pause_until.read().await;
         assert!(*pauses.get("claude").unwrap() >= far_future);
     }
-
-    // --- check_releases_and_cascade early returns ---
 
     #[tokio::test]
     async fn test_check_releases_and_cascade_disabled() {
@@ -14425,8 +16750,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- discover_dependencies early returns ---
-
     #[tokio::test]
     async fn test_discover_dependencies_no_inferrer() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14437,8 +16760,6 @@ mod tests {
         watcher.discover_dependencies().await;
     }
 
-    // --- pull_and_reindex_all_repos no inferrer ---
-
     #[tokio::test]
     async fn test_pull_and_reindex_all_repos_no_inferrer() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14448,8 +16769,6 @@ mod tests {
         // Should return early without panicking
         watcher.pull_and_reindex_all_repos().await;
     }
-
-    // --- reindex_repo early returns ---
 
     #[tokio::test]
     async fn test_reindex_repo_disabled() {
@@ -14531,8 +16850,6 @@ mod tests {
             .await;
     }
 
-    // --- build_inferrer_with_embeddings early returns ---
-
     #[tokio::test]
     async fn test_build_inferrer_with_embeddings_no_known_orgs() {
         let mut config = test_config();
@@ -14557,8 +16874,6 @@ mod tests {
         assert!(result.0.is_none());
         assert!(result.1.is_none());
     }
-
-    // --- poll paused by rate limit ---
 
     #[tokio::test]
     async fn test_poll_returns_early_when_rate_limited() {
@@ -14585,8 +16900,6 @@ mod tests {
         assert!(poll_cycle.is_empty());
     }
 
-    // --- run_housekeeping_cycle when rate limited ---
-
     #[tokio::test]
     async fn test_run_housekeeping_cycle_runs_even_when_provider_rate_limited() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14610,8 +16923,6 @@ mod tests {
             .unwrap();
         assert!(!duration.is_empty());
     }
-
-    // --- poll_source when rate limited ---
 
     #[tokio::test]
     async fn test_poll_source_returns_early_when_rate_limited() {
@@ -14645,10 +16956,8 @@ mod tests {
         assert!(fetched.is_empty());
     }
 
-    // --- process_issue when rate limited ---
-
     #[tokio::test]
-    async fn test_process_issue_returns_false_when_rate_limited() {
+    async fn test_process_issue_is_paused_while_rate_limited() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
@@ -14667,15 +16976,14 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         let result = watcher
-            .process_issue(source, issue, match_result, None, None, None)
+            .process_issue(source, issue, match_result, None, None, None, None)
             .await;
-        assert!(
-            !result,
-            "process_issue should return false when rate limited"
+        assert_eq!(
+            result,
+            IssueRun::Paused,
+            "process_issue should report an issue skipped while rate limited as paused"
         );
     }
-
-    // --- process_ready_retries closed PR trigger reason ---
 
     #[tokio::test]
     async fn test_process_ready_retries_skips_human_closed_pr() {
@@ -14738,8 +17046,6 @@ mod tests {
         );
     }
 
-    // --- Resolved status in fix attempt ---
-
     #[test]
     fn test_is_terminal_attempt_status_exhaustive() {
         // Verify we haven't missed any variants
@@ -14768,8 +17074,6 @@ mod tests {
         );
     }
 
-    // --- refresh_repos when one of the two optionals is None ---
-
     #[tokio::test]
     async fn test_refresh_repos_no_embedding_client() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14779,8 +17083,6 @@ mod tests {
         let result = watcher.refresh_repos().await.unwrap();
         assert_eq!(result, 0);
     }
-
-    // --- ProcessingState with many sources ---
 
     #[test]
     fn test_processing_state_multiple_sources() {
@@ -14810,8 +17112,6 @@ mod tests {
         assert_eq!(state.source_count("sentry"), 5);
         assert_eq!(state.len(), 13);
     }
-
-    // --- Sort stability with mixed priorities ---
 
     #[test]
     fn test_sort_by_priority_mixed_match_and_issue_priority() {
@@ -14846,8 +17146,6 @@ mod tests {
         assert_eq!(issues[2].0.id, "3");
         assert_eq!(issues[2].0.priority, IssuePriority::High);
     }
-
-    // --- parse_approval_reply ---
 
     #[test]
     fn test_parse_approval_reply_multiple_punctuation() {
@@ -14996,8 +17294,6 @@ mod tests {
         );
     }
 
-    // --- parse_approval_reply redirect variants ---
-
     #[test]
     fn test_parse_approval_reply_redirect_use() {
         assert_eq!(
@@ -15056,8 +17352,6 @@ mod tests {
             ApprovalDecision::Unrecognized
         );
     }
-
-    // --- should_request_approval ---
 
     #[test]
     fn test_should_request_approval_require_approval_true() {
@@ -15148,8 +17442,6 @@ mod tests {
         assert!(watcher.should_request_approval(&resolution));
     }
 
-    // --- Confidence ordering and FromStr ---
-
     #[test]
     fn test_confidence_ordering() {
         assert!(Confidence::None < Confidence::Low);
@@ -15166,8 +17458,6 @@ mod tests {
         assert_eq!("HIGH".parse::<Confidence>(), Ok(Confidence::High));
         assert!("invalid".parse::<Confidence>().is_err());
     }
-
-    // --- request_approval integration tests ---
 
     use claudear_core::types::{AskDelivery, AskReply};
     use std::sync::Mutex;

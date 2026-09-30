@@ -30,22 +30,25 @@ impl HousekeepingWorker {
     /// Run the housekeeping loop until the watcher is stopped.
     ///
     /// 1. Warm-start (clone repos, sync DB, load feedback).
-    /// 2. Mark the watcher as running.
+    /// 2. Mark the watcher as running, or return if it was stopped meanwhile.
     /// 3. On every tick: retries, cascades, auto-close, reviews, metrics,
     ///    periodic learning and report-gen
+    ///
+    /// Only warm start can fail: the loop logs its failures and carries on.
     pub async fn start(&self) -> anyhow::Result<()> {
-        // Warm-start: clone repos, sync to DB, index code, load feedback
         self.watcher.warm_start().await?;
-        self.watcher.set_running(true);
-
-        self.run_loop().await
+        if self.watcher.mark_running() {
+            self.run_loop().await;
+        }
+        Ok(())
     }
 
-    /// Run the housekeeping tick loop without warm-starting.
+    /// Run the housekeeping tick loop without warm-starting, until the watcher
+    /// is stopped.
     ///
     /// Assumes the watcher has already been warm-started and marked as running.
     /// Used by [`Watcher::start`] which handles warm-start itself.
-    pub async fn run_loop(&self) -> anyhow::Result<()> {
+    pub async fn run_loop(&self) {
         let mut timer = interval(Duration::from_millis(self.interval_ms));
         timer.tick().await; // skip immediate first tick
 
@@ -81,7 +84,6 @@ impl HousekeepingWorker {
             let cron_start = Instant::now();
             self.watcher
                 .send_cron_check_in("in_progress", &cron_id, None, self.interval_ms);
-            // Periodically refresh repo index to detect new repositories
             if cycle_count.is_multiple_of(REFRESH_INTERVAL) {
                 match self.watcher.refresh_repos().await {
                     Ok(0) => {}
@@ -93,7 +95,6 @@ impl HousekeepingWorker {
                 }
             }
 
-            // Periodically pull and re-index all repos
             if let Some(reindex_dur) = reindex_interval {
                 if last_reindex.elapsed() >= reindex_dur {
                     self.watcher.pull_and_reindex_all_repos().await;
@@ -101,7 +102,6 @@ impl HousekeepingWorker {
                 }
             }
 
-            // Periodically re-index the Discord knowledge source
             if let Some(discord_dur) = discord_reindex_interval {
                 if last_discord_reindex.elapsed() >= discord_dur {
                     self.watcher.reindex_discord_knowledgebase().await;
@@ -109,7 +109,6 @@ impl HousekeepingWorker {
                 }
             }
 
-            // Run independent housekeeping jobs concurrently
             let auto_close_fut = async {
                 if !self.watcher.is_dry_run() {
                     if let Err(e) = self.watcher.check_and_auto_close_prs().await {
@@ -140,7 +139,6 @@ impl HousekeepingWorker {
                 }
             };
 
-            // Weekly repetitive-issues digest (report-only).
             let digest_fut = async {
                 if !self.watcher.is_dry_run() {
                     if let Some(schedule) = digest_schedule.as_mut() {
@@ -172,17 +170,5 @@ impl HousekeepingWorker {
                 self.interval_ms,
             );
         }
-
-        Ok(())
-    }
-
-    /// Signal the watcher to stop.
-    pub fn stop(&self) {
-        self.watcher.stop();
-    }
-
-    /// Signal the watcher to stop and wait for active tasks to drain.
-    pub async fn stop_and_drain(&self) {
-        self.watcher.stop_and_drain().await;
     }
 }

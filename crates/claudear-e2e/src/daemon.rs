@@ -7,9 +7,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const CONTAINER_CONFIG_PATH: &str = "/app/config.toml";
+
 /// Long enough for claudear to drain its runs and interrupt its agent CLIs
 /// before `docker stop` kills it.
-const STOP_TIMEOUT: Duration = Duration::from_secs(40);
+const STOP_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// Handle to a running daemon instance.
 pub enum DaemonHandle {
@@ -46,6 +49,36 @@ impl Drop for DaemonHandle {
     }
 }
 
+/// Arguments that start claudear polling with webhooks off. It must stay in the foreground: a
+/// daemonizing start forks and exits, which stops the container it runs in and leaves [`stop`]
+/// with a child that has already exited.
+fn start_arguments(config_path: &str, port: u16) -> Vec<String> {
+    let poll_interval = POLL_INTERVAL.as_millis().to_string();
+    let port = port.to_string();
+    [
+        "--config",
+        config_path,
+        "--verbose",
+        "start",
+        "--foreground",
+        "--poll",
+        "--poll-interval",
+        &poll_interval,
+        "--port",
+        &port,
+        "--no-webhooks",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// The command the container runs after its entrypoint.
+fn container_command(port: u16) -> Vec<String> {
+    let mut command = vec!["claudear".to_string()];
+    command.extend(start_arguments(CONTAINER_CONFIG_PATH, port));
+    command
+}
+
 /// Start a native daemon process.
 pub fn start_process(
     binary: &str,
@@ -60,19 +93,7 @@ pub fn start_process(
     let log_stderr = log_file.try_clone()?;
 
     let child = Command::new(binary)
-        .args([
-            "--config",
-            config_path.to_str().unwrap_or(""),
-            "--verbose",
-            "start",
-            "--foreground",
-            "--poll",
-            "--poll-interval",
-            "5000",
-            "--port",
-            &port.to_string(),
-            "--no-webhooks",
-        ])
+        .args(start_arguments(&config_path.to_string_lossy(), port))
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_stderr))
         .spawn()
@@ -185,7 +206,7 @@ pub fn start_docker(
         "-p".to_string(),
         format!("{}:{}", port, port),
         "-v".to_string(),
-        format!("{}:/app/config.toml:ro", config_path.display()),
+        format!("{}:{CONTAINER_CONFIG_PATH}:ro", config_path.display()),
         "-v".to_string(),
         format!("{}:/app/data", vol),
     ];
@@ -221,21 +242,8 @@ pub fn start_docker(
         ]);
     }
 
-    args.extend([
-        image.to_string(),
-        "claudear".to_string(),
-        "--config".to_string(),
-        "/app/config.toml".to_string(),
-        "--verbose".to_string(),
-        "start".to_string(),
-        "--foreground".to_string(),
-        "--poll".to_string(),
-        "--poll-interval".to_string(),
-        "5000".to_string(),
-        "--port".to_string(),
-        port.to_string(),
-        "--no-webhooks".to_string(),
-    ]);
+    args.push(image.to_string());
+    args.extend(container_command(port));
 
     let container_id = {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -424,6 +432,22 @@ pub async fn wait_healthy(handle: &DaemonHandle, port: u16, timeout: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_container_command_keeps_the_daemon_in_the_foreground() {
+        let command = container_command(3100);
+        let start = command
+            .iter()
+            .position(|argument| argument == "start")
+            .expect("the container runs claudear start");
+
+        assert!(
+            command[start..]
+                .iter()
+                .any(|argument| argument == "--foreground"),
+            "a daemonizing start exits and stops the container: {command:?}"
+        );
+    }
 
     #[test]
     fn test_extract_token_valid_json() {

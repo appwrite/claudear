@@ -1,7 +1,7 @@
 //! IPC client for communicating with the watcher daemon.
 
-use super::default_socket_path;
 use super::protocol::{IpcCommand, IpcData, IpcResponse};
+use super::{default_socket_path, is_process_running};
 use claudear_core::error::{Error, Result};
 
 use std::path::PathBuf;
@@ -12,6 +12,9 @@ use tokio::time::timeout;
 
 /// Default timeout for IPC operations.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often [`IpcClient::wait_until_stopped`] checks the daemon again.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Client for communicating with the watcher daemon via Unix socket.
 pub struct IpcClient {
@@ -149,6 +152,28 @@ impl IpcClient {
     pub async fn shutdown(&self) -> Result<IpcResponse> {
         self.send(IpcCommand::Shutdown).await
     }
+
+    /// Wait until the daemon's socket no longer accepts connections and, when `pid` is given,
+    /// that process has exited. A child that exited but was not reaped still counts as
+    /// running.
+    ///
+    /// Without a `pid`, returning true confirms only that the daemon closed its socket: its
+    /// process may still be exiting.
+    ///
+    /// Returns false if `timeout` elapses first.
+    pub async fn wait_until_stopped(&self, pid: Option<u32>, timeout: Duration) -> bool {
+        let stopped = async {
+            while !self.has_stopped(pid).await {
+                tokio::time::sleep(STOP_POLL_INTERVAL).await;
+            }
+        };
+        tokio::time::timeout(timeout, stopped).await.is_ok()
+    }
+
+    async fn has_stopped(&self, pid: Option<u32>) -> bool {
+        UnixStream::connect(&self.socket_path).await.is_err()
+            && !pid.is_some_and(is_process_running)
+    }
 }
 
 impl Default for IpcClient {
@@ -268,11 +293,19 @@ pub fn print_response(response: &IpcResponse) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::short_temporary_directory;
+    use std::time::Instant;
+    use tokio::net::UnixListener;
+
+    const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+    const SHORT_TIMEOUT: Duration = Duration::from_millis(500);
+    const CLOSE_DELAY: Duration = Duration::from_millis(300);
 
     #[test]
     fn test_client_default() {
         let client = IpcClient::default();
-        assert!(!client.is_daemon_running()); // Assuming no daemon in tests
+        assert_eq!(client.socket_path, default_socket_path());
+        assert_eq!(client.timeout, DEFAULT_TIMEOUT);
     }
 
     #[test]
@@ -287,8 +320,6 @@ mod tests {
         let client = IpcClient::with_socket_path(path.clone());
         assert_eq!(client.socket_path, path);
     }
-
-    // === Constructor tests ===
 
     #[test]
     fn test_new_uses_default_path() {
@@ -316,8 +347,6 @@ mod tests {
         assert_eq!(client.timeout, Duration::from_secs(30));
     }
 
-    // === with_timeout tests ===
-
     #[test]
     fn test_with_timeout_sets_custom_timeout() {
         let client = IpcClient::new().with_timeout(Duration::from_secs(120));
@@ -339,8 +368,6 @@ mod tests {
         assert_eq!(client.timeout, Duration::from_secs(0));
     }
 
-    // === is_daemon_running tests ===
-
     #[test]
     fn test_is_daemon_running_nonexistent_socket() {
         let client =
@@ -357,8 +384,6 @@ mod tests {
         assert!(!client.is_daemon_running());
         let _ = std::fs::remove_file(&tmp);
     }
-
-    // === send to non-existent socket tests ===
 
     #[tokio::test]
     async fn test_send_to_nonexistent_socket_returns_error() {
@@ -398,8 +423,6 @@ mod tests {
         let result = client.trigger("linear", "LIN-1").await;
         assert!(result.is_err());
     }
-
-    // === print_response tests ===
 
     use super::super::protocol::{ActivityEntry, ActivityType, WatcherState};
     use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
@@ -556,8 +579,6 @@ mod tests {
         print_response(&response);
     }
 
-    // === Coverage tests for print_response with by_source entries ===
-
     #[test]
     fn test_print_response_stats_with_by_source() {
         use claudear_core::types::SourceStats;
@@ -599,8 +620,6 @@ mod tests {
         print_response(&response);
     }
 
-    // === Coverage: state with no poll_interval and no processing ===
-
     #[test]
     fn test_print_response_state_no_poll_no_processing() {
         let state = WatcherState {
@@ -617,8 +636,6 @@ mod tests {
         let response = IpcResponse::Ok(IpcData::State(state));
         print_response(&response);
     }
-
-    // === Coverage: convenience methods that delegate to send ===
 
     #[tokio::test]
     async fn test_pause_nonexistent_socket_returns_error() {
@@ -690,5 +707,66 @@ mod tests {
             IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
         let result = client.shutdown().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_wait_until_stopped_returns_once_the_socket_is_gone() {
+        let directory = short_temporary_directory();
+        let socket_path = directory.path().join("claudear.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let client = IpcClient::with_socket_path(socket_path.clone());
+        let started = Instant::now();
+        let closer = tokio::spawn(async move {
+            tokio::time::sleep(CLOSE_DELAY).await;
+            std::fs::remove_file(&socket_path).unwrap();
+            drop(listener);
+        });
+
+        assert!(client.wait_until_stopped(None, STOP_TIMEOUT).await);
+        assert!(
+            started.elapsed() >= CLOSE_DELAY,
+            "should keep waiting while the listener is open"
+        );
+        closer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wait_until_stopped_waits_for_the_process_to_exit() {
+        let directory = short_temporary_directory();
+        let client = IpcClient::with_socket_path(directory.path().join("claudear.sock"));
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("a running child has a PID");
+
+        assert!(
+            !client.wait_until_stopped(Some(pid), SHORT_TIMEOUT).await,
+            "a live process should count as running even without a socket"
+        );
+
+        let reaper = tokio::spawn(async move { child.kill().await });
+        assert!(client.wait_until_stopped(Some(pid), STOP_TIMEOUT).await);
+        reaper
+            .await
+            .unwrap()
+            .expect("kill and reap the sleep process");
+    }
+
+    #[tokio::test]
+    async fn test_wait_until_stopped_times_out_while_the_socket_accepts() {
+        let directory = short_temporary_directory();
+        let socket_path = directory.path().join("claudear.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let acceptor = tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        let client = IpcClient::with_socket_path(socket_path);
+
+        assert!(!client.wait_until_stopped(None, SHORT_TIMEOUT).await);
+        acceptor.abort();
     }
 }

@@ -71,6 +71,7 @@ graphql_client = { version = "0.16", features = ["reqwest-rustls"] }
 futures = "0.3"
 futures-util = "0.3"
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 
 # Regex
@@ -248,6 +249,7 @@ graphql_client = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 
 # Regex

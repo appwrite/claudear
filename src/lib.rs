@@ -75,6 +75,7 @@ pub use claudear_engine::ipc;
 pub use claudear_engine::processing;
 pub use claudear_engine::repo_index;
 pub use claudear_engine::retry;
+pub use claudear_engine::shutdown;
 pub use claudear_engine::watcher;
 
 // Local modules (thin wrappers)
