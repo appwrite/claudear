@@ -7,7 +7,7 @@
     <a href="https://github.com/abnegate/claudear/actions/workflows/ci.yml"><img src="https://github.com/abnegate/claudear/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
     <a href="https://github.com/abnegate/claudear/releases"><img src="https://img.shields.io/github/v/release/abnegate/claudear" alt="Release"></a>
     <a href="https://github.com/abnegate/claudear/blob/main/LICENSE"><img src="https://img.shields.io/github/license/abnegate/claudear" alt="License"></a>
-    <a href="https://github.com/abnegate/claudear"><img src="https://img.shields.io/badge/rust-1.93+-orange.svg" alt="Rust"></a>
+    <a href="https://github.com/abnegate/claudear"><img src="https://img.shields.io/badge/rust-1.98+-orange.svg" alt="Rust"></a>
   </p>
 </p>
 
@@ -1220,7 +1220,7 @@ git push origin v1.0.0
 
 ### Prerequisites
 
-- Rust 1.93+
+- Rust 1.98+
 - Bun (for dashboard)
 - Docker (optional)
 
