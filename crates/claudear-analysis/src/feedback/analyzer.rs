@@ -1,6 +1,7 @@
 //! Feedback analyzer for improving prompts based on past outcomes.
 
-use super::outcomes::OutcomeTracker;
+use super::outcomes::{trial_from_outcome, OutcomeTracker};
+use abnegate_learn::{Advisor, Config, SimilarTrial, SuggestionKind};
 use claudear_core::error::Result;
 use claudear_core::types::{FixAttempt, Issue};
 use claudear_core::types::{FixOutcome, Outcome};
@@ -65,7 +66,11 @@ impl FeedbackAnalyzer {
     /// Create with custom settings.
     pub fn with_settings(min_similarity: f64, max_similar_results: usize) -> Self {
         Self {
-            tracker: OutcomeTracker::new(),
+            tracker: OutcomeTracker::with_config(
+                Config::new()
+                    .with_minimum_similarity(min_similarity)
+                    .with_similar_limit(max_similar_results),
+            ),
             fix_tracker: None,
             min_similarity,
             max_similar_results,
@@ -83,7 +88,12 @@ impl FeedbackAnalyzer {
         self.tracker.load(outcomes);
     }
 
-    /// Record an outcome.
+    /// Record an already-built outcome, including any embedding the caller attached.
+    pub fn record(&mut self, outcome: FixOutcome) -> Result<i64> {
+        self.tracker.record(outcome)
+    }
+
+    /// Record an outcome built from an attempt.
     pub fn record_outcome(
         &mut self,
         attempt: &FixAttempt,
@@ -91,8 +101,7 @@ impl FeedbackAnalyzer {
         prompt: &str,
         outcome: Outcome,
     ) -> Result<i64> {
-        let fix_outcome = FixOutcome::from_attempt(attempt, issue, prompt, outcome);
-        self.tracker.record(fix_outcome)
+        self.record(FixOutcome::from_attempt(attempt, issue, prompt, outcome))
     }
 
     /// Find similar outcomes using semantic search with a pre-computed embedding.
@@ -127,7 +136,24 @@ impl FeedbackAnalyzer {
             }
         }
 
-        Vec::new()
+        self.similar_from_memory(query_embedding)
+    }
+
+    fn similar_from_memory(&self, query_embedding: &[f32]) -> Vec<SimilarIssue> {
+        self.tracker
+            .memory()
+            .similar(query_embedding)
+            .into_iter()
+            .filter_map(|hit| {
+                self.tracker
+                    .get(hit.trial.id)
+                    .cloned()
+                    .map(|outcome| SimilarIssue {
+                        outcome,
+                        similarity: hit.score,
+                    })
+            })
+            .collect()
     }
 
     /// Build an enhanced prompt using semantic search with a pre-computed embedding.
@@ -165,92 +191,26 @@ impl FeedbackAnalyzer {
 
     /// Extract suggestions from a list of similar issues (shared logic).
     fn suggestions_from_similar(similar: &[SimilarIssue]) -> Vec<PromptSuggestion> {
-        let mut suggestions = Vec::new();
-
-        let successful: Vec<_> = similar
+        let trials: Vec<SimilarTrial> = similar
             .iter()
-            .filter(|s| s.outcome.outcome.is_success())
+            .map(|item| SimilarTrial::new(trial_from_outcome(&item.outcome), item.similarity))
             .collect();
-        let failed: Vec<_> = similar
-            .iter()
-            .filter(|s| !s.outcome.outcome.is_success())
-            .collect();
-
-        if !successful.is_empty() {
-            for s in &successful {
-                if let Some(ref learnings) = s.outcome.learnings {
-                    suggestions.push(PromptSuggestion {
-                        suggestion_type: SuggestionType::AddContext,
-                        text: format!(
-                            "Similar issue was fixed successfully. Learning: {}",
-                            learnings
-                        ),
-                        confidence: s.similarity,
-                        based_on: vec![s.outcome.id],
-                    });
-                }
-            }
-
-            if successful.len() >= 2 {
-                let ids: Vec<_> = successful.iter().map(|s| s.outcome.id).collect();
-                suggestions.push(PromptSuggestion {
-                    suggestion_type: SuggestionType::AddContext,
-                    text: format!(
-                        "{} similar issues were fixed successfully in the past.",
-                        successful.len()
-                    ),
-                    confidence: successful.iter().map(|s| s.similarity).sum::<f64>()
-                        / successful.len() as f64,
-                    based_on: ids,
-                });
-            }
-        }
-
-        if !failed.is_empty() {
-            let error_types: Vec<_> = failed
-                .iter()
-                .filter_map(|s| s.outcome.error_type.as_ref())
-                .collect();
-
-            if !error_types.is_empty() {
-                let ids: Vec<_> = failed.iter().map(|s| s.outcome.id).collect();
-                suggestions.push(PromptSuggestion {
-                    suggestion_type: SuggestionType::Warning,
-                    text: format!(
-                        "Similar issues have failed before with errors: {}. Be careful.",
-                        error_types
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    confidence: failed.iter().map(|s| s.similarity).sum::<f64>()
-                        / failed.len() as f64,
-                    based_on: ids,
-                });
-            }
-
-            if failed.len() > successful.len() && similar.len() >= 3 {
-                suggestions.push(PromptSuggestion {
-                    suggestion_type: SuggestionType::Warning,
-                    text: format!(
-                        "Caution: {} out of {} similar issues failed. This may be difficult to fix automatically.",
-                        failed.len(),
-                        similar.len()
-                    ),
-                    confidence: 0.7,
-                    based_on: failed.iter().map(|s| s.outcome.id).collect(),
-                });
-            }
-        }
-
-        suggestions.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        suggestions
+        Advisor::new()
+            .suggestions(&trials)
+            .into_iter()
+            .map(|suggestion| PromptSuggestion {
+                suggestion_type: match suggestion.kind {
+                    SuggestionKind::Context => SuggestionType::AddContext,
+                    SuggestionKind::Avoid => SuggestionType::AvoidPattern,
+                    SuggestionKind::Instruction => SuggestionType::IncludeInstruction,
+                    SuggestionKind::Warning => SuggestionType::Warning,
+                    _ => SuggestionType::Warning,
+                },
+                text: suggestion.text,
+                confidence: suggestion.confidence,
+                based_on: suggestion.based_on,
+            })
+            .collect()
     }
 
     /// Get the outcome tracker for direct access.
@@ -351,10 +311,49 @@ mod tests {
     #[test]
     fn test_find_similar_no_sqlite_tracker() {
         let analyzer = FeedbackAnalyzer::new();
-        // Without a sqlite tracker, find_similar returns empty
         let embedding = vec![1.0, 0.0, 0.0];
         let similar = analyzer.find_similar(&embedding);
         assert!(similar.is_empty());
+    }
+
+    #[test]
+    fn test_find_similar_falls_back_to_memory() {
+        let mut analyzer = FeedbackAnalyzer::new();
+        let issue = create_test_issue("API timeout error", "Timeout in user service", "linear");
+        let attempt = create_test_attempt("linear");
+        let id = analyzer
+            .record_outcome(&attempt, &issue, "Fix the timeout", Outcome::Merged)
+            .unwrap();
+        analyzer
+            .tracker_mut()
+            .set_embedding(id, vec![1.0, 0.0, 0.0])
+            .unwrap();
+
+        let similar = analyzer.find_similar(&[1.0, 0.0, 0.0]);
+        assert_eq!(similar.len(), 1);
+        assert_eq!(similar[0].outcome.id, id);
+        assert!(similar[0].similarity > 0.9);
+    }
+
+    #[test]
+    fn test_record_keeps_runtime_embedding_for_memory_fallback() {
+        let mut analyzer = FeedbackAnalyzer::new();
+        let issue = create_test_issue("API timeout error", "Timeout in user service", "linear");
+        let attempt = create_test_attempt("linear");
+        let mut outcome =
+            FixOutcome::from_attempt(&attempt, &issue, "Fix the timeout", Outcome::Merged);
+        outcome.set_embedding(vec![1.0, 0.0, 0.0]);
+
+        let id = analyzer.record(outcome).unwrap();
+        let similar = analyzer.find_similar(&[1.0, 0.0, 0.0]);
+
+        assert_eq!(similar.len(), 1);
+        assert_eq!(similar[0].outcome.id, id);
+        assert_eq!(
+            similar[0].outcome.embedding.as_deref(),
+            Some(&[1.0, 0.0, 0.0][..])
+        );
+        assert!(similar[0].similarity > 0.9);
     }
 
     #[test]
@@ -423,8 +422,10 @@ mod tests {
             .iter()
             .any(|s| s.suggestion_type == SuggestionType::Warning);
         assert!(has_warning);
-        let has_caution = suggestions.iter().any(|s| s.text.contains("Caution"));
-        assert!(has_caution);
+        let has_majority = suggestions
+            .iter()
+            .any(|s| s.text.contains("similar attempts failed"));
+        assert!(has_majority);
     }
 
     #[test]
@@ -751,10 +752,10 @@ mod tests {
         assert!(!suggestions.is_empty());
         let context_suggestion = suggestions
             .iter()
-            .find(|s| s.text.contains("2 similar issues were fixed"));
+            .find(|s| s.text.contains("2 similar attempts succeeded"));
         assert!(
             context_suggestion.is_some(),
-            "should produce a '2 similar issues' suggestion"
+            "should produce a '2 similar attempts' suggestion"
         );
         // Average confidence = (0.8 + 0.7) / 2 = 0.75
         let avg_confidence = context_suggestion.unwrap().confidence;
@@ -855,8 +856,7 @@ mod tests {
         ];
 
         let suggestions = FeedbackAnalyzer::suggestions_from_similar(&similar);
-        // No error_types means no "errors: ..." warning
-        let has_error_warning = suggestions.iter().any(|s| s.text.contains("errors:"));
+        let has_error_warning = suggestions.iter().any(|s| s.text.contains("failed with:"));
         assert!(!has_error_warning);
     }
 
@@ -918,18 +918,19 @@ mod tests {
         ];
 
         let suggestions = FeedbackAnalyzer::suggestions_from_similar(&similar);
-        let has_caution = suggestions.iter().any(|s| s.text.contains("Caution"));
+        let has_caution = suggestions
+            .iter()
+            .any(|s| s.text.contains("similar attempts failed"));
         assert!(
             has_caution,
-            "should have Caution when failures > successes and total >= 3"
+            "should warn when failures > successes and total >= 3"
         );
 
-        // Verify the caution message includes correct counts
         let caution = suggestions
             .iter()
-            .find(|s| s.text.contains("Caution"))
+            .find(|s| s.text.contains("similar attempts failed"))
             .unwrap();
-        assert!(caution.text.contains("2 out of 3"));
+        assert!(caution.text.contains("2 of 3"));
         assert_eq!(caution.confidence, 0.7);
     }
 
@@ -1008,10 +1009,12 @@ mod tests {
         ];
 
         let suggestions = FeedbackAnalyzer::suggestions_from_similar(&similar);
-        let has_caution = suggestions.iter().any(|s| s.text.contains("Caution"));
+        let has_caution = suggestions
+            .iter()
+            .any(|s| s.text.contains("similar attempts failed."));
         assert!(
             !has_caution,
-            "should NOT have Caution when failures == successes"
+            "should NOT warn on majority-fail when failures == successes"
         );
     }
 
@@ -1056,8 +1059,13 @@ mod tests {
         ];
 
         let suggestions = FeedbackAnalyzer::suggestions_from_similar(&similar);
-        let has_caution = suggestions.iter().any(|s| s.text.contains("Caution"));
-        assert!(!has_caution, "should NOT have Caution when total < 3");
+        let has_caution = suggestions
+            .iter()
+            .any(|s| s.text.contains("similar attempts failed."));
+        assert!(
+            !has_caution,
+            "should NOT warn on majority-fail when total < 3"
+        );
     }
 
     #[test]
@@ -1156,7 +1164,7 @@ mod tests {
         let suggestions = FeedbackAnalyzer::suggestions_from_similar(&similar);
         let error_warning = suggestions
             .iter()
-            .find(|s| s.text.contains("errors:"))
+            .find(|s| s.text.contains("failed with:"))
             .expect("should have error type warning");
         assert!(error_warning.text.contains("timeout"));
         assert!(error_warning.text.contains("permission"));
@@ -1608,13 +1616,16 @@ mod tests {
         ];
 
         let suggestions = FeedbackAnalyzer::suggestions_from_similar(&similar);
-        // Should have: 2 individual learnings + 1 aggregate "2 similar issues" = 3
-        assert_eq!(suggestions.len(), 3);
-
-        // Verify all are AddContext type
         assert!(suggestions
             .iter()
-            .all(|s| s.suggestion_type == SuggestionType::AddContext));
+            .any(|s| s.suggestion_type == SuggestionType::AddContext
+                && s.text.contains("Always validate input")));
+        assert!(suggestions
+            .iter()
+            .any(|s| s.suggestion_type == SuggestionType::IncludeInstruction));
+        assert!(suggestions
+            .iter()
+            .any(|s| s.text.contains("2 similar attempts succeeded")));
     }
 
     // These types are not currently generated by suggestions_from_similar,
@@ -1667,7 +1678,7 @@ mod tests {
             .find(|s| s.suggestion_type == SuggestionType::Warning)
             .expect("should have Warning");
         assert!(warning.text.contains("syntax"));
-        assert!(warning.text.contains("Be careful"));
+        assert!(warning.text.contains("failed with"));
         assert_eq!(warning.based_on, vec![1]);
     }
 

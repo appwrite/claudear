@@ -401,29 +401,8 @@ impl EmbeddingClient {
 }
 
 /// Calculate cosine similarity between two vectors.
-///
-/// Uses an iterator pattern that is more amenable to LLVM auto-vectorization
-/// than an indexed loop, which can yield significant speedups on 768-dim vectors.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-
-    let (dot_product, norm_a, norm_b) = a
-        .iter()
-        .zip(b.iter())
-        .fold((0.0f32, 0.0f32, 0.0f32), |(dot, na, nb), (&x, &y)| {
-            (dot + x * y, na + x * x, nb + y * y)
-        });
-
-    let norm_a = norm_a.sqrt();
-    let norm_b = norm_b.sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot_product / (norm_a * norm_b)
+    abnegate_learn::cosine_similarity(a, b) as f32
 }
 
 /// Calculate Euclidean distance between two vectors.
@@ -431,21 +410,12 @@ pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return f32::MAX;
     }
-
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum::<f32>()
-        .sqrt()
+    abnegate_learn::euclidean_distance(a, b) as f32
 }
 
 /// Normalize a vector to unit length.
 pub fn normalize(v: &[f32]) -> Vec<f32> {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm == 0.0 {
-        return v.to_vec();
-    }
-    v.iter().map(|x| x / norm).collect()
+    abnegate_learn::normalize(v)
 }
 
 /// Embedding with metadata for similarity search results.

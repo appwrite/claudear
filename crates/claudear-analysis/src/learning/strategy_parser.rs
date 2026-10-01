@@ -2,7 +2,6 @@
 
 use chrono::Utc;
 use claudear_core::types::StrategyFingerprint;
-use std::collections::HashMap;
 use std::path::Path;
 
 pub struct StrategyParser;
@@ -26,81 +25,19 @@ impl StrategyParser {
 
     /// Parse strategy from text content.
     pub fn parse_from_text(content: &str, attempt_id: i64) -> StrategyFingerprint {
-        let file_re =
-            regex_lite::Regex::new(r"(?:src/|lib/|app/|pkg/|internal/|cmd/|tests?/)[\w/._-]+\.\w+")
-                .expect("file path regex should be valid");
-
-        let mut files_explored = Vec::new();
-        let mut files_seen = std::collections::HashSet::new();
-        let mut tools_used: HashMap<String, i64> = HashMap::new();
-        let mut tests_run: i64 = 0;
-        let mut read_count: usize = 0;
-        let mut edit_count: usize = 0;
-        let mut test_count: usize = 0;
-
-        for line in content.lines() {
-            // Count tool usage from Claude's output
-            for tool_name in &["Read", "Edit", "Write", "Bash", "Grep", "Glob"] {
-                if line.contains(tool_name) {
-                    *tools_used.entry(tool_name.to_string()).or_insert(0) += 1;
-                    match *tool_name {
-                        "Read" => read_count += 1,
-                        "Edit" | "Write" => edit_count += 1,
-                        _ => {}
-                    }
-                }
-            }
-
-            // Count test executions
-            let lower = line.to_lowercase();
-            if lower.contains("cargo test")
-                || lower.contains("npm test")
-                || lower.contains("pytest")
-                || lower.contains("make test")
-                || lower.contains("jest")
-            {
-                tests_run += 1;
-                test_count += 1;
-            }
-
-            // Extract file paths
-            for m in file_re.find_iter(line) {
-                let path = m.as_str().to_string();
-                if files_seen.insert(path.clone()) {
-                    files_explored.push(path);
-                }
-            }
-        }
-
-        // Determine fix approach based on activity pattern
-        let fix_approach = if test_count > 0 && edit_count > 0 {
-            "tdd".to_string()
-        } else if read_count > edit_count * 2 {
-            "investigation".to_string()
-        } else if edit_count > 0 {
-            "direct_fix".to_string()
-        } else if read_count > 0 {
-            "exploration".to_string()
-        } else {
-            "unknown".to_string()
-        };
-
-        // Build summary
-        let summary = format!(
-            "{} files explored, {} tests run, approach: {}",
-            files_explored.len(),
-            tests_run,
-            fix_approach
+        let fingerprint = abnegate_learn::Fingerprint::parse(
+            content,
+            &["Read", "Edit", "Write", "Bash", "Grep", "Glob"],
         );
 
         StrategyFingerprint {
             id: 0,
             attempt_id,
-            files_explored,
-            tests_run,
-            tools_used,
-            fix_approach,
-            strategy_summary: summary,
+            files_explored: fingerprint.files,
+            tests_run: fingerprint.tests,
+            tools_used: fingerprint.actions.into_iter().collect(),
+            fix_approach: fingerprint.approach,
+            strategy_summary: fingerprint.summary,
             fix_quality_score: None,
             created_at: Utc::now(),
         }
@@ -169,6 +106,7 @@ impl StrategyParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_parse_tdd_strategy() {
