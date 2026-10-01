@@ -23,84 +23,14 @@ impl LogExtractor {
 
     /// Extract learnings from log text content.
     pub fn extract_from_text(content: &str) -> ExtractedLearnings {
-        let mut learnings = ExtractedLearnings {
-            root_cause: None,
-            files_modified: Vec::new(),
-            strategy_used: None,
-            tests_added: false,
-            key_decisions: Vec::new(),
-        };
-
-        let file_re =
-            regex_lite::Regex::new(r"(?:src/|lib/|app/|pkg/|internal/|cmd/)[\w/._-]+\.\w+")
-                .expect("file path regex should be valid");
-        let root_cause_re = regex_lite::Regex::new(
-            r"(?i)(?:the (?:issue|bug|problem|root cause) (?:was|is)|root cause|fixed by|the fix (?:was|is))\s*[:.]?\s*(.+)",
-        )
-        .expect("root cause regex should be valid");
-
-        let mut files_seen = std::collections::HashSet::new();
-        let mut has_diff_markers = false;
-
-        for line in content.lines() {
-            // Extract file paths from diff markers
-            if line.starts_with("+++ b/") || line.starts_with("--- a/") {
-                if let Some(path) = line.get(6..) {
-                    let path = path.trim();
-                    if !path.is_empty() && files_seen.insert(path.to_string()) {
-                        learnings.files_modified.push(path.to_string());
-                    }
-                }
-                has_diff_markers = true;
-                continue;
-            }
-
-            // Extract file paths from tool-like patterns
-            for m in file_re.find_iter(line) {
-                let path = m.as_str().to_string();
-                if files_seen.insert(path.clone()) {
-                    learnings.files_modified.push(path);
-                }
-            }
-
-            // Root cause detection
-            if learnings.root_cause.is_none() {
-                if let Some(caps) = root_cause_re.captures(line) {
-                    if let Some(cause) = caps.get(1) {
-                        let cause_text = cause.as_str().trim().to_string();
-                        if cause_text.len() > 10 && cause_text.len() < 500 {
-                            learnings.root_cause = Some(cause_text);
-                        }
-                    }
-                }
-            }
-
-            // Test detection
-            let lower = line.to_lowercase();
-            if lower.contains("cargo test")
-                || lower.contains("npm test")
-                || lower.contains("pytest")
-                || lower.contains("make test")
-                || lower.contains("jest")
-                || lower.contains("test passed")
-                || lower.contains("test failed")
-            {
-                learnings.tests_added = true;
-            }
+        let lesson = abnegate_learn::Extractor::extract(content);
+        ExtractedLearnings {
+            root_cause: lesson.root_cause,
+            files_modified: lesson.files,
+            strategy_used: lesson.approach,
+            tests_added: lesson.tests,
+            key_decisions: lesson.decisions,
         }
-
-        // Determine strategy
-        learnings.strategy_used = Some(if learnings.tests_added && has_diff_markers {
-            "test_driven".to_string()
-        } else if has_diff_markers {
-            "direct_fix".to_string()
-        } else if !learnings.files_modified.is_empty() {
-            "investigation_then_fix".to_string()
-        } else {
-            "unknown".to_string()
-        });
-
-        learnings
     }
 
     /// Extract learnings with LLM if available, falling back to heuristics.

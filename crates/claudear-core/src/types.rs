@@ -2419,39 +2419,14 @@ impl FixOutcome {
 
     /// Extract keywords from title and description.
     pub fn extract_keywords(title: &str, description: &str) -> Vec<String> {
-        let text = format!("{} {}", title, description).to_lowercase();
-
-        let significant_words: Vec<&str> = text
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|w| w.len() > 3)
-            .filter(|w| !is_common_word(w))
-            .take(20)
-            .collect();
-
-        significant_words.into_iter().map(String::from).collect()
+        abnegate_learn::tags_from(&format!("{title} {description}"))
     }
 
     /// Categorize an error message into a type.
     pub fn categorize_error(error: &str) -> String {
-        let error_lower = error.to_lowercase();
-
-        if error_lower.contains("timeout") || error_lower.contains("timed out") {
-            "timeout".to_string()
-        } else if error_lower.contains("permission") || error_lower.contains("access denied") {
-            "permission".to_string()
-        } else if error_lower.contains("syntax") || error_lower.contains("parse") {
-            "syntax".to_string()
-        } else if error_lower.contains("test") && error_lower.contains("fail") {
-            "test_failure".to_string()
-        } else if error_lower.contains("build") && error_lower.contains("fail") {
-            "build_failure".to_string()
-        } else if error_lower.contains("not found") || error_lower.contains("missing") {
-            "not_found".to_string()
-        } else if error_lower.contains("conflict") {
-            "conflict".to_string()
-        } else {
-            "unknown".to_string()
-        }
+        abnegate_learn::ErrorClass::classify(error)
+            .as_str()
+            .to_string()
     }
 
     /// Calculate semantic similarity score with another outcome (0.0 to 1.0).
@@ -2469,139 +2444,13 @@ impl FixOutcome {
 
 /// Check if a word is too common to be a useful keyword.
 pub fn is_common_word(word: &str) -> bool {
-    const COMMON_WORDS: &[&str] = &[
-        "the",
-        "a",
-        "an",
-        "is",
-        "are",
-        "was",
-        "were",
-        "be",
-        "been",
-        "being",
-        "have",
-        "has",
-        "had",
-        "do",
-        "does",
-        "did",
-        "will",
-        "would",
-        "could",
-        "should",
-        "may",
-        "might",
-        "must",
-        "shall",
-        "can",
-        "need",
-        "dare",
-        "this",
-        "that",
-        "these",
-        "those",
-        "what",
-        "which",
-        "who",
-        "whom",
-        "when",
-        "where",
-        "why",
-        "how",
-        "all",
-        "each",
-        "every",
-        "both",
-        "few",
-        "more",
-        "most",
-        "other",
-        "some",
-        "such",
-        "than",
-        "too",
-        "very",
-        "just",
-        "also",
-        "only",
-        "now",
-        "then",
-        "here",
-        "there",
-        "with",
-        "from",
-        "into",
-        "onto",
-        "upon",
-        "over",
-        "under",
-        "above",
-        "below",
-        "between",
-        "among",
-        "through",
-        "during",
-        "before",
-        "after",
-        "about",
-        "against",
-        "without",
-        "within",
-        "throughout",
-        "around",
-        "and",
-        "but",
-        "or",
-        "nor",
-        "for",
-        "yet",
-        "so",
-        "because",
-        "although",
-        "while",
-        "if",
-        "unless",
-        "until",
-        "since",
-        "once",
-        "whereas",
-        "error",
-        "issue",
-        "problem",
-        "bug",
-        "fix",
-        "fixed",
-        "fixing",
-    ];
-
-    COMMON_WORDS.contains(&word)
+    abnegate_learn::is_common(word)
 }
 
 /// Cosine similarity between two f32 vectors.
 pub fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-
-    let (dot_product, norm_a, norm_b) = a
-        .iter()
-        .zip(b.iter())
-        .fold((0.0f32, 0.0f32, 0.0f32), |(dot, na, nb), (&x, &y)| {
-            (dot + x * y, na + x * x, nb + y * y)
-        });
-
-    let norm_a = norm_a.sqrt();
-    let norm_b = norm_b.sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot_product / (norm_a * norm_b)
+    abnegate_learn::cosine_similarity(a, b) as f32
 }
-
-// --- Types relocated from learning/cross_repo_correlator.rs ---
 
 /// A detected correlation between two repos having concurrent issues.
 #[derive(Debug, Clone, Serialize, Deserialize)]

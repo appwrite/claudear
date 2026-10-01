@@ -1,9 +1,9 @@
 //! Outcome tracking for fix attempts.
 
-use crate::feedback::{cosine_similarity, EmbeddingClient};
+use crate::feedback::EmbeddingClient;
+use abnegate_learn::{Category, Config, ErrorClass, Memory, Trial, TrialInput, Verdict};
 use claudear_core::error::Result;
 use claudear_core::types::{FixOutcome, Outcome};
-use std::collections::HashMap;
 
 /// Categorize an error message using semantic similarity against reference embeddings.
 ///
@@ -16,86 +16,109 @@ pub async fn categorize_error_semantic(
     reference_embeddings: &[(String, Vec<f32>)],
 ) -> Result<String> {
     let error_embedding = client.embed(error_message).await?;
-
-    let mut best_category = "unknown".to_string();
-    let mut best_similarity: f32 = 0.3; // threshold
-
-    for (category, ref_embedding) in reference_embeddings {
-        let similarity = cosine_similarity(&error_embedding, ref_embedding);
-        if similarity > best_similarity {
-            best_similarity = similarity;
-            best_category = category.clone();
-        }
-    }
-
-    Ok(best_category)
+    let categories: Vec<Category> = reference_embeddings
+        .iter()
+        .map(|(name, embedding)| Category::new(name.clone(), embedding.clone()))
+        .collect();
+    Ok(Category::nearest(&error_embedding, &categories, 0.3)
+        .map(|category| category.name.clone())
+        .unwrap_or_else(|| "unknown".to_string()))
 }
 
 /// Build reference embeddings for error categorization.
 ///
-/// Defines 8 category description strings and embeds them in a single batch call,
-/// returning a mapping from category name to its embedding vector.
+/// Embeds [`ErrorClass::REFERENCES`] in a single batch call, returning a
+/// mapping from category name to its embedding vector.
 pub async fn build_error_reference_embeddings(
     client: &EmbeddingClient,
 ) -> Result<Vec<(String, Vec<f32>)>> {
-    let categories = [
-        ("timeout", "network timeout, connection timed out, request deadline exceeded, slow response"),
-        ("permission", "permission denied, access denied, authentication failed, authorization error, forbidden"),
-        ("syntax", "syntax error, parse error, unexpected token, invalid syntax, malformed input"),
-        ("test_failure", "test failed, test failure, assertion error, test case not passing, spec failure"),
-        ("build_failure", "build failed, compilation error, link error, build process failure"),
-        ("not_found", "not found, missing file, missing module, missing dependency, module not found"),
-        ("conflict", "merge conflict, git conflict, conflicting changes, conflict resolution needed"),
-        ("dependency", "dependency version mismatch, incompatible dependency, package version conflict"),
-    ];
-
-    let descriptions: Vec<&str> = categories.iter().map(|(_, desc)| *desc).collect();
+    let descriptions: Vec<&str> = ErrorClass::REFERENCES
+        .iter()
+        .map(|(_, description)| *description)
+        .collect();
     let embeddings = client.embed_batch(&descriptions).await?;
 
-    let result: Vec<(String, Vec<f32>)> = categories
+    Ok(ErrorClass::REFERENCES
         .iter()
         .zip(embeddings)
         .map(|((name, _), embedding)| (name.to_string(), embedding))
-        .collect();
+        .collect())
+}
 
-    Ok(result)
+pub(crate) fn verdict_of(outcome: Outcome) -> Verdict {
+    match outcome {
+        Outcome::Merged => Verdict::Success,
+        Outcome::Closed | Outcome::Failed => Verdict::Failure,
+        Outcome::CannotFix => Verdict::Skip,
+    }
+}
+
+pub(crate) fn trial_input_from(outcome: &FixOutcome) -> TrialInput {
+    let mut input = TrialInput::new(&outcome.source, &outcome.issue_id)
+        .with_verdict(verdict_of(outcome.outcome))
+        .with_summary(&outcome.issue_text)
+        .with_tags(outcome.keywords.clone())
+        .with_recorded_at(outcome.created_at.timestamp());
+    if outcome.id > 0 {
+        input = input.with_id(outcome.id);
+    }
+    if let Some(error) = &outcome.error_type {
+        input = input.with_error(error);
+    }
+    if let Some(lesson) = &outcome.learnings {
+        input = input.with_lesson(lesson);
+    }
+    if let Some(embedding) = &outcome.embedding {
+        input = input.with_embedding(embedding.clone());
+    }
+    input
+}
+
+pub(crate) fn trial_from_outcome(outcome: &FixOutcome) -> Trial {
+    Trial::from_input(trial_input_from(outcome))
 }
 
 /// Tracks fix outcomes in memory (can be persisted to DB later).
 pub struct OutcomeTracker {
+    memory: Memory,
     outcomes: Vec<FixOutcome>,
-    next_id: i64,
 }
 
 impl OutcomeTracker {
     /// Create a new outcome tracker.
     pub fn new() -> Self {
         Self {
+            memory: Memory::new(),
             outcomes: Vec::new(),
-            next_id: 1,
+        }
+    }
+
+    /// Create with custom similarity limits.
+    pub fn with_config(config: Config) -> Self {
+        Self {
+            memory: Memory::new().with_config(config),
+            outcomes: Vec::new(),
         }
     }
 
     /// Load outcomes from persistent storage (e.g. DB hydration on startup).
     pub fn load(&mut self, outcomes: Vec<FixOutcome>) {
-        if let Some(max_id) = outcomes.iter().map(|o| o.id).max() {
-            self.next_id = max_id + 1;
-        }
+        self.memory.replace(outcomes.iter().map(trial_from_outcome));
         self.outcomes = outcomes;
     }
 
     /// Record a new outcome.
     pub fn record(&mut self, mut outcome: FixOutcome) -> Result<i64> {
-        outcome.id = self.next_id;
-        self.next_id += 1;
-
-        let id = outcome.id;
+        outcome.id = 0;
+        let id = self.memory.record(trial_input_from(&outcome));
+        outcome.id = id;
         self.outcomes.push(outcome);
         Ok(id)
     }
 
     /// Set embedding for an outcome by ID.
     pub fn set_embedding(&mut self, id: i64, embedding: Vec<f32>) -> Result<()> {
+        self.memory.attach_embedding(id, embedding.clone());
         if let Some(outcome) = self.outcomes.iter_mut().find(|o| o.id == id) {
             outcome.set_embedding(embedding);
         }
@@ -110,35 +133,24 @@ impl OutcomeTracker {
             .collect()
     }
 
+    /// The outcome `id`, when it exists.
+    pub fn get(&self, id: i64) -> Option<&FixOutcome> {
+        self.outcomes.iter().find(|outcome| outcome.id == id)
+    }
+
+    /// Trial memory used for cosine fallback when HNSW is unavailable.
+    pub fn memory(&self) -> &Memory {
+        &self.memory
+    }
+
     /// Get success rate for a source.
     pub fn success_rate(&self, source: Option<&str>) -> f64 {
-        let filtered: Vec<_> = match source {
-            Some(s) => self.outcomes.iter().filter(|o| o.source == s).collect(),
-            None => self.outcomes.iter().collect(),
-        };
-
-        if filtered.is_empty() {
-            return 0.0;
-        }
-
-        let successes = filtered.iter().filter(|o| o.outcome.is_success()).count();
-        successes as f64 / filtered.len() as f64
+        self.memory.success_rate(source)
     }
 
     /// Get common error types.
     pub fn common_errors(&self, limit: usize) -> Vec<(String, usize)> {
-        let mut error_counts: HashMap<String, usize> = HashMap::new();
-
-        for outcome in &self.outcomes {
-            if let Some(ref error_type) = outcome.error_type {
-                *error_counts.entry(error_type.clone()).or_insert(0) += 1;
-            }
-        }
-
-        let mut counts: Vec<_> = error_counts.into_iter().collect();
-        counts.sort_by_key(|b| std::cmp::Reverse(b.1));
-        counts.truncate(limit);
-        counts
+        self.memory.common_errors(None, limit)
     }
 
     /// Get all outcomes.
@@ -148,6 +160,7 @@ impl OutcomeTracker {
 
     /// Add learnings to an outcome.
     pub fn add_learnings(&mut self, id: i64, learnings: &str) -> Result<()> {
+        self.memory.attach_lesson(id, learnings);
         if let Some(outcome) = self.outcomes.iter_mut().find(|o| o.id == id) {
             outcome.learnings = Some(learnings.to_string());
         }
@@ -164,6 +177,7 @@ impl Default for OutcomeTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feedback::cosine_similarity;
     use chrono::Utc;
     use claudear_core::types::{is_common_word, FixAttempt, Issue, IssuePriority, IssueStatus};
 
