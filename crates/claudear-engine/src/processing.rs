@@ -3599,7 +3599,7 @@ pub async fn record_feedback_outcome(
     }
 
     let mut analyzer = feedback_analyzer.lock().await;
-    if let Err(e) = analyzer.record_outcome(&attempt, issue, &prompt, outcome) {
+    if let Err(e) = analyzer.record(fix_outcome) {
         tracing::warn!(error = %e, "Failed to record feedback outcome in memory");
     }
 }
@@ -4703,6 +4703,12 @@ mod tests {
         assert!(
             !outcomes.is_empty(),
             "should have stored a feedback outcome"
+        );
+        let analyzer = feedback_analyzer.lock().await;
+        assert_eq!(analyzer.tracker().all().len(), 1);
+        assert_eq!(
+            analyzer.tracker().all()[0].outcome,
+            claudear_analysis::feedback::Outcome::Failed
         );
     }
 

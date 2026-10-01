@@ -88,7 +88,12 @@ impl FeedbackAnalyzer {
         self.tracker.load(outcomes);
     }
 
-    /// Record an outcome.
+    /// Record an already-built outcome, including any embedding the caller attached.
+    pub fn record(&mut self, outcome: FixOutcome) -> Result<i64> {
+        self.tracker.record(outcome)
+    }
+
+    /// Record an outcome built from an attempt.
     pub fn record_outcome(
         &mut self,
         attempt: &FixAttempt,
@@ -96,8 +101,7 @@ impl FeedbackAnalyzer {
         prompt: &str,
         outcome: Outcome,
     ) -> Result<i64> {
-        let fix_outcome = FixOutcome::from_attempt(attempt, issue, prompt, outcome);
-        self.tracker.record(fix_outcome)
+        self.record(FixOutcome::from_attempt(attempt, issue, prompt, outcome))
     }
 
     /// Find similar outcomes using semantic search with a pre-computed embedding.
@@ -328,6 +332,27 @@ mod tests {
         let similar = analyzer.find_similar(&[1.0, 0.0, 0.0]);
         assert_eq!(similar.len(), 1);
         assert_eq!(similar[0].outcome.id, id);
+        assert!(similar[0].similarity > 0.9);
+    }
+
+    #[test]
+    fn test_record_keeps_runtime_embedding_for_memory_fallback() {
+        let mut analyzer = FeedbackAnalyzer::new();
+        let issue = create_test_issue("API timeout error", "Timeout in user service", "linear");
+        let attempt = create_test_attempt("linear");
+        let mut outcome =
+            FixOutcome::from_attempt(&attempt, &issue, "Fix the timeout", Outcome::Merged);
+        outcome.set_embedding(vec![1.0, 0.0, 0.0]);
+
+        let id = analyzer.record(outcome).unwrap();
+        let similar = analyzer.find_similar(&[1.0, 0.0, 0.0]);
+
+        assert_eq!(similar.len(), 1);
+        assert_eq!(similar[0].outcome.id, id);
+        assert_eq!(
+            similar[0].outcome.embedding.as_deref(),
+            Some(&[1.0, 0.0, 0.0][..])
+        );
         assert!(similar[0].similarity > 0.9);
     }
 

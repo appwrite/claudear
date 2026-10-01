@@ -48,8 +48,7 @@ pub async fn build_error_reference_embeddings(
 pub(crate) fn verdict_of(outcome: Outcome) -> Verdict {
     match outcome {
         Outcome::Merged => Verdict::Success,
-        Outcome::Closed | Outcome::Failed => Verdict::Failure,
-        Outcome::CannotFix => Verdict::Skip,
+        Outcome::Closed | Outcome::Failed | Outcome::CannotFix => Verdict::Failure,
     }
 }
 
@@ -217,6 +216,14 @@ mod tests {
             parent_attempt_id: None,
             cascade_repo: None,
         }
+    }
+
+    #[test]
+    fn cannot_fix_maps_to_failure_verdict() {
+        assert_eq!(verdict_of(Outcome::Merged), Verdict::Success);
+        assert_eq!(verdict_of(Outcome::Closed), Verdict::Failure);
+        assert_eq!(verdict_of(Outcome::Failed), Verdict::Failure);
+        assert_eq!(verdict_of(Outcome::CannotFix), Verdict::Failure);
     }
 
     #[test]
