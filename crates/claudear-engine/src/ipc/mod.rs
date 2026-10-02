@@ -10,7 +10,7 @@ pub use client::{print_response, IpcClient};
 pub use protocol::{IpcCommand, IpcData, IpcResponse, WatcherState};
 pub use server::IpcServer;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Returns a private runtime directory for IPC files, scoped to the current user.
 ///
@@ -67,26 +67,34 @@ pub fn is_daemon_running() -> bool {
 
 /// Get the PID of the running daemon, if any.
 pub fn get_daemon_pid() -> Option<u32> {
-    let pid_path = default_pid_path();
-    if pid_path.exists() {
-        std::fs::read_to_string(&pid_path)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-    } else {
-        None
-    }
+    read_pid_file(&default_pid_path())
+}
+
+/// The PID recorded in the PID file at `path`, if it holds one.
+fn read_pid_file(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.trim().parse().ok())
 }
 
 /// Write the current process PID to the pid file.
 pub fn write_pid_file() -> std::io::Result<()> {
-    let pid_path = default_pid_path();
-    std::fs::write(&pid_path, std::process::id().to_string())
+    write_pid_file_at(&default_pid_path())
+}
+
+/// Write the current process PID to the PID file at `path`.
+fn write_pid_file_at(path: &Path) -> std::io::Result<()> {
+    std::fs::write(path, std::process::id().to_string())
 }
 
 /// Remove the PID file.
 pub fn remove_pid_file() {
-    let pid_path = default_pid_path();
-    let _ = std::fs::remove_file(&pid_path);
+    remove_pid_file_at(&default_pid_path());
+}
+
+/// Remove the PID file at `path`, if there is one.
+fn remove_pid_file_at(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// Remove the socket file.
@@ -192,44 +200,23 @@ mod tests {
     }
 
     #[test]
-    fn test_write_and_remove_pid_file_does_not_panic() {
-        // We avoid actually writing the PID file if a daemon is running,
-        // as that could interfere with the running daemon. Instead, we test
-        // the functions only when no daemon is active.
-        if is_daemon_running() {
-            // A daemon is running; skip this test to avoid interfering.
-            return;
-        }
+    fn test_pid_file_records_our_pid_until_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("claudear.pid");
 
-        // Save any existing PID file content so we can restore it.
-        let pid_path = default_pid_path();
-        let existing_content = std::fs::read_to_string(&pid_path).ok();
-
-        // Write our PID file.
-        let write_result = write_pid_file();
-        assert!(write_result.is_ok(), "write_pid_file should succeed");
-
-        // Verify get_daemon_pid returns our PID.
-        let read_pid = get_daemon_pid();
+        write_pid_file_at(&pid_path).expect("writing the PID file should succeed");
         assert_eq!(
-            read_pid,
+            read_pid_file(&pid_path),
             Some(std::process::id()),
-            "get_daemon_pid should return our process PID after write_pid_file"
+            "the PID file must hold our process PID once written"
         );
 
-        // Remove the PID file.
-        remove_pid_file();
-
-        // Verify the PID file is gone (or restore the original if there was one).
-        if let Some(content) = existing_content {
-            // Restore original content for the running daemon.
-            let _ = std::fs::write(&pid_path, content);
-        } else {
-            assert!(
-                !pid_path.exists(),
-                "PID file should be removed after remove_pid_file"
-            );
-        }
+        remove_pid_file_at(&pid_path);
+        assert!(
+            !pid_path.exists(),
+            "the PID file should be gone once removed"
+        );
+        assert_eq!(read_pid_file(&pid_path), None);
     }
 
     #[test]

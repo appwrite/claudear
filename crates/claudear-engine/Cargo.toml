@@ -60,6 +60,9 @@ tower-cookies = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 
+# Private per-run directories for deploy_qa live QA
+tempfile = { workspace = true }
+
 # Crypto
 hex = { workspace = true }
 rand = { workspace = true }
@@ -87,5 +90,4 @@ indicatif = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 http-body-util = { workspace = true }

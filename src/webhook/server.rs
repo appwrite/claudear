@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::error::Result;
 use crate::feedback::{FeedbackAnalyzer, IssueEmbeddingService};
+use crate::heartbeat::{self, Heartbeat};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer};
 use crate::notifier::Notifier;
 use crate::runner::AgentRunner;
@@ -768,6 +769,12 @@ async fn webhook_handler(
             Json(json!({ "status": "error", "reason": "Failed to record attempt" })),
         );
     }
+    let heartbeat = Heartbeat::start(
+        Arc::clone(&state.tracker),
+        &source_name,
+        &issue.id,
+        heartbeat::INTERVAL,
+    );
 
     // Persist full issue content to the issues table (independent of embeddings)
     {
@@ -783,6 +790,7 @@ async fn webhook_handler(
     let handler_clone = Arc::clone(handler);
 
     tokio::spawn(async move {
+        let _heartbeat = heartbeat;
         let cleanup_state = Arc::clone(&state_clone);
         let cleanup_key = processing_key.clone();
         let result = process_issue(

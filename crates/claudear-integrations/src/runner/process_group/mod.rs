@@ -13,8 +13,16 @@ pub use drain::Drain;
 pub use guard::Guard;
 pub use registry::Registry;
 
+/// The environment variable carrying a run's marker. Every process the run
+/// starts inherits it, and only those that keep it can be found once they
+/// leave the run's process group.
+pub(crate) const MARKER_VARIABLE: &str = marker::Marker::VARIABLE;
+
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
+    pub(crate) use super::MARKER_VARIABLE;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::marker::Marker;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
@@ -29,10 +37,6 @@ pub(crate) mod tests {
 
     /// Generous, because CI runs the tests under `cargo tarpaulin`'s ptrace.
     pub(crate) const RUN_DEADLINE: Duration = Duration::from_secs(60);
-
-    /// The environment variable carrying a run's marker, which tests scrub with
-    /// `env -u` to start a process the run cannot find.
-    pub(crate) const MARKER_VARIABLE: &str = Marker::VARIABLE;
 
     pub(crate) const BACKGROUND_SLEEP: &str = "sleep 300 & echo $!; exec sleep 300";
 

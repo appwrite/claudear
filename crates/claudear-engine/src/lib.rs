@@ -7,6 +7,7 @@ pub mod agent_classifier;
 pub mod api;
 pub mod api_events;
 pub mod discord_index;
+pub mod heartbeat;
 pub mod housekeeping;
 pub mod intent;
 pub mod ipc;

@@ -119,11 +119,17 @@ instructions_file = "./claude-instructions.md"
 
 # Tool permissions granted without prompting (--allowedTools)
 # See: https://docs.anthropic.com/en/docs/claude-code/settings
+# permissions and skip_permissions govern fix runs and [deploy_qa] live QA,
+# which gets them on top of readonly_tools. A scoped Bash(...) rule allows only
+# the commands it matches: Bash(git *) does not allow curl, so live-QA HTTP
+# checks need e.g. "Bash(curl:*)" here or skip_permissions = true. Without
+# skip_permissions, live QA logs a warning when these plus readonly_tools grant
+# no Bash at all, or only scoped Bash(...) rules.
 permissions = ["Bash(git *)", "Read", "Edit"]
 
 readonly_tools = ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]
 
-# Skip all permission prompts (default: true)
+# Skip all permission prompts (default: false)
 skip_permissions = true
 
 # CLI binary name/path (default: auto-detected, e.g., "claude", "codex")
@@ -131,6 +137,9 @@ binary = "claude"
 
 # Extra environment variables for the agent process.
 # Useful when the daemon runs as a service and the CLI needs PATH or other vars.
+# Passed verbatim (no ${VAR} expansion) to every agent run of every source,
+# fix runs and [deploy_qa] live QA alike, so a secret here reaches all of them.
+# Live QA drops any named CLAUDEAR_*, as it does Claudear's own variables.
 # [agent.providers.claude.env]
 # PATH = "/home/user/.local/bin:/home/user/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin"
 
@@ -147,6 +156,7 @@ sandbox = ""
 # Gated per-run by `sources` against the issue source. Default here: HelpScout only.
 # Add "discord" to enable there; set sources = [] to enable for all sources.
 # Keep secrets out of this file: reference them via ${VAR} from the daemon/provider env.
+# [deploy_qa] runs have no CLAUDEAR_* variables, so ${CLAUDEAR_*} never resolves there.
 # [agent.providers.claude.mcp.appwrite]
 # command = "uvx"
 # args    = ["mcp-server-appwrite", "--databases", "--users", "--functions"]
@@ -174,6 +184,23 @@ sandbox = ""
 # When Grafana sits behind Cloudflare Access, pass the service-token headers as a
 # JSON string (inline literals or ${VAR} both work).
 # GRAFANA_EXTRA_HEADERS         = "{\"CF-Access-Client-Id\": \"your-cf-access-client-id\", \"CF-Access-Client-Secret\": \"your-cf-access-client-secret\"}"
+
+# Headless browser (@playwright/mcp) for [deploy_qa] live QA of console UI
+# changes. Attached to deploy_qa runs only, so fix runs never drive a browser.
+# Needs Node.js (npx) on the daemon host (the Docker image has none) plus the
+# Chromium build this exact version expects and its OS libraries; install them
+# as root or with sudo:
+#   npx -y @playwright/mcp@0.0.82 install-browser --with-deps chromium
+# Keep the version pinned: @latest can move to a Playwright release whose
+# browser build is not installed. --browser chromium uses that build instead of
+# Google Chrome; --isolated keeps each run's profile in memory, so concurrent
+# runs don't clash. Logins do not come from env vars: add "--storage-state",
+# "<file>" (a saved Playwright session) or "--secrets", "<dotenv file>" (keys
+# the agent types in place of the values) to args.
+# [agent.providers.claude.mcp.playwright]
+# command = "npx"
+# args    = ["-y", "@playwright/mcp@0.0.82", "--headless", "--isolated", "--browser", "chromium"]
+# sources = ["deploy_qa"]
 
 # A/B Experiments (optional)
 # Test different providers or configurations against each other.
@@ -803,7 +830,18 @@ github_search_repos = []
 # ============================================
 # Deploy QA (live release-tip watches)
 # ============================================
-# Durable-watches new GitHub release tips and runs observe/report live QA.
+# Durable-watches new GitHub release tips and runs live QA against them: the
+# agent runs real checks and reports, and is told never to open fix PRs. Each
+# run works in a fresh owner-only directory under
+# <workspace>/.claudear-deploy-qa that is deleted afterwards, and loads only
+# the MCP servers attached for deploy_qa and your user-level Claude Code
+# settings, never a .mcp.json or project/local settings. Its "no fix PRs, no
+# posting, QA-project-only writes" rules are prompt rules, not a sandbox: the
+# agent has the same access as fix runs, and their environment minus
+# Claudear's own CLAUDEAR_* variables (its master key and tokens). Claudear
+# redacts the credentials it recognizes from the report before posting it to
+# #releases and never sends it to other notifier channels, but don't rely on
+# redaction to keep a secret out of #releases.
 # Separate from [regression] / ReleaseTracker (those track bug-fix inclusion).
 # Do not point issues.discord at #releases — that would spawn fix agents on
 # bot posts. Required env for a live host (not used in CI):
@@ -811,6 +849,11 @@ github_search_repos = []
 #                                    required (or scm.github.token) whenever
 #                                    deploy_qa is enabled with tracks
 #   CLAUDEAR_DISCORD_BOT_TOKEN     - bot that can reply / create threads
+#   QA credentials the playbook's checks need (e.g. a throwaway QA project's
+#   API key) - set in the daemon or provider env, which every agent run
+#   inherits, so scope them to the QA project, and don't name them CLAUDEAR_*,
+#   which live QA never gets; an MCP server env references them as ${VAR},
+#   and the browser logs in via --storage-state or --secrets
 # Live host probes are performed by the agent; CI uses a no-op probe seam.
 
 [deploy_qa]
@@ -818,6 +861,10 @@ github_search_repos = []
 enabled = false
 poll_interval_ms = 300000
 skip_if_previous_running = true
+# Seconds one live-QA run may take. The runner stops a run past the smaller of
+# this and [agent] timeout_secs; its tip is marked errored and may be retried
+# up to [retry] max_retries times.
+timeout_secs = 1800
 discord_channel_id = "990878183580651571"
 # GitHub login -> Discord user map for the FAIL @releaser mention. Use an
 # absolute path: a relative one breaks under systemd and drops the mention.

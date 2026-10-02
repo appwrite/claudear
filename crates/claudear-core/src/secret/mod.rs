@@ -7,12 +7,20 @@
 //! - Serde support — deserializes/serializes as a plain string for TOML round-tripping
 //! - Constant-time equality — uses `subtle::ConstantTimeEq` to prevent timing attacks
 //! - Encryption at rest — AES-256-GCM encryption with `ENC[v1:...]` format
+//! - Redaction — [`Redactor`] masks credentials in untrusted text before it
+//!   leaves Claudear
 
 pub mod encryption;
+mod redactor;
+
+pub use redactor::Redactor;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
+
+/// What every redacted secret is replaced with.
+pub const REDACTED: &str = "[REDACTED]";
 
 /// A wrapper around a secret string that provides secure handling.
 ///
@@ -53,13 +61,13 @@ impl Drop for SecretValue {
 
 impl std::fmt::Debug for SecretValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("[REDACTED]")
+        f.write_str(REDACTED)
     }
 }
 
 impl std::fmt::Display for SecretValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("[REDACTED]")
+        f.write_str(REDACTED)
     }
 }
 
@@ -114,9 +122,11 @@ impl OptionalSecretExt for Option<SecretValue> {
     }
 }
 
-/// Known secret prefixes/patterns to redact from log output.
+/// Known secret prefixes/patterns to redact.
 const SECRET_PATTERNS: &[&str] = &[
     "ghp_",        // GitHub personal access token
+    "gho_",        // GitHub OAuth token, as `gh auth token` prints
+    "ghr_",        // GitHub refresh token
     "ghs_",        // GitHub App server-to-server token
     "ghu_",        // GitHub App user-to-server token
     "github_pat_", // GitHub fine-grained PAT
@@ -128,15 +138,16 @@ const SECRET_PATTERNS: &[&str] = &[
     "xoxr-",       // Slack refresh token
     "sntryu_",     // Sentry user token
     "sntrys_",     // Sentry system token
+    "sk-ant-",     // Anthropic API key or OAuth token
     "-----BEGIN",  // PEM private key
     "ENC[v1:",     // Encrypted secret prefix
 ];
 
 /// Redact known secret patterns from a string.
 ///
-/// Replaces any occurrence of a known secret prefix (plus following non-whitespace
-/// characters) with `[REDACTED]`. Used by the log redaction layer to prevent
-/// accidental secret leakage in log output.
+/// Replaces any occurrence of a known secret prefix (plus the characters up to
+/// the next delimiter) with [`REDACTED`]. [`Redactor`] applies it after its own
+/// rules.
 pub fn redact_secrets(input: &str) -> String {
     let mut output = input.to_string();
     for pattern in SECRET_PATTERNS {
@@ -154,7 +165,7 @@ pub fn redact_secrets(input: &str) -> String {
                 })
                 .map(|pos| after_pattern + pos)
                 .unwrap_or(output.len());
-            output.replace_range(start..end, "[REDACTED]");
+            output.replace_range(start..end, REDACTED);
         }
     }
     output

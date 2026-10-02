@@ -1,5 +1,6 @@
 //! Main watcher that coordinates sources, Claude, and notifications.
 
+use crate::heartbeat::{Heartbeat, Liveness};
 use crate::intent::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
@@ -18,7 +19,7 @@ use claudear_core::error::Result;
 use claudear_core::types::{
     ActionKind, ActivityLogEntry, AskRequest, BlockingQuestion, DeployQaTip, DeployQaTipStatus,
     FixAttempt, FixAttemptStats, FixAttemptStatus, Issue, IssueEmbedding, IssueType, MatchPriority,
-    MatchResult, ProcessingMetric, RegressionWatch, ReplyKind, TimelineEventStatus,
+    MatchResult, PrRecord, ProcessingMetric, RegressionWatch, ReplyKind, TimelineEventStatus,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
@@ -49,6 +50,10 @@ const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
 
 /// Issue metadata carrying the reviewed PR's repo into a review rerun.
 const REVIEW_PR_REPO_KEY: &str = "review_pr_repo";
+
+/// Decision recorded when a review rerun waits for its PR's repository to be
+/// indexed.
+const REVIEW_RERUN_DEFERRED_DECISION: &str = "review_rerun_deferred";
 
 /// How many review-driven reruns a PR gets before claudear stops answering
 /// review feedback on it and leaves the PR to humans.
@@ -315,6 +320,12 @@ pub struct Watcher {
     /// so overlapping dispatches never start the same tip twice. Each id is
     /// held by a [`DeployQaTipClaim`], whose `Drop` needs a synchronous lock.
     dispatched_deploy_qa_tips: Mutex<HashSet<String>>,
+    /// How often this watcher's runs send heartbeats, and how long its orphan
+    /// sweeps let a run stay silent before releasing its attempt.
+    liveness: Liveness,
+    /// URLs of the PRs whose review reruns wait for their repository to be
+    /// indexed, so each wait is recorded once rather than every cycle.
+    deferred_review_reruns: Mutex<HashSet<String>>,
 }
 
 /// A ledger comment carried by a review batch: `(scm_comment_id, comment_kind)`.
@@ -323,6 +334,18 @@ type CommentRef = (i64, &'static str);
 /// Actionable review feedback grouped for one PR:
 /// `(pr_url, feedback_summary, feedback_count, comment_refs)`.
 type PrReviewFeedback = (String, String, usize, Vec<CommentRef>);
+
+/// What became of review feedback handed to
+/// [`Watcher::process_review_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewOutcome {
+    /// The feedback is dealt with: a rerun addressing it started, or the PR
+    /// was left to humans.
+    Handled,
+    /// The rerun waits for the PR's repository to be indexed, so the
+    /// feedback stays outstanding without spending any of its retries.
+    Deferred,
+}
 
 impl Watcher {
     /// Create a new watcher.
@@ -407,6 +430,8 @@ impl Watcher {
             intent_classifier,
             spawn_handles: tokio::sync::Mutex::new(Vec::new()),
             dispatched_deploy_qa_tips: Mutex::new(HashSet::new()),
+            liveness: Liveness::default(),
+            deferred_review_reruns: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1031,24 +1056,39 @@ impl Watcher {
         self.is_running.store(running, Ordering::SeqCst);
     }
 
+    /// Release attempts whose runs were orphaned by a crash, restart or
+    /// shutdown, which otherwise stay `pending` and block their issues from
+    /// ever being picked or retried again.
+    ///
+    /// A daemon, a foreground `poll`, one-shot triggers and the webhook server
+    /// can all be running attempts against the same database, and every run
+    /// keeps its attempt's [`Heartbeat`] going until it ends. Only attempts
+    /// silent for longer than [`Liveness::stale_after`] are released, so a
+    /// live run is never swept however long it waits on approval, a question
+    /// or its agent, and a run that died is recovered within minutes. This
+    /// runs on start and every housekeeping cycle.
+    fn release_orphaned_attempts(&self) {
+        let stale_after = self.liveness.stale_after;
+        match self.tracker.release_orphaned_pending_attempts(stale_after) {
+            Ok(0) => {}
+            Ok(released) => tracing::info!(
+                component = "watcher",
+                released,
+                stale_after_secs = stale_after.as_secs(),
+                "Released orphaned pending attempts"
+            ),
+            Err(e) => {
+                tracing::warn!(component = "watcher", error = %e, "Failed to release orphaned attempts")
+            }
+        }
+    }
+
     /// Start the watcher with polling.
     pub async fn start(self: &Arc<Self>, interval_ms: Option<u64>) -> Result<()> {
         self.clear_rate_limit_pause().await;
 
-        // Runs killed by the last shutdown stay `pending`, which blocks the issue
-        // from ever being picked or retried again.
         if !self.dry_run {
-            match self.tracker.release_orphaned_pending_attempts() {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(
-                    component = "watcher",
-                    released = n,
-                    "Released attempts orphaned by the last shutdown"
-                ),
-                Err(e) => {
-                    tracing::warn!(component = "watcher", error = %e, "Failed to release orphaned attempts")
-                }
-            }
+            self.release_orphaned_attempts();
         }
 
         let configured_poll_interval = interval_ms.unwrap_or(self.config.poll_interval_ms);
@@ -1357,7 +1397,7 @@ impl Watcher {
                     .process_review_action(&attempt, &feedback_summary)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(ReviewOutcome::Handled) => {
                         // Durably handled: acknowledge exactly the comments in this
                         // batch so they aren't re-surfaced, without touching any
                         // comment recorded concurrently while we were processing.
@@ -1367,6 +1407,12 @@ impl Watcher {
                         {
                             tracing::warn!(pr_url = %pr_url, error = %e, "Failed to mark review comments handled");
                         }
+                    }
+                    Ok(ReviewOutcome::Deferred) => {
+                        tracing::debug!(
+                            pr_url = %pr_url,
+                            "Leaving review feedback outstanding until the PR's repository is indexed"
+                        );
                     }
                     Err(e) => {
                         tracing::error!(
@@ -1459,12 +1505,17 @@ impl Watcher {
     /// Process review feedback by triggering Claude to address the feedback.
     ///
     /// This creates a new Claude session with the original issue context plus
-    /// the review feedback appended to help Claude understand what to fix.
+    /// the review feedback appended to help Claude understand what to fix. A
+    /// rerun that never starts fails without counting toward
+    /// [`MAX_REVIEW_CYCLES`], so its feedback is retried instead of being lost
+    /// to the cap. A rerun whose PR repository cannot be resolved from the
+    /// index is [deferred](ReviewOutcome::Deferred) before anything can
+    /// charge the feedback for it, and runs once the repository is indexed.
     async fn process_review_action(
         &self,
         attempt: &claudear_core::types::FixAttempt,
         feedback: &str,
-    ) -> Result<()> {
+    ) -> Result<ReviewOutcome> {
         tracing::info!(
             source = %attempt.source,
             issue_id = %attempt.issue_id,
@@ -1473,28 +1524,8 @@ impl Watcher {
             "Processing review feedback for issue"
         );
 
-        // Increment the review_cycles count
         if let Some(ref pr_url) = attempt.pr_url {
-            // Cascade PRs are watched without a PR record; create one so the cap counts them too
-            let pr_record = match self.tracker.get_pr(pr_url) {
-                Ok(Some(record)) => Some(record),
-                Ok(None) => match (&attempt.scm_repo, attempt.scm_pr_number) {
-                    (Some(repo), Some(number)) => {
-                        let mut record = claudear_core::types::PrRecord::new(pr_url, repo, number);
-                        record.attempt_id = Some(attempt.id);
-                        record.issue_id = Some(attempt.issue_id.clone());
-                        record.issue_source = Some(attempt.source.clone());
-                        Some(record)
-                    }
-                    _ => None,
-                },
-                Err(e) => {
-                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to load PR record for review cycle cap");
-                    None
-                }
-            };
-            // Update the PR record with incremented review_cycles
-            if let Some(mut pr_record) = pr_record {
+            if let Some(pr_record) = self.review_cycle_record(attempt, pr_url) {
                 if pr_record.review_cycles >= MAX_REVIEW_CYCLES {
                     tracing::warn!(
                         pr_url = %pr_url,
@@ -1519,14 +1550,20 @@ impl Watcher {
                     if let Some(rw) = &self.review_watcher {
                         rw.unwatch_pr(pr_url);
                     }
-                    return Ok(());
-                }
-                pr_record.review_cycles += 1;
-                pr_record.last_review_at = Some(chrono::Utc::now());
-                if let Err(e) = self.tracker.upsert_pr(&pr_record) {
-                    tracing::warn!(error = %e, "Failed to update PR review cycles");
+                    return Ok(ReviewOutcome::Handled);
                 }
             }
+        }
+
+        if let (Some(pr_url), Some(repo)) = (attempt.pr_url.as_deref(), attempt.scm_repo.as_deref())
+        {
+            if let RepoResolution::Skip { reason } =
+                resolve_repo_for_cascade(self.inferrer.as_ref(), repo)
+            {
+                self.defer_review_rerun(attempt, pr_url, repo, &reason);
+                return Ok(ReviewOutcome::Deferred);
+            }
+            self.lock_deferred_review_reruns().remove(pr_url);
         }
 
         if self.config.learning.review_classification {
@@ -1595,7 +1632,7 @@ impl Watcher {
                     source = %attempt.source,
                     "Source not found for review action"
                 );
-                return Ok(());
+                return Ok(ReviewOutcome::Handled);
             }
         };
 
@@ -1647,8 +1684,68 @@ impl Watcher {
             "Re-processing issue to address review feedback"
         );
 
-        // If the same issue is currently being processed, wait for that run
-        // to finish so review feedback isn't silently dropped.
+        let charged = self.charge_review_cycle(attempt, pr_url);
+        let rerun = self
+            .rerun_with_review_feedback(attempt, feedback, existing_pr_branch)
+            .await;
+        if rerun.is_err() && charged {
+            self.refund_review_cycle(attempt, pr_url);
+        }
+        rerun.map(|()| ReviewOutcome::Handled)
+    }
+
+    /// Leave `attempt`'s review feedback outstanding because the repository of
+    /// the PR under review, `repo`, cannot be resolved from the index,
+    /// recording the wait once rather than every cycle it lasts.
+    fn defer_review_rerun(&self, attempt: &FixAttempt, pr_url: &str, repo: &str, reason: &str) {
+        let newly_deferred = self
+            .lock_deferred_review_reruns()
+            .insert(pr_url.to_string());
+        if !newly_deferred {
+            tracing::debug!(
+                pr_url = %pr_url,
+                repo = %repo,
+                "Review rerun still waiting for its PR repository"
+            );
+            return;
+        }
+        tracing::warn!(
+            short_id = %attempt.short_id,
+            repo = %repo,
+            reason = %reason,
+            "PR repo not resolvable, deferring review rerun"
+        );
+        self.record_attempt_decision(
+            attempt,
+            REVIEW_RERUN_DEFERRED_DECISION,
+            format!(
+                "Deferred review rerun for {}: PR repository {} is not resolvable",
+                attempt.short_id, repo
+            ),
+            json!({ "pr_repo": repo, "reason": reason }),
+        );
+    }
+
+    /// Lock the PRs whose review reruns are deferred, recovering them from a
+    /// poisoned lock: the set only gains or loses whole URLs, so a holder that
+    /// panicked cannot leave it inconsistent.
+    fn lock_deferred_review_reruns(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.deferred_review_reruns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Rerun `attempt`'s issue with review `feedback` on its PR branch, in
+    /// the PR's repository.
+    ///
+    /// A run of the same issue already in flight is waited on, for up to five
+    /// minutes, so the feedback is not silently dropped.
+    async fn rerun_with_review_feedback(
+        &self,
+        attempt: &FixAttempt,
+        feedback: &str,
+        existing_pr_branch: Option<String>,
+    ) -> Result<()> {
         let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
         let wait_started = std::time::Instant::now();
         let max_wait = std::time::Duration::from_secs(300);
@@ -1716,6 +1813,59 @@ impl Watcher {
         }
 
         Ok(())
+    }
+
+    /// The PR record `attempt`'s review cycles are counted on. Cascade PRs are
+    /// watched without one, so it is built from the attempt for them and the
+    /// cap still counts their reruns.
+    fn review_cycle_record(&self, attempt: &FixAttempt, pr_url: &str) -> Option<PrRecord> {
+        match self.tracker.get_pr(pr_url) {
+            Ok(Some(record)) => Some(record),
+            Ok(None) => match (&attempt.scm_repo, attempt.scm_pr_number) {
+                (Some(repo), Some(number)) => {
+                    let mut record = PrRecord::new(pr_url, repo, number);
+                    record.attempt_id = Some(attempt.id);
+                    record.issue_id = Some(attempt.issue_id.clone());
+                    record.issue_source = Some(attempt.source.clone());
+                    Some(record)
+                }
+                _ => None,
+            },
+            Err(e) => {
+                tracing::warn!(pr_url = %pr_url, error = %e, "Failed to load PR record for review cycle cap");
+                None
+            }
+        }
+    }
+
+    /// Count a review-driven rerun of `pr_url` toward [`MAX_REVIEW_CYCLES`],
+    /// returning whether it was counted.
+    fn charge_review_cycle(&self, attempt: &FixAttempt, pr_url: &str) -> bool {
+        let Some(mut record) = self.review_cycle_record(attempt, pr_url) else {
+            return false;
+        };
+        record.review_cycles += 1;
+        record.last_review_at = Some(Utc::now());
+        match self.tracker.upsert_pr(&record) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(pr_url = %pr_url, error = %e, "Failed to update PR review cycles");
+                false
+            }
+        }
+    }
+
+    /// Give back the review cycle charged for a rerun of `pr_url` that never
+    /// started, so reruns that keep failing to start cannot use up
+    /// [`MAX_REVIEW_CYCLES`] before any feedback is addressed.
+    fn refund_review_cycle(&self, attempt: &FixAttempt, pr_url: &str) {
+        let Some(mut record) = self.review_cycle_record(attempt, pr_url) else {
+            return;
+        };
+        record.review_cycles = record.review_cycles.saturating_sub(1).max(0);
+        if let Err(e) = self.tracker.upsert_pr(&record) {
+            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to refund PR review cycle");
+        }
     }
 
     /// Trigger cascade processing for downstream repos after a PR is merged
@@ -2536,13 +2686,14 @@ Create a PR with your changes.{custom_instructions}"#,
         self.notifier.notify_repetitive_digest(&digest).await
     }
 
-    /// Run housekeeping tasks: retries, cascades, and metrics.
-    /// Called on the global timer, separate from per-source polling.
+    /// Run housekeeping tasks: orphaned-attempt release, retries, cascades,
+    /// and metrics. Called on the global timer, separate from per-source
+    /// polling.
     pub async fn run_housekeeping_cycle(&self) -> Result<()> {
         let housekeeping_started_at = std::time::Instant::now();
 
-        // Run retries, PR merge cascades, and release cascades concurrently
         if !self.dry_run {
+            self.release_orphaned_attempts();
             let (retries_result, pr_merges_result, releases_result) = tokio::join!(
                 self.process_ready_retries(),
                 self.check_pr_merges_and_cascade(),
@@ -2897,8 +3048,7 @@ Create a PR with your changes.{custom_instructions}"#,
             None => String::new(),
         };
 
-        let scratch = std::env::temp_dir().join("claudear-qa");
-        let _ = std::fs::create_dir_all(&scratch);
+        let scratch = crate::processing::qa_scratch_directory();
 
         let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
         let reply = match tokio::time::timeout(
@@ -3935,6 +4085,25 @@ Create a PR with your changes.{custom_instructions}"#,
         self.tracker.record_activity(&activity).ok();
     }
 
+    /// Record a decision about `attempt`'s issue on the issue's timeline, for
+    /// when only the attempt is at hand.
+    fn record_attempt_decision(
+        &self,
+        attempt: &FixAttempt,
+        decision: &str,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) {
+        let activity = ActivityLogEntry::new("decision", message.into())
+            .with_source(attempt.source.clone())
+            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+            .with_metadata(json!({
+                "decision": decision,
+                "details": details,
+            }));
+        self.tracker.record_activity(&activity).ok();
+    }
+
     /// Start QA for pending `deploy_qa` release tips without waiting for it to
     /// finish, returning a handle per started run.
     ///
@@ -4166,6 +4335,15 @@ Create a PR with your changes.{custom_instructions}"#,
     /// [is runnable](DeployQaTipStatus::is_runnable) and this process
     /// [claims](Self::claim_deploy_qa_tip) it, so no retry, trigger or other
     /// daemon re-runs a tip that is running or already has a verdict.
+    ///
+    /// A review rerun is skipped, leaving its attempt untouched, when the
+    /// repository of the PR under review cannot be resolved from the index,
+    /// so the feedback is retried later instead of being addressed in a
+    /// repository inferred from the issue.
+    ///
+    /// From the moment the attempt is recorded until the run ends, a
+    /// [`Heartbeat`] shows orphan sweeps in every process that the run is
+    /// alive.
     async fn process_issue(
         &self,
         source: Arc<dyn IssueSource>,
@@ -4267,6 +4445,12 @@ Create a PR with your changes.{custom_instructions}"#,
         ) {
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
+        let _heartbeat = Heartbeat::start(
+            Arc::clone(&self.tracker),
+            source.name(),
+            &issue.id,
+            self.liveness.interval,
+        );
 
         // Timeline: attempt created (pending).
         self.tracker
@@ -4315,23 +4499,36 @@ Create a PR with your changes.{custom_instructions}"#,
             self.link_deploy_qa_tip_attempt(tip, attempt_id);
         }
 
-        // A review rerun must work in the repo the PR lives in; re-inferring
-        // lands on the same wrong repo a previous run already swapped away from.
+        // A review rerun must work in the repo the PR lives in, never one
+        // inferred from the issue: inference lands on the same wrong repo a
+        // previous run already swapped away from.
         let pr_repo = review_feedback
             .as_ref()
             .and_then(|_| issue.get_metadata::<String>(REVIEW_PR_REPO_KEY));
-        let pinned = pr_repo.and_then(|repo| {
-            match resolve_repo_for_cascade(self.inferrer.as_ref(), &repo) {
-                r @ RepoResolution::Resolved { .. } => Some(r),
+        let mut resolution = match pr_repo {
+            Some(repo) => match resolve_repo_for_cascade(self.inferrer.as_ref(), &repo) {
+                resolved @ RepoResolution::Resolved { .. } => resolved,
                 RepoResolution::Skip { reason } => {
-                    tracing::warn!(short_id = %issue.short_id, repo = %repo, reason = %reason, "PR repo not resolvable, falling back to inference");
-                    None
+                    tracing::warn!(
+                        short_id = %issue.short_id,
+                        repo = %repo,
+                        reason = %reason,
+                        "PR repo not resolvable, deferring review rerun"
+                    );
+                    self.record_issue_decision(
+                        &issue,
+                        REVIEW_RERUN_DEFERRED_DECISION,
+                        format!(
+                            "Deferred review rerun for {}: PR repository {} is not resolvable",
+                            issue.short_id, repo
+                        ),
+                        json!({ "pr_repo": repo, "reason": reason }),
+                    );
+                    return false;
                 }
-            }
-        });
-        let mut resolution = pinned.unwrap_or_else(|| {
-            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker))
-        });
+            },
+            None => resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker)),
+        };
 
         // Log resolution decision (watcher-specific verbose logging)
         match &resolution {
@@ -5122,16 +5319,16 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
     /// issue, bypassing classification. Backs the `claudear action ...` CLI.
     ///
-    /// Every action is refused for observe-only `deploy_qa` issues: `resolve`
-    /// would enter the fix pipeline, and `reply` / `verify` would post through
-    /// the source, which records any comment as the release's QA verdict.
+    /// Every action is refused for `deploy_qa` issues, which only run live QA:
+    /// `resolve` would enter the fix pipeline, and `reply` / `verify` would post
+    /// through the source, which records any comment as the release's QA verdict.
     pub async fn run_action(
         &self,
         action: ActionKind,
         source_name: &str,
         issue_id: &str,
     ) -> Result<crate::processing::ProcessingOutcome> {
-        use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
+        use crate::processing::{refuse_live_qa_action, IssueProcessor, ProcessingInput};
 
         let source = self
             .sources
@@ -5145,13 +5342,9 @@ Create a PR with your changes.{custom_instructions}"#,
                 source = source_name,
                 issue_id = issue_id,
                 %action,
-                "Refusing manual action for observe-only deploy_qa issue"
+                "Refusing manual action for live-QA deploy_qa issue"
             );
-            return Ok(ProcessingOutcome::Failed {
-                error: format!(
-                    "{DEPLOY_QA_SOURCE} issues are observe-only; {action} is not permitted"
-                ),
-            });
+            return Ok(refuse_live_qa_action(action));
         }
 
         let issue = source.get_issue(issue_id).await?;
@@ -5373,7 +5566,7 @@ mod tests {
     use async_trait::async_trait;
     use claudear_analysis::deploy_qa::{VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX};
     use claudear_config::config::{DeployQaConfig, DeployQaTrackConfig};
-    use claudear_core::types::IssuePriority;
+    use claudear_core::types::{IndexedRepo, IssuePriority, RepoIndex};
     use claudear_integrations::notifier::Notifier;
     use claudear_integrations::reports::Report;
     use claudear_integrations::source::{DeployQaSource, IssueSource};
@@ -5620,17 +5813,57 @@ mod tests {
         sources: Vec<Arc<dyn IssueSource>>,
         dry_run: bool,
     ) -> Arc<Watcher> {
-        let agent: Arc<dyn claudear_integrations::runner::AgentRunner> =
+        build_test_watcher(notifier, tracker, sources, dry_run, None)
+    }
+
+    /// A live test watcher that resolves repositories through `inferrer`.
+    fn create_test_watcher_with_inferrer(
+        notifier: Arc<dyn Notifier>,
+        tracker: Arc<dyn FixAttemptTracker>,
+        sources: Vec<Arc<dyn IssueSource>>,
+        inferrer: RepoInferrer,
+    ) -> Arc<Watcher> {
+        build_test_watcher(notifier, tracker, sources, false, Some(inferrer))
+    }
+
+    /// An inferrer whose index holds only `repo`.
+    fn inferrer_indexing(repo: IndexedRepo) -> RepoInferrer {
+        let mut index = RepoIndex::new();
+        index.add_repo(repo);
+        RepoInferrer::new(index)
+    }
+
+    fn build_test_watcher(
+        notifier: Arc<dyn Notifier>,
+        tracker: Arc<dyn FixAttemptTracker>,
+        sources: Vec<Arc<dyn IssueSource>>,
+        dry_run: bool,
+        inferrer: Option<RepoInferrer>,
+    ) -> Arc<Watcher> {
+        Arc::new(Watcher::new(WatcherOptions {
+            inferrer,
+            dry_run,
+            ..live_watcher_options(notifier, tracker, sources)
+        }))
+    }
+
+    /// Options for a live test watcher, for tests to override field by field.
+    fn live_watcher_options(
+        notifier: Arc<dyn Notifier>,
+        tracker: Arc<dyn FixAttemptTracker>,
+        sources: Vec<Arc<dyn IssueSource>>,
+    ) -> WatcherOptions {
+        let agent: Arc<dyn AgentRunner> =
             Arc::new(claudear_integrations::runner::ClaudeAgentRunner::new(
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             ));
-        Arc::new(Watcher::new(WatcherOptions {
+        WatcherOptions {
             config: test_config(),
             sources,
             notifier,
-            tracker: tracker.clone(),
-            inferrer: None, // Tests don't need inference
+            tracker,
+            inferrer: None,
             embedding_client: None,
             review_watcher: None,
             issue_embedding_service: None,
@@ -5645,9 +5878,9 @@ mod tests {
             classification_agent: None,
             repo_classification_agent: None,
             qa_agent: None,
-            dry_run,
+            dry_run: false,
             llm_engine: None,
-        }))
+        }
     }
 
     #[test]
@@ -6892,6 +7125,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_watcher_start_leaves_a_run_live_in_another_process_pending() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        let source = Arc::new(MockSource::new("mock")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker.clone(), vec![source], false);
+
+        let runner = {
+            let watcher = Arc::clone(&watcher);
+            tokio::spawn(async move { watcher.start(Some(50)).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !watcher.is_running() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the watcher should finish starting");
+        watcher.stop();
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
+        assert!(joined.is_ok(), "watcher start loop did not stop in time");
+        assert!(joined.unwrap().expect("task join failed").is_ok());
+        assert_eq!(
+            tracker.get_attempt("mock", "1").unwrap().unwrap().status,
+            FixAttemptStatus::Pending,
+            "an attempt that started moments ago may still be running in another process sharing \
+             the database, so starting this watcher must not fail it"
+        );
+    }
+
     #[test]
     fn test_group_review_feedback_by_pr_batches_same_pr() {
         let review1 = claudear_integrations::scm::CodeReview {
@@ -7006,6 +7271,97 @@ mod tests {
         );
     }
 
+    /// A review watcher watching `pr_url` for issue `1` of the `mock` source,
+    /// whose SCM reports nothing new, so each check surfaces only the comments
+    /// `tracker` still holds unhandled.
+    fn review_watcher_watching(
+        tracker: Arc<SqliteTracker>,
+        pr_url: &str,
+        repo: &str,
+        pr_number: i64,
+    ) -> Arc<ReviewWatcher> {
+        let review_watcher = Arc::new(ReviewWatcher::with_tracker(
+            Arc::new(MergedPrs(Vec::new())),
+            tracker,
+        ));
+        review_watcher.watch_pr(PrReviewState::new(pr_url, repo, pr_number, "1", "mock"));
+        review_watcher
+    }
+
+    /// A live test watcher that acts on the feedback `review_watcher` surfaces
+    /// and resolves repositories through `inferrer`.
+    fn create_reviewing_test_watcher(
+        tracker: Arc<SqliteTracker>,
+        source: Arc<dyn IssueSource>,
+        inferrer: RepoInferrer,
+        review_watcher: Arc<ReviewWatcher>,
+    ) -> Arc<Watcher> {
+        Arc::new(Watcher::new(WatcherOptions {
+            inferrer: Some(inferrer),
+            review_watcher: Some(review_watcher),
+            ..live_watcher_options(Arc::new(MockNotifier::new(true)), tracker, vec![source])
+        }))
+    }
+
+    /// A conversation comment on a PR asking claudear for `body`.
+    fn review_comment(id: i64, body: &str) -> claudear_integrations::scm::ReviewComment {
+        claudear_integrations::scm::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: body.to_string(),
+            user: claudear_integrations::scm::ReviewUser {
+                login: "reviewer".to_string(),
+                id: 1,
+                user_type: None,
+            },
+            created_at: "2026-09-30T00:00:00Z".to_string(),
+            updated_at: "2026-09-30T00:00:00Z".to_string(),
+            html_url: String::new(),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        }
+    }
+
+    /// The repositories an issue's runs resolved, as its timeline records them.
+    fn resolved_repositories(tracker: &SqliteTracker, source: &str, issue_id: &str) -> Vec<String> {
+        tracker
+            .get_activities_for_issue(source, issue_id)
+            .unwrap()
+            .into_iter()
+            .filter(|activity| activity.activity_type == TimelineEventStatus::RepoResolved.as_str())
+            .filter_map(|activity| {
+                activity.metadata.and_then(|metadata| {
+                    metadata
+                        .get("repo")
+                        .and_then(|repo| repo.as_str())
+                        .map(str::to_string)
+                })
+            })
+            .collect()
+    }
+
+    /// The details of every decision recorded for an issue to defer its review
+    /// rerun.
+    fn review_rerun_deferrals(
+        tracker: &SqliteTracker,
+        source: &str,
+        issue_id: &str,
+    ) -> Vec<serde_json::Value> {
+        tracker
+            .get_activities_for_issue(source, issue_id)
+            .unwrap()
+            .into_iter()
+            .filter(|activity| activity.activity_type == "decision")
+            .filter_map(|activity| activity.metadata)
+            .filter(|metadata| metadata["decision"] == "review_rerun_deferred")
+            .map(|metadata| metadata["details"].clone())
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_process_review_action_waits_for_inflight_issue_processing() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -7027,12 +7383,13 @@ mod tests {
             )],
         )) as Arc<dyn IssueSource>;
 
-        let watcher = Arc::new(create_test_watcher(
+        let checkout = tempfile::tempdir().unwrap();
+        let watcher = create_test_watcher_with_inferrer(
             notifier,
             tracker.clone(),
             vec![source],
-            false,
-        ));
+            inferrer_indexing(IndexedRepo::new("org/repo", checkout.path())),
+        );
         watcher.is_running.store(true, Ordering::SeqCst);
 
         watcher.lock_processing().insert("mock:1".to_string());
@@ -7059,7 +7416,7 @@ mod tests {
         assert_eq!(
             updated_attempt.status,
             claudear_core::types::FixAttemptStatus::Failed,
-            "review rerun should execute after lock release (repo resolution fails in test setup, marking failed)"
+            "review rerun should execute after lock release (fetching the repo fails in test setup, marking failed)"
         );
     }
 
@@ -7082,15 +7439,16 @@ mod tests {
                 "mock",
             )],
         )) as Arc<dyn IssueSource>;
-        let watcher = Arc::new(create_test_watcher(
+        let checkout = tempfile::tempdir().unwrap();
+        let watcher = create_test_watcher_with_inferrer(
             notifier,
             tracker.clone(),
             vec![source],
-            false,
-        ));
+            inferrer_indexing(IndexedRepo::new("org/repo", checkout.path())),
+        );
         watcher.is_running.store(true, Ordering::SeqCst);
 
-        // Each allowed rerun fails on repo resolution in this setup; reset to the
+        // Each allowed rerun fails fetching the repo in this setup; reset to the
         // open-PR state before the next round of feedback arrives
         for _ in 0..MAX_REVIEW_CYCLES {
             let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
@@ -7119,6 +7477,243 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_feedback_after_reruns_that_never_started_still_starts_a_rerun() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let pr_url = "https://github.com/org/repo/pull/1";
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker.mark_success("mock", "1", pr_url).unwrap();
+        let review_watcher = review_watcher_watching(tracker.clone(), pr_url, "org/repo", 1);
+        let checkout = tempfile::tempdir().unwrap();
+        let indexing_pr_repo = || inferrer_indexing(IndexedRepo::new("org/repo", checkout.path()));
+        let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+
+        let issue_unavailable = create_reviewing_test_watcher(
+            tracker.clone(),
+            Arc::new(MockSource::new("mock")),
+            indexing_pr_repo(),
+            review_watcher.clone(),
+        );
+        for _ in 0..5 {
+            assert!(
+                issue_unavailable
+                    .process_review_action(&attempt, "Please add a test")
+                    .await
+                    .is_err(),
+                "a rerun whose issue cannot be fetched must fail so its feedback is retried"
+            );
+        }
+
+        let issue_available = create_reviewing_test_watcher(
+            tracker.clone(),
+            Arc::new(MockSource::with_issues(
+                "mock",
+                vec![Issue::new(
+                    "1",
+                    "MOCK-1",
+                    "Mock issue",
+                    "http://example.com/mock/1",
+                    "mock",
+                )],
+            )),
+            indexing_pr_repo(),
+            review_watcher.clone(),
+        );
+        issue_available
+            .lock_processing()
+            .insert("mock:1".to_string());
+        for _ in 0..5 {
+            assert!(
+                issue_available
+                    .process_review_action(&attempt, "Please add a test")
+                    .await
+                    .is_err(),
+                "a rerun still waiting on the run that holds its issue when the watcher stops \
+                 must fail so its feedback is retried"
+            );
+        }
+        issue_available.lock_processing().remove("mock:1");
+        issue_available.is_running.store(true, Ordering::SeqCst);
+        issue_available
+            .process_review_action(&attempt, "Please add a test")
+            .await
+            .unwrap();
+
+        assert!(
+            review_watcher.get_state(pr_url).is_some(),
+            "reruns that never started must not leave the PR to humans"
+        );
+        assert_eq!(
+            tracker.get_attempt("mock", "1").unwrap().unwrap().status,
+            FixAttemptStatus::Failed,
+            "feedback after reruns that never started must still start a rerun, which fails \
+             fetching the repository in this setup"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_rerun_never_moves_to_an_inferred_repo_when_its_pr_repo_is_unindexed() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let pr_repo = "org/lib";
+        let pr_url = "https://github.com/org/lib/pull/7";
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker.mark_success("mock", "1", pr_url).unwrap();
+
+        let mut issue = Issue::new(
+            "1",
+            "MOCK-1",
+            "Mock issue",
+            "http://example.com/mock/1",
+            "mock",
+        );
+        issue.description = Some("Crash in src/app.ts".to_string());
+        let source = Arc::new(MockSource::with_issues("mock", vec![issue])) as Arc<dyn IssueSource>;
+        let checkout = tempfile::tempdir().unwrap();
+        let mut inferred_repo = IndexedRepo::new("org/app", checkout.path());
+        inferred_repo.files = vec!["src/app.ts".to_string()];
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
+            inferrer: Some(inferrer_indexing(inferred_repo)),
+            agent: Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+            ..live_watcher_options(
+                Arc::new(MockNotifier::new(true)),
+                tracker.clone(),
+                vec![source],
+            )
+        }));
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+        let _ = watcher
+            .process_review_action(&attempt, "Please add a test")
+            .await;
+
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "no agent may run for a rerun whose PR repository is not indexed"
+        );
+        let resolved = resolved_repositories(&tracker, "mock", "1");
+        assert!(
+            resolved.is_empty(),
+            "a review rerun must work in its PR's repository, never one inferred from the \
+             issue, but it resolved {resolved:?}"
+        );
+        let deferrals = review_rerun_deferrals(&tracker, "mock", "1");
+        assert_eq!(
+            deferrals.len(),
+            1,
+            "the rerun must record why it did not run"
+        );
+        assert_eq!(
+            deferrals[0]["pr_repo"], pr_repo,
+            "the rerun must wait for its PR's repository"
+        );
+        assert!(
+            deferrals[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(pr_repo)),
+            "the recorded reason must name the repository that is missing: {}",
+            deferrals[0]
+        );
+        let after = tracker.get_attempt("mock", "1").unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            FixAttemptStatus::Success,
+            "a rerun that never started must leave the attempt and its open PR as they were"
+        );
+        assert_eq!(after.pr_url.as_deref(), Some(pr_url));
+    }
+
+    #[tokio::test]
+    async fn test_review_feedback_outlasts_a_rerun_deferred_until_its_pr_repository_is_indexed() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let pr_repo = "org/lib";
+        let pr_url = "https://github.com/org/lib/pull/7";
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker.mark_success("mock", "1", pr_url).unwrap();
+        tracker
+            .record_pr_review_comment(pr_url, &review_comment(42, "@claudear please add a test"))
+            .unwrap();
+        let review_watcher = review_watcher_watching(tracker.clone(), pr_url, pr_repo, 7);
+        let source = Arc::new(MockSource::with_issues(
+            "mock",
+            vec![Issue::new(
+                "1",
+                "MOCK-1",
+                "Mock issue",
+                "http://example.com/mock/1",
+                "mock",
+            )],
+        )) as Arc<dyn IssueSource>;
+        let checkout = tempfile::tempdir().unwrap();
+        let unhandled_comments = || -> Vec<i64> {
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .into_iter()
+                .map(|comment| comment.id)
+                .collect()
+        };
+
+        let before_indexing = create_reviewing_test_watcher(
+            tracker.clone(),
+            source.clone(),
+            inferrer_indexing(IndexedRepo::new("org/app", checkout.path())),
+            review_watcher.clone(),
+        );
+        for _ in 0..8 {
+            before_indexing.check_reviews().await.unwrap();
+        }
+
+        assert_eq!(
+            unhandled_comments(),
+            vec![42],
+            "feedback whose rerun waits for the PR's repository to be indexed must stay \
+             outstanding however many cycles it waits, not spend its retries and be given up on"
+        );
+        assert!(
+            resolved_repositories(&tracker, "mock", "1").is_empty(),
+            "nothing may run while the PR's repository is not indexed"
+        );
+        assert!(
+            !tracker
+                .get_activities_for_issue("mock", "1")
+                .unwrap()
+                .iter()
+                .any(|activity| {
+                    activity.activity_type == TimelineEventStatus::ProcessingStarted.as_str()
+                }),
+            "a rerun that is waiting must not show on the timeline as started"
+        );
+        assert_eq!(
+            review_rerun_deferrals(&tracker, "mock", "1").len(),
+            1,
+            "the wait must be recorded once for operators, not every cycle"
+        );
+
+        let after_indexing = create_reviewing_test_watcher(
+            tracker.clone(),
+            source,
+            inferrer_indexing(IndexedRepo::new(pr_repo, checkout.path())),
+            review_watcher,
+        );
+        after_indexing.check_reviews().await.unwrap();
+
+        assert_eq!(
+            resolved_repositories(&tracker, "mock", "1"),
+            vec![pr_repo.to_string()],
+            "once the PR's repository is indexed, the next cycle must rerun in it"
+        );
+        assert!(
+            unhandled_comments().is_empty(),
+            "the rerun that started settles the feedback"
+        );
+    }
+
+    #[tokio::test]
     async fn test_process_review_action_exits_when_watcher_stopping() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -7139,12 +7734,13 @@ mod tests {
             )],
         )) as Arc<dyn IssueSource>;
 
-        let watcher = Arc::new(create_test_watcher(
+        let checkout = tempfile::tempdir().unwrap();
+        let watcher = create_test_watcher_with_inferrer(
             notifier,
             tracker.clone(),
             vec![source],
-            false,
-        ));
+            inferrer_indexing(IndexedRepo::new("org/repo", checkout.path())),
+        );
 
         watcher.lock_processing().insert("mock:1".to_string());
         watcher.is_running.store(false, Ordering::SeqCst);
@@ -9354,6 +9950,9 @@ mod tests {
         tracker: Arc<SqliteTracker>,
         tip: DeployQaTip,
         agent_calls: Arc<AtomicUsize>,
+        /// The watcher's `workspace`, where live-QA runs create their private
+        /// directories; removed when the harness drops.
+        _workspace: tempfile::TempDir,
     }
 
     impl DeployQaHarness {
@@ -9415,10 +10014,12 @@ mod tests {
         }
 
         fn build(
-            config: Config,
+            mut config: Config,
             answer: QaAnswer,
             source: impl FnOnce(Arc<dyn FixAttemptTracker>, &DeployQaTip) -> Arc<dyn IssueSource>,
         ) -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            config.workspace = workspace.path().to_path_buf();
             let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
             let tip = tracker
                 .upsert_deploy_qa_tip(&DeployQaTip::new(DEPLOY_QA_TRACK, DEPLOY_QA_REPO, "1.2.3"))
@@ -9440,6 +10041,7 @@ mod tests {
                 tracker,
                 tip,
                 agent_calls,
+                _workspace: workspace,
             }
         }
 
@@ -9543,7 +10145,7 @@ mod tests {
                     error.contains(&action.to_string()),
                     "the refusal should name the {action} action: {error}"
                 ),
-                _ => panic!("{action} on an observe-only deploy_qa issue must be refused"),
+                _ => panic!("{action} on a deploy_qa issue must be refused"),
             }
             assert_eq!(
                 self.agent_calls(),
@@ -9766,7 +10368,7 @@ mod tests {
         assert_eq!(
             harness.agent_calls(),
             1,
-            "a triggered deploy_qa attempt must take the read-only QA path, not the fix pipeline"
+            "a triggered deploy_qa attempt must take the live QA path, not the fix pipeline"
         );
     }
 
@@ -9791,7 +10393,7 @@ mod tests {
         assert_eq!(
             harness.agent_calls(),
             1,
-            "observe-only deploy_qa attempts must not wait on human approval"
+            "live-QA deploy_qa attempts must not wait on human approval"
         );
         assert_ne!(
             harness.stored_status(),
@@ -15057,8 +15659,6 @@ mod tests {
         );
     }
 
-    // --- should_request_approval ---
-
     #[test]
     fn test_should_request_approval_require_approval_true() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -15148,8 +15748,6 @@ mod tests {
         assert!(watcher.should_request_approval(&resolution));
     }
 
-    // --- Confidence ordering and FromStr ---
-
     #[test]
     fn test_confidence_ordering() {
         assert!(Confidence::None < Confidence::Low);
@@ -15166,8 +15764,6 @@ mod tests {
         assert_eq!("HIGH".parse::<Confidence>(), Ok(Confidence::High));
         assert!("invalid".parse::<Confidence>().is_err());
     }
-
-    // --- request_approval integration tests ---
 
     use claudear_core::types::{AskDelivery, AskReply};
     use std::sync::Mutex;
@@ -15501,6 +16097,126 @@ mod tests {
             ApprovalDecision::Redirect {
                 repo_name: "org/other-repo".to_string()
             }
+        );
+    }
+
+    /// How long the orphan-sweep tests let a run stay silent before a sweep
+    /// treats its attempt as orphaned: a few seconds, as attempt timestamps
+    /// only resolve whole seconds, and enough that a stalled test runtime is
+    /// not mistaken for a dead run.
+    const ORPHAN_SWEEP_WINDOW: Duration = Duration::from_secs(5);
+
+    /// How often the orphan-sweep tests' runs send heartbeats: many times
+    /// within [`ORPHAN_SWEEP_WINDOW`].
+    const TEST_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+
+    /// A watcher that asks for approval before every run, waits up to a
+    /// minute for the answer, and sends heartbeats and sweeps orphans on
+    /// test-sized timing.
+    fn approval_gated_watcher(
+        notifier: Arc<ApprovalMockNotifier>,
+        tracker: Arc<SqliteTracker>,
+    ) -> Arc<Watcher> {
+        let mut watcher = create_approval_watcher(notifier, tracker, true, Some(60));
+        watcher.liveness = Liveness {
+            interval: TEST_HEARTBEAT_INTERVAL,
+            stale_after: ORPHAN_SWEEP_WINDOW,
+        };
+        Arc::new(watcher)
+    }
+
+    /// Process `issue` in the background until its run stops to wait for
+    /// approval, by when its attempt is recorded.
+    async fn start_run_awaiting_approval(
+        watcher: &Arc<Watcher>,
+        notifier: &ApprovalMockNotifier,
+        issue: Issue,
+    ) -> tokio::task::JoinHandle<bool> {
+        let source = Arc::new(MockSource::with_issues(&issue.source, vec![issue.clone()]))
+            as Arc<dyn IssueSource>;
+        let run = {
+            let watcher = Arc::clone(watcher);
+            tokio::spawn(async move {
+                watcher
+                    .process_issue(
+                        source,
+                        issue,
+                        MatchResult::matched("Mock match", MatchPriority::Normal),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while notifier.ask_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the run should stop to ask for approval");
+        run
+    }
+
+    #[tokio::test]
+    async fn test_attempt_awaiting_approval_survives_orphan_sweeps() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_no_reply());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = approval_gated_watcher(notifier.clone(), tracker.clone());
+        let issue = test_issue();
+        let run = start_run_awaiting_approval(&watcher, &notifier, issue.clone()).await;
+
+        tokio::time::sleep(ORPHAN_SWEEP_WINDOW + Duration::from_secs(1)).await;
+        tracker
+            .release_orphaned_pending_attempts(ORPHAN_SWEEP_WINDOW)
+            .unwrap();
+        watcher.release_orphaned_attempts();
+        let attempt = tracker
+            .get_attempt(&issue.source, &issue.id)
+            .unwrap()
+            .unwrap();
+
+        *notifier.reply.lock().unwrap() = Some("no".to_string());
+        let finished = tokio::time::timeout(Duration::from_secs(10), run).await;
+        assert_eq!(
+            attempt.status,
+            FixAttemptStatus::Pending,
+            "a run waiting on approval is live, so no sweep, in its own process or another, \
+             may release its attempt, however far the wait outlasts the sweep window"
+        );
+        assert!(
+            finished.is_ok(),
+            "the run should end once approval is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attempt_of_an_aborted_run_is_released_once_its_heartbeat_goes_stale() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_no_reply());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = approval_gated_watcher(notifier.clone(), tracker.clone());
+        let issue = test_issue();
+        let run = start_run_awaiting_approval(&watcher, &notifier, issue.clone()).await;
+
+        run.abort();
+        assert!(
+            run.await.is_err_and(|error| error.is_cancelled()),
+            "the run should be aborted while it waits"
+        );
+        tokio::time::sleep(ORPHAN_SWEEP_WINDOW + Duration::from_secs(2)).await;
+        watcher.release_orphaned_attempts();
+
+        assert_eq!(
+            tracker
+                .get_attempt(&issue.source, &issue.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            FixAttemptStatus::Failed,
+            "a run that died stops showing it is alive, so the watcher's next sweep past the \
+             window must hand its attempt back to the retry queue rather than leave the issue \
+             blocked"
         );
     }
 }

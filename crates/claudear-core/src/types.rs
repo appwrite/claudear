@@ -1895,7 +1895,7 @@ pub enum DeployQaTipStatus {
     /// Tip detected; waiting to be enqueued.
     #[default]
     Pending,
-    /// An observe/report agent attempt is in flight.
+    /// A live-QA agent attempt is in flight.
     Running,
     /// All LIVE-TESTABLE PRs verified (no live failures).
     Verified,
@@ -1904,7 +1904,7 @@ pub enum DeployQaTipStatus {
     Unverified,
     /// At least one LIVE-TESTABLE PR failed.
     Failed,
-    /// The observe/report attempt ended without reaching a verdict.
+    /// The live-QA attempt ended without reaching a verdict.
     Errored,
 }
 
