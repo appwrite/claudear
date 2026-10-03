@@ -66,6 +66,10 @@ impl HousekeepingWorker {
         // daemon restarts during the target hour on the target weekday.
         let mut digest_schedule = self.watcher.repetitive_digest_schedule();
 
+        // Support forum digest, scanned on its own interval from the first tick.
+        let support_digest_interval = self.watcher.support_digest_interval();
+        let mut last_support_digest: Option<Instant> = None;
+
         while self.watcher.is_running() {
             timer.tick().await;
             if !self.watcher.is_running() {
@@ -155,12 +159,27 @@ impl HousekeepingWorker {
                 }
             };
 
-            let (_, _, housekeeping_ok, _, _) = tokio::join!(
+            // Discord support forum digest (report-only).
+            let support_digest_fut = async {
+                if !self.watcher.is_dry_run() {
+                    if let Some(interval) = support_digest_interval {
+                        if last_support_digest.is_none_or(|at| at.elapsed() >= interval) {
+                            if let Err(e) = self.watcher.send_support_digest().await {
+                                tracing::error!(component = "digest", error = %e, "Error sending support digest");
+                            }
+                            last_support_digest = Some(Instant::now());
+                        }
+                    }
+                }
+            };
+
+            let (_, _, housekeeping_ok, _, _, _) = tokio::join!(
                 auto_close_fut,
                 reviews_fut,
                 housekeeping_fut,
                 learning_fut,
-                digest_fut
+                digest_fut,
+                support_digest_fut
             );
 
             let duration_secs = cron_start.elapsed().as_secs_f64();

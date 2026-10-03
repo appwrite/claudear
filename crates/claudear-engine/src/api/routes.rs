@@ -134,6 +134,11 @@ pub fn create_api_router_full(
             "/api/support/replies/{action_run_id}/rating",
             axum::routing::post(rate_reply_handler),
         )
+        .route("/api/support/drafts", get(support_drafts_handler))
+        .route(
+            "/api/support/drafts/{thread_id}",
+            axum::routing::post(review_draft_handler),
+        )
         .route("/api/feedback", get(feedback_handler))
         .route("/api/regressions", get(regressions_handler))
         .route(
@@ -1448,6 +1453,86 @@ async fn rate_reply_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Suggested answers to Discord support threads that wait for a reviewer, read
+/// from the threads project. Empty when support drafts are off.
+async fn support_drafts_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<crate::support_digest::DraftReview>>, StatusCode> {
+    let cfg = &state.config.reports.support_digest;
+    if !cfg.enabled || !cfg.drafts {
+        return Ok(Json(Vec::new()));
+    }
+    let store = crate::support_digest::ThreadsStore::new(cfg).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    store.drafts_to_review().await.map(Json).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[derive(Deserialize)]
+struct ReviewDraftRequest {
+    status: crate::support_digest::DraftStatus,
+    #[serde(default)]
+    answer: Option<String>,
+}
+
+/// Approve or reject a support draft, optionally with an edited answer. The
+/// threads project posts an approved draft to its Discord thread.
+async fn review_draft_handler(
+    admin: AdminUser,
+    State(state): State<ApiState>,
+    Path(thread_id): Path<String>,
+    Json(body): Json<ReviewDraftRequest>,
+) -> Result<StatusCode, StatusCode> {
+    use crate::support_digest::DraftStatus;
+
+    let cfg = &state.config.reports.support_digest;
+    if !cfg.enabled || !cfg.drafts {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    // Thread ids are Discord snowflakes and end up in the Appwrite URL path.
+    if thread_id.is_empty() || !thread_id.chars().all(|c| c.is_ascii_digit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if !matches!(body.status, DraftStatus::Approved | DraftStatus::Rejected) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let answer = body
+        .answer
+        .as_deref()
+        .map(str::trim)
+        .filter(|answer| !answer.is_empty());
+
+    let internal = |e: claudear_core::error::Error| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let store = crate::support_digest::ThreadsStore::new(cfg).map_err(internal)?;
+    match store.draft(&thread_id).await.map_err(internal)? {
+        None => return Err(StatusCode::NOT_FOUND),
+        // Already on its way to the forum.
+        Some(draft) if matches!(draft.status, DraftStatus::Approved | DraftStatus::Sent) => {
+            return Err(StatusCode::CONFLICT)
+        }
+        Some(_) => {}
+    }
+    match store
+        .review_draft(&thread_id, body.status, answer, &admin.0.email)
+        .await
+        .map_err(internal)?
+    {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 async fn metrics_handler(

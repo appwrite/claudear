@@ -276,6 +276,27 @@ export interface SupportReply {
   rated_by?: string | null;
 }
 
+export type SupportDraftStatus = 'pending' | 'approved' | 'rejected' | 'sent' | 'failed';
+
+export interface SupportDraftMessage {
+  author: string;
+  poster: boolean;
+  content: string;
+  timestamp: string;
+}
+
+export interface SupportDraft {
+  thread_id: string;
+  title: string;
+  url: string;
+  status: SupportDraftStatus;
+  answer: string;
+  reviewer?: string | null;
+  error?: string | null;
+  updated_at: string;
+  messages: SupportDraftMessage[];
+}
+
 export interface SupportRatingSummary {
   total_replies: number;
   rated_count: number;
@@ -913,6 +934,18 @@ export async function rateReply(
   note?: string,
 ): Promise<void> {
   await postJson(`${API_BASE}/support/replies/${actionRunId}/rating`, { rating, note });
+}
+
+export async function fetchSupportDrafts(): Promise<SupportDraft[]> {
+  return fetchJson(`${API_BASE}/support/drafts`);
+}
+
+export async function reviewSupportDraft(
+  threadId: string,
+  status: 'approved' | 'rejected',
+  answer?: string,
+): Promise<void> {
+  await postJson(`${API_BASE}/support/drafts/${threadId}`, { status, answer });
 }
 
 export async function fetchPrs(params?: {
