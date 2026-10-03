@@ -447,6 +447,7 @@ fn tool_definitions(cfg: &McpSearchServerConfig) -> Vec<Value> {
                 "properties": {
                     "query": { "type": "string", "description": "Natural-language query." },
                     "channel_id": { "type": "string", "description": "Optional Discord channel id to scope the search." },
+                    "channel": { "type": "string", "description": "Optional channel name to scope the search (resolved against indexed channels; matched loosely ignoring case/emoji/punctuation)." },
                     "limit": { "type": "integer", "description": "Max results to return.", "minimum": 1 }
                 },
                 "required": ["query"]
@@ -478,6 +479,7 @@ fn tool_definitions(cfg: &McpSearchServerConfig) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "status": { "type": "string", "description": "Filter by conversation status; 'all' for every status. Defaults to the configured trigger status.", "enum": ["active", "pending", "closed", "spam", "open", "all"] },
                     "limit": { "type": "integer", "description": "Max conversations to return.", "minimum": 1 }
                 },
                 "required": []
@@ -563,12 +565,17 @@ fn find_symbol(ctx: &McpContext<'_>, args: &Value) -> Value {
         Err(msg) => return tool_error(&msg),
     };
 
+    let requested = usize_arg(args, "limit");
     match service.find_symbol(name, kind, repo_id) {
         Ok(mut symbols) => {
             // The storage layer caps symbol lookups generously (up to 100); apply
             // the configured limit here so this tool is bounded like the others.
-            symbols.truncate(ctx.cfg.resolve_limit(usize_arg(args, "limit")));
-            tool_text(format_symbols(&symbols, &repo_name_map(ctx.tracker)))
+            let total = symbols.len();
+            symbols.truncate(ctx.cfg.resolve_limit(requested));
+            let shown = symbols.len();
+            let mut out = format_symbols(&symbols, &repo_name_map(ctx.tracker));
+            out.push_str(&cap_note(total, shown, requested, ctx.cfg.max_limit));
+            tool_text(out)
         }
         Err(e) => tool_error(&format!("Symbol search failed: {e}")),
     }
@@ -582,15 +589,16 @@ async fn discord_search(ctx: &McpContext<'_>, args: &Value) -> Value {
         return tool_error("Missing required argument: query");
     };
 
-    // A present-but-invalid channel_id must error rather than silently search
-    // every channel (same rule as repo scoping for the code tools).
-    let channel_id = match scoped_str_arg(args, "channel_id") {
+    // Scope by channel_id (preferred) or channel name (resolved against the
+    // indexed-channel registry, loosely matched). A present-but-invalid value is
+    // an error rather than a silent all-channel search.
+    let channel_id = match resolve_search_channel(ctx, args) {
         Ok(c) => c,
         Err(msg) => return tool_error(&msg),
     };
     let limit = ctx.cfg.resolve_limit(usize_arg(args, "limit"));
 
-    match service.search(query, channel_id, limit).await {
+    match service.search(query, channel_id.as_deref(), limit).await {
         Ok(results) if results.is_empty() => {
             tool_text("No relevant Discord discussions found.".to_string())
         }
@@ -599,6 +607,38 @@ async fn discord_search(ctx: &McpContext<'_>, args: &Value) -> Value {
         )),
         Err(e) => tool_error(&format!("Discord search failed: {e}")),
     }
+}
+
+/// Resolve the optional channel scope for `discord_search`: `channel_id` as-is,
+/// or a `channel` name matched loosely against the indexed-channel registry.
+fn resolve_search_channel(ctx: &McpContext<'_>, args: &Value) -> Result<Option<String>, String> {
+    if let Some(id) = scoped_str_arg(args, "channel_id")? {
+        return Ok(Some(id.to_string()));
+    }
+    if let Some(name) = scoped_str_arg(args, "channel")? {
+        let channels = ctx
+            .tracker
+            .list_discord_channels()
+            .map_err(|e| format!("Failed to list indexed channels: {e}"))?;
+        // Prefer an exact (case-insensitive) name before a loose match.
+        let exact = channels.iter().find(|c| {
+            c.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        });
+        let wanted = normalize_channel_name(name);
+        return exact
+            .or_else(|| {
+                channels.iter().find(|c| {
+                    c.name
+                        .as_deref()
+                        .is_some_and(|n| normalize_channel_name(n) == wanted)
+                })
+            })
+            .map(|c| Some(c.channel_id.clone()))
+            .ok_or_else(|| format!("Channel '{name}' not found in the indexed channels."));
+    }
+    Ok(None)
 }
 
 /// Live listing of recent messages in a Discord channel (not semantic search).
@@ -638,13 +678,37 @@ async fn resolve_discord_channel(
             .list_guild_channels(guild)
             .await
             .map_err(|e| format!("Failed to list Discord channels: {e}"))?;
-        return channels
-            .iter()
-            .find(|c| c.name.as_deref() == Some(name))
+        // Prefer an exact (case-insensitive) name, falling back to a loose match,
+        // so `foo-bar` wins over `foobar` when both exist.
+        let exact = channels.iter().find(|c| {
+            c.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        });
+        let wanted = normalize_channel_name(name);
+        return exact
+            .or_else(|| {
+                channels.iter().find(|c| {
+                    c.name
+                        .as_deref()
+                        .is_some_and(|n| normalize_channel_name(n) == wanted)
+                })
+            })
             .map(|c| c.id.clone())
             .ok_or_else(|| format!("Channel '{name}' not found in the configured guild."));
     }
     Err("Provide 'channel_id' or 'channel'.".to_string())
+}
+
+/// Normalize a channel name for loose matching: lowercase, keep alphanumerics
+/// (Unicode-aware, so non-Latin names like `日本語` survive), dropping spaces,
+/// punctuation and emoji. So "🗄-database", "Database", and "database" compare
+/// equal, while distinct non-ASCII names stay distinct.
+fn normalize_channel_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// Live listing of HelpScout conversations from the configured mailboxes.
@@ -652,20 +716,25 @@ async fn helpscout_list_conversations(ctx: &McpContext<'_>, args: &Value) -> Val
     let Some(source) = ctx.helpscout else {
         return tool_error("HelpScout listing is unavailable (HelpScout not configured).");
     };
-    let limit = ctx.cfg.resolve_limit(usize_arg(args, "limit"));
+    let requested = usize_arg(args, "limit");
+    let limit = ctx.cfg.resolve_limit(requested);
+    let status = str_arg(args, "status");
 
-    match source.fetch_issues().await {
+    match source.list_conversations(status).await {
         Ok(mut issues) => {
-            // fetch_issues concatenates per-mailbox results in config order; sort
-            // globally newest-first (by update, then creation) before limiting so
-            // a later mailbox's newer conversations aren't dropped.
+            // Results concatenate per-mailbox in config order; sort globally
+            // newest-first (by update, then creation) before limiting so a later
+            // mailbox's newer conversations aren't dropped.
             issues.sort_by(|a, b| {
                 let ka = a.updated_at.or(a.created_at);
                 let kb = b.updated_at.or(b.created_at);
                 kb.cmp(&ka)
             });
+            let total = issues.len();
             issues.truncate(limit);
-            tool_text(format_helpscout_conversations(&issues))
+            let mut out = format_helpscout_conversations(&issues);
+            out.push_str(&cap_note(total, issues.len(), requested, ctx.cfg.max_limit));
+            tool_text(out)
         }
         Err(e) => tool_error(&format!("HelpScout listing failed: {e}")),
     }
@@ -894,6 +963,25 @@ fn rpc_result(id: Value, result: Value) -> Value {
 
 fn rpc_error(id: Value, code: i64, message: String) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+/// A trailing note making result capping visible: shown vs. available, and when
+/// a requested limit exceeded the server cap. Empty when nothing was capped.
+fn cap_note(
+    total_available: usize,
+    shown: usize,
+    requested: Option<usize>,
+    max_limit: usize,
+) -> String {
+    if total_available > shown {
+        format!(
+            "\n\n_(showing {shown} of {total_available}; raise `limit` for more, up to max_limit={max_limit}.)_"
+        )
+    } else if requested.is_some_and(|r| r > max_limit) {
+        format!("\n\n_(requested limit exceeds max_limit={max_limit}; showing {shown}.)_")
+    } else {
+        String::new()
+    }
 }
 
 /// Build a successful `tools/call` result carrying a single text block.
@@ -1980,9 +2068,20 @@ mod tests {
 
     // --- list tools (HelpScout + Discord) -----------------------------------
 
-    /// A fake HelpScout `IssueSource` returning canned conversations.
+    /// A fake HelpScout `IssueSource` returning canned conversations and
+    /// recording the status passed to `list_conversations`.
     struct FakeHelpScout {
         issues: Vec<Issue>,
+        last_status: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FakeHelpScout {
+        fn new(issues: Vec<Issue>) -> Self {
+            Self {
+                issues,
+                last_status: std::sync::Mutex::new(None),
+            }
+        }
     }
 
     #[async_trait]
@@ -1994,6 +2093,13 @@ mod tests {
             "HelpScout"
         }
         async fn fetch_issues(&self) -> crate::error::Result<Vec<Issue>> {
+            Ok(self.issues.clone())
+        }
+        async fn list_conversations(
+            &self,
+            status: Option<&str>,
+        ) -> crate::error::Result<Vec<Issue>> {
+            *self.last_status.lock().unwrap() = status.map(str::to_string);
             Ok(self.issues.clone())
         }
         fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
@@ -2038,13 +2144,11 @@ mod tests {
         // Deliberately out of order: HS-2 is newest, HS-1 oldest. Newest-first
         // ordering + limit=2 must keep HS-2 and HS-3 and drop the oldest (HS-1),
         // not just the last in input order.
-        let source = FakeHelpScout {
-            issues: vec![
-                hs_issue("HS-1", "Login broken", "active", "a@x.com", 60),
-                hs_issue("HS-2", "Billing question", "pending", "b@x.com", 1),
-                hs_issue("HS-3", "Feature request", "active", "c@x.com", 10),
-            ],
-        };
+        let source = FakeHelpScout::new(vec![
+            hs_issue("HS-1", "Login broken", "active", "a@x.com", 60),
+            hs_issue("HS-2", "Billing question", "pending", "b@x.com", 1),
+            hs_issue("HS-3", "Feature request", "active", "c@x.com", 10),
+        ]);
         let tracker = SqliteTracker::in_memory().unwrap();
         let ctx = McpContext {
             cfg: &cfg,
@@ -2276,5 +2380,171 @@ mod tests {
         assert!(format_discord_messages("100", &[]).contains("No messages"));
         let dm = format_discord_messages("100", &[dmsg("1", "100", "alice", "hello world")]);
         assert!(dm.contains("alice") && dm.contains("hello world"));
+    }
+
+    // --- follow-up enhancements: fuzzy names, status filter, cap notes -------
+
+    #[test]
+    fn normalize_channel_name_is_loose() {
+        let want = normalize_channel_name("database");
+        assert_eq!(normalize_channel_name("🗄-database"), want);
+        assert_eq!(normalize_channel_name("Database"), want);
+        assert_eq!(normalize_channel_name("DATA_BASE"), want); // underscores dropped
+                                                               // Different words stay distinct.
+        assert_ne!(normalize_channel_name("databases"), want);
+        // Non-ASCII letters are preserved (not collapsed to empty), so distinct
+        // non-Latin names remain distinct.
+        assert!(!normalize_channel_name("日本語").is_empty());
+        assert_ne!(
+            normalize_channel_name("日本語"),
+            normalize_channel_name("中文")
+        );
+    }
+
+    #[test]
+    fn cap_note_reports_truncation_and_cap() {
+        // Truncated: showing fewer than available.
+        assert!(cap_note(10, 3, Some(3), 50).contains("showing 3 of 10"));
+        // Requested beyond the cap.
+        assert!(cap_note(2, 2, Some(100), 50).contains("max_limit=50"));
+        // Nothing capped.
+        assert_eq!(cap_note(2, 2, Some(2), 50), "");
+    }
+
+    #[tokio::test]
+    async fn helpscout_list_forwards_status_filter() {
+        let cfg = McpSearchServerConfig {
+            enabled: true,
+            expose_helpscout: true,
+            ..Default::default()
+        };
+        let source = FakeHelpScout::new(vec![hs_issue("HS-1", "x", "closed", "a@x.com", 1)]);
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: None,
+            discord_search: None,
+            tracker: &tracker,
+            cf_verifier: None,
+            helpscout: Some(&source),
+            discord_lister: None,
+            discord_guild_id: None,
+        };
+        let resp = post(
+            &ctx,
+            json!({ "id": 1, "method": "tools/call",
+                    "params": { "name": "helpscout_list_conversations", "arguments": { "status": "all" } } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"].get("isError"), None);
+        assert_eq!(
+            source.last_status.lock().unwrap().as_deref(),
+            Some("all"),
+            "status not forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_search_resolves_channel_name_loosely() {
+        // Seed the indexed-channel registry with an emoji/case channel name.
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        tracker
+            .upsert_discord_channel(
+                "999",
+                Some("guild1"),
+                None,
+                Some("🗄-Database"),
+                Some(0),
+                claudear_core::types::DiscordChannelKind::Channel,
+                false,
+            )
+            .unwrap();
+        let cfg = cfg(false, true);
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: None,
+            discord_search: None,
+            tracker: tracker.as_ref(),
+            cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
+        };
+
+        // Loose name match resolves to the channel id.
+        assert_eq!(
+            resolve_search_channel(&ctx, &json!({ "channel": "database" })).unwrap(),
+            Some("999".to_string())
+        );
+        // channel_id passed through as-is.
+        assert_eq!(
+            resolve_search_channel(&ctx, &json!({ "channel_id": "42" })).unwrap(),
+            Some("42".to_string())
+        );
+        // Unknown name errors rather than silently searching everything.
+        assert!(resolve_search_channel(&ctx, &json!({ "channel": "nope" })).is_err());
+        // No scope -> None.
+        assert_eq!(resolve_search_channel(&ctx, &json!({})).unwrap(), None);
+
+        // Exact name wins over a looser collision. Seed both "foo-bar" (id 1)
+        // and "foobar" (id 2); the registry orders by name so "foo-bar" is first.
+        // Request the EXACT "foobar": a loose-only resolver would wrongly return
+        // the first normalized match ("foo-bar", id 1), so only exact-before-loose
+        // yields id 2 — making this fail without the exact step.
+        for (id, name) in [("1", "foo-bar"), ("2", "foobar")] {
+            tracker
+                .upsert_discord_channel(
+                    id,
+                    Some("guild1"),
+                    None,
+                    Some(name),
+                    Some(0),
+                    claudear_core::types::DiscordChannelKind::Channel,
+                    false,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            resolve_search_channel(&ctx, &json!({ "channel": "foobar" })).unwrap(),
+            Some("2".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_list_resolves_emoji_channel_name() {
+        let cfg = cfg(false, true);
+        let lister = FakeDiscord {
+            guild_id: "guild1".to_string(),
+            by_channel: std::collections::HashMap::from([(
+                "300".to_string(),
+                vec![dmsg("1", "300", "alice", "db migration notes")],
+            )]),
+            channels: vec![dchan("300", "🗄-database")],
+        };
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: None,
+            discord_search: None,
+            tracker: &tracker,
+            cf_verifier: None,
+            helpscout: None,
+            discord_lister: Some(&lister),
+            discord_guild_id: Some("guild1"),
+        };
+        // "database" loosely matches the "🗄-database" channel.
+        let resp = post(
+            &ctx,
+            json!({ "id": 1, "method": "tools/call",
+                    "params": { "name": "discord_list_messages", "arguments": { "channel": "database" } } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"].get("isError"), None);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("db migration notes"));
     }
 }

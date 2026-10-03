@@ -186,6 +186,43 @@ impl<H: HttpClient> HelpScoutSource<H> {
             .await
     }
 
+    /// The status used when none is requested: the configured trigger status,
+    /// or "active" when unset.
+    fn default_status(&self) -> &str {
+        if self.config.trigger_status.trim().is_empty() {
+            "active"
+        } else {
+            self.config.trigger_status.as_str()
+        }
+    }
+
+    /// List conversations across the configured mailboxes filtered by `status`
+    /// (a HelpScout status such as "active"/"pending"/"closed", or "all").
+    async fn fetch_with_status(&self, status: &str) -> Result<Vec<Issue>> {
+        let mut issues = Vec::new();
+        for mailbox in &self.config.mailbox_ids {
+            let path = format!(
+                "/v2/conversations?mailbox={}&status={}&embed=threads",
+                urlencoding(mailbox),
+                urlencoding(status),
+            );
+            let resp = self.api_get(&path).await?;
+            if !resp.is_success() {
+                return Err(Error::source(
+                    "helpscout",
+                    format!("list conversations failed ({}): {}", resp.status, resp.body),
+                ));
+            }
+            let list: ConversationsListResponse = resp.json()?;
+            if let Some(embedded) = list.embedded {
+                for c in embedded.conversations {
+                    issues.push(self.map_conversation(c));
+                }
+            }
+        }
+        Ok(issues)
+    }
+
     /// Fetch the threads for a conversation (used to build full context).
     async fn fetch_threads(&self, conversation_id: &str) -> Vec<HsThread> {
         match self
@@ -323,34 +360,15 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
     }
 
     async fn fetch_issues(&self) -> Result<Vec<Issue>> {
-        let status = if self.config.trigger_status.trim().is_empty() {
-            "active"
-        } else {
-            self.config.trigger_status.as_str()
-        };
+        self.fetch_with_status(self.default_status()).await
+    }
 
-        let mut issues = Vec::new();
-        for mailbox in &self.config.mailbox_ids {
-            let path = format!(
-                "/v2/conversations?mailbox={}&status={}&embed=threads",
-                urlencoding(mailbox),
-                urlencoding(status),
-            );
-            let resp = self.api_get(&path).await?;
-            if !resp.is_success() {
-                return Err(Error::source(
-                    "helpscout",
-                    format!("list conversations failed ({}): {}", resp.status, resp.body),
-                ));
-            }
-            let list: ConversationsListResponse = resp.json()?;
-            if let Some(embedded) = list.embedded {
-                for c in embedded.conversations {
-                    issues.push(self.map_conversation(c));
-                }
-            }
-        }
-        Ok(issues)
+    async fn list_conversations(&self, status: Option<&str>) -> Result<Vec<Issue>> {
+        let status = status
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.default_status());
+        self.fetch_with_status(status).await
     }
 
     fn matches_criteria(&self, issue: &Issue) -> MatchResult {
@@ -601,6 +619,33 @@ mod tests {
             i.get_metadata::<Vec<String>>("labels"),
             Some(vec!["bug".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_conversations_forwards_status() {
+        let list = r#"{"_embedded":{"conversations":[
+            {"id":1,"number":1,"subject":"Closed one","status":"closed","mailboxId":1,
+             "primaryCustomer":{"id":1,"email":"a@b.com"}}
+        ]}}"#;
+        // The conversations response only matches when the URL carries
+        // status=closed, so a successful fetch proves the status was forwarded.
+        let mock = MockHttpClient::new(vec![
+            ("/v2/oauth2/token", 200, TOKEN_BODY),
+            ("status=closed", 200, list),
+        ]);
+        let source = HelpScoutSource::with_http_client(test_config(), mock);
+        let issues = source.list_conversations(Some("closed")).await.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "1");
+
+        // A different status does not hit the status=closed stub -> 404 -> error,
+        // confirming the status really goes into the query (not hardcoded).
+        let mock2 = MockHttpClient::new(vec![
+            ("/v2/oauth2/token", 200, TOKEN_BODY),
+            ("status=closed", 200, list),
+        ]);
+        let source2 = HelpScoutSource::with_http_client(test_config(), mock2);
+        assert!(source2.list_conversations(Some("active")).await.is_err());
     }
 
     #[test]

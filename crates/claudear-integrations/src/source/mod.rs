@@ -43,6 +43,13 @@ pub trait IssueSource: Send + Sync {
     /// Fetch issues that should be considered for processing.
     async fn fetch_issues(&self) -> Result<Vec<Issue>>;
 
+    /// List issues/conversations, optionally filtered by a source-specific
+    /// status string (e.g. "active"/"closed"/"all" for HelpScout). Defaults to
+    /// [`Self::fetch_issues`], ignoring the status.
+    async fn list_conversations(&self, _status: Option<&str>) -> Result<Vec<Issue>> {
+        self.fetch_issues().await
+    }
+
     /// Check if a specific issue matches the processing criteria.
     fn matches_criteria(&self, issue: &Issue) -> MatchResult;
 
