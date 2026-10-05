@@ -150,8 +150,9 @@ impl<H: SentryHttpClient> RegressionChecker for SentryRegressionChecker<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Utc};
-    use claudear_core::http::HttpResponse;
+    use abnegate_http::HttpResponse;
+    use chrono::Duration;
+    use chrono::Utc;
     use claudear_core::types::IssueType;
 
     struct MockSentryClient {
@@ -161,10 +162,7 @@ mod tests {
     impl MockSentryClient {
         fn new(status: u16, body: &str) -> Self {
             Self {
-                response: HttpResponse {
-                    status,
-                    body: body.to_string(),
-                },
+                response: HttpResponse::new(status, body.to_string()),
             }
         }
     }
@@ -172,10 +170,7 @@ mod tests {
     #[async_trait]
     impl SentryHttpClient for MockSentryClient {
         async fn get(&self, _url: &str, _auth_token: &str) -> Result<HttpResponse> {
-            Ok(HttpResponse {
-                status: self.response.status,
-                body: self.response.body.clone(),
-            })
+            Ok(self.response.clone())
         }
 
         async fn put(
@@ -184,10 +179,7 @@ mod tests {
             _auth_token: &str,
             _body: serde_json::Value,
         ) -> Result<HttpResponse> {
-            Ok(HttpResponse {
-                status: 200,
-                body: "{}".to_string(),
-            })
+            Ok(HttpResponse::new(200, "{}"))
         }
     }
 

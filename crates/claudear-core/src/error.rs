@@ -1,5 +1,6 @@
 //! Error types for the claudear application.
 
+use abnegate_http::Error as HttpError;
 use thiserror::Error;
 
 /// Main error type for the application.
@@ -61,8 +62,8 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn config(msg: impl Into<String>) -> Self {
-        Self::Config(msg.into())
+    pub fn config(message: impl Into<String>) -> Self {
+        Self::Config(message.into())
     }
 
     pub fn source(source_name: impl Into<String>, message: impl Into<String>) -> Self {
@@ -72,12 +73,12 @@ impl Error {
         }
     }
 
-    pub fn webhook(msg: impl Into<String>) -> Self {
-        Self::Webhook(msg.into())
+    pub fn webhook(message: impl Into<String>) -> Self {
+        Self::Webhook(message.into())
     }
 
-    pub fn runner(msg: impl Into<String>) -> Self {
-        Self::Runner(msg.into())
+    pub fn runner(message: impl Into<String>) -> Self {
+        Self::Runner(message.into())
     }
 
     pub fn notifier(notifier: impl Into<String>, message: impl Into<String>) -> Self {
@@ -94,35 +95,45 @@ impl Error {
         }
     }
 
-    pub fn network(msg: impl Into<String>) -> Self {
-        Self::Network(msg.into())
+    pub fn network(message: impl Into<String>) -> Self {
+        Self::Network(message.into())
     }
 
-    pub fn api(msg: impl Into<String>) -> Self {
-        Self::Api(msg.into())
+    pub fn api(message: impl Into<String>) -> Self {
+        Self::Api(message.into())
     }
 
-    pub fn storage(msg: impl Into<String>) -> Self {
-        Self::Storage(msg.into())
+    pub fn storage(message: impl Into<String>) -> Self {
+        Self::Storage(message.into())
     }
 
-    pub fn git(msg: impl Into<String>) -> Self {
-        Self::Git(msg.into())
+    pub fn git(message: impl Into<String>) -> Self {
+        Self::Git(message.into())
     }
 
-    pub fn io(msg: impl Into<String>) -> Self {
-        Self::Io(std::io::Error::other(msg.into()))
+    pub fn io(message: impl Into<String>) -> Self {
+        Self::Io(std::io::Error::other(message.into()))
     }
 
-    pub fn database(msg: impl Into<String>) -> Self {
-        Self::Database(msg.into())
+    pub fn database(message: impl Into<String>) -> Self {
+        Self::Database(message.into())
     }
 }
 
 #[cfg(feature = "sqlite")]
 impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
-        Error::Database(e.to_string())
+    fn from(error: rusqlite::Error) -> Self {
+        Error::Database(error.to_string())
+    }
+}
+
+impl From<HttpError> for Error {
+    fn from(error: HttpError) -> Self {
+        match error {
+            HttpError::Request(source) | HttpError::UnreadableBody(source) => Self::Http(source),
+            HttpError::TooManyRedirects => Self::Network(error.to_string()),
+            _ => Self::Other(error.to_string()),
+        }
     }
 }
 
@@ -612,5 +623,96 @@ mod tests {
             Ok(0)
         }
         assert!(inner_fail().is_err());
+    }
+
+    async fn refused_connection() -> reqwest::Error {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a client without a proxy builds")
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1")
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_from_the_http_client_stays_an_http_error() {
+        let error = Error::from(HttpError::from(refused_connection().await));
+
+        assert!(matches!(error, Error::Http(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_body_from_the_http_client_is_an_http_error() {
+        let error = Error::from(HttpError::UnreadableBody(refused_connection().await));
+
+        assert!(matches!(error, Error::Http(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_redirect_loop_from_the_http_client_is_a_network_error() {
+        let error = Error::from(HttpError::TooManyRedirects);
+
+        assert!(matches!(error, Error::Network(_)), "{error:?}");
+        assert_eq!(error.to_string(), "Network error: Too many redirects.");
+    }
+
+    #[test]
+    fn a_json_error_from_the_http_client_keeps_its_parse_message() {
+        let parse = serde_json::from_str::<serde_json::Value>("not json")
+            .expect_err("the body is not JSON");
+
+        let error = Error::from(HttpError::from(parse));
+
+        assert!(matches!(error, Error::Other(_)), "{error:?}");
+        assert!(
+            error.to_string().starts_with("JSON parse error: "),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_method_from_the_http_client_is_other() {
+        let error = Error::from(HttpError::Unsupported(reqwest::Method::POST));
+
+        assert!(matches!(error, Error::Other(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "POST is not supported by this HTTP client"
+        );
+    }
+
+    #[test]
+    fn an_oversized_body_from_the_http_client_is_other() {
+        let error = Error::from(HttpError::oversized_body(16));
+
+        assert!(matches!(error, Error::Other(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "The response body is larger than 16 bytes."
+        );
+    }
+
+    #[test]
+    fn every_refused_destination_from_the_http_client_is_other() {
+        for refusal in [
+            HttpError::InvalidUrl,
+            HttpError::InvalidHeaderName,
+            HttpError::InvalidHeaderValue,
+            HttpError::UnsupportedScheme,
+            HttpError::EmbeddedCredentials,
+            HttpError::MissingHost,
+            HttpError::PrivateAddress,
+            HttpError::InternalHost,
+            HttpError::unfetchable_resolution("inside.example"),
+        ] {
+            let message = refusal.to_string();
+
+            let error = Error::from(refusal);
+
+            assert!(matches!(error, Error::Other(_)), "{error:?}");
+            assert_eq!(error.to_string(), message);
+        }
     }
 }

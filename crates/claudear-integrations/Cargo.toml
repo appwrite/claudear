@@ -11,6 +11,7 @@ default = []
 sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite", "claudear-analysis/sqlite"]
 
 [dependencies]
+abnegate-http = { workspace = true }
 claudear-core = { workspace = true }
 claudear-config = { workspace = true }
 claudear-storage = { workspace = true }

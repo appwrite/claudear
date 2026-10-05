@@ -12,6 +12,7 @@ sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite"]
 cuda = ["ort/cuda"]
 
 [dependencies]
+abnegate-http = { workspace = true }
 abnegate-index = { workspace = true }
 claudear-core = { workspace = true }
 claudear-config = { workspace = true }

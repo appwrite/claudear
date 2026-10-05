@@ -1,12 +1,18 @@
 //! Sentry issue source adapter.
 
 use super::IssueSource;
-use crate::webhook::{sentry_map_priority as map_priority, sentry_map_status as map_status};
+use crate::webhook::sentry_map_priority as map_priority;
+use crate::webhook::sentry_map_status as map_status;
+use abnegate_http::HttpResponse;
 use async_trait::async_trait;
 use claudear_config::config::SentryConfig;
-use claudear_core::error::{Error, Result};
-use claudear_core::http::HttpResponse;
-use claudear_core::types::{Issue, IssuePriority, IssueStatus, MatchPriority, MatchResult};
+use claudear_core::error::Error;
+use claudear_core::error::Result;
+use claudear_core::types::Issue;
+use claudear_core::types::IssuePriority;
+use claudear_core::types::IssueStatus;
+use claudear_core::types::MatchPriority;
+use claudear_core::types::MatchResult;
 use futures::future::join_all;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -51,7 +57,7 @@ impl SentryHttpClient for ReqwestSentryClient {
             .await?;
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 
     async fn put(
@@ -69,10 +75,7 @@ impl SentryHttpClient for ReqwestSentryClient {
             .await?;
         let status = response.status().as_u16();
         let body_text = response.text().await.unwrap_or_default();
-        Ok(HttpResponse {
-            status,
-            body: body_text,
-        })
+        Ok(HttpResponse::new(status, body_text))
     }
 }
 
@@ -179,7 +182,7 @@ impl<H: SentryHttpClient> SentrySource<H> {
             ));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     async fn fetch_top_issues(&self) -> Result<Vec<SentryApiIssue>> {
@@ -731,24 +734,12 @@ mod tests {
 
         pub fn mock_get(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
             let mut responses = self.get_responses.lock().unwrap();
-            responses.insert(
-                url.into(),
-                HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            responses.insert(url.into(), HttpResponse::new(status, body));
         }
 
         pub fn mock_put(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
             let mut responses = self.put_responses.lock().unwrap();
-            responses.insert(
-                url.into(),
-                HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            responses.insert(url.into(), HttpResponse::new(status, body));
         }
 
         #[expect(dead_code)]
@@ -769,15 +760,9 @@ mod tests {
             // tests about the window register the windowed URL explicitly
             let unwindowed = url.split("&statsPeriod=").next().unwrap_or(url);
             if let Some(response) = responses.get(url).or_else(|| responses.get(unwindowed)) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
@@ -793,39 +778,24 @@ mod tests {
                 .push(("PUT".to_string(), url.to_string()));
             let responses = self.put_responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
     }
 
     #[test]
     fn test_http_response_is_success() {
-        let response = HttpResponse {
-            status: 200,
-            body: "{}".to_string(),
-        };
+        let response = HttpResponse::new(200, "{}");
         assert!(response.is_success());
-        let response = HttpResponse {
-            status: 404,
-            body: "{}".to_string(),
-        };
+        let response = HttpResponse::new(404, "{}");
         assert!(!response.is_success());
     }
 
     #[test]
     fn test_http_response_json() {
-        let response = HttpResponse {
-            status: 200,
-            body: r#"{"id": "123"}"#.to_string(),
-        };
+        let response = HttpResponse::new(200, r#"{"id": "123"}"#);
         let parsed: serde_json::Value = response.json().unwrap();
         assert_eq!(parsed["id"], "123");
     }
@@ -2548,41 +2518,18 @@ mod tests {
 
     #[test]
     fn test_http_response_json_parse_failure() {
-        let response = HttpResponse {
-            status: 200,
-            body: "not json at all".to_string(),
-        };
-        let result: Result<serde_json::Value> = response.json();
+        let response = HttpResponse::new(200, "not json at all");
+        let result: Result<serde_json::Value> = response.json().map_err(Error::from);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("JSON parse error"));
     }
 
     #[test]
     fn test_http_response_boundary_status_codes() {
-        // 199 is not success
-        assert!(!HttpResponse {
-            status: 199,
-            body: String::new()
-        }
-        .is_success());
-        // 200 is success
-        assert!(HttpResponse {
-            status: 200,
-            body: String::new()
-        }
-        .is_success());
-        // 299 is success
-        assert!(HttpResponse {
-            status: 299,
-            body: String::new()
-        }
-        .is_success());
-        // 300 is not success
-        assert!(!HttpResponse {
-            status: 300,
-            body: String::new()
-        }
-        .is_success());
+        assert!(!HttpResponse::new(199, "").is_success());
+        assert!(HttpResponse::new(200, "").is_success());
+        assert!(HttpResponse::new(299, "").is_success());
+        assert!(!HttpResponse::new(300, "").is_success());
     }
 
     #[tokio::test]
@@ -2698,8 +2645,6 @@ mod tests {
         assert_eq!(result.priority, MatchPriority::Normal);
         assert!(result.reason.contains("Top issue"));
     }
-
-    // --- New tests for coverage ---
 
     #[tokio::test]
     async fn test_build_issue_context_stacktrace_missing_fields() {
