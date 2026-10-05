@@ -3,14 +3,20 @@
 use super::get_source_emoji;
 use super::Notifier;
 use crate::reports::Report;
+use abnegate_http::HttpResponse;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 use claudear_config::config::SlackConfig;
 use claudear_config::users::UserRegistry;
-use claudear_core::error::{Error, Result};
-use claudear_core::http::HttpResponse;
-use claudear_core::types::{AskDelivery, AskReply, AskRequest, Issue};
-use serde::{Deserialize, Serialize};
+use claudear_core::error::Error;
+use claudear_core::error::Result;
+use claudear_core::types::AskDelivery;
+use claudear_core::types::AskReply;
+use claudear_core::types::AskRequest;
+use claudear_core::types::Issue;
+use serde::Deserialize;
+use serde::Serialize;
 
 /// Trait for HTTP client used by Slack notifier.
 #[async_trait]
@@ -65,7 +71,7 @@ impl SlackHttpClient for ReqwestSlackHttpClient {
         let response = req.send().await?;
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 
     async fn get_json(&self, url: &str, auth_token: Option<&str>) -> Result<HttpResponse> {
@@ -76,7 +82,7 @@ impl SlackHttpClient for ReqwestSlackHttpClient {
         let response = req.send().await?;
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 }
 
@@ -1422,10 +1428,10 @@ mod tests {
                 auth_token.map(|s| s.to_string()),
             ));
 
-            Ok(HttpResponse {
-                status: self.response_status,
-                body: self.response_body.clone(),
-            })
+            Ok(HttpResponse::new(
+                self.response_status,
+                self.response_body.clone(),
+            ))
         }
 
         async fn get_json(&self, url: &str, auth_token: Option<&str>) -> Result<HttpResponse> {
@@ -1439,17 +1445,14 @@ mod tests {
             let responses = self.get_responses.lock().unwrap();
             for (prefix, body) in responses.iter() {
                 if url.starts_with(prefix) || url.contains(prefix) {
-                    return Ok(HttpResponse {
-                        status: self.response_status,
-                        body: body.clone(),
-                    });
+                    return Ok(HttpResponse::new(self.response_status, body.clone()));
                 }
             }
 
-            Ok(HttpResponse {
-                status: self.response_status,
-                body: self.response_body.clone(),
-            })
+            Ok(HttpResponse::new(
+                self.response_status,
+                self.response_body.clone(),
+            ))
         }
     }
 
@@ -4299,8 +4302,6 @@ mod tests {
         assert!(trigger_block.is_some());
     }
 
-    // === Coverage tests for build_closed_message ===
-
     #[test]
     fn test_build_closed_message_without_mention_v2() {
         let issue = test_issue();
@@ -4332,8 +4333,6 @@ mod tests {
             _ => panic!("Expected Section block with mention at position 0"),
         }
     }
-
-    // === Coverage tests for build_cascade_success_message ===
 
     #[test]
     fn test_build_cascade_success_message_basic() {
@@ -4369,8 +4368,6 @@ mod tests {
             _ => panic!("Expected mention Section at position 0"),
         }
     }
-
-    // === Coverage tests for build_cascade_failed_message ===
 
     #[test]
     fn test_build_cascade_failed_message_basic() {
@@ -4427,8 +4424,6 @@ mod tests {
         }
     }
 
-    // === Coverage tests for build_regression_detected_message ===
-
     #[test]
     fn test_build_regression_detected_message_basic() {
         let issue = test_issue();
@@ -4481,8 +4476,6 @@ mod tests {
         }
     }
 
-    // === Coverage tests for build_regression_resolved_message ===
-
     #[test]
     fn test_build_regression_resolved_message_basic() {
         let issue = test_issue();
@@ -4508,8 +4501,6 @@ mod tests {
             _ => panic!("Expected mention at position 0"),
         }
     }
-
-    // === Coverage tests for Notifier trait methods via mock HTTP ===
 
     #[tokio::test]
     async fn test_notify_merged_sends_correct_content() {
@@ -4625,8 +4616,6 @@ mod tests {
         assert!(text.contains("Cascade Failed"));
     }
 
-    // === Coverage: build_success_message with is_pr_update and changelog ===
-
     #[test]
     fn test_build_success_message_pr_update_v2() {
         let mut issue = test_issue();
@@ -4646,8 +4635,6 @@ mod tests {
         assert!(block_json.contains("Fixed authentication bug"));
     }
 
-    // === Coverage: build_completed_message with custom completion_reason ===
-
     #[test]
     fn test_build_completed_message_with_custom_reason() {
         let mut issue = test_issue();
@@ -4657,8 +4644,6 @@ mod tests {
         let block_json = serde_json::to_string(&blocks).unwrap();
         assert!(block_json.contains("Already fixed in previous release"));
     }
-
-    // === Coverage: confidence in success messages ===
 
     #[test]
     fn test_build_success_message_with_confidence() {

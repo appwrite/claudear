@@ -3,6 +3,7 @@
 //! Defines a common trait and shared types used by both GitHub and GitLab
 //! backends for PR monitoring and review watching.
 
+use abnegate_http::ReqwestHttpClient;
 use async_trait::async_trait;
 use claudear_core::error::Result;
 use claudear_core::types::{
@@ -13,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub use claudear_core::types::{PrReviewState, ReviewComment, ReviewUser};
+
+/// Room for the unified diff of a large pull request.
+pub const BODY_LIMIT: usize = 8 * ReqwestHttpClient::DEFAULT_BODY_LIMIT;
 
 /// Check whether a bot user should be skipped based on the allowed-bots list.
 ///
@@ -6524,8 +6528,6 @@ mod tests {
         }
     }
 
-    // --- comment_is_after_cursor tests ---
-
     #[test]
     fn comment_is_after_cursor_no_cursor() {
         let comment = make_review_comment("src/main.rs", "fix", Some(1));
@@ -6606,8 +6608,6 @@ mod tests {
         ));
     }
 
-    // --- ScmRelease serde ---
-
     #[test]
     fn scm_release_serialization_round_trip() {
         let release = ScmRelease {
@@ -6658,8 +6658,6 @@ mod tests {
         assert_eq!(cloned.name, release.name);
     }
 
-    // --- RemoteRepo serde ---
-
     #[test]
     fn remote_repo_serialization_round_trip() {
         let repo = RemoteRepo {
@@ -6697,8 +6695,6 @@ mod tests {
         let repo: RemoteRepo = serde_json::from_str(json).unwrap();
         assert_eq!(repo.ssh_url, "");
     }
-
-    // --- ReviewComment serde ---
 
     #[test]
     fn review_comment_serialization_round_trip() {
@@ -6765,8 +6761,6 @@ mod tests {
         assert!(deserialized.user.user_type.is_none());
     }
 
-    // --- CodeReview serde ---
-
     #[test]
     fn code_review_serialization_round_trip() {
         let review = CodeReview {
@@ -6793,8 +6787,6 @@ mod tests {
         );
     }
 
-    // --- PrSummary serde ---
-
     #[test]
     fn pr_summary_serialization_round_trip() {
         let summary = PrSummary {
@@ -6810,8 +6802,6 @@ mod tests {
         assert_eq!(deserialized.branch, "fix/auth-bug");
         assert_eq!(deserialized.url, "https://github.com/org/repo/pull/42");
     }
-
-    // --- ReviewUser serde ---
 
     #[test]
     fn review_user_serialization_round_trip() {
@@ -6837,8 +6827,6 @@ mod tests {
         assert_eq!(user.login, "dependabot[bot]");
     }
 
-    // --- PostReviewAction ---
-
     #[test]
     fn post_review_action_equality() {
         assert_eq!(PostReviewAction::Comment, PostReviewAction::Comment);
@@ -6859,8 +6847,6 @@ mod tests {
         );
         assert_eq!(format!("{:?}", PostReviewAction::Approve), "Approve");
     }
-
-    // --- PrStatusUpdate ---
 
     #[test]
     fn pr_status_update_fields() {
@@ -6896,8 +6882,6 @@ mod tests {
         assert!(update.regression_watch_id.is_none());
     }
 
-    // --- InlineReviewComment ---
-
     #[test]
     fn inline_review_comment_fields() {
         let comment = InlineReviewComment {
@@ -6919,8 +6903,6 @@ mod tests {
         };
         assert!(comment.position.is_none());
     }
-
-    // --- ReviewEvent requires_action for case-insensitive states (extended) ---
 
     #[test]
     fn review_event_requires_action_lowercase_changes_requested_2() {
@@ -6969,8 +6951,6 @@ mod tests {
         };
         assert!(!event.requires_action());
     }
-
-    // --- PrReviewState serde with all-None cursors ---
 
     #[test]
     fn pr_review_state_serde_none_cursors() {

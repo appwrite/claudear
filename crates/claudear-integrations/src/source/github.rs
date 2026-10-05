@@ -1,18 +1,23 @@
 //! GitHub Issues source adapter.
 
 use super::IssueSource;
-use crate::github::{GitHubClient, GitHubIssue};
+use crate::github::GitHubClient;
+use crate::github::GitHubIssue;
+use abnegate_http::HttpClient;
 use async_trait::async_trait;
 use claudear_config::config::GitHubConfig;
-use claudear_core::error::{Error, Result};
-use claudear_core::http::HttpClient;
-use claudear_core::types::{Issue, IssueStatus, MatchPriority, MatchResult};
+use claudear_core::error::Error;
+use claudear_core::error::Result;
+use claudear_core::types::Issue;
+use claudear_core::types::IssueStatus;
+use claudear_core::types::MatchPriority;
+use claudear_core::types::MatchResult;
 
 /// GitHub Issues source.
 ///
 /// Fetches issues from GitHub repositories and maps them to the unified Issue type.
 /// Source name is `"github_issues"` to avoid collision with the `"github"` ScmProvider.
-pub struct GitHubSource<H: HttpClient = claudear_core::http::ReqwestHttpClient> {
+pub struct GitHubSource<H: HttpClient = abnegate_http::ReqwestHttpClient> {
     client: GitHubClient<H>,
     config: GitHubConfig,
 }
@@ -274,8 +279,6 @@ mod tests {
         GitHubConfig::test_default()
     }
 
-    // --- Unit tests for free functions ---
-
     #[test]
     fn test_format_issue_id() {
         assert_eq!(format_issue_id("owner/repo", 42), "owner:repo#42");
@@ -326,8 +329,6 @@ mod tests {
         assert_eq!(repo, "myorg/myrepo");
         assert_eq!(number, 99);
     }
-
-    // --- Unit tests for map_issue ---
 
     #[test]
     fn test_map_issue_open() {
@@ -404,8 +405,6 @@ mod tests {
         assert_eq!(issue.status, IssueStatus::Resolved);
         assert_eq!(issue.description, None);
     }
-
-    // --- Unit tests for matches_criteria ---
 
     #[test]
     fn test_matches_criteria_basic_match() {
@@ -503,8 +502,6 @@ mod tests {
         assert!(result.matches);
     }
 
-    // --- Unit tests for context formatting ---
-
     #[test]
     fn test_format_context() {
         let mut issue = Issue::new(
@@ -545,8 +542,6 @@ mod tests {
         assert!(context.contains("**Title:** Simple issue"));
         assert!(!context.contains("## Description"));
     }
-
-    // --- Source trait tests ---
 
     #[test]
     fn test_source_name() {
@@ -603,12 +598,11 @@ mod tests {
         assert!(context.contains("**Title:** Async context test"));
     }
 
-    // --- Mock HTTP integration tests ---
-
     mod fetch_tests {
         use super::*;
+        use abnegate_http::HttpClient;
+        use abnegate_http::HttpResponse;
         use async_trait::async_trait;
-        use claudear_core::http::{HttpClient, HttpResponse};
         use std::collections::HashMap;
         use std::sync::Mutex;
 
@@ -624,13 +618,10 @@ mod tests {
             }
 
             fn mock_response(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
-                self.responses.lock().unwrap().insert(
-                    url.into(),
-                    HttpResponse {
-                        status,
-                        body: body.into(),
-                    },
-                );
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .insert(url.into(), HttpResponse::new(status, body));
             }
         }
 
@@ -640,18 +631,12 @@ mod tests {
                 &self,
                 url: &str,
                 _headers: Vec<(&str, String)>,
-            ) -> claudear_core::error::Result<HttpResponse> {
+            ) -> abnegate_http::Result<HttpResponse> {
                 let responses = self.responses.lock().unwrap();
                 if let Some(response) = responses.get(url) {
-                    Ok(HttpResponse {
-                        status: response.status,
-                        body: response.body.clone(),
-                    })
+                    Ok(response.clone())
                 } else {
-                    Ok(HttpResponse {
-                        status: 404,
-                        body: "Not found".to_string(),
-                    })
+                    Ok(HttpResponse::new(404, "Not found"))
                 }
             }
         }

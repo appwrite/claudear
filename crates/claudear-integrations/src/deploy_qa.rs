@@ -464,14 +464,17 @@ pub fn try_build_discord(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use abnegate_http::HttpResponse;
     use async_trait::async_trait;
-    use claudear_analysis::deploy_qa::{
-        VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX, VERDICT_UNVERIFIED,
-    };
+    use claudear_analysis::deploy_qa::VERDICT_ALL_VERIFIED;
+    use claudear_analysis::deploy_qa::VERDICT_FAIL;
+    use claudear_analysis::deploy_qa::VERDICT_PREFIX;
+    use claudear_analysis::deploy_qa::VERDICT_UNVERIFIED;
     use claudear_core::error::Error;
-    use claudear_core::http::HttpResponse;
-    use serde_json::{json, Value};
-    use std::sync::{Arc, Mutex};
+    use serde_json::json;
+    use serde_json::Value;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     const CHANNEL: &str = "990878183580651571";
     const RELEASE_MESSAGE: &str = "1111";
@@ -519,10 +522,7 @@ mod tests {
     }
 
     fn respond(status: u16, body: Value) -> Result<HttpResponse> {
-        Ok(HttpResponse {
-            status,
-            body: body.to_string(),
-        })
+        Ok(HttpResponse::new(status, body.to_string()))
     }
 
     #[async_trait]

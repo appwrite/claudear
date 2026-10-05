@@ -1,12 +1,18 @@
 //! Discord API client for thread management.
 
-use super::types::{
-    CreateMessageParams, CreateThreadParams, DiscordChannel, DiscordMessage, DiscordThread,
-};
+use super::types::CreateMessageParams;
+use super::types::CreateThreadParams;
+use super::types::DiscordChannel;
+use super::types::DiscordMessage;
+use super::types::DiscordThread;
+use abnegate_http::HttpResponse;
 use async_trait::async_trait;
-use claudear_core::error::{Error, Result};
-use claudear_core::http::HttpResponse;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use claudear_core::error::Error;
+use claudear_core::error::Result;
+use reqwest::header::HeaderMap;
+use reqwest::header::HeaderValue;
+use reqwest::header::AUTHORIZATION;
+use reqwest::header::CONTENT_TYPE;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
@@ -53,28 +59,28 @@ impl DiscordHttpClient for ReqwestDiscordClient {
         let response = self.client.get(url).send().await?;
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 
     async fn post(&self, url: &str, body: serde_json::Value) -> Result<HttpResponse> {
         let response = self.client.post(url).json(&body).send().await?;
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 
     async fn patch(&self, url: &str, body: serde_json::Value) -> Result<HttpResponse> {
         let response = self.client.patch(url).json(&body).send().await?;
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 
     async fn put_empty(&self, url: &str) -> Result<HttpResponse> {
         let response = self.client.put(url).send().await?;
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 }
 
@@ -127,7 +133,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             ));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Create a thread in a channel (without a starting message).
@@ -152,7 +158,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             ));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Create a thread from an existing message.
@@ -181,7 +187,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             ));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Get a thread by ID.
@@ -199,7 +205,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             ));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Send a message to a channel or thread.
@@ -224,7 +230,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             ));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Fetch a single message by ID from a channel.
@@ -245,7 +251,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             ));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// List recent messages from a channel.
@@ -271,7 +277,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             ));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// List messages from a channel after a given message ID (for incremental polling).
@@ -379,7 +385,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             ));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Unarchive a thread.
@@ -400,7 +406,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             ));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// List active threads in a channel.
@@ -565,33 +571,24 @@ pub mod mock {
         }
 
         pub fn mock_get(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
-            self.get_responses.lock().unwrap().insert(
-                url.into(),
-                HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            self.get_responses
+                .lock()
+                .unwrap()
+                .insert(url.into(), HttpResponse::new(status, body));
         }
 
         pub fn mock_post(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
-            self.post_responses.lock().unwrap().insert(
-                url.into(),
-                HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            self.post_responses
+                .lock()
+                .unwrap()
+                .insert(url.into(), HttpResponse::new(status, body));
         }
 
         pub fn mock_patch(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
-            self.patch_responses.lock().unwrap().insert(
-                url.into(),
-                HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            self.patch_responses
+                .lock()
+                .unwrap()
+                .insert(url.into(), HttpResponse::new(status, body));
         }
     }
 
@@ -599,54 +596,33 @@ pub mod mock {
     impl DiscordHttpClient for MockDiscordClient {
         async fn get(&self, url: &str) -> Result<HttpResponse> {
             let responses = self.get_responses.lock().unwrap();
-            if let Some(r) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: r.status,
-                    body: r.body.clone(),
-                })
+            if let Some(response) = responses.get(url) {
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
         async fn post(&self, url: &str, _body: serde_json::Value) -> Result<HttpResponse> {
             let responses = self.post_responses.lock().unwrap();
-            if let Some(r) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: r.status,
-                    body: r.body.clone(),
-                })
+            if let Some(response) = responses.get(url) {
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
         async fn patch(&self, url: &str, _body: serde_json::Value) -> Result<HttpResponse> {
             let responses = self.patch_responses.lock().unwrap();
-            if let Some(r) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: r.status,
-                    body: r.body.clone(),
-                })
+            if let Some(response) = responses.get(url) {
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
         async fn put_empty(&self, _url: &str) -> Result<HttpResponse> {
-            Ok(HttpResponse {
-                status: 204,
-                body: String::new(),
-            })
+            Ok(HttpResponse::new(204, ""))
         }
     }
 }
@@ -670,45 +646,23 @@ mod tests {
 
     #[test]
     fn test_http_response_is_success() {
-        assert!(HttpResponse {
-            status: 200,
-            body: "".to_string()
-        }
-        .is_success());
-        assert!(HttpResponse {
-            status: 201,
-            body: "".to_string()
-        }
-        .is_success());
-        assert!(!HttpResponse {
-            status: 400,
-            body: "".to_string()
-        }
-        .is_success());
-        assert!(!HttpResponse {
-            status: 500,
-            body: "".to_string()
-        }
-        .is_success());
+        assert!(HttpResponse::new(200, "").is_success());
+        assert!(HttpResponse::new(201, "").is_success());
+        assert!(!HttpResponse::new(400, "").is_success());
+        assert!(!HttpResponse::new(500, "").is_success());
     }
 
     #[test]
     fn test_http_response_json() {
-        let response = HttpResponse {
-            status: 200,
-            body: r#"{"id": "123"}"#.to_string(),
-        };
+        let response = HttpResponse::new(200, r#"{"id": "123"}"#);
         let parsed: serde_json::Value = response.json().unwrap();
         assert_eq!(parsed["id"], "123");
     }
 
     #[test]
     fn test_http_response_json_error() {
-        let response = HttpResponse {
-            status: 200,
-            body: "invalid".to_string(),
-        };
-        let result: Result<serde_json::Value> = response.json();
+        let response = HttpResponse::new(200, "invalid");
+        let result: Result<serde_json::Value> = response.json().map_err(Error::from);
         assert!(result.is_err());
     }
 

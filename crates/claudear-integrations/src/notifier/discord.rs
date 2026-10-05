@@ -2,15 +2,23 @@
 
 use super::Notifier;
 use crate::ask_reply_inbox;
-use crate::discord::{CreateMessageParams, DiscordClient, DiscordMessageReference, MessageEmbed};
+use crate::discord::CreateMessageParams;
+use crate::discord::DiscordClient;
+use crate::discord::DiscordMessageReference;
+use crate::discord::MessageEmbed;
 use crate::reports::RepetitiveDigest;
+use abnegate_http::HttpResponse;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 use claudear_config::config::DiscordConfig;
 use claudear_config::users::UserRegistry;
-use claudear_core::error::{Error, Result};
-use claudear_core::http::HttpResponse;
-use claudear_core::types::{AskDelivery, AskReply, AskRequest, Issue};
+use claudear_core::error::Error;
+use claudear_core::error::Result;
+use claudear_core::types::AskDelivery;
+use claudear_core::types::AskReply;
+use claudear_core::types::AskRequest;
+use claudear_core::types::Issue;
 use serde::Serialize;
 
 /// Trait for HTTP client used by Discord notifier.
@@ -50,7 +58,7 @@ impl DiscordWebhookClient for ReqwestDiscordWebhookClient {
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
 
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 }
 
@@ -1637,8 +1645,6 @@ mod tests {
         assert!(msgs[1].embeds.as_ref().unwrap()[0].title.is_none());
     }
 
-    // --- Native reply reference (threading answers to the question) ---
-
     #[test]
     fn test_origin_reply_reference_targets_original_message() {
         let issue = Issue::new(
@@ -2020,10 +2026,10 @@ mod tests {
                 .unwrap()
                 .push((url.to_string(), body.clone()));
 
-            Ok(HttpResponse {
-                status: self.response_status,
-                body: self.response_body.clone(),
-            })
+            Ok(HttpResponse::new(
+                self.response_status,
+                self.response_body.clone(),
+            ))
         }
     }
 
@@ -2377,10 +2383,7 @@ mod tests {
 
     #[test]
     fn test_http_response_fields() {
-        let response = HttpResponse {
-            status: 201,
-            body: "Created".to_string(),
-        };
+        let response = HttpResponse::new(201, "Created");
         assert_eq!(response.status, 201);
         assert_eq!(response.body, "Created");
     }
@@ -2860,8 +2863,6 @@ mod tests {
         assert_eq!(delivery.channel, "discord");
         assert!(delivery.message_id.is_none());
     }
-
-    // --- Additional tests for coverage ---
 
     fn make_ask_request(
         correlation_id: &str,
@@ -3998,8 +3999,6 @@ mod tests {
         assert!(body["embeds"][0]["url"].is_null());
     }
 
-    // --- Synchronous tests for standalone build_* helpers ---
-
     fn test_issue() -> Issue {
         Issue::new(
             "42",
@@ -4701,8 +4700,6 @@ mod tests {
             .contains("require attention"));
     }
 
-    // --- Tests for notify_merged message building ---
-
     #[tokio::test]
     async fn test_notify_merged_sends_correct_embed() {
         let mock = MockDiscordWebhookClient::success();
@@ -4742,8 +4739,6 @@ mod tests {
         let content = body["content"].as_str().unwrap();
         assert!(content.contains("<@987654321>"));
     }
-
-    // --- Tests for notify_closed message building ---
 
     #[tokio::test]
     async fn test_notify_closed_sends_correct_embed() {
@@ -4785,8 +4780,6 @@ mod tests {
         let content = body["content"].as_str().unwrap();
         assert!(content.contains("<@987654321>"));
     }
-
-    // --- Tests for cascade success message ---
 
     #[tokio::test]
     async fn test_notify_success_cascade_sends_cascade_embed() {
@@ -4834,8 +4827,6 @@ mod tests {
         assert!(footer.contains("Cascade"));
     }
 
-    // --- Tests for cascade failed message ---
-
     #[tokio::test]
     async fn test_notify_failed_cascade_sends_cascade_failed_embed() {
         let mock = MockDiscordWebhookClient::success();
@@ -4870,8 +4861,6 @@ mod tests {
         let footer = embed["footer"]["text"].as_str().unwrap();
         assert!(footer.contains("Cascade"));
     }
-
-    // --- Tests for regression detected message ---
 
     #[tokio::test]
     async fn test_notify_failed_regression_sends_regression_embed() {
@@ -4909,8 +4898,6 @@ mod tests {
         assert!(footer.contains("Regression Monitor"));
     }
 
-    // --- Tests for regression resolved message ---
-
     #[tokio::test]
     async fn test_notify_completed_regression_resolved_sends_resolved_embed() {
         let mock = MockDiscordWebhookClient::success();
@@ -4933,8 +4920,6 @@ mod tests {
         assert!(footer.contains("Regression Monitor"));
     }
 
-    // --- Tests for is_pr_update path in success message ---
-
     #[tokio::test]
     async fn test_notify_success_pr_update_sends_updated_title() {
         let mock = MockDiscordWebhookClient::success();
@@ -4954,8 +4939,6 @@ mod tests {
         let pr_field = fields.iter().find(|f| f["name"] == "Updated PR").unwrap();
         assert!(pr_field["value"].as_str().unwrap().contains("View PR"));
     }
-
-    // --- Test to_create_message_params content truncation ---
 
     #[test]
     fn test_to_create_message_params_truncates_long_content() {
@@ -5034,8 +5017,6 @@ mod tests {
         assert!(params.embeds.is_some());
     }
 
-    // --- Test cascade success without optional fields ---
-
     #[test]
     fn test_build_cascade_success_message_without_optional_metadata() {
         let issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
@@ -5064,8 +5045,6 @@ mod tests {
         let error_field = fields.iter().find(|f| f.name == "Error").unwrap();
         assert_eq!(error_field.value, "Some error");
     }
-
-    // --- Test build functions directly ---
 
     #[test]
     fn test_build_start_message_fields() {
@@ -5200,8 +5179,6 @@ mod tests {
         assert_eq!(trigger.value, "Manual trigger");
     }
 
-    // === Coverage: build_success_message with changelog metadata ===
-
     #[test]
     fn test_build_success_message_changelog_field() {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
@@ -5214,8 +5191,6 @@ mod tests {
             .any(|f| f.name == "Changes" && f.value.contains("Fixed auth bug")));
     }
 
-    // === Coverage: build_completed_message with custom completion_reason ===
-
     #[test]
     fn test_build_completed_message_custom_reason() {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
@@ -5227,8 +5202,6 @@ mod tests {
             .iter()
             .any(|f| f.name == "Reason" && f.value.contains("Already fixed")));
     }
-
-    // === Coverage: confidence field in success messages ===
 
     #[test]
     fn test_build_success_message_with_confidence() {

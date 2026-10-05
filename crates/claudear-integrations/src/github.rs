@@ -1,12 +1,21 @@
 //! GitHub PR monitoring and issue resolution.
 
-use crate::scm::{
-    CodeReview, InlineReviewComment, PostReviewAction, PrSummary, RemoteRepo, ReviewComment,
-    ReviewUser, ScmProvider, ScmRelease,
-};
+use crate::scm::CodeReview;
+use crate::scm::InlineReviewComment;
+use crate::scm::PostReviewAction;
+use crate::scm::PrSummary;
+use crate::scm::RemoteRepo;
+use crate::scm::ReviewComment;
+use crate::scm::ReviewUser;
+use crate::scm::ScmProvider;
+use crate::scm::ScmRelease;
+use crate::scm::BODY_LIMIT;
+use abnegate_http::HttpClient;
+use abnegate_http::ReqwestHttpClient;
 use async_trait::async_trait;
 use claudear_config::config::GitHubConfig;
-use claudear_core::error::{Error, Result};
+use claudear_core::error::Error;
+use claudear_core::error::Result;
 use claudear_core::secret::OptionalSecretExt;
 use serde::Deserialize;
 
@@ -16,9 +25,6 @@ pub use crate::scm::{
     RemoteRepo as OrgRepo, ReviewComment as PrReviewComment, ReviewEvent, ReviewUser as GitHubUser,
     ReviewWatcher,
 };
-
-// Backward-compatibility re-exports (types moved to http module)
-pub use claudear_core::http::{HttpClient, ReqwestHttpClient};
 
 /// GitHub API client for PR monitoring.
 pub struct GitHubClient<H: HttpClient = ReqwestHttpClient> {
@@ -82,7 +88,9 @@ impl GitHubClient<ReqwestHttpClient> {
     pub fn new(config: GitHubConfig) -> Self {
         Self {
             config,
-            http: ReqwestHttpClient::new(),
+            http: ReqwestHttpClient::new()
+                .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new()))
+                .with_body_limit(BODY_LIMIT),
             self_login: std::sync::OnceLock::new(),
         }
     }
@@ -917,7 +925,7 @@ impl<H: HttpClient> GitHubClient<H> {
             return Err(Error::Other(format!("GitHub API error: {}", response.body)));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Close an issue.
@@ -1165,9 +1173,13 @@ impl<H: HttpClient> ScmProvider for GitHubClient<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claudear_core::http::HttpResponse;
+    use crate::test_support::loopback_transport;
+    use crate::test_support::ok_response;
+    use crate::test_support::serve_once;
+    use abnegate_http::HttpResponse;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     /// Mock HTTP client for testing.
     #[expect(clippy::type_complexity)]
@@ -1187,13 +1199,7 @@ mod tests {
         /// Add a mock response for a URL.
         pub fn mock_response(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
             let mut responses = self.responses.lock().unwrap();
-            responses.insert(
-                url.into(),
-                HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            responses.insert(url.into(), HttpResponse::new(status, body));
         }
 
         /// Get recorded requests.
@@ -1204,29 +1210,25 @@ mod tests {
 
     #[async_trait]
     impl HttpClient for MockHttpClient {
-        async fn get(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
-            // Record the request
+        async fn get(
+            &self,
+            url: &str,
+            headers: Vec<(&str, String)>,
+        ) -> abnegate_http::Result<HttpResponse> {
             let owned_headers: Vec<(String, String)> = headers
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
+                .map(|(name, value)| (name.to_string(), value.clone()))
                 .collect();
             self.requests
                 .lock()
                 .unwrap()
                 .push((url.to_string(), owned_headers));
 
-            // Return mock response
             let responses = self.responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
@@ -1235,10 +1237,10 @@ mod tests {
             url: &str,
             headers: Vec<(&str, String)>,
             _body: &str,
-        ) -> Result<HttpResponse> {
+        ) -> abnegate_http::Result<HttpResponse> {
             let owned_headers: Vec<(String, String)> = headers
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
+                .map(|(name, value)| (name.to_string(), value.clone()))
                 .collect();
             self.requests
                 .lock()
@@ -1247,15 +1249,9 @@ mod tests {
 
             let responses = self.responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
@@ -1264,10 +1260,10 @@ mod tests {
             url: &str,
             headers: Vec<(&str, String)>,
             _body: &str,
-        ) -> Result<HttpResponse> {
+        ) -> abnegate_http::Result<HttpResponse> {
             let owned_headers: Vec<(String, String)> = headers
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
+                .map(|(name, value)| (name.to_string(), value.clone()))
                 .collect();
             self.requests
                 .lock()
@@ -1276,15 +1272,9 @@ mod tests {
 
             let responses = self.responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
@@ -1293,10 +1283,10 @@ mod tests {
             url: &str,
             headers: Vec<(&str, String)>,
             _body: &str,
-        ) -> Result<HttpResponse> {
+        ) -> abnegate_http::Result<HttpResponse> {
             let owned_headers: Vec<(String, String)> = headers
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
+                .map(|(name, value)| (name.to_string(), value.clone()))
                 .collect();
             self.requests
                 .lock()
@@ -1305,22 +1295,20 @@ mod tests {
 
             let responses = self.responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
-        async fn delete(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
+        async fn delete(
+            &self,
+            url: &str,
+            headers: Vec<(&str, String)>,
+        ) -> abnegate_http::Result<HttpResponse> {
             let owned_headers: Vec<(String, String)> = headers
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
+                .map(|(name, value)| (name.to_string(), value.clone()))
                 .collect();
             self.requests
                 .lock()
@@ -1329,78 +1317,48 @@ mod tests {
 
             let responses = self.responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
     }
 
     #[test]
     fn test_http_response_is_success() {
-        let response = HttpResponse {
-            status: 200,
-            body: "{}".to_string(),
-        };
+        let response = HttpResponse::new(200, "{}");
         assert!(response.is_success());
 
-        let response = HttpResponse {
-            status: 201,
-            body: "{}".to_string(),
-        };
+        let response = HttpResponse::new(201, "{}");
         assert!(response.is_success());
 
-        let response = HttpResponse {
-            status: 404,
-            body: "{}".to_string(),
-        };
+        let response = HttpResponse::new(404, "{}");
         assert!(!response.is_success());
 
-        let response = HttpResponse {
-            status: 500,
-            body: "{}".to_string(),
-        };
+        let response = HttpResponse::new(500, "{}");
         assert!(!response.is_success());
     }
 
     #[test]
     fn test_http_response_is_not_found() {
-        let response = HttpResponse {
-            status: 404,
-            body: "{}".to_string(),
-        };
+        let response = HttpResponse::new(404, "{}");
         assert!(response.is_not_found());
 
-        let response = HttpResponse {
-            status: 200,
-            body: "{}".to_string(),
-        };
+        let response = HttpResponse::new(200, "{}");
         assert!(!response.is_not_found());
     }
 
     #[test]
     fn test_http_response_json() {
-        let response = HttpResponse {
-            status: 200,
-            body: r#"{"name": "test"}"#.to_string(),
-        };
+        let response = HttpResponse::new(200, r#"{"name": "test"}"#);
         let parsed: serde_json::Value = response.json().unwrap();
         assert_eq!(parsed["name"], "test");
     }
 
     #[test]
     fn test_http_response_json_error() {
-        let response = HttpResponse {
-            status: 200,
-            body: "invalid json".to_string(),
-        };
-        let result: Result<serde_json::Value> = response.json();
+        let response = HttpResponse::new(200, "invalid json");
+        let result: Result<serde_json::Value> = response.json().map_err(Error::from);
         assert!(result.is_err());
     }
 
@@ -4064,7 +4022,68 @@ mod tests {
         }
     }
 
-    // --- merge_pr tests ---
+    #[test]
+    fn the_default_transport_reads_up_to_the_scm_limit() {
+        let client = GitHubClient::new(test_config());
+
+        let transport = format!("{:?}", client.http);
+
+        assert!(
+            transport.contains(&format!("body_limit: {BODY_LIMIT}")),
+            "{transport}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scm_limit_admits_a_diff_larger_than_the_crate_default() {
+        let size = ReqwestHttpClient::DEFAULT_BODY_LIMIT + 1;
+        let url = serve_once(ok_response(size, &vec![b'+'; size])).await;
+        let client = GitHubClient::with_http_client(test_config(), loopback_transport(BODY_LIMIT));
+
+        let response = client
+            .http
+            .get(&url, Vec::new())
+            .await
+            .expect("a diff under the SCM limit is read");
+
+        assert_eq!(response.body.len(), size);
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_short_is_a_transient_error_rather_than_an_empty_success() {
+        let url = serve_once(ok_response(100, b"short")).await;
+        let client = GitHubClient::with_http_client(test_config(), loopback_transport(BODY_LIMIT));
+
+        let error = client
+            .http
+            .get(&url, Vec::new())
+            .await
+            .expect_err("the body ended 95 bytes early");
+
+        let error = Error::from(error);
+
+        assert!(matches!(error, Error::Http(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn the_scm_limit_refuses_a_larger_body() {
+        let url = serve_once(ok_response(BODY_LIMIT + 1, b"")).await;
+        let client = GitHubClient::with_http_client(test_config(), loopback_transport(BODY_LIMIT));
+
+        let error = client
+            .http
+            .get(&url, Vec::new())
+            .await
+            .expect_err("a declared length over the SCM limit is refused");
+
+        assert!(
+            matches!(
+                error,
+                abnegate_http::Error::OversizedBody { limit, .. } if limit == BODY_LIMIT
+            ),
+            "{error}"
+        );
+    }
 
     #[tokio::test]
     async fn test_merge_pr_success() {
@@ -4126,8 +4145,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- close_pr tests ---
-
     #[tokio::test]
     async fn test_close_pr_success() {
         let mock = MockHttpClient::new();
@@ -4173,8 +4190,6 @@ mod tests {
             "error should mention token: {err_msg}"
         );
     }
-
-    // --- delete_branch tests ---
 
     #[tokio::test]
     async fn test_delete_branch_success() {
@@ -4239,8 +4254,6 @@ mod tests {
             "error should mention token: {err_msg}"
         );
     }
-
-    // --- post_review tests ---
 
     #[tokio::test]
     async fn test_post_review_comment_success() {
@@ -4330,8 +4343,6 @@ mod tests {
             "error should mention token: {err_msg}"
         );
     }
-
-    // --- post_review_with_comments tests ---
 
     #[tokio::test]
     async fn test_post_review_with_comments_success() {
@@ -4432,8 +4443,6 @@ mod tests {
         );
     }
 
-    // --- list_open_prs tests ---
-
     #[tokio::test]
     async fn test_list_open_prs_success() {
         let mock = MockHttpClient::new();
@@ -4501,8 +4510,6 @@ mod tests {
             "error should mention token: {err_msg}"
         );
     }
-
-    // --- get_latest_release tests ---
 
     #[tokio::test]
     async fn test_get_latest_release_success() {
@@ -4574,8 +4581,6 @@ mod tests {
         );
     }
 
-    // --- create_release tests ---
-
     #[tokio::test]
     async fn test_create_release_success() {
         let mock = MockHttpClient::new();
@@ -4639,8 +4644,6 @@ mod tests {
         );
     }
 
-    // --- parse_pr_number tests ---
-
     #[test]
     fn test_parse_pr_number_pull_url() {
         assert_eq!(
@@ -4685,8 +4688,6 @@ mod tests {
             None
         );
     }
-
-    // --- list_repo_issues tests ---
 
     #[tokio::test]
     async fn test_list_repo_issues_success() {
@@ -4798,8 +4799,6 @@ mod tests {
         );
     }
 
-    // --- get_issue tests ---
-
     #[tokio::test]
     async fn test_get_issue_success() {
         let mock = MockHttpClient::new();
@@ -4874,8 +4873,6 @@ mod tests {
         );
     }
 
-    // --- close_issue tests ---
-
     #[tokio::test]
     async fn test_close_issue_success() {
         let mock = MockHttpClient::new();
@@ -4921,8 +4918,6 @@ mod tests {
             "error should mention token: {err_msg}"
         );
     }
-
-    // --- add_issue_comment tests ---
 
     #[tokio::test]
     async fn test_add_issue_comment_success() {
@@ -5059,8 +5054,6 @@ mod tests {
             "error should mention token: {err_msg}"
         );
     }
-
-    // --- ScmProvider trait delegation tests ---
 
     #[tokio::test]
     async fn test_scm_provider_merge_pr() {

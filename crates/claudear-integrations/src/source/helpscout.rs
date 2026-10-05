@@ -4,22 +4,27 @@
 //! as an "inbox". Uses the Mailbox API v2 with OAuth2 client-credentials.
 
 use super::IssueSource;
+use abnegate_http::HttpClient;
+use abnegate_http::HttpResponse;
+use abnegate_http::ReqwestHttpClient;
 use async_trait::async_trait;
-use claudear_config::config::{HelpScoutConfig, ReplyAs};
-use claudear_core::error::{Error, Result};
-use claudear_core::http::{HttpClient, ReqwestHttpClient};
-use claudear_core::types::{Issue, MatchPriority, MatchResult};
+use claudear_config::config::HelpScoutConfig;
+use claudear_config::config::ReplyAs;
+use claudear_core::error::Error;
+use claudear_core::error::Result;
+use claudear_core::types::Issue;
+use claudear_core::types::MatchPriority;
+use claudear_core::types::MatchResult;
 use serde::Deserialize;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 /// Base URL for the HelpScout Mailbox API v2.
 const HELPSCOUT_API_BASE: &str = "https://api.helpscout.net";
 
 /// Refresh the access token this many seconds before it actually expires.
 const TOKEN_EXPIRY_BUFFER_SECS: u64 = 60;
-
-// ---- HelpScout API response shapes ----
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
@@ -113,7 +118,9 @@ pub struct HelpScoutSource<H: HttpClient = ReqwestHttpClient> {
 impl HelpScoutSource<ReqwestHttpClient> {
     /// Create a HelpScout source with the default HTTP client.
     pub fn new(config: HelpScoutConfig) -> Self {
-        Self::with_http_client(config, ReqwestHttpClient::new())
+        let http = ReqwestHttpClient::new()
+            .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new()));
+        Self::with_http_client(config, http)
     }
 }
 
@@ -129,22 +136,20 @@ impl<H: HttpClient> HelpScoutSource<H> {
 
     /// Return a valid bearer token, fetching a new one if needed.
     async fn access_token(&self) -> Result<String> {
-        // Fast path: a cached, non-expired token.
         if let Ok(guard) = self.token.lock() {
-            if let Some((tok, refresh_at)) = guard.as_ref() {
+            if let Some((cached, refresh_at)) = guard.as_ref() {
                 if Instant::now() < *refresh_at {
-                    return Ok(tok.clone());
+                    return Ok(cached.clone());
                 }
             }
         }
 
-        // Fetch a fresh token via client-credentials.
         let body = format!(
             "grant_type=client_credentials&client_id={}&client_secret={}",
             urlencoding(self.config.app_id.expose()),
             urlencoding(self.config.app_secret.expose()),
         );
-        let resp = self
+        let response = self
             .http
             .post(
                 &format!("{HELPSCOUT_API_BASE}/v2/oauth2/token"),
@@ -155,13 +160,16 @@ impl<H: HttpClient> HelpScoutSource<H> {
                 &body,
             )
             .await?;
-        if !resp.is_success() {
+        if !response.is_success() {
             return Err(Error::source(
                 "helpscout",
-                format!("token request failed ({}): {}", resp.status, resp.body),
+                format!(
+                    "token request failed ({}): {}",
+                    response.status, response.body
+                ),
             ));
         }
-        let token: TokenResponse = resp.json()?;
+        let token: TokenResponse = response.json()?;
         let ttl = token
             .expires_in
             .saturating_sub(TOKEN_EXPIRY_BUFFER_SECS)
@@ -176,14 +184,15 @@ impl<H: HttpClient> HelpScoutSource<H> {
     }
 
     /// Authorized GET returning the raw response.
-    async fn api_get(&self, path_and_query: &str) -> Result<claudear_core::http::HttpResponse> {
+    async fn api_get(&self, path_and_query: &str) -> Result<HttpResponse> {
         let token = self.access_token().await?;
-        self.http
+        Ok(self
+            .http
             .get(
                 &format!("{HELPSCOUT_API_BASE}{path_and_query}"),
                 vec![("Authorization", format!("Bearer {token}"))],
             )
-            .await
+            .await?)
     }
 
     /// The status used when none is requested: the configured trigger status,
@@ -206,14 +215,17 @@ impl<H: HttpClient> HelpScoutSource<H> {
                 urlencoding(mailbox),
                 urlencoding(status),
             );
-            let resp = self.api_get(&path).await?;
-            if !resp.is_success() {
+            let response = self.api_get(&path).await?;
+            if !response.is_success() {
                 return Err(Error::source(
                     "helpscout",
-                    format!("list conversations failed ({}): {}", resp.status, resp.body),
+                    format!(
+                        "list conversations failed ({}): {}",
+                        response.status, response.body
+                    ),
                 ));
             }
-            let list: ConversationsListResponse = resp.json()?;
+            let list: ConversationsListResponse = response.json()?;
             if let Some(embedded) = list.embedded {
                 for c in embedded.conversations {
                     issues.push(self.map_conversation(c));
@@ -229,11 +241,11 @@ impl<H: HttpClient> HelpScoutSource<H> {
             .api_get(&format!("/v2/conversations/{conversation_id}/threads"))
             .await
         {
-            Ok(resp) if resp.is_success() => resp
+            Ok(response) if response.is_success() => response
                 .json::<ThreadsListResponse>()
                 .ok()
-                .and_then(|r| r.embedded)
-                .map(|e| e.threads)
+                .and_then(|threads| threads.embedded)
+                .map(|embedded| embedded.threads)
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
@@ -394,19 +406,22 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
     }
 
     async fn get_issue(&self, issue_id: &str) -> Result<Issue> {
-        let resp = self
+        let response = self
             .api_get(&format!("/v2/conversations/{issue_id}"))
             .await?;
-        if resp.is_not_found() {
+        if response.is_not_found() {
             return Err(Error::issue_not_found("helpscout", issue_id));
         }
-        if !resp.is_success() {
+        if !response.is_success() {
             return Err(Error::source(
                 "helpscout",
-                format!("get conversation failed ({}): {}", resp.status, resp.body),
+                format!(
+                    "get conversation failed ({}): {}",
+                    response.status, response.body
+                ),
             ));
         }
-        let mut conversation: HsConversation = resp.json()?;
+        let mut conversation: HsConversation = response.json()?;
         // Ensure we have the full thread history for context.
         if conversation
             .embedded
@@ -424,7 +439,7 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
         // HelpScout uses JSON-PATCH to update conversation status.
         let token = self.access_token().await?;
         let body = r#"[{"op":"replace","path":"/status","value":"closed"}]"#;
-        let resp = self
+        let response = self
             .http
             .patch(
                 &format!("{HELPSCOUT_API_BASE}/v2/conversations/{issue_id}"),
@@ -435,12 +450,15 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
                 body,
             )
             .await?;
-        if resp.is_success() {
+        if response.is_success() {
             Ok(())
         } else {
             Err(Error::source(
                 "helpscout",
-                format!("close conversation failed ({}): {}", resp.status, resp.body),
+                format!(
+                    "close conversation failed ({}): {}",
+                    response.status, response.body
+                ),
             ))
         }
     }
@@ -469,7 +487,7 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
             }
         };
 
-        let resp = self
+        let response = self
             .http
             .post(
                 &format!("{HELPSCOUT_API_BASE}{endpoint}"),
@@ -480,12 +498,12 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
                 &body,
             )
             .await?;
-        if resp.is_success() {
+        if response.is_success() {
             Ok(())
         } else {
             Err(Error::source(
                 "helpscout",
-                format!("post reply failed ({}): {}", resp.status, resp.body),
+                format!("post reply failed ({}): {}", response.status, response.body),
             ))
         }
     }
@@ -494,7 +512,7 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claudear_core::http::HttpResponse;
+    use abnegate_http::HttpResponse;
     use std::collections::HashMap;
 
     /// Mock HTTP client: returns canned responses keyed by a substring of the URL.
@@ -520,22 +538,20 @@ mod tests {
             let responses = self.responses.lock().unwrap();
             for (key, status, body) in responses.iter() {
                 if url.contains(key.as_str()) {
-                    return HttpResponse {
-                        status: *status,
-                        body: body.clone(),
-                    };
+                    return HttpResponse::new(*status, body.clone());
                 }
             }
-            HttpResponse {
-                status: 404,
-                body: "{}".to_string(),
-            }
+            HttpResponse::new(404, "{}")
         }
     }
 
     #[async_trait]
     impl HttpClient for MockHttpClient {
-        async fn get(&self, url: &str, _headers: Vec<(&str, String)>) -> Result<HttpResponse> {
+        async fn get(
+            &self,
+            url: &str,
+            _headers: Vec<(&str, String)>,
+        ) -> abnegate_http::Result<HttpResponse> {
             self.requests
                 .lock()
                 .unwrap()
@@ -548,7 +564,7 @@ mod tests {
             url: &str,
             _headers: Vec<(&str, String)>,
             body: &str,
-        ) -> Result<HttpResponse> {
+        ) -> abnegate_http::Result<HttpResponse> {
             self.requests
                 .lock()
                 .unwrap()
@@ -561,7 +577,7 @@ mod tests {
             url: &str,
             _headers: Vec<(&str, String)>,
             body: &str,
-        ) -> Result<HttpResponse> {
+        ) -> abnegate_http::Result<HttpResponse> {
             self.requests
                 .lock()
                 .unwrap()

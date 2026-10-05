@@ -1,12 +1,15 @@
 //! SMS notifier via Twilio.
 
 use super::Notifier;
+use abnegate_http::HttpResponse;
 use async_trait::async_trait;
 use claudear_config::config::SmsConfig;
 use claudear_config::users::UserRegistry;
-use claudear_core::error::{Error, Result};
-use claudear_core::http::HttpResponse;
-use claudear_core::types::{AskDelivery, AskRequest, Issue};
+use claudear_core::error::Error;
+use claudear_core::error::Result;
+use claudear_core::types::AskDelivery;
+use claudear_core::types::AskRequest;
+use claudear_core::types::Issue;
 
 /// Trait for HTTP client used by SMS notifier.
 #[async_trait]
@@ -63,7 +66,7 @@ impl SmsHttpClient for ReqwestSmsClient {
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
 
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 }
 
@@ -400,10 +403,10 @@ mod tests {
                 params_owned,
             ));
 
-            Ok(HttpResponse {
-                status: self.response_status,
-                body: self.response_body.clone(),
-            })
+            Ok(HttpResponse::new(
+                self.response_status,
+                self.response_body.clone(),
+            ))
         }
     }
 
@@ -963,10 +966,7 @@ mod tests {
 
     #[test]
     fn test_http_response_fields() {
-        let response = HttpResponse {
-            status: 201,
-            body: "Created".to_string(),
-        };
+        let response = HttpResponse::new(201, "Created");
         assert_eq!(response.status, 201);
         assert_eq!(response.body, "Created");
     }
@@ -1185,8 +1185,6 @@ mod tests {
         assert_eq!(to_param.1, "+15550009999");
     }
 
-    // --- Tests for cascade success message ---
-
     #[tokio::test]
     async fn test_notify_success_cascade_message_format() {
         let mock = MockSmsClient::success();
@@ -1207,8 +1205,6 @@ mod tests {
         assert!(body.contains("https://github.com/downstream/repo/pull/5"));
     }
 
-    // --- Tests for PR update success message ---
-
     #[tokio::test]
     async fn test_notify_success_pr_update_message_format() {
         let mock = MockSmsClient::success();
@@ -1228,8 +1224,6 @@ mod tests {
         assert!(body.contains("https://github.com/org/repo/pull/77"));
     }
 
-    // --- Tests for regression resolved completed message ---
-
     #[tokio::test]
     async fn test_notify_completed_regression_resolved_message_format() {
         let mock = MockSmsClient::success();
@@ -1245,8 +1239,6 @@ mod tests {
         assert!(body.contains("SEN-1"));
         assert!(body.contains("no regression"));
     }
-
-    // --- Tests for regression detected failed message ---
 
     #[tokio::test]
     async fn test_notify_failed_regression_detected_message_format() {
@@ -1267,8 +1259,6 @@ mod tests {
         assert!(body.contains("Tests failing again"));
     }
 
-    // --- Tests for cascade failed message ---
-
     #[tokio::test]
     async fn test_notify_failed_cascade_message_format() {
         let mock = MockSmsClient::success();
@@ -1285,8 +1275,6 @@ mod tests {
         assert!(body.contains("downstream/repo"));
         assert!(body.contains("Build error"));
     }
-
-    // --- Tests for notify_merged and notify_closed ---
 
     #[tokio::test]
     async fn test_notify_merged_message_format() {
@@ -1324,8 +1312,6 @@ mod tests {
         assert!(body.contains("https://github.com/org/repo/pull/43"));
     }
 
-    // --- Test failed cascade with long error truncation ---
-
     #[tokio::test]
     async fn test_notify_failed_cascade_truncates_long_error() {
         let mock = MockSmsClient::success();
@@ -1341,8 +1327,6 @@ mod tests {
         assert!(body.contains("CASCADE FAILED"));
         assert!(body.contains("..."));
     }
-
-    // --- Test regression with long error truncation ---
 
     #[tokio::test]
     async fn test_notify_failed_regression_truncates_long_error() {

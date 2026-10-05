@@ -1,17 +1,25 @@
 //! GitLab API client for MR monitoring and issue management.
 
-use crate::scm::{
-    CodeReview, PostReviewAction, PrInfo, PrStatus, PrSummary, RemoteRepo, ReviewComment,
-    ReviewUser, ScmProvider,
-};
+use crate::scm::CodeReview;
+use crate::scm::PostReviewAction;
+use crate::scm::PrInfo;
+use crate::scm::PrStatus;
+use crate::scm::PrSummary;
+use crate::scm::RemoteRepo;
+use crate::scm::ReviewComment;
+use crate::scm::ReviewUser;
+use crate::scm::ScmProvider;
+use crate::scm::BODY_LIMIT;
+use abnegate_http::HttpClient;
+use abnegate_http::ReqwestHttpClient;
 use async_trait::async_trait;
 use claudear_config::config::GitLabConfig;
-use claudear_core::error::{Error, Result};
-use claudear_core::http::HttpClient;
+use claudear_core::error::Error;
+use claudear_core::error::Result;
 use serde::Deserialize;
 
 /// GitLab API client for MR monitoring.
-pub struct GitLabClient<H: HttpClient = claudear_core::http::ReqwestHttpClient> {
+pub struct GitLabClient<H: HttpClient = ReqwestHttpClient> {
     config: GitLabConfig,
     http: H,
 }
@@ -105,12 +113,14 @@ pub struct GitLabIssue {
     pub assignees: Vec<GitLabUser>,
 }
 
-impl GitLabClient<claudear_core::http::ReqwestHttpClient> {
+impl GitLabClient<ReqwestHttpClient> {
     /// Create a new GitLab client with the default HTTP client.
     pub fn new(config: GitLabConfig) -> Self {
         Self {
             config,
-            http: claudear_core::http::ReqwestHttpClient::new(),
+            http: ReqwestHttpClient::new()
+                .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new()))
+                .with_body_limit(BODY_LIMIT),
         }
     }
 }
@@ -208,7 +218,7 @@ impl<H: HttpClient> GitLabClient<H> {
             )));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Fetch group issues.
@@ -252,7 +262,7 @@ impl<H: HttpClient> GitLabClient<H> {
             )));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Get a single issue.
@@ -281,7 +291,7 @@ impl<H: HttpClient> GitLabClient<H> {
             )));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Get MR notes (comments) for mapping to reviews.
@@ -365,7 +375,7 @@ impl<H: HttpClient> GitLabClient<H> {
             )));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Map a GitLab note to a CodeReview (for general notes).
@@ -1023,8 +1033,11 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::loopback_transport;
+    use crate::test_support::ok_response;
+    use crate::test_support::serve_once;
+    use abnegate_http::HttpResponse;
     use claudear_config::config::GitLabConfig;
-    use claudear_core::http::HttpResponse;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1045,13 +1058,10 @@ mod tests {
 
         /// Add a mock response for a URL.
         fn mock_response(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
-            self.responses.lock().unwrap().insert(
-                url.into(),
-                HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            self.responses
+                .lock()
+                .unwrap()
+                .insert(url.into(), HttpResponse::new(status, body));
         }
 
         /// Get captured headers for a given URL.
@@ -1062,12 +1072,16 @@ mod tests {
 
     #[async_trait]
     impl HttpClient for MockHttpClient {
-        async fn get(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
+        async fn get(
+            &self,
+            url: &str,
+            headers: Vec<(&str, String)>,
+        ) -> abnegate_http::Result<HttpResponse> {
             // Capture headers for inspection
             {
                 let owned: Vec<(String, String)> = headers
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .map(|(name, value)| (name.to_string(), value.clone()))
                     .collect();
                 self.captured_headers
                     .lock()
@@ -1077,15 +1091,9 @@ mod tests {
 
             let responses = self.responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
@@ -1094,11 +1102,11 @@ mod tests {
             url: &str,
             headers: Vec<(&str, String)>,
             _body: &str,
-        ) -> Result<HttpResponse> {
+        ) -> abnegate_http::Result<HttpResponse> {
             {
                 let owned: Vec<(String, String)> = headers
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .map(|(name, value)| (name.to_string(), value.clone()))
                     .collect();
                 self.captured_headers
                     .lock()
@@ -1107,15 +1115,9 @@ mod tests {
             }
             let responses = self.responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
@@ -1124,11 +1126,11 @@ mod tests {
             url: &str,
             headers: Vec<(&str, String)>,
             _body: &str,
-        ) -> Result<HttpResponse> {
+        ) -> abnegate_http::Result<HttpResponse> {
             {
                 let owned: Vec<(String, String)> = headers
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .map(|(name, value)| (name.to_string(), value.clone()))
                     .collect();
                 self.captured_headers
                     .lock()
@@ -1137,23 +1139,21 @@ mod tests {
             }
             let responses = self.responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
-        async fn delete(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
+        async fn delete(
+            &self,
+            url: &str,
+            headers: Vec<(&str, String)>,
+        ) -> abnegate_http::Result<HttpResponse> {
             {
                 let owned: Vec<(String, String)> = headers
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .map(|(name, value)| (name.to_string(), value.clone()))
                     .collect();
                 self.captured_headers
                     .lock()
@@ -1162,15 +1162,9 @@ mod tests {
             }
             let responses = self.responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
     }
@@ -1181,6 +1175,53 @@ mod tests {
         config.trigger_labels = vec![];
         config.trigger_states = vec![];
         config
+    }
+
+    #[test]
+    fn the_default_transport_reads_up_to_the_scm_limit() {
+        let client = GitLabClient::new(test_config());
+
+        let transport = format!("{:?}", client.http);
+
+        assert!(
+            transport.contains(&format!("body_limit: {BODY_LIMIT}")),
+            "{transport}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scm_limit_admits_a_diff_larger_than_the_crate_default() {
+        let size = ReqwestHttpClient::DEFAULT_BODY_LIMIT + 1;
+        let url = serve_once(ok_response(size, &vec![b'+'; size])).await;
+        let client = GitLabClient::with_http_client(test_config(), loopback_transport(BODY_LIMIT));
+
+        let response = client
+            .http
+            .get(&url, Vec::new())
+            .await
+            .expect("a diff under the SCM limit is read");
+
+        assert_eq!(response.body.len(), size);
+    }
+
+    #[tokio::test]
+    async fn the_scm_limit_refuses_a_larger_body() {
+        let url = serve_once(ok_response(BODY_LIMIT + 1, b"")).await;
+        let client = GitLabClient::with_http_client(test_config(), loopback_transport(BODY_LIMIT));
+
+        let error = client
+            .http
+            .get(&url, Vec::new())
+            .await
+            .expect_err("a declared length over the SCM limit is refused");
+
+        assert!(
+            matches!(
+                error,
+                abnegate_http::Error::OversizedBody { limit, .. } if limit == BODY_LIMIT
+            ),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1245,15 +1286,11 @@ mod tests {
     #[test]
     fn test_encode_project_path() {
         assert_eq!(
-            GitLabClient::<claudear_core::http::ReqwestHttpClient>::encode_project_path(
-                "group/repo"
-            ),
+            GitLabClient::<ReqwestHttpClient>::encode_project_path("group/repo"),
             "group%2Frepo"
         );
         assert_eq!(
-            GitLabClient::<claudear_core::http::ReqwestHttpClient>::encode_project_path(
-                "group/subgroup/repo"
-            ),
+            GitLabClient::<ReqwestHttpClient>::encode_project_path("group/subgroup/repo"),
             "group%2Fsubgroup%2Frepo"
         );
     }
@@ -5481,8 +5518,6 @@ mod tests {
         );
     }
 
-    // --- merge_pr tests ---
-
     #[tokio::test]
     async fn test_merge_pr_success() {
         let mock = MockHttpClient::new();
@@ -5547,8 +5582,6 @@ mod tests {
         );
     }
 
-    // --- close_pr tests ---
-
     #[tokio::test]
     async fn test_close_pr_success() {
         let mock = MockHttpClient::new();
@@ -5593,8 +5626,6 @@ mod tests {
             "error should mention token: {err_msg}"
         );
     }
-
-    // --- delete_branch tests ---
 
     #[tokio::test]
     async fn test_delete_branch_success() {
@@ -5660,8 +5691,6 @@ mod tests {
             "error should mention token: {err_msg}"
         );
     }
-
-    // --- post_review tests ---
 
     #[tokio::test]
     async fn test_post_review_comment_success() {
@@ -5841,8 +5870,6 @@ mod tests {
         );
     }
 
-    // --- list_open_prs tests ---
-
     #[tokio::test]
     async fn test_list_open_prs_success() {
         let mock = MockHttpClient::new();
@@ -5911,8 +5938,6 @@ mod tests {
         );
     }
 
-    // --- get_pr_branch tests ---
-
     #[tokio::test]
     async fn test_get_pr_branch_success() {
         let mock = MockHttpClient::new();
@@ -5946,15 +5971,11 @@ mod tests {
         );
     }
 
-    // --- pr_url_pattern tests ---
-
     #[test]
     fn test_pr_url_pattern() {
         let client = GitLabClient::new(test_config());
         assert_eq!(ScmProvider::pr_url_pattern(&client), "%-/merge_requests/%");
     }
-
-    // --- parse_pr_number tests ---
 
     #[test]
     fn test_parse_pr_number_valid() {
@@ -6000,8 +6021,6 @@ mod tests {
             None
         );
     }
-
-    // --- get_latest_release tests ---
 
     #[tokio::test]
     async fn test_get_latest_release_success() {
@@ -6086,8 +6105,6 @@ mod tests {
         );
     }
 
-    // --- create_release tests ---
-
     #[tokio::test]
     async fn test_create_release_success() {
         let mock = MockHttpClient::new();
@@ -6154,8 +6171,6 @@ mod tests {
         );
     }
 
-    // --- ScmProvider name test ---
-
     #[test]
     fn test_scm_provider_name_is_gitlab() {
         let config = test_config();
@@ -6163,8 +6178,6 @@ mod tests {
         let provider: &dyn ScmProvider = &client;
         assert_eq!(provider.name(), "gitlab");
     }
-
-    // --- get_mr_approvals no-token test ---
 
     #[tokio::test]
     async fn test_get_mr_approvals_no_token_direct() {
@@ -6178,8 +6191,6 @@ mod tests {
         );
     }
 
-    // --- get_mr_notes no-token test ---
-
     #[tokio::test]
     async fn test_get_mr_notes_no_token() {
         let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
@@ -6191,8 +6202,6 @@ mod tests {
             "error should mention token: {err_msg}"
         );
     }
-
-    // --- merge_pr via ScmProvider trait ---
 
     #[tokio::test]
     async fn test_scm_provider_merge_pr() {
@@ -6209,8 +6218,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- close_pr via ScmProvider trait ---
-
     #[tokio::test]
     async fn test_scm_provider_close_pr() {
         let mock = MockHttpClient::new();
@@ -6226,8 +6233,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- delete_branch via ScmProvider trait ---
-
     #[tokio::test]
     async fn test_scm_provider_delete_branch() {
         let mock = MockHttpClient::new();
@@ -6242,8 +6247,6 @@ mod tests {
         let result = provider.delete_branch("group/repo", "my-branch").await;
         assert!(result.is_ok());
     }
-
-    // --- nested project path in write ops ---
 
     #[tokio::test]
     async fn test_merge_pr_nested_project_path() {

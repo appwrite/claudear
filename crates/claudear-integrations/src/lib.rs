@@ -17,5 +17,7 @@ pub mod runner;
 pub mod scm;
 pub mod source;
 pub mod telemetry;
+#[cfg(test)]
+mod test_support;
 pub mod tls;
 pub mod webhook;
