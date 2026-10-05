@@ -2344,7 +2344,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     // Handle Repos commands early (don't need sources or repository validation)
     if let Commands::Repos(ref repos_cmd) = cli.command {
-        let db_tracker = SqliteTracker::new(&config.db_path)?;
+        let tracker = SqliteTracker::new(&config.db_path)?;
 
         /// Guard that calls `finish_indexing_progress` on drop so error paths
         /// (via `?`) never leave the DB stuck in "running" status.
@@ -2360,7 +2360,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         match repos_cmd {
             ReposCommands::List => {
                 // First show indexed repos from the database
-                let indexed_repos = db_tracker.list_indexed_repos()?;
+                let indexed_repos = tracker.list_indexed_repos()?;
 
                 if indexed_repos.is_empty() {
                     println!("\nNo indexed repositories.");
@@ -2387,8 +2387,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
 
             ReposCommands::Index { force } => {
-                use claudear::DependencyDiscovery;
-                use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+                use claudear::repo::discover_configured;
+                use claudear::repo::save_discovered;
+                use indicatif::MultiProgress;
+                use indicatif::ProgressBar;
+                use indicatif::ProgressStyle;
 
                 println!("\nBuilding repository index...");
                 println!("  Known orgs: {:?}", config.known_orgs);
@@ -2411,10 +2414,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 let total_repos = repos.len();
 
                 // Track progress in DB for dashboard
-                let _ = db_tracker.start_indexing_progress(total_repos);
-                let _indexing_guard = IndexingGuard {
-                    tracker: &db_tracker,
-                };
+                let _ = tracker.start_indexing_progress(total_repos);
+                let _indexing_guard = IndexingGuard { tracker: &tracker };
 
                 let multi = MultiProgress::new();
 
@@ -2444,7 +2445,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 for repo in &repos {
                     // Check if already indexed (skip unless force)
                     if !force {
-                        if let Ok(Some(_)) = db_tracker.get_indexed_repo(&repo.name) {
+                        if let Ok(Some(_)) = tracker.get_indexed_repo(&repo.name) {
                             skipped_count += 1;
                             overall_pb.inc(1);
                             overall_pb.set_message(format!(
@@ -2452,7 +2453,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 saved_count, skipped_count
                             ));
                             // Notify dashboard so progress bar doesn't jump
-                            let _ = db_tracker.update_indexing_progress(
+                            let _ = tracker.update_indexing_progress(
                                 saved_count + skipped_count,
                                 &repo.name,
                                 0,
@@ -2468,7 +2469,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     repo_pb.set_prefix(repo.name.clone());
 
                     // Update dashboard progress
-                    let _ = db_tracker.update_indexing_progress(
+                    let _ = tracker.update_indexing_progress(
                         saved_count + skipped_count,
                         &repo.name,
                         repo.files.len(),
@@ -2476,7 +2477,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     );
 
                     // Save repo metadata
-                    let repo_id = db_tracker.save_indexed_repo(
+                    let repo_id = tracker.save_indexed_repo(
                         &repo.name,
                         &repo.path.to_string_lossy(),
                         Some(repo.scm_url.as_str()),
@@ -2497,7 +2498,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         .collect();
 
                     // Save file index
-                    db_tracker.save_repo_files(repo_id, &files_with_types)?;
+                    tracker.save_repo_files(repo_id, &files_with_types)?;
 
                     total_files_saved += repo.files.len();
                     repo_pb.set_position(repo.files.len() as u64);
@@ -2520,45 +2521,26 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 );
 
                 // Auto-discover dependencies between indexed repos
-                let dep_pb = multi.add(ProgressBar::new_spinner());
-                dep_pb.set_style(
+                let dependency_progress = multi.add(ProgressBar::new_spinner());
+                dependency_progress.set_style(
                     ProgressStyle::with_template("{spinner:.blue} {msg}")
                         .unwrap()
                         .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
                 );
-                dep_pb.set_message("Discovering dependencies...");
-                dep_pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                dependency_progress.set_message("Discovering dependencies...");
+                dependency_progress.enable_steady_tick(std::time::Duration::from_millis(80));
 
-                let discovery = DependencyDiscovery::new(config.known_orgs.clone());
-                match discovery.scan_directories(&config.auto_discover_paths) {
-                    Ok(discovered) if !discovered.is_empty() => {
-                        let mut dep_count = 0;
-                        for dep in &discovered {
-                            if let Err(e) =
-                                db_tracker.add_dependency(&dep.depends_on, &dep.repo, &dep.dep_type)
-                            {
-                                tracing::warn!(
-                                    error = %e,
-                                    upstream = %dep.depends_on,
-                                    downstream = %dep.repo,
-                                    "Failed to save dependency"
-                                );
-                            } else {
-                                dep_count += 1;
-                            }
-                        }
-                        dep_pb.finish_with_message(format!(
-                            "Discovered and saved {} dependencies",
-                            dep_count
-                        ));
-                    }
-                    Ok(_) => {
-                        dep_pb.finish_with_message("No dependencies found between indexed repos.")
-                    }
-                    Err(e) => dep_pb.finish_with_message(format!(
-                        "Warning: dependency discovery failed: {}",
-                        e
-                    )),
+                let discovered =
+                    discover_configured(&config.known_orgs, &config.auto_discover_paths);
+                if discovered.is_empty() {
+                    dependency_progress
+                        .finish_with_message("No dependencies found under auto_discover_paths.");
+                } else {
+                    let saved = save_discovered(&tracker, &discovered);
+                    dependency_progress.finish_with_message(format!(
+                        "Discovered and saved {} dependencies",
+                        saved
+                    ));
                 }
 
                 // Guard will call finish_indexing_progress() on drop
@@ -2589,7 +2571,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
 
             ReposCommands::Stats => {
-                let stats = db_tracker.get_index_stats()?;
+                let stats = tracker.get_index_stats()?;
 
                 println!("\nRepository Index Statistics:");
                 println!("  Total repositories: {}", stats.repo_count);
@@ -2607,7 +2589,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 }
 
                 // Also show inference stats if available
-                if let Ok(inference_stats) = db_tracker.get_inference_stats() {
+                if let Ok(inference_stats) = tracker.get_inference_stats() {
                     println!("\n  Inference Statistics:");
                     println!("    Total attempts: {}", inference_stats.total_attempts);
                     if inference_stats.total_attempts > 0 {
@@ -2640,7 +2622,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 downstream,
                 dep_type,
             } => {
-                db_tracker.add_dependency(upstream, downstream, dep_type)?;
+                tracker.add_dependency(upstream, downstream, dep_type)?;
                 println!(
                     "Linked: {} depends on {} ({})",
                     downstream, upstream, dep_type
@@ -2653,7 +2635,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 let mut manager = RepoRelationships::with_defaults();
 
                 // Add DB dependencies to the manager
-                let db_deps = db_tracker.list_all_dependencies()?;
+                let db_deps = tracker.list_all_dependencies()?;
                 for dep in db_deps {
                     let dtype =
                         DependencyType::parse(&dep.dep_type).unwrap_or(DependencyType::Manual);
@@ -2673,8 +2655,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             ReposCommands::Cascade { repo } => {
                 // Query DB directly for dependants
-                let direct = db_tracker.get_direct_dependants(repo)?;
-                let all = db_tracker.get_all_dependants(repo)?;
+                let direct = tracker.get_direct_dependants(repo)?;
+                let all = tracker.get_all_dependants(repo)?;
 
                 println!("\n=== Cascading Changes from {} ===\n", repo);
 
@@ -2698,13 +2680,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
 
             ReposCommands::Discover { paths, save, clear } => {
-                use claudear::DependencyDiscovery;
+                use claudear::repo::dependency_type;
+                use claudear::repo::discover_configured;
 
-                // Use provided paths or fall back to config
                 let scan_paths = if paths.is_empty() {
-                    config.auto_discover_paths.clone()
+                    &config.auto_discover_paths
                 } else {
-                    paths.clone()
+                    paths
                 };
 
                 if scan_paths.is_empty() {
@@ -2718,51 +2700,65 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 println!("Known orgs: {:?}", config.known_orgs);
                 println!("Scanning: {:?}\n", scan_paths);
 
-                let discovery = DependencyDiscovery::new(config.known_orgs.clone());
-                let discovered = discovery.scan_directories(&scan_paths)?;
+                let discovered = discover_configured(&config.known_orgs, scan_paths);
 
                 if discovered.is_empty() {
                     println!("No dependencies found from known organizations.");
                     return Ok(());
                 }
 
-                // Group by repo for display
-                let mut by_repo: std::collections::HashMap<String, Vec<_>> =
+                let mut by_repository: std::collections::HashMap<&str, Vec<_>> =
                     std::collections::HashMap::new();
-                for dep in &discovered {
-                    by_repo.entry(dep.repo.clone()).or_default().push(dep);
+                for dependency in &discovered {
+                    by_repository
+                        .entry(dependency.repository.as_str())
+                        .or_default()
+                        .push(dependency);
                 }
 
                 println!(
                     "Discovered {} dependencies across {} repositories:\n",
                     discovered.len(),
-                    by_repo.len()
+                    by_repository.len()
                 );
-                for (repo, deps) in &by_repo {
-                    println!("  {}", repo);
-                    for dep in deps {
-                        println!("    -> {} ({})", dep.depends_on, dep.dep_type);
+                for (repository, dependencies) in &by_repository {
+                    println!("  {}", repository);
+                    for dependency in dependencies {
+                        println!("    -> {} ({})", dependency.depends_on, dependency.manifest);
                     }
                 }
 
                 if *save {
                     if *clear {
                         println!("\nClearing existing dependencies...");
-                        db_tracker.clear_repositories()?;
+                        tracker.clear_repositories()?;
                     }
 
                     println!("\nSaving to database...");
-                    for dep in &discovered {
-                        // Add repo with its path
-                        db_tracker.upsert_repository(&dep.repo, Some(&dep.repo_path), None)?;
-                        // Add dependency
-                        db_tracker.add_dependency(&dep.depends_on, &dep.repo, &dep.dep_type)?;
+                    let mut saved = 0;
+                    for dependency in &discovered {
+                        let Some(kind) = dependency_type(dependency.manifest) else {
+                            tracing::warn!(
+                                manifest = %dependency.manifest,
+                                upstream = %dependency.depends_on,
+                                downstream = %dependency.repository,
+                                "Skipped a dependency from a manifest cascades do not follow"
+                            );
+                            continue;
+                        };
+                        tracker.upsert_repository(
+                            &dependency.repository,
+                            Some(&dependency.repository_path.to_string_lossy()),
+                            None,
+                        )?;
+                        tracker.add_dependency(
+                            &dependency.depends_on,
+                            &dependency.repository,
+                            kind.as_str(),
+                        )?;
+                        saved += 1;
                     }
-                    println!(
-                        "Saved {} dependencies to {:?}",
-                        discovered.len(),
-                        config.db_path
-                    );
+                    println!("Saved {} dependencies to {:?}", saved, config.db_path);
                 } else {
                     println!("\nRun with --save to persist to database.");
                 }
@@ -2895,45 +2891,26 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                 // Sync to database (includes files by default)
                 let sync_files = !*skip_files;
-                let synced = db_tracker.sync_from_index(&index, sync_files)?;
+                let synced = tracker.sync_from_index(&index, sync_files)?;
 
                 println!("\nSynced {} repository paths to database", synced);
                 if sync_files {
                     // Show stats after file sync
-                    let stats = db_tracker.get_index_stats()?;
+                    let stats = tracker.get_index_stats()?;
                     println!("  Including {} files in database", stats.file_count);
                 } else {
                     println!("  Skipped file lists (use without --skip-files for full indexing)");
                 }
 
-                // Auto-discover dependencies
-                use claudear::DependencyDiscovery;
-                let discovery = DependencyDiscovery::new(config.known_orgs.clone());
-                match discovery.scan_directories(&config.auto_discover_paths) {
-                    Ok(discovered) if !discovered.is_empty() => {
-                        let mut dep_count = 0;
-                        for dep in &discovered {
-                            if let Err(e) =
-                                db_tracker.add_dependency(&dep.depends_on, &dep.repo, &dep.dep_type)
-                            {
-                                tracing::warn!(
-                                    error = %e,
-                                    upstream = %dep.depends_on,
-                                    downstream = %dep.repo,
-                                    "Failed to save dependency"
-                                );
-                            } else {
-                                dep_count += 1;
-                            }
-                        }
-                        println!("  Discovered and saved {} dependencies", dep_count);
-                    }
-                    Ok(_) => {
-                        println!("  No dependencies found between indexed repos.");
-                    }
-                    Err(e) => {
-                        println!("  Warning: dependency discovery failed: {}", e);
-                    }
+                use claudear::repo::discover_configured;
+                use claudear::repo::save_discovered;
+                let discovered =
+                    discover_configured(&config.known_orgs, &config.auto_discover_paths);
+                if discovered.is_empty() {
+                    println!("  No dependencies found under auto_discover_paths.");
+                } else {
+                    let saved = save_discovered(&tracker, &discovered);
+                    println!("  Discovered and saved {} dependencies", saved);
                 }
             }
         }

@@ -6,12 +6,14 @@
 //! Note: GitHub/GitLab-specific index building functions live in the root crate's
 //! `repo::index` module since they depend on SCM provider types.
 
-pub use claudear_core::types::{IndexedRepo, RepoIndex};
+pub use claudear_core::types::IndexedRepo;
+pub use claudear_core::types::RepoIndex;
 
 use super::GitOps;
 use claudear_core::error::Result;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use walkdir::WalkDir;
 
 /// Build a repo index by scanning filesystem paths for repos from known orgs.
@@ -78,16 +80,30 @@ pub fn index_repo_files(index: &mut RepoIndex, repo_name: &str) -> Option<usize>
     Some(file_count)
 }
 
-/// Expand ~ to home directory.
+/// How a configured path names the current user's home directory.
+const HOME: &str = "~";
+
+/// `path` with a leading `~` or `~/` resolved against the current user's home.
 fn expand_path(path: &str) -> PathBuf {
-    if let Some(stripped) = path.strip_prefix('~') {
-        if let Some(home) = dirs::home_dir() {
-            // Strip the leading / if present (e.g., ~/foo -> foo, ~ -> empty)
-            let suffix = stripped.strip_prefix('/').unwrap_or(stripped);
-            return home.join(suffix);
-        }
+    expand_path_in(path, dirs::home_dir().as_deref())
+}
+
+/// `path` with a leading `~` or `~/` resolved against `home`. Another user's
+/// home (`~user/...`) cannot be resolved this way and is left as written.
+pub(crate) fn expand_path_in(path: &str, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return PathBuf::from(path);
+    };
+    if path == HOME {
+        return home.to_path_buf();
     }
-    PathBuf::from(path)
+    match path
+        .strip_prefix(HOME)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        Some(relative) => home.join(relative.trim_start_matches('/')),
+        None => PathBuf::from(path),
+    }
 }
 
 /// Check if a directory entry is hidden.
@@ -208,10 +224,24 @@ mod tests {
 
     #[test]
     fn test_expand_path_home() {
-        let expanded = expand_path("~/test");
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(expanded, home.join("test"));
-        }
+        let home = Path::new("/home/someone");
+        assert_eq!(expand_path_in("~", Some(home)), home);
+        assert_eq!(expand_path_in("~/test", Some(home)), home.join("test"));
+        assert_eq!(expand_path_in("~//test", Some(home)), home.join("test"));
+    }
+
+    #[test]
+    fn test_expand_path_leaves_another_users_home_as_written() {
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            expand_path_in("~other/projects", Some(home)),
+            PathBuf::from("~other/projects")
+        );
+    }
+
+    #[test]
+    fn test_expand_path_without_a_home_leaves_the_path_as_written() {
+        assert_eq!(expand_path_in("~/test", None), PathBuf::from("~/test"));
     }
 
     #[test]

@@ -152,6 +152,7 @@ http-body-util = "0.1"
 
 # Shared infrastructure
 abnegate-index = "0.1.0"
+abnegate-vcs = "0.1.3"
 
 # Internal crates
 claudear-core = { path = "crates/claudear-core" }
