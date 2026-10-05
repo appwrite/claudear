@@ -3,20 +3,22 @@
 //! Defines a common trait and shared types used by both GitHub and GitLab
 //! backends for PR monitoring and review watching.
 
-use abnegate_http::ReqwestHttpClient;
 use async_trait::async_trait;
 use claudear_core::error::Result;
-use claudear_core::types::{
-    ActivityLogEntry, FixAttempt, IssueType, PrReviewRecord, RegressionWatch,
-};
+use claudear_core::types::ActivityLogEntry;
+use claudear_core::types::FixAttempt;
+use claudear_core::types::IssueType;
+use claudear_core::types::PrReviewRecord;
+use claudear_core::types::RegressionWatch;
 use claudear_storage::FixAttemptTracker;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use std::sync::Arc;
 
-pub use claudear_core::types::{PrReviewState, ReviewComment, ReviewUser};
-
-/// Room for the unified diff of a large pull request.
-pub const BODY_LIMIT: usize = 8 * ReqwestHttpClient::DEFAULT_BODY_LIMIT;
+pub use claudear_analysis::release::BODY_LIMIT;
+pub use claudear_core::types::PrReviewState;
+pub use claudear_core::types::ReviewComment;
+pub use claudear_core::types::ReviewUser;
 
 /// Check whether a bot user should be skipped based on the allowed-bots list.
 ///

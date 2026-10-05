@@ -29,6 +29,9 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 
+# HTTP
+reqwest = { workspace = true }
+
 # Regex
 regex-lite = { workspace = true }
 

@@ -870,6 +870,7 @@ dependencies = [
  "rand 0.10.0",
  "rayon",
  "regex-lite",
+ "reqwest 0.13.2",
  "semver",
  "serde",
  "serde_json",

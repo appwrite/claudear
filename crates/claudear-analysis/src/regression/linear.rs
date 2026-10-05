@@ -5,11 +5,14 @@
 //! 2. Scraping appwrite.io/threads for similar mentions
 //! 3. Using semantic similarity with embeddings to match issues
 
-use crate::feedback::{cosine_similarity, EmbeddingClient};
-use crate::regression::{RegressionChecker, RegressionResult};
+use crate::feedback::cosine_similarity;
+use crate::feedback::EmbeddingClient;
+use crate::regression::RegressionChecker;
+use crate::regression::RegressionResult;
+use abnegate_http::HttpClient;
+use abnegate_http::ReqwestHttpClient;
 use async_trait::async_trait;
 use claudear_core::error::Result;
-use claudear_core::http::{HttpClient, ReqwestHttpClient};
 use claudear_core::types::RegressionWatch;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -98,7 +101,8 @@ impl LinearRegressionChecker<ReqwestHttpClient> {
     ) -> Self {
         Self {
             config,
-            http: ReqwestHttpClient::new(),
+            http: ReqwestHttpClient::new()
+                .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new())),
             keywords,
             original_issue_text,
             original_embedding: None,
@@ -113,12 +117,12 @@ impl LinearRegressionChecker<ReqwestHttpClient> {
         original_issue_text: String,
         embedding_client: Arc<EmbeddingClient>,
     ) -> Result<Self> {
-        // Pre-compute the embedding for the original issue
+        let http = ReqwestHttpClient::new()?;
         let original_embedding = embedding_client.embed(&original_issue_text).await?;
 
         Ok(Self {
             config,
-            http: ReqwestHttpClient::new(),
+            http,
             keywords,
             original_issue_text,
             original_embedding: Some(original_embedding),
@@ -582,10 +586,12 @@ impl<H: HttpClient> RegressionChecker for LinearRegressionChecker<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Utc};
-    use claudear_core::http::HttpResponse;
+    use abnegate_http::HttpResponse;
+    use chrono::Duration;
+    use chrono::Utc;
     use claudear_core::types::IssueType;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     struct MockHttpClient {
         responses: Vec<HttpResponse>,
@@ -597,10 +603,7 @@ mod tests {
             Self {
                 responses: responses
                     .into_iter()
-                    .map(|(status, body)| HttpResponse {
-                        status,
-                        body: body.to_string(),
-                    })
+                    .map(|(status, body)| HttpResponse::new(status, body.to_string()))
                     .collect(),
                 call_count: AtomicUsize::new(0),
             }
@@ -609,19 +612,17 @@ mod tests {
 
     #[async_trait]
     impl HttpClient for MockHttpClient {
-        async fn get(&self, _url: &str, _headers: Vec<(&str, String)>) -> Result<HttpResponse> {
-            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
-            if idx < self.responses.len() {
-                Ok(HttpResponse {
-                    status: self.responses[idx].status,
-                    body: self.responses[idx].body.clone(),
-                })
-            } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not Found".to_string(),
-                })
-            }
+        async fn get(
+            &self,
+            _url: &str,
+            _headers: Vec<(&str, String)>,
+        ) -> abnegate_http::Result<HttpResponse> {
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .responses
+                .get(call)
+                .cloned()
+                .unwrap_or_else(|| HttpResponse::new(404, "Not Found")))
         }
     }
 
@@ -880,12 +881,35 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    struct MockErrorHttpClient;
+    struct MockErrorHttpClient {
+        client: reqwest::Client,
+    }
+
+    impl MockErrorHttpClient {
+        fn new() -> Self {
+            Self {
+                client: reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .expect("a client without a proxy builds"),
+            }
+        }
+    }
 
     #[async_trait]
     impl HttpClient for MockErrorHttpClient {
-        async fn get(&self, _url: &str, _headers: Vec<(&str, String)>) -> Result<HttpResponse> {
-            Err(claudear_core::error::Error::network("connection refused"))
+        async fn get(
+            &self,
+            _url: &str,
+            _headers: Vec<(&str, String)>,
+        ) -> abnegate_http::Result<HttpResponse> {
+            let refusal = self
+                .client
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+                .expect_err("nothing listens on port 1");
+            Err(abnegate_http::Error::from(refusal))
         }
     }
 
@@ -898,10 +922,6 @@ mod tests {
             mock,
         )
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 1. strip_html_tags edge cases
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_strip_html_tags_empty_string() {
@@ -949,10 +969,6 @@ mod tests {
         let result = checker.strip_html_tags("  plain text  ");
         assert_eq!(result, "plain text");
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 2. extract_thread_sections
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_extract_thread_sections_no_headings_fallback() {
@@ -1011,10 +1027,6 @@ mod tests {
         assert!(!sections.is_empty());
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 3. check_similarity without embedding client
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_check_similarity_without_embedding_returns_zero() {
         let checker = make_checker(MockHttpClient::new(vec![]));
@@ -1022,10 +1034,6 @@ mod tests {
         let similarity = checker.check_similarity("any text").await.unwrap();
         assert!((similarity - 0.0).abs() < f32::EPSILON);
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 4. search_github_issues_since
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_search_github_issues_since_empty_token() {
@@ -1149,10 +1157,6 @@ mod tests {
         assert_eq!(checker.http.call_count.load(Ordering::SeqCst), 1);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 5. check_appwrite_threads
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_check_appwrite_threads_non_200() {
         let mock = MockHttpClient::new(vec![(503, "Service Unavailable")]);
@@ -1174,17 +1178,13 @@ mod tests {
             create_config(),
             vec!["keyword".to_string()],
             "Some issue".to_string(),
-            MockErrorHttpClient,
+            MockErrorHttpClient::new(),
         );
 
         // Network error should be caught and return empty vec (not propagate error)
         let results = checker.check_appwrite_threads().await.unwrap();
         assert!(results.is_empty());
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 6. check_regression trait impl
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_check_regression_empty_token_and_threads_error() {
@@ -1200,7 +1200,7 @@ mod tests {
             config,
             vec!["keyword".to_string()],
             "Some issue".to_string(),
-            MockErrorHttpClient, // threads will get a network error
+            MockErrorHttpClient::new(), // threads will get a network error
         );
 
         let mut watch = RegressionWatch::new(IssueType::LinearBug, "linear-err", 1);
@@ -1322,10 +1322,6 @@ mod tests {
         );
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 7. LinearRegressionConfig::default()
-    // ═══════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_linear_regression_config_default_repos() {
         let config = LinearRegressionConfig::default();
@@ -1350,10 +1346,6 @@ mod tests {
         let config = LinearRegressionConfig::default();
         assert!(config.github_token.is_empty());
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 8. SimilarityMatch struct — Clone and Debug
-    // ═══════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_similarity_match_clone() {
@@ -1383,10 +1375,6 @@ mod tests {
         assert!(debug_output.contains("Debug Issue"));
         assert!(debug_output.contains("0.77"));
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 9. Constructor field verification
-    // ═══════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_with_http_client_sets_fields_correctly() {
@@ -1439,10 +1427,6 @@ mod tests {
         assert_eq!(checker.original_issue_text, "Issue text");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 10. LinearRegressionConfig clone and debug
-    // ═══════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_linear_regression_config_clone() {
         let config = LinearRegressionConfig {
@@ -1464,10 +1448,6 @@ mod tests {
         assert!(debug.contains("test-token"));
         assert!(debug.contains("test/repo"));
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 11. search_github_issues (the non-_since variant)
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_search_github_issues_empty_token_returns_empty() {
@@ -1616,10 +1596,6 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 12. search_github_issues_since - date filtering edge cases
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_search_github_issues_since_invalid_date_format() {
         // Issue with an unparseable created_at should be filtered out
@@ -1762,10 +1738,6 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 13. check_appwrite_threads - additional paths
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_check_appwrite_threads_success_empty_body() {
         let mock = MockHttpClient::new(vec![(200, "")]);
@@ -1815,10 +1787,6 @@ mod tests {
         let results = checker.check_appwrite_threads().await.unwrap();
         assert!(results.is_empty());
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 14. extract_thread_sections - more tag patterns
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_extract_thread_sections_h3_tag() {
@@ -1892,10 +1860,6 @@ mod tests {
         assert!(sections[0].1.contains("Just plain text"));
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 15. strip_html_tags - unicode and edge cases
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_strip_html_tags_unicode_content() {
         let checker = make_checker(MockHttpClient::new(vec![]));
@@ -1937,10 +1901,6 @@ mod tests {
         assert_eq!(result, "body{color:red}Visible");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 16. check_regression - additional trait impl paths
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_check_regression_github_error_propagates() {
         // If the GitHub HTTP call itself errors, it should propagate
@@ -1948,7 +1908,7 @@ mod tests {
             create_config(),
             vec!["keyword".to_string()],
             "Some issue".to_string(),
-            MockErrorHttpClient,
+            MockErrorHttpClient::new(),
         );
 
         let mut watch = RegressionWatch::new(IssueType::LinearBug, "linear-err2", 1);
@@ -2028,10 +1988,6 @@ mod tests {
         assert!(details.contains("0 repos"), "Got: {}", details);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 17. extract_thread_sections - UTF-8 boundary safety
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_extract_thread_sections_with_multibyte_utf8() {
         let checker = make_checker(MockHttpClient::new(vec![]));
@@ -2054,10 +2010,6 @@ mod tests {
         let (title, _) = &sections[0];
         assert!(title.contains("Long Thread"));
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 18. search_github_issues - keyword limiting (take(5))
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_search_github_issues_limits_to_5_keywords() {
@@ -2084,10 +2036,6 @@ mod tests {
         // One HTTP call made (one repo), meaning the query was built successfully
         assert_eq!(checker.http.call_count.load(Ordering::SeqCst), 1);
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 19. search_github_issues_since - mixed results (some old, some new)
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_search_github_issues_since_filters_old_keeps_new() {
@@ -2137,10 +2085,6 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 20. check_regression with empty github token + threads success
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_check_regression_empty_token_skips_github_checks_threads() {
         let config = LinearRegressionConfig {
@@ -2169,10 +2113,6 @@ mod tests {
         // Only 1 HTTP call (threads), not 2 (no GitHub search)
         assert_eq!(checker.http.call_count.load(Ordering::SeqCst), 1);
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 21. SimilarityMatch edge values
-    // ═══════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_similarity_match_zero_similarity() {
@@ -2205,10 +2145,6 @@ mod tests {
         assert!(m.title.is_empty());
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 22. LinearRegressionConfig - boundary threshold values
-    // ═══════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_config_zero_threshold() {
         let config = LinearRegressionConfig {
@@ -2240,10 +2176,6 @@ mod tests {
         assert_eq!(config.scm_repos.len(), 100);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 23. extract_thread_sections - title with only closing tag
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_extract_thread_sections_empty_title_is_skipped() {
         let checker = make_checker(MockHttpClient::new(vec![]));
@@ -2262,10 +2194,6 @@ mod tests {
         assert_eq!(sections[0].0, "Appwrite Threads Page");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 24. Verify MockHttpClient exhaustion returns 404
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_mock_http_client_returns_404_when_exhausted() {
         let mock = MockHttpClient::new(vec![(200, "ok")]);
@@ -2279,10 +2207,6 @@ mod tests {
         assert_eq!(r2.status, 404);
         assert_eq!(r2.body, "Not Found");
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 25. check_regression with embedding client present (semantic method)
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_check_regression_with_embedding_client_shows_semantic_method() {
@@ -2323,10 +2247,6 @@ mod tests {
         );
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 26. strip_html_tags - more edge cases
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_strip_html_tags_unclosed_tag() {
         let checker = make_checker(MockHttpClient::new(vec![]));
@@ -2350,10 +2270,6 @@ mod tests {
         assert_eq!(result, "&amp; &lt; &gt;");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 27. extract_thread_sections - content/title emptiness combinations
-    // ═══════════════════════════════════════════════════════════════════
-
     #[tokio::test]
     async fn test_extract_thread_sections_title_but_empty_content() {
         let checker = make_checker(MockHttpClient::new(vec![]));
@@ -2369,10 +2285,6 @@ mod tests {
         assert!(!sections.is_empty());
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 28. RegressionResult helper methods
-    // ═══════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_regression_result_no_regression() {
         let result = crate::regression::RegressionResult::no_regression();
@@ -2387,10 +2299,6 @@ mod tests {
         assert!(result.regression_detected);
         assert_eq!(result.details.unwrap(), "Found similar issues");
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 29. check_similarity with embedding client but no original_embedding
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_check_similarity_with_client_but_no_original_embedding() {
@@ -2413,10 +2321,6 @@ mod tests {
             .unwrap();
         assert!((sim - 0.0).abs() < f32::EPSILON);
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 30. GitHub issue search result JSON deserialization edge cases
-    // ═══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_search_github_issues_since_empty_items_array() {
@@ -2475,10 +2379,6 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 31. Regression detection format strings
-    // ═══════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_similarity_match_format_string() {
         let m = SimilarityMatch {
@@ -2497,10 +2397,6 @@ mod tests {
         assert!(formatted.contains("Authentication failure"));
         assert!(formatted.contains("issues/42"));
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 32. LinearRegressionChecker::new (production constructor)
-    // ═══════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_linear_regression_checker_new() {
@@ -2523,8 +2419,6 @@ mod tests {
         assert!(checker.embedding_client.is_none());
     }
 
-    // --- RegressionResult construction (extended) ---
-
     #[test]
     fn test_regression_result_no_regression_2() {
         let result = crate::regression::RegressionResult::no_regression();
@@ -2540,8 +2434,6 @@ mod tests {
         assert_eq!(result.details, Some("Found similar issue".to_string()));
     }
 
-    // --- extract_thread_sections with <h3> tags ---
-
     #[tokio::test]
     async fn test_extract_thread_sections_h3_tags() {
         let checker = make_checker(MockHttpClient::new(vec![]));
@@ -2549,8 +2441,6 @@ mod tests {
         let sections = checker.extract_thread_sections(html);
         assert!(!sections.is_empty());
     }
-
-    // --- extract_thread_sections with <div class="post"> (extended) ---
 
     #[tokio::test]
     async fn test_extract_thread_sections_div_post_class_2() {
@@ -2560,8 +2450,6 @@ mod tests {
         let sections = checker.extract_thread_sections(html);
         assert!(!sections.is_empty());
     }
-
-    // --- strip_html_tags with angle brackets in text (extended) ---
 
     #[tokio::test]
     async fn test_strip_html_tags_unclosed_tag_2() {
@@ -2577,8 +2465,6 @@ mod tests {
         let result = checker.strip_html_tags("<p>word1</p>  <p>word2</p>   <p>word3</p>");
         assert_eq!(result, "word1 word2 word3");
     }
-
-    // --- search_github_issues_since with multiple keywords over limit ---
 
     #[tokio::test]
     async fn test_search_github_issues_since_exactly_5_keywords() {
@@ -2602,8 +2488,6 @@ mod tests {
         assert!(results.is_empty());
         assert_eq!(checker.http.call_count.load(Ordering::SeqCst), 1);
     }
-
-    // --- check_regression with empty repos ---
 
     #[tokio::test]
     async fn test_check_regression_empty_repos() {
@@ -2633,8 +2517,6 @@ mod tests {
         let details = result.details.unwrap();
         assert!(details.contains("0 repos"));
     }
-
-    // --- check_regression details includes threshold ---
 
     #[tokio::test]
     async fn test_check_regression_details_includes_threshold_percentage() {
@@ -2668,8 +2550,6 @@ mod tests {
         );
     }
 
-    // --- check_appwrite_threads success with no matching content ---
-
     #[tokio::test]
     async fn test_check_appwrite_threads_html_with_only_tags() {
         let mock = MockHttpClient::new(vec![(200, "<html><head></head><body></body></html>")]);
@@ -2684,8 +2564,6 @@ mod tests {
         let results = checker.check_appwrite_threads().await.unwrap();
         assert!(results.is_empty());
     }
-
-    // --- GitHubSearchResult deserialization ---
 
     #[test]
     fn test_github_search_result_deserialization() {
@@ -2729,8 +2607,6 @@ mod tests {
         let result: GitHubSearchResult = serde_json::from_str(json).unwrap();
         assert!(result.items.is_empty());
     }
-
-    // --- GitHubIssue deserialization ---
 
     #[test]
     fn test_github_issue_with_null_body() {

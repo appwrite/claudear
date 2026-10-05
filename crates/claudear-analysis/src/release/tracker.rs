@@ -11,9 +11,14 @@
 //! - Manual → check release_after
 
 use crate::release::ReleaseClient;
-use crate::repo::{DependencyType, RepoRelationships};
+use crate::repo::DependencyType;
+use crate::repo::RepoRelationships;
+use abnegate_http::HttpClient;
+use abnegate_http::ReqwestHttpClient;
 use claudear_core::error::Result;
-use claudear_core::types::{RegressionWatch, RegressionWatchStatus, ReleaseTracking};
+use claudear_core::types::RegressionWatch;
+use claudear_core::types::RegressionWatchStatus;
+use claudear_core::types::ReleaseTracking;
 use claudear_storage::FixAttemptTracker;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,9 +35,7 @@ pub struct ReleaseTrackerConfig {
 }
 
 /// Tracks releases to detect when bug fixes are included in production.
-pub struct ReleaseTracker<
-    C: claudear_core::http::HttpClient = claudear_core::http::ReqwestHttpClient,
-> {
+pub struct ReleaseTracker<C: HttpClient = ReqwestHttpClient> {
     client: ReleaseClient<C>,
     tracker: Arc<dyn FixAttemptTracker>,
     config: ReleaseTrackerConfig,
@@ -40,7 +43,7 @@ pub struct ReleaseTracker<
     relationships: RepoRelationships,
 }
 
-impl ReleaseTracker<claudear_core::http::ReqwestHttpClient> {
+impl ReleaseTracker<ReqwestHttpClient> {
     /// Create a new release tracker with the default HTTP client.
     pub fn new(token: impl Into<String>, tracker: Arc<dyn FixAttemptTracker>) -> Self {
         Self {
@@ -81,7 +84,7 @@ impl ReleaseTracker<claudear_core::http::ReqwestHttpClient> {
     }
 }
 
-impl<C: claudear_core::http::HttpClient> ReleaseTracker<C> {
+impl<C: HttpClient> ReleaseTracker<C> {
     /// Create a new release tracker with a custom HTTP client.
     pub fn with_http_client(
         client: ReleaseClient<C>,
@@ -477,13 +480,12 @@ impl<C: claudear_core::http::HttpClient> ReleaseTracker<C> {
         };
 
         // Check if the package version in lock file includes the fix
-        let version_ok =
-            ReleaseClient::<claudear_core::http::ReqwestHttpClient>::check_lock_file_version(
-                &lock_content,
-                lock_file_path,
-                package_name,
-                &min_version,
-            )?;
+        let version_ok = ReleaseClient::<ReqwestHttpClient>::check_lock_file_version(
+            &lock_content,
+            lock_file_path,
+            package_name,
+            &min_version,
+        )?;
 
         if version_ok {
             tracing::debug!(
@@ -645,12 +647,13 @@ impl<C: claudear_core::http::HttpClient> ReleaseTracker<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use abnegate_http::HttpResponse;
     use async_trait::async_trait;
-    use claudear_core::http::HttpClient;
-    use claudear_core::http::HttpResponse;
     use claudear_core::types::IssueType;
-    use claudear_storage::{AttemptTracker, SqliteTracker};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use claudear_storage::AttemptTracker;
+    use claudear_storage::SqliteTracker;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     struct MockHttpClient {
         call_count: AtomicUsize,
@@ -663,10 +666,7 @@ mod tests {
                 call_count: AtomicUsize::new(0),
                 responses: responses
                     .into_iter()
-                    .map(|(status, body)| HttpResponse {
-                        status,
-                        body: body.to_string(),
-                    })
+                    .map(|(status, body)| HttpResponse::new(status, body.to_string()))
                     .collect(),
             }
         }
@@ -674,19 +674,17 @@ mod tests {
 
     #[async_trait]
     impl HttpClient for MockHttpClient {
-        async fn get(&self, _url: &str, _headers: Vec<(&str, String)>) -> Result<HttpResponse> {
-            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
-            if idx < self.responses.len() {
-                Ok(HttpResponse {
-                    status: self.responses[idx].status,
-                    body: self.responses[idx].body.clone(),
-                })
-            } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: r#"{"message": "Not Found"}"#.to_string(),
-                })
-            }
+        async fn get(
+            &self,
+            _url: &str,
+            _headers: Vec<(&str, String)>,
+        ) -> abnegate_http::Result<HttpResponse> {
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .responses
+                .get(call)
+                .cloned()
+                .unwrap_or_else(|| HttpResponse::new(404, r#"{"message": "Not Found"}"#)))
         }
     }
 
@@ -1310,8 +1308,6 @@ mod tests {
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("ReleaseTrackerConfig"));
     }
-
-    // --- New tests targeting uncovered lines ---
 
     // Covers lines 43-48: ReleaseTracker::new constructor
     #[test]
@@ -3144,8 +3140,6 @@ mod tests {
         assert!(result);
     }
 
-    // --- Config edge cases ---
-
     #[test]
     fn test_release_tracker_config_empty_package_names() {
         let config = ReleaseTrackerConfig {
@@ -3199,8 +3193,6 @@ mod tests {
         };
         assert_eq!(config.poll_interval_ms, u64::MAX);
     }
-
-    // --- check_pending_watches edge cases ---
 
     #[tokio::test]
     async fn test_check_pending_watches_empty_tracker() {
@@ -3293,8 +3285,6 @@ mod tests {
         assert_eq!(updated_a.status, RegressionWatchStatus::Monitoring);
     }
 
-    // --- check_watch_release: URL prefix stripping ---
-
     #[tokio::test]
     async fn test_check_watch_release_strips_scm_url_prefix() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3386,8 +3376,6 @@ mod tests {
         assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
     }
 
-    // --- check_watch_release: no target repos configured ---
-
     #[tokio::test]
     async fn test_check_watch_release_empty_target_repos() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3444,8 +3432,6 @@ mod tests {
         let result = release_tracker.check_watch_release(&watch).await.unwrap();
         assert!(!result);
     }
-
-    // --- check_watch_release: multiple target repos, second matches ---
 
     #[tokio::test]
     async fn test_check_watch_release_multiple_targets_second_matches() {
@@ -3566,8 +3552,6 @@ mod tests {
         assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
     }
 
-    // --- check_graph_release: Composer with version NOT ok ---
-
     #[tokio::test]
     async fn test_check_graph_release_composer_version_too_old() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3639,8 +3623,6 @@ mod tests {
         assert!(!result);
     }
 
-    // --- check_graph_release: Npm with no lock file found ---
-
     #[tokio::test]
     async fn test_check_graph_release_npm_lock_file_not_found() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3696,8 +3678,6 @@ mod tests {
         assert!(!result);
     }
 
-    // --- check_graph_release: GitSubmodule with commit NOT in release ---
-
     #[tokio::test]
     async fn test_check_graph_release_git_submodule_not_in_release() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3743,8 +3723,6 @@ mod tests {
         assert!(!result);
     }
 
-    // --- check_graph_release: GitSubmodule with no merge commit sha ---
-
     #[tokio::test]
     async fn test_check_graph_release_git_submodule_no_merge_commit() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3787,8 +3765,6 @@ mod tests {
             .unwrap();
         assert!(!result);
     }
-
-    // --- check_graph_release: Manual with target before source ---
 
     #[tokio::test]
     async fn test_check_graph_release_manual_target_before_source() {
@@ -3843,8 +3819,6 @@ mod tests {
         assert!(!result);
     }
 
-    // --- transition_to_monitoring: verify release tracking is recorded ---
-
     #[tokio::test]
     async fn test_transition_to_monitoring_records_release_tracking() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3876,8 +3850,6 @@ mod tests {
         assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
     }
 
-    // --- transition_to_monitoring with LinearBug issue type ---
-
     #[tokio::test]
     async fn test_transition_to_monitoring_linear_bug() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3908,8 +3880,6 @@ mod tests {
         assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
         assert_eq!(updated.issue_type, IssueType::LinearBug);
     }
-
-    // --- verify_release_after: source release found but published_at is null -> error ---
 
     #[tokio::test]
     async fn test_verify_release_after_source_release_no_published_at_errors() {
@@ -3969,8 +3939,6 @@ mod tests {
         assert!(!result);
     }
 
-    // --- verify_release_after: target published just 1 second after ---
-
     #[tokio::test]
     async fn test_verify_release_after_target_one_second_after() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4011,8 +3979,6 @@ mod tests {
         assert!(result);
     }
 
-    // --- verify_release_after: invalid source merged_at timestamp ---
-
     #[tokio::test]
     async fn test_verify_release_after_invalid_source_merged_at() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4052,8 +4018,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- verify_release_after: invalid target published_at timestamp ---
-
     #[tokio::test]
     async fn test_verify_release_after_invalid_target_published_at() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4092,8 +4056,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- find_dependency_type: transitive chain returns first hop type ---
-
     #[test]
     fn test_find_dependency_type_transitive_returns_first_hop() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4121,8 +4083,6 @@ mod tests {
         assert_eq!(dep_type, DependencyType::Npm);
     }
 
-    // --- find_dependency_type: direct dependency ---
-
     #[test]
     fn test_find_dependency_type_direct_dependency() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4144,8 +4104,6 @@ mod tests {
         let dep_type = release_tracker.find_dependency_type("lib", "app");
         assert_eq!(dep_type, DependencyType::GitSubmodule);
     }
-
-    // --- Npm package name extraction: repo with no slash ---
 
     #[tokio::test]
     async fn test_npm_package_name_no_slash_uses_whole_name() {
@@ -4222,8 +4180,6 @@ mod tests {
         assert!(result);
     }
 
-    // --- check_direct_release_any_target: multiple targets, all fail ---
-
     #[tokio::test]
     async fn test_check_direct_release_any_target_all_fail() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4266,8 +4222,6 @@ mod tests {
             .unwrap();
         assert!(!result);
     }
-
-    // --- check_direct_release_any_target: second target succeeds ---
 
     #[tokio::test]
     async fn test_check_direct_release_any_target_second_succeeds() {
@@ -4325,8 +4279,6 @@ mod tests {
         assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
     }
 
-    // --- verify_lock_file: npm lock with package name override ---
-
     #[tokio::test]
     async fn test_verify_lock_file_npm_with_scoped_package() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4374,8 +4326,6 @@ mod tests {
             .unwrap();
         assert!(result);
     }
-
-    // --- verify_lock_file: composer lock with packages-dev dependency ---
 
     #[tokio::test]
     async fn test_verify_lock_file_composer_dev_dependency() {
@@ -4429,8 +4379,6 @@ mod tests {
         assert!(result);
     }
 
-    // --- verify_lock_file: package not found in lock file ---
-
     #[tokio::test]
     async fn test_verify_lock_file_package_not_found() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4482,8 +4430,6 @@ mod tests {
             .unwrap();
         assert!(!result);
     }
-
-    // --- check_watch_release: fallback to direct when graph has no path ---
 
     #[tokio::test]
     async fn test_check_watch_release_no_graph_path_fallback_succeeds() {
@@ -4566,8 +4512,6 @@ mod tests {
         assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
     }
 
-    // --- check_watch_release: PR returns 404 ---
-
     #[tokio::test]
     async fn test_check_watch_release_pr_details_404() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4616,8 +4560,6 @@ mod tests {
         assert!(!result);
     }
 
-    // --- check_direct_release: release found but commit NOT in it ---
-
     #[tokio::test]
     async fn test_check_direct_release_release_found_commit_diverged() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4659,8 +4601,6 @@ mod tests {
         assert!(!result);
     }
 
-    // --- verify_commit_ancestry: commit is NOT found (404) ---
-
     #[tokio::test]
     async fn test_verify_commit_ancestry_404() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4688,8 +4628,6 @@ mod tests {
             .unwrap();
         assert!(!result);
     }
-
-    // --- verify_commit_ancestry: commit is identical ---
 
     #[tokio::test]
     async fn test_verify_commit_ancestry_identical() {
@@ -4719,8 +4657,6 @@ mod tests {
         assert!(result);
     }
 
-    // --- config accessor returns reference ---
-
     #[test]
     fn test_config_accessor_returns_reference() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -4746,8 +4682,6 @@ mod tests {
             Some(&vec!["b".to_string()])
         );
     }
-
-    // --- verify_release_after: source release with very distant timestamps ---
 
     #[tokio::test]
     async fn test_verify_release_after_distant_timestamps() {
@@ -4797,8 +4731,6 @@ mod tests {
             .unwrap();
         assert!(result);
     }
-
-    // --- check_watch_release: fix repo matches target with github prefix ---
 
     #[tokio::test]
     async fn test_check_watch_release_fix_repo_matches_target_with_github_prefix() {
@@ -4873,8 +4805,6 @@ mod tests {
         assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
     }
 
-    // --- MockHttpClient: exhausted responses returns 404 ---
-
     #[tokio::test]
     async fn test_mock_http_client_exhausted_responses() {
         let mock = MockHttpClient::new(vec![(200, r#"{"ok": true}"#)]);
@@ -4888,8 +4818,6 @@ mod tests {
         assert_eq!(resp2.status, 404);
         assert!(resp2.body.contains("Not Found"));
     }
-
-    // --- ReleaseTrackerConfig Debug format ---
 
     #[test]
     fn test_release_tracker_config_debug_format_with_values() {
@@ -4908,8 +4836,6 @@ mod tests {
         assert!(debug_str.contains("5000"));
         assert!(debug_str.contains("pkg"));
     }
-
-    // --- End-to-end: full check_pending_watches through Composer graph ---
 
     #[tokio::test]
     async fn test_end_to_end_composer_graph_flow() {
@@ -5015,8 +4941,6 @@ mod tests {
         assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
     }
 
-    // --- End-to-end: full flow with transitive dependency chain ---
-
     #[tokio::test]
     async fn test_end_to_end_transitive_dependency_chain() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -5118,8 +5042,6 @@ mod tests {
         assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
     }
 
-    // --- check_graph_release: Manual, no source release, target after merge time ---
-
     #[tokio::test]
     async fn test_check_graph_release_manual_no_source_release() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -5183,8 +5105,6 @@ mod tests {
         assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
     }
 
-    // --- RegressionWatch::new sets default fields correctly ---
-
     #[test]
     fn test_regression_watch_new_defaults() {
         let watch = RegressionWatch::new(IssueType::LinearBug, "LIN-123", 42);
@@ -5199,8 +5119,6 @@ mod tests {
         assert!(watch.regressed_at.is_none());
     }
 
-    // --- ReleaseTracking::new sets fields correctly ---
-
     #[test]
     fn test_release_tracking_new() {
         let tracking = ReleaseTracking::new(5, "v1.2.3", "org/repo");
@@ -5210,8 +5128,6 @@ mod tests {
         assert_eq!(tracking.release_commit, "org/repo");
         assert!(tracking.released_at.is_some());
     }
-
-    // --- check_pending_watches returns empty when all watches are non-AwaitingRelease ---
 
     #[tokio::test]
     async fn test_check_pending_watches_only_awaiting_release_status() {
@@ -5239,8 +5155,6 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // --- find_dependency_type with empty graph ---
-
     #[test]
     fn test_find_dependency_type_empty_graph() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -5257,8 +5171,6 @@ mod tests {
         let dep_type = release_tracker.find_dependency_type("any", "thing");
         assert_eq!(dep_type, DependencyType::Manual);
     }
-
-    // --- check_graph_release: Composer with package name from config ---
 
     #[tokio::test]
     async fn test_check_graph_release_composer_with_custom_package_name() {
