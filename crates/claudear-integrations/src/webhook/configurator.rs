@@ -7,10 +7,10 @@ use claudear_config::config::{
     Config, DiscordNotifierConfig, GitHubConfig, GitLabConfig, JiraConfig, LinearConfig,
     SentryConfig, SlackSourceConfig, TelegramConfig, WhatsAppConfig,
 };
-use claudear_config::env_writer::update_env_file;
+use claudear_config::environment;
 use claudear_core::error::{Error, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// Result of webhook auto-configuration.
@@ -98,7 +98,10 @@ impl WebhookConfigurator {
     ///    (Linear, Sentry, GitHub PAT/App, GitLab, Jira, Telegram, Slack, WhatsApp,
     ///    and Discord notifier webhook URLs)
     /// 2. Emit notes for enabled services that currently require manual setup
-    /// 2. Write the returned secrets to the .env file
+    /// 3. Write the returned secrets to the .env file
+    ///
+    /// The .env file is checked first, so a path the secrets could not be
+    /// written to fails before any webhook is created remotely.
     ///
     /// # Arguments
     /// * `base_url` - The public URL where webhooks will be received
@@ -106,8 +109,10 @@ impl WebhookConfigurator {
         tracing::info!("Starting webhook auto-configuration...");
         tracing::info!("Base URL: {}", base_url);
 
+        environment::probe(&self.env_path)?;
+
         let mut result = WebhookSetupResult::default();
-        let mut env_updates: HashMap<String, String> = HashMap::new();
+        let mut updates: BTreeMap<String, String> = BTreeMap::new();
         let mut configured_any = false;
         let mut attempted_auto_config = false;
         let mut failure_warnings: Vec<String> = Vec::new();
@@ -122,7 +127,7 @@ impl WebhookConfigurator {
                         result.linear_configured = true;
                         result.linear_webhook_id = Some(webhook_id);
                         result.linear_secret = Some(secret.clone());
-                        env_updates.insert("LINEAR_WEBHOOK_SECRET".to_string(), secret);
+                        updates.insert(environment::LINEAR_WEBHOOK_SECRET.to_string(), secret);
                         configured_any = true;
                         tracing::info!("Linear webhook configured successfully");
                     }
@@ -145,7 +150,7 @@ impl WebhookConfigurator {
                         result.sentry_project_count = count;
                         if let Some(s) = secret {
                             result.sentry_secret = Some(s.clone());
-                            env_updates.insert("SENTRY_CLIENT_SECRET".to_string(), s);
+                            updates.insert(environment::SENTRY_CLIENT_SECRET.to_string(), s);
                         }
                         configured_any = true;
                         tracing::info!("Sentry webhooks configured for {} project(s)", count);
@@ -216,7 +221,8 @@ impl WebhookConfigurator {
                     Ok(generated_secret) => {
                         configured_any = true;
                         if let Some(secret) = generated_secret {
-                            env_updates.insert("TELEGRAM_WEBHOOK_SECRET".to_string(), secret);
+                            updates
+                                .insert(environment::TELEGRAM_WEBHOOK_SECRET.to_string(), secret);
                         }
                         notes.push("Telegram webhook configured (Bot API setWebhook)".to_string());
                     }
@@ -255,7 +261,7 @@ impl WebhookConfigurator {
                 match self.configure_discord_notifier(discord_notifier).await {
                     Ok(webhook_url) => {
                         configured_any = true;
-                        env_updates.insert("DISCORD_WEBHOOK_URL".to_string(), webhook_url);
+                        updates.insert(environment::DISCORD_WEBHOOK_URL.to_string(), webhook_url);
                         notes.push(
                             "Discord notifier webhook URL auto-created for configured channel"
                                 .to_string(),
@@ -378,7 +384,10 @@ impl WebhookConfigurator {
                     Ok(generated_verify_token) => {
                         configured_any = true;
                         if let Some(token) = generated_verify_token {
-                            env_updates.insert("WHATSAPP_WEBHOOK_VERIFY_TOKEN".to_string(), token);
+                            updates.insert(
+                                environment::WHATSAPP_WEBHOOK_VERIFY_TOKEN.to_string(),
+                                token,
+                            );
                         }
                         notes.push(
                             "WhatsApp webhook subscription configured (WABA subscribed_apps)"
@@ -418,7 +427,8 @@ impl WebhookConfigurator {
                         Ok((group_count, generated_secret)) => {
                             configured_any = true;
                             if let Some(secret) = generated_secret {
-                                env_updates.insert("GITLAB_WEBHOOK_SECRET".to_string(), secret);
+                                updates
+                                    .insert(environment::GITLAB_WEBHOOK_SECRET.to_string(), secret);
                             }
                             let note = format!(
                                 "GitLab issue webhooks configured for {} group(s)",
@@ -455,7 +465,7 @@ impl WebhookConfigurator {
                 Ok((repo_count, generated_secret)) => {
                     configured_any = true;
                     if let Some(secret) = generated_secret {
-                        env_updates.insert("GITHUB_WEBHOOK_SECRET".to_string(), secret);
+                        updates.insert(environment::GITHUB_WEBHOOK_SECRET.to_string(), secret);
                     }
                     let note = format!(
                         "GitHub review webhooks configured for {} repo(s)",
@@ -477,11 +487,13 @@ impl WebhookConfigurator {
                     Ok((secret, persist_app_secret, persist_github_secret)) => {
                         configured_any = true;
                         if persist_app_secret {
-                            env_updates
-                                .insert("GITHUB_APP_WEBHOOK_SECRET".to_string(), secret.clone());
+                            updates.insert(
+                                environment::GITHUB_APP_WEBHOOK_SECRET.to_string(),
+                                secret.clone(),
+                            );
                         }
                         if persist_github_secret {
-                            env_updates.insert("GITHUB_WEBHOOK_SECRET".to_string(), secret);
+                            updates.insert(environment::GITHUB_WEBHOOK_SECRET.to_string(), secret);
                         }
                         notes
                             .push("GitHub App webhook configured via /app/hook/config".to_string());
@@ -499,10 +511,9 @@ impl WebhookConfigurator {
             }
         }
 
-        // Write secrets to .env file
-        if !env_updates.is_empty() {
+        if !updates.is_empty() {
             tracing::info!("Writing secrets to {}", self.env_path.display());
-            update_env_file(&self.env_path, &env_updates)?;
+            environment::update(&self.env_path, &updates)?;
         }
 
         result.warnings.extend(failure_warnings.clone());
@@ -2804,6 +2815,63 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Failed to configure any webhooks"));
         assert!(err_msg.contains("Jira"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_configure_fails_before_any_remote_call_when_the_env_directory_is_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let locked = directory.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = locked.join("probe");
+        if std::fs::write(&probe, "").is_ok() {
+            std::fs::remove_file(&probe).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipped: this user can write to a 0500 directory");
+            return;
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let mut config = test_config();
+        config.issues.jira = Some(JiraConfig {
+            enabled: true,
+            base_url: format!("http://{address}"),
+            api_token: "jira-token".into(),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, locked.join(".env"));
+
+        let result = configurator.configure("https://example.com").await;
+
+        server.abort();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "a webhook API was called before the .env path was checked"
+        );
+        match result {
+            Err(Error::Config(message)) => {
+                assert!(message.contains("Failed to write"), "{message}");
+                assert!(message.contains("Permission denied"), "{message}");
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
