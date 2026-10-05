@@ -3823,7 +3823,11 @@ impl Config {
                 .as_ref()
                 .and_then(|c| c.max_concurrent)
                 .unwrap_or(self.max_concurrent),
-            "github_issues" => self.scm.github.max_concurrent.unwrap_or(self.max_concurrent),
+            "github_issues" => self
+                .scm
+                .github
+                .max_concurrent
+                .unwrap_or(self.max_concurrent),
             "helpscout" => self
                 .issues
                 .helpscout

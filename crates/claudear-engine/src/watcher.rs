@@ -7380,12 +7380,30 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let issues = vec![
-            Issue::new("1", "CEIL-1", "Ceiling issue 1", "http://example.com/1", "mock"),
-            Issue::new("2", "CEIL-2", "Ceiling issue 2", "http://example.com/2", "mock"),
-            Issue::new("3", "CEIL-3", "Ceiling issue 3", "http://example.com/3", "mock"),
+            Issue::new(
+                "1",
+                "CEIL-1",
+                "Ceiling issue 1",
+                "http://example.com/1",
+                "mock",
+            ),
+            Issue::new(
+                "2",
+                "CEIL-2",
+                "Ceiling issue 2",
+                "http://example.com/2",
+                "mock",
+            ),
+            Issue::new(
+                "3",
+                "CEIL-3",
+                "Ceiling issue 3",
+                "http://example.com/3",
+                "mock",
+            ),
         ];
-        let source = Arc::new(MockSource::with_issues("mock", issues.clone()))
-            as Arc<dyn IssueSource>;
+        let source =
+            Arc::new(MockSource::with_issues("mock", issues.clone())) as Arc<dyn IssueSource>;
 
         let mut config = test_config();
         // Global ceiling of 2; a generous per-source budget so the per-source
