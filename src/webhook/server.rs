@@ -1183,6 +1183,7 @@ async fn process_issue(
         github_client: None,
         llm_analyzer: None,
         intent_classifier: None,
+        session_limiter: None,
     };
 
     let input = ProcessingInput {

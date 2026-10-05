@@ -418,7 +418,9 @@ pub struct Watcher {
     /// so the total number of issues being worked on at once never exceeds
     /// `config.max_concurrent_sessions`, no matter how high per-source
     /// `max_concurrent` limits sum. Per-source limits still apply on top.
-    session_limiter: Semaphore,
+    /// Shared (`Arc`) so detached session-spawning work — e.g. the retrieval
+    /// judge in [`IssueProcessor`] — counts against the same ceiling.
+    session_limiter: Arc<Semaphore>,
     /// Optional LLM analyzer for enhanced analysis across the pipeline.
     llm_analyzer: Option<Arc<crate::llm_analyzer::LlmAnalyzerImpl>>,
     /// Intent classifier for QA-vs-fix routing. Backend selected by `qa.use_llm`:
@@ -554,7 +556,7 @@ impl Watcher {
             last_seen_releases: RwLock::new(HashMap::new()),
             rate_limit_pause_until: RwLock::new(HashMap::new()),
             slot_available: Notify::new(),
-            session_limiter: Semaphore::new(session_limit),
+            session_limiter: Arc::new(Semaphore::new(session_limit)),
             llm_analyzer,
             intent_classifier,
             spawn_handles: tokio::sync::Mutex::new(Vec::new()),
@@ -5046,6 +5048,7 @@ Create a PR with your changes.{custom_instructions}"#,
             github_client: self.github_client.clone(),
             llm_analyzer: self.llm_analyzer.clone(),
             intent_classifier: self.intent_classifier.clone(),
+            session_limiter: Some(Arc::clone(&self.session_limiter)),
         };
 
         let input = ProcessingInput {
@@ -5827,6 +5830,7 @@ Create a PR with your changes.{custom_instructions}"#,
             github_client: self.github_client.clone(),
             llm_analyzer: self.llm_analyzer.clone(),
             intent_classifier: self.intent_classifier.clone(),
+            session_limiter: Some(Arc::clone(&self.session_limiter)),
         };
 
         let input = ProcessingInput {
