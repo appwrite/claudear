@@ -1,9 +1,13 @@
 //! Repository dependency tracking and relationships.
 
-use chrono::{DateTime, Utc};
+use abnegate_vcs::Manifest;
+use chrono::DateTime;
+use chrono::Utc;
 use claudear_core::error::Result;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use serde::Deserialize;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 /// Type of dependency between repositories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +42,15 @@ impl DependencyType {
             DependencyType::GitSubmodule => "git_submodule",
             DependencyType::Manual => "manual",
         }
+    }
+}
+
+/// The dependency type a package manager's manifest declares, if claudear cascades through it.
+pub fn dependency_type(manifest: Manifest) -> Option<DependencyType> {
+    match manifest {
+        Manifest::Composer => Some(DependencyType::Composer),
+        Manifest::Npm => Some(DependencyType::Npm),
+        _ => None,
     }
 }
 
@@ -519,6 +532,15 @@ impl Default for RepoRelationships {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_every_manifest_maps_to_a_dependency_type_stored_as_it_parses_back() {
+        for manifest in [Manifest::Composer, Manifest::Npm] {
+            let kind = dependency_type(manifest).expect("every known manifest cascades");
+            assert_eq!(kind.as_str(), manifest.as_str());
+            assert_eq!(DependencyType::parse(kind.as_str()), Some(kind));
+        }
+    }
 
     #[test]
     fn test_dependency_type_parse() {

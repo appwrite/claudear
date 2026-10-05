@@ -882,9 +882,8 @@ impl Watcher {
 
     /// Discover dependencies between indexed repos and save them to the database.
     pub async fn discover_dependencies(&self) {
-        let inferrer = match &self.inferrer {
-            Some(inf) => inf,
-            None => return,
+        let Some(inferrer) = &self.inferrer else {
+            return;
         };
 
         let known_orgs = self.config.known_orgs.clone();
@@ -892,54 +891,41 @@ impl Watcher {
             return;
         }
 
-        let repo_paths: Vec<String> = match inferrer.with_index(|index| {
+        let repository_paths: Vec<_> = match inferrer.with_index(|index| {
             Ok(index
                 .list()
                 .iter()
-                .map(|r| r.path.to_string_lossy().to_string())
+                .map(|repository| repository.path.clone())
                 .collect())
         }) {
             Ok(paths) => paths,
-            Err(e) => {
-                tracing::warn!("Failed to get repo paths for dependency discovery: {}", e);
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to get repo paths for dependency discovery: {}",
+                    error
+                );
                 return;
             }
         };
 
-        if repo_paths.is_empty() {
+        if repository_paths.is_empty() {
             return;
         }
 
         let tracker = self.tracker.clone();
-        let result = tokio::task::spawn_blocking(move || -> claudear_core::error::Result<usize> {
-            let discovery = claudear_analysis::repo::DependencyDiscovery::new(known_orgs);
-            let discovered = discovery.scan_directories(&repo_paths)?;
-            let mut count = 0;
-            for dep in &discovered {
-                if let Err(e) = tracker.add_dependency(&dep.depends_on, &dep.repo, &dep.dep_type) {
-                    tracing::warn!(
-                        error = %e,
-                        upstream = %dep.depends_on,
-                        downstream = %dep.repo,
-                        "Failed to save dependency"
-                    );
-                } else {
-                    count += 1;
-                }
-            }
-            Ok(count)
+        let result = tokio::task::spawn_blocking(move || {
+            let discovered = claudear_analysis::repo::DependencyDiscovery::new(known_orgs)
+                .scan_directories(&repository_paths);
+            claudear_analysis::repo::save_discovered(tracker.as_ref(), &discovered)
         })
         .await;
 
         match result {
-            Ok(Ok(count)) if count > 0 => {
+            Ok(count) if count > 0 => {
                 tracing::info!("Discovered and saved {} dependencies", count);
             }
-            Ok(Err(e)) => {
-                tracing::warn!("Dependency discovery failed: {}", e);
-            }
-            Err(e) => {
-                tracing::warn!("Dependency discovery task panicked: {}", e);
+            Err(error) => {
+                tracing::warn!("Dependency discovery task panicked: {}", error);
             }
             _ => {}
         }
@@ -17722,6 +17708,45 @@ mod tests {
         assert!(watcher.inferrer.is_none());
         // Should return early without panicking
         watcher.discover_dependencies().await;
+    }
+
+    #[tokio::test]
+    async fn test_discover_dependencies_stores_what_the_cascade_loads() {
+        use claudear_analysis::repo::DependencyType;
+
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkout.path().join("composer.json"),
+            serde_json::json!({
+                "name": "appwrite/cloud",
+                "require": { "utopia-php/database": "^1.0", "symfony/console": "^5.0" },
+                "require-dev": { "utopia-php/database": "^1.0" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.known_orgs = vec!["utopia-php".to_string()];
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            inferrer: Some(inferrer_indexing(IndexedRepo::new(
+                "appwrite/cloud",
+                checkout.path(),
+            ))),
+            ..live_watcher_options(Arc::new(MockNotifier::new(true)), tracker.clone(), vec![])
+        });
+
+        watcher.discover_dependencies().await;
+
+        let stored = tracker.list_all_dependencies().unwrap();
+        assert_eq!(stored.len(), 1, "{stored:?}");
+        assert_eq!(stored[0].upstream, "utopia-php/database");
+        assert_eq!(stored[0].downstream, "appwrite/cloud");
+        assert_eq!(
+            DependencyType::parse(&stored[0].dep_type),
+            Some(DependencyType::Composer)
+        );
     }
 
     #[tokio::test]

@@ -6,12 +6,14 @@
 //! Note: GitHub/GitLab-specific index building functions live in the root crate's
 //! `repo::index` module since they depend on SCM provider types.
 
-pub use claudear_core::types::{IndexedRepo, RepoIndex};
+pub use claudear_core::types::IndexedRepo;
+pub use claudear_core::types::RepoIndex;
 
 use super::GitOps;
 use claudear_core::error::Result;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use walkdir::WalkDir;
 
 /// Build a repo index by scanning filesystem paths for repos from known orgs.
