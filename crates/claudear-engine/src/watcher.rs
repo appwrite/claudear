@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, RwLock, Semaphore};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 /// A candidate issue ready for dispatch: the issue, its match result, and the
 /// decided routing `Intent` (`None` for non-QA-eligible / QA-disabled sources).
@@ -1201,6 +1201,11 @@ impl Watcher {
     /// initial fan-out poll already ran in [`Self::start`]).
     async fn run_source_worker(self: Arc<Self>, source_idx: usize, interval_ms: u64) {
         let mut timer = interval(Duration::from_millis(interval_ms));
+        // A poll can run longer than the interval (slow API, waiting for dispatch
+        // slots). Delay, not the default Burst, so missed ticks are not replayed
+        // back-to-back afterwards; the next poll is spaced a full interval after
+        // the previous one finishes, matching the old loop's post-completion reset.
+        timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         timer.tick().await; // consume the immediate first tick
 
         while self.is_running.load(Ordering::SeqCst) {
