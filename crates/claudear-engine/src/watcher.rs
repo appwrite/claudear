@@ -7359,15 +7359,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_ceiling_blocks_processing_and_frees_on_completion() {
+    async fn test_session_ceiling_caps_concurrent_processing_and_frees_slots() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-        let issue = Issue::new("1", "CEIL-1", "Ceiling issue", "http://example.com/1", "mock");
-        let source = Arc::new(MockSource::with_issues("mock", vec![issue.clone()]))
+        let issues = vec![
+            Issue::new("1", "CEIL-1", "Ceiling issue 1", "http://example.com/1", "mock"),
+            Issue::new("2", "CEIL-2", "Ceiling issue 2", "http://example.com/2", "mock"),
+            Issue::new("3", "CEIL-3", "Ceiling issue 3", "http://example.com/3", "mock"),
+        ];
+        let source = Arc::new(MockSource::with_issues("mock", issues.clone()))
             as Arc<dyn IssueSource>;
 
         let mut config = test_config();
-        config.max_concurrent_sessions = 1;
+        // Global ceiling of 2; a generous per-source budget so the per-source
+        // lane is never the binding limit (the ceiling is what we test).
+        config.max_concurrent_sessions = 2;
+        config.max_concurrent = 10;
         config.processing_delay_ms = 0;
 
         let watcher = Arc::new(Watcher::new(WatcherOptions {
@@ -7398,46 +7405,65 @@ mod tests {
         }));
         watcher.is_running.store(true, Ordering::SeqCst);
 
-        // Saturate the global ceiling by holding its only session permit.
-        let held = watcher
+        // Saturate the global ceiling by holding both session permits, standing
+        // in for two runs already in flight.
+        let held_a = watcher
             .session_limiter
             .try_acquire()
-            .expect("the single session permit should be free");
+            .expect("the first session permit should be free");
+        let held_b = watcher
+            .session_limiter
+            .try_acquire()
+            .expect("the second session permit should be free");
         assert_eq!(watcher.session_limiter.available_permits(), 0);
 
-        // Start a real processing run. It must park on the session permit.
-        let w = Arc::clone(&watcher);
-        let handle = tokio::spawn(async move {
-            w.process_issue(
-                source,
-                issue,
-                MatchResult::matched("Test", MatchPriority::Normal),
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-        });
+        // Start three more real processing runs. With the ceiling saturated,
+        // none may begin work: concurrent processing cannot exceed the limit.
+        let handles: Vec<_> = issues
+            .into_iter()
+            .map(|issue| {
+                let w = Arc::clone(&watcher);
+                let s = Arc::clone(&source);
+                tokio::spawn(async move {
+                    w.process_issue(
+                        s,
+                        issue,
+                        MatchResult::matched("Test", MatchPriority::Normal),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                })
+            })
+            .collect();
 
-        // While the ceiling is saturated the run cannot proceed.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            !handle.is_finished(),
-            "processing ran even though the session ceiling was saturated"
+            handles.iter().all(|h| !h.is_finished()),
+            "a run started even though the session ceiling was saturated"
         );
+        assert_eq!(watcher.session_limiter.available_permits(), 0);
 
-        // Freeing the slot lets the parked run proceed to completion.
-        drop(held);
-        let _ = tokio::time::timeout(Duration::from_secs(10), handle)
-            .await
-            .expect("processing did not complete after a session slot was freed");
-
-        // Completion returns the permit to the ceiling.
+        // Freeing the ceiling lets the parked runs proceed; each must release
+        // its slot on completion, so all permits return.
+        drop(held_a);
+        drop(held_b);
+        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "processing did not complete after the session slots were freed"
+        );
         assert_eq!(
             watcher.session_limiter.available_permits(),
-            1,
-            "completing a run must free its session slot"
+            2,
+            "completing every run must free its session slot"
         );
     }
 
