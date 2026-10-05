@@ -888,7 +888,7 @@ impl Default for QaConfig {
             answer_timeout_secs: 600,
             max_qa_per_cycle: 20,
             use_llm: false,
-            max_concurrent: 1,
+            max_concurrent: 6,
         }
     }
 }

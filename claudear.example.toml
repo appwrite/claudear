@@ -1031,8 +1031,9 @@ use_llm = false
 # Max questions answered concurrently per source, independent of the fix-lane
 # concurrency budget (max_concurrent / [sources.<name>].max_concurrent). Increase
 # this to answer more questions in parallel without affecting fix throughput.
-# Clamped to 1 if set to 0 to avoid deadlock. (default: 1)
-max_concurrent = 1
+# Still bounded by the global max_concurrent_sessions ceiling.
+# Clamped to 1 if set to 0 to avoid deadlock. (default: 6)
+max_concurrent = 6
 
 # ============================================
 # Reply Action
