@@ -4802,6 +4802,19 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         };
 
+        // Re-check shutdown after waiting for a permit: the watcher can begin
+        // stopping while this run is queued on a saturated ceiling, and a drain
+        // must not have new runs start behind it once a slot frees. Bail before
+        // claiming the deploy_qa tip so a stopped run never leaves a tip in
+        // `Running`.
+        if self.is_stopped() {
+            tracing::info!(
+                short_id = %issue.short_id,
+                "Not starting issue processing: watcher began stopping while waiting for a session slot"
+            );
+            return IssueRun::Stopping;
+        }
+
         // Re-check the rate-limit pause after waiting for a permit: a pause can
         // begin while queued here, and a saturated queue must not keep launching
         // sessions through it. Bail before claiming the deploy_qa tip so a paused
@@ -7465,6 +7478,128 @@ mod tests {
             2,
             "completing every run must free its session slot"
         );
+    }
+
+    /// Source whose `fetch_issues` blocks at a gate, standing in for a slow API,
+    /// and counts how many times it was polled.
+    struct BlockingFetchSource {
+        name: &'static str,
+        gate: Arc<Gate>,
+        fetch_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl IssueSource for BlockingFetchSource {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn display_name(&self) -> &str {
+            self.name
+        }
+        async fn fetch_issues(&self) -> Result<Vec<Issue>> {
+            self.fetch_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.gate.pass().await;
+            Ok(vec![])
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("blocking match", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
+            Ok(format!("Context for {}", issue.short_id))
+        }
+        async fn get_issue(&self, id: &str) -> Result<Issue> {
+            Err(claudear_core::error::Error::source(
+                self.name,
+                format!("Issue {id} not found"),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_source_workers_poll_independently() {
+        // A source stuck in a slow `fetch_issues` must not delay another
+        // source's polling: each runs in its own worker.
+        let gate = Arc::new(Gate::default());
+        let slow = Arc::new(BlockingFetchSource {
+            name: "slow",
+            gate: Arc::clone(&gate),
+            fetch_calls: AtomicUsize::new(0),
+        });
+        let fast = Arc::new(MockSource::new("fast"));
+        let sources: Vec<Arc<dyn IssueSource>> = vec![
+            Arc::clone(&slow) as Arc<dyn IssueSource>,
+            Arc::clone(&fast) as Arc<dyn IssueSource>,
+        ];
+
+        let mut config = test_config();
+        config.poll_interval_ms = 1000; // one poll per second per source
+
+        let tracker: Arc<dyn claudear_storage::FixAttemptTracker> =
+            Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
+            config,
+            sources,
+            notifier: Arc::new(MockNotifier::new(true)),
+            tracker: Arc::clone(&tracker),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(claudear_integrations::runner::ClaudeAgentRunner::new(
+                claudear_integrations::runner::ClaudeRunnerConfig::default(),
+                tracker,
+            )),
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: true,
+            llm_engine: None,
+        }));
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        let poller = {
+            let w = Arc::clone(&watcher);
+            tokio::spawn(async move { w.run_source_poll_loop(1000).await })
+        };
+
+        // Wait (robustly, not on a fixed sleep that flakes under CI load) until
+        // the fast source has polled at least twice while the slow source stays
+        // stuck in its first fetch.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while fast.fetch_call_count() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let fast_polls = fast.fetch_call_count();
+        let slow_polls = slow.fetch_calls.load(AtomicOrdering::SeqCst);
+        assert!(
+            fast_polls >= 2,
+            "the fast source should have polled repeatedly while the slow source was blocked, got {fast_polls}"
+        );
+        // The slow source is parked in its first fetch, so it cannot poll again:
+        // its worker makes no progress while the fast one keeps going.
+        assert_eq!(
+            slow_polls, 1,
+            "the slow source should still be parked in its first fetch, got {slow_polls}"
+        );
+        assert!(
+            !gate.was_cancelled(),
+            "the slow source's fetch should still be waiting at the gate"
+        );
+
+        // Release the slow source and stop; the loop must wind down cleanly.
+        gate.open();
+        watcher.stop();
+        let _ = tokio::time::timeout(Duration::from_secs(10), poller)
+            .await
+            .expect("the poll loop did not stop after the watcher was stopped");
     }
 
     #[tokio::test]
