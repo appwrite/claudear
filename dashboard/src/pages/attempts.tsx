@@ -29,6 +29,7 @@ const statusOptions = [
   { value: 'merged', label: 'Merged' },
   { value: 'closed', label: 'Closed' },
   { value: 'cannot_fix', label: 'Cannot Fix' },
+  { value: 'declined', label: 'Declined' },
 ]
 
 const sourceOptions = [

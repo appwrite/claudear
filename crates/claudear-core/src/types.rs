@@ -346,6 +346,10 @@ pub enum FixAttemptStatus {
     /// Input was a question and was answered (no PR/fix attempted).
     #[serde(rename = "answered")]
     Answered,
+    /// A human refused approval to work on the issue, so it is neither
+    /// retried nor asked about again unless its attempt is reset.
+    #[serde(rename = "declined")]
+    Declined,
 }
 
 impl std::fmt::Display for FixAttemptStatus {
@@ -358,6 +362,7 @@ impl std::fmt::Display for FixAttemptStatus {
             Self::Closed => write!(f, "closed"),
             Self::CannotFix => write!(f, "cannot_fix"),
             Self::Answered => write!(f, "answered"),
+            Self::Declined => write!(f, "declined"),
         }
     }
 }
@@ -374,6 +379,7 @@ impl std::str::FromStr for FixAttemptStatus {
             "closed" => Ok(Self::Closed),
             "cannot_fix" => Ok(Self::CannotFix),
             "answered" => Ok(Self::Answered),
+            "declined" => Ok(Self::Declined),
             _ => Err(format!("Unknown status: {}", s)),
         }
     }
@@ -1895,7 +1901,7 @@ pub enum DeployQaTipStatus {
     /// Tip detected; waiting to be enqueued.
     #[default]
     Pending,
-    /// An observe/report agent attempt is in flight.
+    /// A live-QA agent attempt is in flight.
     Running,
     /// All LIVE-TESTABLE PRs verified (no live failures).
     Verified,
@@ -1904,7 +1910,7 @@ pub enum DeployQaTipStatus {
     Unverified,
     /// At least one LIVE-TESTABLE PR failed.
     Failed,
-    /// The observe/report attempt ended without reaching a verdict.
+    /// The live-QA attempt ended without reaching a verdict.
     Errored,
 }
 
@@ -3996,17 +4002,19 @@ mod tests {
             FixAttemptStatus::Merged,
             FixAttemptStatus::Closed,
             FixAttemptStatus::CannotFix,
+            FixAttemptStatus::Answered,
+            FixAttemptStatus::Declined,
         ] {
             let json = serde_json::to_string(&status).unwrap();
-            // Verify serde serialization matches Display
-            assert_eq!(json, format!("\"{}\"", status));
-            // Verify round-trip through serde
+            assert_eq!(
+                json,
+                format!("\"{}\"", status),
+                "{status} must serialize as its Display form"
+            );
             let parsed: FixAttemptStatus = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, status);
-            // Verify round-trip through FromStr
-            let display_str = status.to_string();
-            let from_str: FixAttemptStatus = display_str.parse().unwrap();
-            assert_eq!(from_str, status);
+            assert_eq!(parsed, status, "{status} must round-trip through serde");
+            let from_str: FixAttemptStatus = status.to_string().parse().unwrap();
+            assert_eq!(from_str, status, "{status} must round-trip through FromStr");
         }
     }
 

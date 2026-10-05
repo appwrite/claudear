@@ -2,6 +2,7 @@
 
 use super::{process_group, AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
+use claudear_config::AgentConfig;
 use claudear_core::error::{Error, Result};
 use claudear_core::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
 use claudear_core::types::{ActivityLogEntry, AgentExecution, AgentResult, Issue};
@@ -13,15 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
-
-/// How long to keep waiting for the CLI's output after its process group is
-/// killed. Its own output is already buffered by then, so this only bounds the
-/// wait on processes that escaped the group while holding the pipes.
-const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// When to stop reading the CLI's output after its process group is killed,
-/// even while a process that escaped the group keeps writing to the pipes.
-const OUTPUT_DRAIN_CUTOFF: Duration = Duration::from_secs(10);
 
 const OUTPUT_HELD_OPEN_MESSAGE: &str =
     "Stopped reading Codex output held open by a process outside its process group";
@@ -239,13 +231,19 @@ impl AgentRunner for CodexAgentRunner {
 
         let stdout_handle = tokio::spawn(Self::read_output(
             stdout,
-            group.drain(OUTPUT_DRAIN_TIMEOUT, OUTPUT_DRAIN_CUTOFF),
+            group.drain(
+                AgentConfig::OUTPUT_DRAIN_TIMEOUT,
+                AgentConfig::OUTPUT_DRAIN_CUTOFF,
+            ),
             label.to_string(),
             "stdout",
         ));
         let stderr_handle = tokio::spawn(Self::read_output(
             stderr,
-            group.drain(OUTPUT_DRAIN_TIMEOUT, OUTPUT_DRAIN_CUTOFF),
+            group.drain(
+                AgentConfig::OUTPUT_DRAIN_TIMEOUT,
+                AgentConfig::OUTPUT_DRAIN_CUTOFF,
+            ),
             label.to_string(),
             "stderr",
         ));

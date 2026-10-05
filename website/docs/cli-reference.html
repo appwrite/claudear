@@ -151,12 +151,13 @@ Options:
       --poll-interval &lt;POLL_INTERVAL&gt;  Polling interval in milliseconds (requires --poll) [default: 300000]
       --no-webhooks                    Disable webhook server
       --no-dashboard                   Disable dashboard API
+      --foreground                     Run in the foreground instead of daemonizing (useful for systemd/launchd)
   -h, --help                           Print help</code></pre></div>
         </section>
 
         <section class="cli-section" data-cli-depth="3">
           <h3 id="claudear-stop"><code>claudear stop</code></h3>
-          <p>Stop the running watcher daemon</p>
+          <p>Stop the running watcher daemon, the one <code>claudear start</code> runs; stop <code>claudear poll</code> and <code>claudear webhook</code> with a signal instead. The daemon stops taking new work and gives in-flight runs up to 30 seconds to finish. <code>claudear stop</code> waits up to 45 seconds for the daemon to exit and reports progress every 5 seconds. It prints <code>Daemon stopped.</code> once the daemon has exited, or exits with code 1 if the daemon is still running after 45 seconds. See <a href="./operations.html#graceful-shutdown">Graceful shutdown</a>.</p>
           <div class="cli-help-block"><pre><code>Stop the running watcher daemon
 
 Usage: claudear stop

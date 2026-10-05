@@ -212,6 +212,18 @@ pub trait AttemptTracker: Send + Sync {
         Ok(())
     }
 
+    /// Mark an issue's attempt as declined because a human refused approval
+    /// to work on it, unless the attempt already has an outcome of its own,
+    /// such as an open or merged PR, an answer or `cannot_fix`.
+    ///
+    /// Default no-op; persistent trackers should set the attempt status to
+    /// `declined` so neither the orphan sweep nor the retry manager runs the
+    /// issue again and asks for approval once more.
+    fn mark_declined(&self, source: &str, issue_id: &str, reason: &str) -> Result<()> {
+        let _ = (source, issue_id, reason);
+        Ok(())
+    }
+
     /// Read the routing intent classified for an attempt, if one was stored.
     fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
         let _ = (source, issue_id);
@@ -259,9 +271,26 @@ pub trait AttemptTracker: Send + Sync {
         self.mark_failed(source, issue_id, error_message)
     }
 
-    /// Fail recent `pending` attempts left behind by a previous process, without
-    /// spending a retry. Only safe at startup, before any run is in flight.
-    fn release_orphaned_pending_attempts(&self) -> Result<usize> {
+    /// Record that the run holding `issue_id`'s `pending` attempt is still
+    /// alive, so [`Self::release_orphaned_pending_attempts`] leaves the attempt
+    /// to it however long the run takes.
+    fn record_attempt_heartbeat(&self, source: &str, issue_id: &str) -> Result<()> {
+        let _ = (source, issue_id);
+        Ok(())
+    }
+
+    /// Release `pending` attempts whose runs have shown no sign of life for
+    /// longer than `stale_after`, returning how many were released.
+    ///
+    /// A live run, in whichever process shares the database, refreshes its
+    /// attempt's [heartbeat](Self::record_attempt_heartbeat) well within
+    /// `stale_after`, so an attempt silent for longer was orphaned by a crash,
+    /// restart or shutdown mid-run and would otherwise block its issue for
+    /// good. A run's last sign of life is its latest heartbeat, or when its
+    /// attempt was recorded if that is later, as it is for a retry whose run
+    /// has not sent one yet. A released attempt is failed without spending a
+    /// retry, or closed as `cannot_fix` once it is more than three days old.
+    fn release_orphaned_pending_attempts(&self, _stale_after: Duration) -> Result<usize> {
         Ok(0)
     }
 }
@@ -466,6 +495,11 @@ pub trait ActivityStore: Send + Sync {
     }
 
     /// Upsert a PR record. Returns the row ID.
+    ///
+    /// An existing record keeps its review cycle count, which only
+    /// [`Self::charge_pr_review_cycle`] and [`Self::refund_pr_review_cycle`]
+    /// change, so a writer holding a stale copy of the record cannot undo
+    /// cycles another process counted.
     fn upsert_pr(&self, _pr: &PrRecord) -> Result<i64> {
         Ok(0)
     }
@@ -473,6 +507,26 @@ pub trait ActivityStore: Send + Sync {
     /// Get a PR record by URL.
     fn get_pr(&self, _pr_url: &str) -> Result<Option<PrRecord>> {
         Ok(None)
+    }
+
+    /// Count one review-driven rerun of `pr` toward `cap`, returning `false`
+    /// without counting it once `pr` has used all `cap`. A PR with no record
+    /// yet gets one from `pr`'s URL, repository, number, status, creation
+    /// time and links to its attempt and issue. The cap is checked and the
+    /// rerun counted in one step, so processes sharing the store never count
+    /// more than `cap` reruns between them.
+    ///
+    /// Default returns `true` without counting anything: a store that keeps
+    /// no PR records enforces no cap.
+    fn charge_pr_review_cycle(&self, _pr: &PrRecord, _cap: i32) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Give back one review-driven rerun of `pr_url` counted by
+    /// [`Self::charge_pr_review_cycle`], never going below zero, so reruns
+    /// other processes counted meanwhile stay counted.
+    fn refund_pr_review_cycle(&self, _pr_url: &str) -> Result<()> {
+        Ok(())
     }
 
     /// Update a PR's status.
@@ -3462,6 +3516,21 @@ mod tests {
                 .get_pr("https://github.com/org/repo/pull/1")
                 .unwrap()
                 .is_none());
+        }
+
+        #[test]
+        fn test_default_charge_pr_review_cycle_enforces_no_cap() {
+            let store = MockActivityExt;
+            let pr = PrRecord::new("https://github.com/org/repo/pull/1", "org/repo", 1);
+            assert!(store.charge_pr_review_cycle(&pr, 0).unwrap());
+        }
+
+        #[test]
+        fn test_default_refund_pr_review_cycle_succeeds() {
+            let store = MockActivityExt;
+            assert!(store
+                .refund_pr_review_cycle("https://github.com/org/repo/pull/1")
+                .is_ok());
         }
 
         #[test]

@@ -664,6 +664,7 @@ fn get_attempts(tracker: &Arc<dyn FixAttemptTracker>, limit: Option<usize>) -> V
         FixAttemptStatus::Merged,
         FixAttemptStatus::Closed,
         FixAttemptStatus::CannotFix,
+        FixAttemptStatus::Declined,
     ] {
         if let Ok(attempts) = tracker.get_attempts_by_status(status) {
             all.extend(attempts);
@@ -692,6 +693,7 @@ fn get_attempt_records(tracker: &Arc<dyn FixAttemptTracker>) -> Vec<FixAttempt> 
         FixAttemptStatus::Merged,
         FixAttemptStatus::Closed,
         FixAttemptStatus::CannotFix,
+        FixAttemptStatus::Declined,
     ] {
         if let Ok(attempts) = tracker.get_attempts_by_status(status) {
             all.extend(attempts);
@@ -2322,7 +2324,7 @@ async fn telemetry_timeseries_handler(
                 FixAttemptStatus::Merged => point.merged += 1,
                 FixAttemptStatus::Closed => point.closed += 1,
                 FixAttemptStatus::CannotFix => point.cannot_fix += 1,
-                FixAttemptStatus::Answered => {}
+                FixAttemptStatus::Answered | FixAttemptStatus::Declined => {}
             }
         }
     }

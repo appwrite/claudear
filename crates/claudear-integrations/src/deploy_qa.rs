@@ -7,6 +7,7 @@ use claudear_analysis::deploy_qa::{
     classify_deploy_qa_verdict, DeployQaVerdict, GitHubDiscordMap, DEPLOY_QA_SOURCE,
 };
 use claudear_core::error::Result;
+use claudear_core::secret::Redactor;
 use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
 use claudear_storage::DeployQaStore;
 
@@ -32,10 +33,14 @@ const REPORT_CHARACTER_LIMIT: usize = 4000;
 const ELLIPSIS: char = '…';
 
 /// Discord reporter for deploy-QA results.
+///
+/// Reports come from an agent with shell and browser access, so every report
+/// passes through `redactor` before it is posted.
 pub struct DeployQaDiscord<H: DiscordHttpClient = ReqwestDiscordClient> {
     client: DiscordClient<H>,
     channel_id: String,
     map: GitHubDiscordMap,
+    redactor: Redactor,
 }
 
 impl DeployQaDiscord<ReqwestDiscordClient> {
@@ -44,11 +49,13 @@ impl DeployQaDiscord<ReqwestDiscordClient> {
         bot_token: impl Into<String>,
         channel_id: impl Into<String>,
         map: GitHubDiscordMap,
+        redactor: Redactor,
     ) -> Result<Self> {
         Ok(Self {
             client: DiscordClient::new(bot_token)?,
             channel_id: channel_id.into(),
             map,
+            redactor,
         })
     }
 }
@@ -59,11 +66,13 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
         client: DiscordClient<H>,
         channel_id: impl Into<String>,
         map: GitHubDiscordMap,
+        redactor: Redactor,
     ) -> Self {
         Self {
             client,
             channel_id: channel_id.into(),
             map,
+            redactor,
         }
     }
 
@@ -105,7 +114,7 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
     ) -> Result<String> {
         self.reply(
             release_message_id,
-            report_embed(TITLE_VERIFIED, COLOR_VERIFIED, report, release_url),
+            self.report_embed(TITLE_VERIFIED, COLOR_VERIFIED, report, release_url),
         )
         .await
     }
@@ -120,7 +129,7 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
     ) -> Result<String> {
         self.reply(
             release_message_id,
-            report_embed(TITLE_UNVERIFIED, COLOR_UNVERIFIED, report, release_url),
+            self.report_embed(TITLE_UNVERIFIED, COLOR_UNVERIFIED, report, release_url),
         )
         .await
     }
@@ -148,12 +157,33 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
             Some(mention) => format!("{mention} {summary}"),
             None => summary,
         };
-        let embed = report_embed(&title, COLOR_FAIL, report, tip.html_url.as_deref());
+        let embed = self.report_embed(&title, COLOR_FAIL, report, tip.html_url.as_deref());
         let sent = self
             .client
             .send_message(&thread_id, CreateMessageParams::with_embed(content, embed))
             .await?;
         Ok((thread_id, sent.id))
+    }
+
+    /// Embed `report`, redacted before it is truncated so a cut can never
+    /// leave part of a secret that no longer matches.
+    fn report_embed(
+        &self,
+        title: &str,
+        color: u32,
+        report: &str,
+        release_url: Option<&str>,
+    ) -> MessageEmbed {
+        let embed = MessageEmbed::new()
+            .title(title)
+            .description(truncate_report(&self.redactor.redact(report)))
+            .color(color)
+            .footer(DEPLOY_QA_SOURCE)
+            .timestamp(chrono::Utc::now().to_rfc3339());
+        match release_url {
+            Some(url) => embed.url(url),
+            None => embed,
+        }
     }
 
     async fn reply(&self, release_message_id: &str, embed: MessageEmbed) -> Result<String> {
@@ -206,6 +236,10 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
 
 /// Classify a deploy-QA report, persist the tip's status, and post the outcome
 /// to Discord `#releases`.
+///
+/// The verdict is read from the report as the agent wrote it; the reporter
+/// redacts credentials only from what it posts, so a redacted line can never
+/// hide a `LIVE FAIL`.
 ///
 /// Only loading the tip or persisting its status can fail. Once the status is
 /// stored, Discord problems (no reporter, no announcement, a failed post, ids
@@ -312,19 +346,6 @@ fn record_discord_ids<S: DeployQaStore + ?Sized>(
     }
 }
 
-fn report_embed(title: &str, color: u32, report: &str, release_url: Option<&str>) -> MessageEmbed {
-    let embed = MessageEmbed::new()
-        .title(title)
-        .description(truncate_report(report))
-        .color(color)
-        .footer(DEPLOY_QA_SOURCE)
-        .timestamp(chrono::Utc::now().to_rfc3339());
-    match release_url {
-        Some(url) => embed.url(url),
-        None => embed,
-    }
-}
-
 fn is_deploy_qa_post(message: &DiscordMessage) -> bool {
     message.embeds.iter().any(|embed| {
         embed
@@ -428,11 +449,14 @@ pub fn try_build_discord(
     bot_token: Option<&str>,
     channel_id: Option<&str>,
     map: GitHubDiscordMap,
+    redactor: Redactor,
 ) -> Result<Option<DeployQaDiscord>> {
     let token = bot_token.filter(|token| !token.is_empty());
     let channel = channel_id.filter(|channel| !channel.is_empty());
     match (token, channel) {
-        (Some(token), Some(channel)) => Ok(Some(DeployQaDiscord::new(token, channel, map)?)),
+        (Some(token), Some(channel)) => {
+            Ok(Some(DeployQaDiscord::new(token, channel, map, redactor)?))
+        }
         _ => Ok(None),
     }
 }
@@ -441,7 +465,9 @@ pub fn try_build_discord(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use claudear_analysis::deploy_qa::{VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX};
+    use claudear_analysis::deploy_qa::{
+        VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX, VERDICT_UNVERIFIED,
+    };
     use claudear_core::error::Error;
     use claudear_core::http::HttpResponse;
     use serde_json::{json, Value};
@@ -454,6 +480,12 @@ mod tests {
     const TAG: &str = "1.2.3";
     const RELEASER: &str = "abnegate";
     const RELEASER_DISCORD_ID: &str = "452316113016193024";
+    const KNOWN_SECRET: &str = "configured-bot-token-0001";
+    const BEARER_TOKEN: &str = "abc123def456ghi789";
+    const GITHUB_TOKEN: &str = "ghp_0123456789abcdefXYZ";
+    const MASK: &str = "[REDACTED]";
+    const DISCORD_EMBED_DESCRIPTION_LIMIT: usize = 4096;
+    const CUT_MARKER: char = '…';
 
     #[derive(Debug, Clone)]
     struct Request {
@@ -564,7 +596,11 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap();
-        (DeployQaDiscord::with_client(client, CHANNEL, map), requests)
+        let redactor = Redactor::new([KNOWN_SECRET]);
+        (
+            DeployQaDiscord::with_client(client, CHANNEL, map, redactor),
+            requests,
+        )
     }
 
     fn posts(requests: &Requests) -> Vec<Request> {
@@ -575,6 +611,20 @@ mod tests {
             .filter(|request| request.method == "POST")
             .cloned()
             .collect()
+    }
+
+    fn posted_text(requests: &Requests) -> String {
+        posts(requests)
+            .iter()
+            .map(|request| request.body.to_string())
+            .collect()
+    }
+
+    fn description(request: &Request) -> String {
+        request.body["embeds"][0]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn release_url(repo: &str, tag: &str) -> String {
@@ -704,6 +754,17 @@ mod tests {
             .expect("reporting should not fail once the status is stored")
     }
 
+    async fn posted_title(text: &str) -> Value {
+        let store = MemoryStore::new(tip());
+        let (discord, requests) = reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+        report(&store, &discord, text).await;
+        posts(&requests)
+            .pop()
+            .expect("the report should be posted")
+            .body["embeds"][0]["title"]
+            .clone()
+    }
+
     fn assert_reply_without_mention(request: &Request) {
         assert!(request.is_post_to(&format!("/channels/{CHANNEL}/messages")));
         assert_eq!(
@@ -734,7 +795,6 @@ mod tests {
         let posts = posts(&requests);
         assert_eq!(posts.len(), 1, "{posts:?}");
         assert_reply_without_mention(&posts[0]);
-        assert_eq!(posts[0].body["embeds"][0]["title"], TITLE_VERIFIED);
         let stored = store.tip();
         assert_eq!(stored.status, DeployQaTipStatus::Verified);
         assert_eq!(stored.discord_message_id.as_deref(), Some(RELEASE_MESSAGE));
@@ -757,8 +817,9 @@ mod tests {
         let posts = posts(&requests);
         assert_eq!(posts.len(), 1, "exactly one reply, no thread: {posts:?}");
         assert_reply_without_mention(&posts[0]);
+        let verified_title = posted_title(&verdict_report("LIVE PASS", VERDICT_ALL_VERIFIED)).await;
         assert_ne!(
-            posts[0].body["embeds"][0]["title"], TITLE_VERIFIED,
+            posts[0].body["embeds"][0]["title"], verified_title,
             "a blocked check must not be reported as verified"
         );
         let stored = store.tip();
@@ -888,6 +949,157 @@ mod tests {
         );
         assert_eq!(posts(&requests).len(), 1);
         assert_eq!(store.tip().status, DeployQaTipStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn fail_report_is_posted_without_credentials() {
+        let store = MemoryStore::new(tip());
+        let (discord, requests) = reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+        let leaky_report = format!(
+            "- #42 login LIVE FAIL: 401 with `Authorization: Bearer {BEARER_TOKEN}`\n\
+             - #43 release notes INFRA, cloned with {GITHUB_TOKEN}\n\
+             - #44 bot token {KNOWN_SECRET} in the logs INFRA\n\
+             {VERDICT_PREFIX} {VERDICT_FAIL}"
+        );
+
+        let verdict = report(&store, &discord, &leaky_report).await;
+
+        assert_eq!(verdict, DeployQaVerdict::Fail);
+        assert_eq!(store.tip().status, DeployQaTipStatus::Failed);
+        let posted = posted_text(&requests);
+        for (kind, value) in [
+            ("bearer token", BEARER_TOKEN),
+            ("GitHub token", GITHUB_TOKEN),
+            ("configured bot token", KNOWN_SECRET),
+        ] {
+            assert!(
+                !posted.contains(value),
+                "the {kind} reached the posted report"
+            );
+        }
+        let fail_post = posts(&requests)
+            .pop()
+            .expect("the FAIL report should be posted");
+        assert!(fail_post.is_post_to(&format!("/channels/{CREATED_THREAD}/messages")));
+        let description = description(&fail_post);
+        assert!(
+            description.contains(MASK),
+            "the FAIL report must show where a credential was masked"
+        );
+        assert!(
+            description.contains("#42 login LIVE FAIL"),
+            "the FAIL report must keep its failing result"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_and_unverified_replies_are_posted_without_credentials() {
+        for (result, expected) in [
+            ("LIVE PASS", DeployQaVerdict::AllVerified),
+            ("LIVE BLOCKED", DeployQaVerdict::Unverified),
+        ] {
+            let store = MemoryStore::new(tip());
+            let (discord, requests) =
+                reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+            let leaky_report = format!(
+                "- #42 new route {result}, checked with X-Appwrite-Key: {BEARER_TOKEN}\n\
+                 - #43 ci INFRA, bot token {KNOWN_SECRET}\n\
+                 {VERDICT_PREFIX} {VERDICT_ALL_VERIFIED}"
+            );
+
+            let verdict = report(&store, &discord, &leaky_report).await;
+
+            assert_eq!(verdict, expected, "{result}");
+            let posts = posts(&requests);
+            assert_eq!(
+                posts.len(),
+                1,
+                "{result}: the report must be posted as one reply"
+            );
+            assert_reply_without_mention(&posts[0]);
+            let description = description(&posts[0]);
+            for (kind, value) in [
+                ("X-Appwrite-Key value", BEARER_TOKEN),
+                ("configured bot token", KNOWN_SECRET),
+            ] {
+                assert!(
+                    !description.contains(value),
+                    "{result}: the {kind} reached the posted reply"
+                );
+            }
+            assert!(
+                description.contains(MASK),
+                "{result}: the reply must show where a credential was masked"
+            );
+            assert!(
+                description.contains(&format!("{VERDICT_PREFIX} {VERDICT_ALL_VERIFIED}")),
+                "{result}: the reply must keep its verdict line"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn report_is_redacted_before_it_is_truncated() {
+        const FRAGMENT_LENGTH: usize = 8;
+        let fragments: Vec<&str> = (0..=KNOWN_SECRET.len() - FRAGMENT_LENGTH)
+            .map(|start| &KNOWN_SECRET[start..start + FRAGMENT_LENGTH])
+            .collect();
+        let check = format!("- #42 check LIVE PASS token={KNOWN_SECRET}\n");
+        let checks = check.repeat(1_000);
+        let footer = format!("{VERDICT_PREFIX} {VERDICT_ALL_VERIFIED}");
+        for shift in 0..check.len() {
+            let store = MemoryStore::new(tip());
+            let (discord, requests) =
+                reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+            let leaky_report = format!("{checks}{}\n{footer}", " ".repeat(shift));
+
+            report(&store, &discord, &leaky_report).await;
+
+            let posted = posted_text(&requests);
+            assert!(
+                !fragments.iter().any(|fragment| posted.contains(fragment)),
+                "shifted {shift}: part of the configured bot token reached the posted report"
+            );
+            let description = description(&posts(&requests)[0]);
+            assert!(
+                description.contains(MASK),
+                "shifted {shift}: the report must show where the token was masked"
+            );
+            assert!(
+                description.ends_with(&footer),
+                "shifted {shift}: the truncated report must keep its verdict line"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verdict_is_classified_from_the_report_before_redaction() {
+        let store = MemoryStore::new(tip());
+        let (discord, requests) = reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+        let leaky_report = format!(
+            "- #42 login with Authorization: Bearer {BEARER_TOKEN} LIVE FAIL\n\
+             {VERDICT_PREFIX} {VERDICT_UNVERIFIED}"
+        );
+
+        let verdict = report(&store, &discord, &leaky_report).await;
+
+        assert_eq!(
+            verdict,
+            DeployQaVerdict::Fail,
+            "redacting the header must not hide its LIVE FAIL from classification"
+        );
+        let fail_post = posts(&requests)
+            .pop()
+            .expect("the FAIL report should be posted");
+        assert!(
+            fail_post.is_post_to(&format!("/channels/{CREATED_THREAD}/messages")),
+            "the report must be posted as a FAIL, in the release thread: {fail_post:?}"
+        );
+        let description = description(&fail_post);
+        assert!(
+            !description.contains(BEARER_TOKEN),
+            "the bearer token reached the posted report"
+        );
     }
 
     #[tokio::test]
@@ -1128,8 +1340,22 @@ mod tests {
 
         let truncated = truncate_report(&report);
 
-        assert_eq!(truncated.chars().count(), REPORT_CHARACTER_LIMIT);
-        assert!(truncated.starts_with(ELLIPSIS));
-        assert!(truncated.ends_with(&footer));
+        let length = truncated.chars().count();
+        assert!(
+            length <= DISCORD_EMBED_DESCRIPTION_LIMIT,
+            "{length} characters do not fit in a Discord embed description"
+        );
+        assert!(
+            length < report.chars().count(),
+            "a report too long for Discord must be cut"
+        );
+        assert!(
+            truncated.starts_with(CUT_MARKER),
+            "a cut report must show that text was dropped"
+        );
+        assert!(
+            truncated.ends_with(&footer),
+            "a cut report must keep its tail, where the verdict footer is"
+        );
     }
 }

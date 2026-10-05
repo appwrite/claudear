@@ -330,6 +330,15 @@ mod tests {
             ..failed.clone()
         };
         assert!(!manager.should_retry(&cannot_fix));
+
+        let declined = FixAttempt {
+            status: FixAttemptStatus::Declined,
+            ..failed.clone()
+        };
+        assert!(
+            !manager.should_retry(&declined),
+            "an attempt a human declined must never be retried"
+        );
     }
 
     #[test]

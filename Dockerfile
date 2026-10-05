@@ -164,5 +164,5 @@ EXPOSE 3100 443 80
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3100/api/health || exit 1
 
-ENTRYPOINT ["tini", "--", "docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "docker-entrypoint.sh"]
 CMD ["claudear", "start", "--foreground"]

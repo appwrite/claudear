@@ -29,6 +29,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
   - [Daemon Mode](#daemon-mode)
   - [Polling Mode](#polling-mode-foreground)
   - [Webhook Mode](#webhook-mode)
+  - [Graceful Shutdown](#graceful-shutdown)
   - [Manual Triggers](#manual-triggers)
   - [PR Management](#pr-management)
   - [Retry Management](#retry-management)
@@ -185,7 +186,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 ### Deploy QA
 - Durable last-seen watches for GitHub release tips (separate from regression inclusion tracking)
 - Tag filters (`any`, `suffix:-db`, `not_suffix:-db`) per track
-- Observe/report agent enqueue — never opens fix PRs for a release announcement
+- Live QA agent enqueue — runs real checks against the release from a private per-run directory, and is told never to open fix PRs for a release announcement
 - Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + mapped `@releaser`
 
 ### Notifications
@@ -222,6 +223,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Runs as a background service with full IPC control
 - `start` / `stop` / `pause` / `resume` / `status` / `activity` commands
 - Unix socket communication with configurable timeout
+- Graceful shutdown: stops taking new work and gives in-flight runs up to 30 seconds to finish
 
 ### Security
 - API security headers (HSTS, X-Content-Type-Options, X-Frame-Options)
@@ -496,16 +498,17 @@ claudear start --poll --poll-interval 60000
 # Start without webhooks or dashboard
 claudear start --poll --no-webhooks --no-dashboard
 
+# Stay in the foreground (for systemd, launchd, or Docker)
+claudear start --poll --foreground
+
 # Control the daemon
 claudear status              # Check daemon health
 claudear pause               # Stop picking up new issues
 claudear resume              # Resume processing
 claudear activity            # View recent activity
 claudear activity 50         # Show last 50 entries
-claudear stop                # Stop the daemon
+claudear stop                # Stop after in-flight runs finish (up to 30s)
 ```
-
-`claudear stop` lets runs in progress finish for up to 30s, then interrupts the agent CLIs still running and kills any left 5s later. SIGTERM, as sent by `kill`, `systemctl stop` or `docker stop`, shuts down `start`, `webhook` and `poll` the same way, except that it interrupts the agent CLIs at once, as Ctrl-C does. Either way shutting down can take up to 35s, so give a service manager at least 40s before it kills Claudear.
 
 ### Polling Mode (Foreground)
 
@@ -537,6 +540,29 @@ The `--setup` flag:
 2. Creates webhooks pointing to your server
 3. Retrieves signing secrets and writes them to your `.env` file
 4. Starts the webhook server with verification enabled
+
+### Graceful Shutdown
+
+`claudear start`, `claudear poll`, `claudear webhook`, and `claudear dry-run` shut down on SIGTERM, SIGINT, or SIGHUP, as `kill`, `systemctl stop`, `docker stop`, Ctrl+C, or a closing terminal send them. A daemon started with `claudear start` also shuts down on `claudear stop`; stop the other commands with a signal. Any of these signals that was already ignored when Claudear started stays ignored: a Claudear started under `nohup` keeps running when its terminal closes, and one that a script starts in the background keeps running on Ctrl+C, because the script's shell ignores SIGINT for it. Claudear then:
+
+1. Stops taking new work:
+   - polling and background housekeeping start no new runs
+   - issue webhooks are answered with `503 Service Unavailable` and `Retry-After: 60`, and not recorded, so a redelivery is processed once Claudear is back (GitHub review and pull request webhooks are still accepted)
+   - IPC `Trigger` and `ProcessRetries` commands are refused
+2. On a signal, interrupts the agent CLIs at once, logging `Interrupting the agent CLIs of the runs in flight`. Each agent CLI leads a process group of its own, out of reach of the terminal's Ctrl+C, so Claudear passes on the SIGINT that Ctrl+C would send. It does not wait for the runs first: service managers and Docker follow SIGTERM with SIGKILL after a deadline, and agent runs take minutes. `claudear stop`, or a service that stops on its own, leaves the agent CLIs running instead.
+3. Waits up to 30 seconds for in-flight runs to finish, as interrupted runs do once they have recorded how they ended. A run that records a failure is retried later, like any failed run.
+4. Interrupts the agent CLIs still running after that, logging `Interrupting the agent CLIs of the runs still in flight after 30s`, and gives their runs up to 5 more seconds to record how they ended. Any agent process still running then is killed. Runs that background housekeeping started (retries, review runs, merge follow-ups, and release cascades) stop when the 30 seconds run out instead, and their agent CLIs are killed straight away.
+5. Exits, logging `Exiting with runs still in flight` if any are left. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends. A run that could not record how it ended leaves its fix attempt `pending` until a running daemon (`claudear start`, `claudear poll` or `claudear webhook`) finds that the run has sent no heartbeat for 5 minutes. Then an attempt started in the last 3 days goes back up for retry without spending a retry, and an older one is closed as `cannot_fix`, which `claudear reset <source> <issue_id>` undoes. Cascade attempts stay `pending`.
+
+While it drains, `claudear status` reports `Running: false`. `claudear stop` waits up to 45 seconds for the daemon to exit and reports progress every 5 seconds. It prints `Daemon stopped.` and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 45 seconds. Until the daemon has exited, `claudear start` cannot start another one: the new daemon exits at once with `Another claudear daemon is already running. Stop it first with 'claudear stop'`. A signal that reaches Claudear while it shuts down, including after `claudear stop`, forces the exit: Claudear kills every agent CLI and dies of SIGINT at once.
+
+Exit codes:
+
+- `0`: graceful shutdown, including when the drain runs out of time
+- `130` (death by SIGINT): a signal during the shutdown forced the exit
+- `1`: a service failed or stopped on its own (`The <name> service stopped unexpectedly`), which started the shutdown
+
+One-shot commands that run agents (`claudear trigger`, `claudear action`, and `claudear retries process`) also stop on SIGTERM, SIGINT, or SIGHUP: they interrupt their agent CLIs at once, kill any still running 5 seconds later, and give the command up to 30 seconds to record how its runs ended before it exits as interrupted, dying of SIGINT. A second signal exits at once.
 
 ### Manual Triggers
 
@@ -735,6 +761,7 @@ Works in every daemon mode — `claudear start` (no `--poll` needed), `claudear 
 enabled = true
 poll_interval_ms = 300000
 skip_if_previous_running = true
+timeout_secs = 1800                # per live-QA run; the runner stops it past min(this, [agent] timeout_secs)
 discord_channel_id = "990878183580651571"
 github_discord_map_path = "/etc/claudear/github-discord-map.json"  # absolute: relative paths break under systemd
 
@@ -747,14 +774,32 @@ tag_filter = "any"                 # any | suffix:-db | not_suffix:-db
 On a new tip Claudear:
 
 1. Persists last-seen tag per track in SQLite (`deploy_qa_tips`) and skips duplicates. On first enable a track has no last-seen tag, so its current tip counts as new and gets one QA run.
-2. Skips enqueue if a previous attempt on that track is still pending or running. A tip whose attempt ends without a verdict (agent error or timeout) is marked `errored` so it no longer blocks the track. Tips left `running` longer than twice the QA answer timeout (`[qa] answer_timeout_secs`) are marked `errored` on the next poll tick, so a crashed or interrupted run stops blocking its track without affecting runs live in other processes that share the database (a `claudear trigger`, `claudear retries process` or second `claudear poll`). The retry manager may still retry a failed attempt, but only an `errored` tip is re-run: a tip that is running or has a recorded verdict is never re-run, by a retry or by `claudear trigger`.
-3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **observe/report only**, no fix PRs. `claudear action` (`reply`, `verify` or `resolve`) refuses these issues.
+2. Skips enqueue if a previous attempt on that track is still pending or running. A tip whose attempt ends without a verdict (agent error, timeout, or a report Claudear could not record) is marked `errored` so it no longer blocks the track. Tips left `running` longer than `[deploy_qa] timeout_secs` plus a margin of that timeout again (at least 10 minutes) are marked `errored` on the next poll tick, so a crashed or interrupted run stops blocking its track without affecting runs live in other processes that share the database (a `claudear trigger`, `claudear retries process` or second `claudear poll`). The retry manager may retry a failed attempt up to `[retry] max_retries` times, but only an `errored` tip is re-run: a tip that is running or has a recorded verdict is never re-run, by a retry or by `claudear trigger`.
+3. Enqueues a synthetic `deploy_qa` issue (`track:repo:tag`) with the bundled playbook — **live QA that only reports**: the agent runs real checks against the release and is told never to open fix PRs, branches or commits (see **Guardrails** below). `claudear action` (`reply`, `verify` or `resolve`) refuses these issues.
 4. Classifies the agent's report, records the tip as `verified`, `unverified` or `failed`, and posts the outcome under the release announcement in Discord `#releases` (the agent never posts itself):
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
    - **Unverified** — nothing failed, but a PR is `LIVE BLOCKED`, the footer is `DEPLOY_QA_VERDICT: UNVERIFIED`, or the footer is missing: reply, no @, so blocked checks never page the releaser but are never reported as verified either.
    - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser via `github-discord-map.json` (reusing the announcement's existing thread when it already has one).
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
+
+**Tool access.** A live-QA run gets the provider's fix-run access (`permissions`, and `skip_permissions` when set) plus its read-only tools (`readonly_tools`), and uses `qa_model` when one is set. A scoped rule allows only the commands it matches: with `permissions = ["Bash(git *)"]` the agent can run `git` but not `curl`, so HTTP checks need a rule such as `Bash(curl:*)` or `skip_permissions = true`. Unless `skip_permissions` is set, a run logs a warning when its allowed tools (`permissions` plus `readonly_tools`, so a `Bash` entry in either counts) grant no shell at all, and a different one when they grant only scoped `Bash(...)` rules.
+
+**Where it runs.** Each run starts in a fresh directory of its own, `<workspace>/.claudear-deploy-qa/<short id>-<random>`, never a repo checkout, and on Unix the agent gets that directory's resolved path, with no symlinks in it. Claudear creates `.claudear-deploy-qa` and every run directory owner-only (0700 on Unix), and deletes a run's directory when the run ends, after any report is delivered; a run cut short by a daemon crash leaves its directory behind. On Unix the workspace must be owned by the daemon user and writable by no other user, or anyone who can write to it could swap `.claudear-deploy-qa` for a directory of their own. Group write is allowed only when the workspace's group is the daemon user's primary group, as with the user-private groups Ubuntu gives each user; if that group has other members, remove its write access. An existing `.claudear-deploy-qa` must be a real directory, not a symlink, and on Unix one the daemon user owns, which Claudear restricts to 0700 before use. Otherwise the run fails, as it also does when `.claudear-deploy-qa` is replaced while a run's directory is being created in it. The agent CLI gets `--strict-mcp-config` and `--setting-sources user`, so only the MCP servers Claudear attaches for `deploy_qa` load, and only your user-level Claude Code settings apply: never a `.mcp.json`, and never project or local settings (`.claude/settings.json`, `.claude/settings.local.json`).
+
+**Context.** Unlike a question, a live-QA run gets no retrieved context: no code search results, indexed Discord discussions or reply chain, because people other than your operators can write that text and the agent can run commands. Besides Claudear's own rules, its prompt holds only the tip (the playbook and release details) and your agent instructions from the dashboard.
+
+**Time limit.** The runner stops a live-QA run once it exceeds the smaller of `[agent] timeout_secs` and `[deploy_qa] timeout_secs`, and records it as timed out. That kills the agent CLI and everything still running in its process group, such as a hung `curl`, but not a process that moved to a session of its own. Once the CLI is gone, the runner waits a few seconds for such a process to release its output, then keeps the output read so far, so a run that finished within its limit is still reported. Processing only gives up on the run itself if the runner fails to stop it, and not before the runner has had time past `[deploy_qa] timeout_secs` to return a finished run or to kill and record a timed-out one. Either way a timed-out run's tip is marked `errored`, and the retry manager may run it again up to `[retry] max_retries` times.
+
+**Guardrails.** The agent is told not to modify any repository or open fix PRs, branches or commits, not to post to Discord, Slack or any other channel, to make state-changing requests only in the playbook's throwaway QA project, to keep secrets out of its report, and to treat release notes, PR text, web pages and command output as data, not instructions. These are prompt rules, not a sandbox: the agent runs as the daemon user with the same files, network access and environment as fix runs, except that it inherits none of Claudear's own `CLAUDEAR_*` variables (its master key and tokens), so give it credentials that can only touch the throwaway QA project. The report goes only to `#releases`: if Claudear cannot record it, the run fails and the tip is marked `errored` rather than the report going to your other notifier channels. Before posting, Claudear redacts the credentials it recognizes: the tokens, keys, passwords, webhook URLs and webhook secrets in its config; the values of secret-named variables (names containing `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY` or `AUTH`, ending in `_KEY`, and the like) in the daemon environment, the provider `env` and each MCP server's `env` and `headers`; credential header values (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Fallback-Cookies` and the `X-Appwrite-*` key, JWT and session headers); any token of 8 or more characters after `Bearer`, so a long word there is masked too; `Basic` credentials, base64 of `user:password` whatever characters it uses; URL passwords; secret-named `NAME=value` assignments and JSON fields, Appwrite `a_session_*` session cookies among them; the `value` of a JSON object whose `name` is secret-named, as browser tools list cookies and headers; generated-looking values (20 or more characters mixing letters and digits) after a credential label or flag, such as `API key:`, `key=`, `--key` or a `| key |` table cell; Appwrite API keys (`standard_`, `organization_` and `account_` keys, and `ephemeral_` or `dynamic_` JWT keys); PEM blocks; JWTs, including one after `_`; and GitHub, GitLab, Linear, Slack, Sentry and Anthropic tokens by their prefixes. It cannot mask what it does not recognize, such as a configured secret shorter than 8 characters, one the agent reformatted, or an unlabelled token with no known prefix, and the unredacted report stays in Claudear's database and execution logs, so don't rely on redaction to keep a secret out of `#releases`.
+
+**Credentials.**
+
+- The provider `env` (`[agent.providers.claude.env]`) is passed verbatim, with no `${VAR}` expansion, to every agent run of every source (fix runs, Q&A and replies as well as live QA), and so is the daemon environment the agent inherits. A QA key set there reaches all of them. The one exception: a live-QA run gets no variable named `CLAUDEAR_*` from either, such as `CLAUDEAR_MASTER_KEY` or Claudear's GitHub and Discord tokens, so give QA credentials other names.
+- An MCP server's `env` values can reference `${VAR}`, which Claude Code expands from the agent's environment, so the secret itself stays out of the config file. The only `CLAUDEAR_*` variable in a live-QA run's environment is `CLAUDEAR_RUN`, the per-run marker Claudear uses to find and kill the processes the run leaves behind, so any other `${CLAUDEAR_*}` reference never resolves there.
+- `@playwright/mcp` does not read logins from environment variables. Give it a saved session with `--storage-state <file>` (cookies and local storage, e.g. saved with Playwright's `storageState()`), or `--secrets <dotenv file>`, whose keys the agent types in place of the values; Playwright MCP also masks those values in its tool output, as a convenience rather than a security boundary.
+
+**Browser.** The commented Playwright entry in [`claudear.example.toml`](claudear.example.toml) attaches a headless browser to `deploy_qa` runs only (`sources = ["deploy_qa"]`). It needs Node.js and `npx` on the daemon host, plus the Chromium build that exact `@playwright/mcp` version expects and its OS libraries: `npx -y @playwright/mcp@0.0.82 install-browser --with-deps chromium` (`--with-deps` installs system packages, so it needs root or sudo). Pin the version as the example does rather than using `@latest`, which can move to a Playwright release whose browser build is not installed, and keep `--browser chromium` so the server uses that build instead of looking for Google Chrome. The Docker image ships neither Node.js nor a browser.
 
 Requires a GitHub token (`scm.github.token` or `CLAUDEAR_GITHUB_TOKEN`) for release polling: config validation rejects an enabled `[deploy_qa]` with tracks but no token. A live host also needs a Discord bot token with message + create-thread permissions.
 
@@ -865,6 +910,7 @@ When an issue is assigned to a user, Claudear routes notifications to their conf
 | **Closed** | PR closed without merging (triggers retry) |
 | **Failed** | Fix attempt failed (triggers retry) |
 | **Cannot Fix** | Max retries exhausted |
+| **Declined** | A human refused approval; not retried or asked about again unless reset |
 
 ---
 
@@ -999,6 +1045,8 @@ use_agent = false
 
 ## Running as a Service
 
+Service managers need `claudear start --foreground`: without it, `start` forks into the background and the manager loses track of the daemon. Give Claudear 50 seconds to stop before the manager sends SIGKILL: that covers the 30-second drain (see [Graceful Shutdown](#graceful-shutdown)), up to 5 seconds for interrupted agent CLIs, up to 5 seconds for blocking work to stop, and a margin. The defaults fall short of that in Docker (10 seconds) and launchd (20 seconds); systemd's 90 seconds would do, and the unit below sets 50 like the other examples.
+
 ### macOS (launchd)
 
 Create `~/Library/LaunchAgents/com.claudear.plist`:
@@ -1014,15 +1062,15 @@ Create `~/Library/LaunchAgents/com.claudear.plist`:
     <array>
         <string>/usr/local/bin/claudear</string>
         <string>start</string>
-        <string>--foreground</string>
         <string>--poll</string>
+        <string>--foreground</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>ExitTimeOut</key>
-    <integer>40</integer>
+    <integer>50</integer>
     <key>StandardOutPath</key>
     <string>/tmp/claudear.log</string>
     <key>StandardErrorPath</key>
@@ -1034,6 +1082,8 @@ Create `~/Library/LaunchAgents/com.claudear.plist`:
 ```bash
 launchctl load ~/Library/LaunchAgents/com.claudear.plist
 ```
+
+`ExitTimeOut` is how long launchd waits after SIGTERM before it sends SIGKILL. `KeepAlive` restarts Claudear whenever it exits, so stop it with `launchctl unload ~/Library/LaunchAgents/com.claudear.plist` rather than `claudear stop`.
 
 ### Linux (systemd)
 
@@ -1047,7 +1097,9 @@ After=network.target
 [Service]
 Type=simple
 User=YOUR_USER
-ExecStart=/usr/local/bin/claudear start --foreground --poll
+ExecStart=/usr/local/bin/claudear start --poll --foreground
+KillMode=mixed
+TimeoutStopSec=50
 Restart=on-failure
 RestartSec=10
 
@@ -1059,6 +1111,8 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now claudear
 ```
+
+`KillMode=mixed` sends SIGTERM to Claudear only, so the agent CLIs it started get the SIGINT Claudear passes on rather than systemd's SIGTERM, and their runs can record how they ended; systemd kills any that are left once Claudear exits. `TimeoutStopSec=50` is how long systemd waits for Claudear to exit before it sends SIGKILL.
 
 ---
 
@@ -1085,8 +1139,8 @@ docker build -t claudear .
 
 # Run with config file
 docker run -d \
-  --stop-timeout 40 \
   -p 3100:3100 \
+  --stop-timeout 50 \
   -v $(pwd)/claudear.toml:/app/claudear.toml \
   -v $(pwd):/app/workspace \
   -v claudear-data:/app/data \
@@ -1094,26 +1148,33 @@ docker run -d \
 
 # Or with environment variable overrides
 docker run -d \
-  --stop-timeout 40 \
   -p 3100:3100 \
+  --stop-timeout 50 \
   -v $(pwd)/claudear.toml:/app/claudear.toml \
   -v $(pwd):/app/workspace \
   -v claudear-data:/app/data \
-  -e LINEAR_API_KEY=your-key \
-  -e GITHUB_TOKEN=your-token \
+  -e CLAUDEAR_LINEAR_API_KEY=your-key \
+  -e CLAUDEAR_GITHUB_TOKEN=your-token \
   claudear
 ```
+
+### Stopping
+
+`docker stop` sends SIGTERM, which tini forwards to Claudear, so it interrupts its agent CLIs and shuts down gracefully (see [Graceful Shutdown](#graceful-shutdown)). Docker kills the container if it is still running when the stop timeout runs out, and the default of 10 seconds is shorter than a shutdown can take: `docker-compose.yml` sets `stop_grace_period: 50s`, and the standalone examples pass `--stop-timeout 50`. For a container started without either, use `docker stop -t 50`.
+
+Stop the container with `docker stop` (or `docker compose stop`) rather than running `claudear stop` inside it: the container ends as soon as Claudear exits, and a restart policy such as the compose file's `unless-stopped` starts it again unless Docker itself stopped it.
 
 ### Docker Details
 
 The Docker image:
 - Multi-stage build (Bun for dashboard, Rust for binary, Debian slim runtime)
-- Includes Claude Code (installed via npm), git, and Node.js
+- Includes Claude Code (native installer), git, the GitHub CLI (`gh`), `curl`, `jq` and `sqlite3`; it has no Node.js, `npx` or browser, so the `[deploy_qa]` Playwright browser needs an image built on top of it
+- Runs Claudear under [tini](https://github.com/krallin/tini), which forwards signals and reaps orphaned processes
+- Runs `claudear start --foreground` by default (webhooks and dashboard on port 3100); pass a command after the image name (or set `command:` in `docker-compose.yml`) to change it, e.g. `claudear start --foreground --poll`
 - Embeds the dashboard UI in the binary
 - Persists embedding model cache between restarts
 - Supports both `ANTHROPIC_API_KEY` and OAuth login for Claude authentication
 - Health check on `/api/health` every 30 seconds
-- Runs `claudear start --foreground` under `tini`, so `docker stop` shuts it down gracefully; `docker-compose.yml` gives it the 40s this can take (pass `--stop-timeout 40` to `docker run`)
 
 > **Note**: SQLite WAL mode is incompatible with Docker Desktop's VirtioFS bind mounts. Use Docker named volumes (e.g., `claudear-data:/app/data`) instead of bind mounts for the database directory.
 

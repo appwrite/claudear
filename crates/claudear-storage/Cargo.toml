@@ -41,3 +41,6 @@ hex = { workspace = true }
 
 # Random (for test utilities)
 rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

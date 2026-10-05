@@ -5,10 +5,12 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::error::Result;
 use crate::feedback::{FeedbackAnalyzer, IssueEmbeddingService};
+use crate::heartbeat::{self, Heartbeat};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer};
 use crate::notifier::Notifier;
 use crate::runner::AgentRunner;
 use crate::scm::ReviewWatcher;
+use crate::shutdown;
 use crate::storage::FixAttemptTracker;
 use crate::types::{validate_issue_id, ActivityLogEntry, Issue, IssueEmbedding, ProcessingMetric};
 use crate::users::UserRegistry;
@@ -16,7 +18,7 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderName, Method, StatusCode},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::get,
     Router,
 };
@@ -24,8 +26,9 @@ use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tokio_util::task::TaskTracker;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -38,6 +41,13 @@ const PROCESSING_ENTRY_TTL_SECS: u64 = 3600;
 
 /// Maximum number of entries in the processing set before forced cleanup.
 const MAX_PROCESSING_ENTRIES: usize = 1000;
+
+/// How long a sender should wait before redelivering a webhook refused during shutdown: until
+/// the old daemon has exited and a restarted one can take the delivery.
+const SHUTDOWN_RETRY_AFTER: Duration = shutdown::EXIT_TIMEOUT.saturating_add(RESTART_MARGIN);
+
+/// How long a restarted daemon takes to serve webhooks again once the old one has exited.
+const RESTART_MARGIN: Duration = Duration::from_secs(15);
 
 /// Maximum concurrent `/mcp` requests. Semantic searches serialize on the shared
 /// embedding pool, so this caps queued blocking work under a burst.
@@ -77,6 +87,7 @@ pub(crate) struct AppState {
     /// Tracks currently processing webhooks with timestamps for TTL-based cleanup.
     /// Key: processing key (source:issue_id), Value: timestamp when processing started.
     processing: RwLock<HashMap<String, Instant>>,
+    runs: TaskTracker,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -112,6 +123,7 @@ pub struct WebhookServer {
     port: u16,
     /// When set, the dashboard API routes are merged into the webhook server.
     dashboard_config_path: Option<std::path::PathBuf>,
+    runs: TaskTracker,
 }
 
 impl WebhookServer {
@@ -170,6 +182,7 @@ impl WebhookServer {
             qa_agent: None,
             port,
             dashboard_config_path: None,
+            runs: TaskTracker::new(),
         }
     }
 
@@ -227,6 +240,12 @@ impl WebhookServer {
     /// Enable the dashboard API routes alongside the webhook routes.
     pub fn set_dashboard(&mut self, config_path: std::path::PathBuf) {
         self.dashboard_config_path = Some(config_path);
+    }
+
+    /// Share the tracker that webhook-started runs are spawned on. Closing it makes the
+    /// server answer new issue webhooks with 503; waiting on it drains the runs in flight.
+    pub fn set_runs(&mut self, runs: TaskTracker) {
+        self.runs = runs;
     }
 
     /// Build a repository inferrer from config.
@@ -315,6 +334,7 @@ impl WebhookServer {
             suppression_regex_cache,
             qa_agent: self.qa_agent,
             processing: RwLock::new(HashMap::new()),
+            runs: self.runs,
         });
 
         // Concurrency limit: max 10 concurrent webhook processing
@@ -325,7 +345,7 @@ impl WebhookServer {
         let mut webhook_routes = Router::new().route("/health", get(health_handler)).route(
             "/webhook/{source}",
             get(webhook_verify_handler)
-                .post(webhook_handler)
+                .post(serve_webhook)
                 .layer(concurrency_layer),
         );
 
@@ -532,6 +552,26 @@ async fn webhook_verify_handler(
     (StatusCode::OK, query.hub_challenge.unwrap_or_default()).into_response()
 }
 
+/// Answer a webhook with [`webhook_handler`]'s reply. The handler answers 503 only when it
+/// refuses a webhook during shutdown, so that reply also tells the sender when to retry.
+async fn serve_webhook(
+    state: State<Arc<AppState>>,
+    source: Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (status, reply) = webhook_handler(state, source, headers, body).await;
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        return (
+            status,
+            [(header::RETRY_AFTER, SHUTDOWN_RETRY_AFTER.as_secs())],
+            reply,
+        )
+            .into_response();
+    }
+    (status, reply).into_response()
+}
+
 async fn webhook_handler(
     State(state): State<Arc<AppState>>,
     Path(source_name): Path<String>,
@@ -620,6 +660,19 @@ async fn webhook_handler(
                 .unwrap_or_default();
             return (StatusCode::OK, Json(json!({ "challenge": challenge })));
         }
+    }
+
+    // Tracked from before the check to after the spawn, so the drain can't miss this run.
+    let _request = state.runs.token();
+    if state.runs.is_closed() {
+        tracing::info!(
+            source = source_name.as_str(),
+            "Refusing webhook while shutting down"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "unavailable", "reason": "Shutting down" })),
+        );
     }
 
     // Webhook delivery ID idempotency: prevent redelivered webhooks from
@@ -869,6 +922,12 @@ async fn webhook_handler(
             Json(json!({ "status": "error", "reason": "Failed to record attempt" })),
         );
     }
+    let heartbeat = Heartbeat::start(
+        Arc::clone(&state.tracker),
+        &source_name,
+        &issue.id,
+        heartbeat::INTERVAL,
+    );
 
     // Persist full issue content to the issues table (independent of embeddings)
     {
@@ -883,7 +942,8 @@ async fn webhook_handler(
     let state_clone = Arc::clone(&state);
     let handler_clone = Arc::clone(handler);
 
-    tokio::spawn(async move {
+    state.runs.spawn(async move {
+        let _heartbeat = heartbeat;
         let cleanup_state = Arc::clone(&state_clone);
         let cleanup_key = processing_key.clone();
         let result = process_issue(
@@ -1204,6 +1264,7 @@ mod tests {
     use crate::types::Outcome;
     use crate::types::{Issue, MatchPriority, MatchResult};
     use async_trait::async_trait;
+    use futures::FutureExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Mock notifier for testing
@@ -1629,6 +1690,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -1676,6 +1738,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(processing_set),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -1721,6 +1784,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -1800,6 +1864,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -1854,6 +1919,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -1930,6 +1996,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -2016,6 +2083,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -2074,6 +2142,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -2133,6 +2202,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(processing),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -2188,6 +2258,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -2265,6 +2336,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -2397,6 +2469,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -2515,6 +2588,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         }
     }
@@ -2605,6 +2679,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -2645,6 +2720,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -2657,13 +2733,19 @@ mod tests {
         tracker: Arc<dyn FixAttemptTracker>,
         sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
     ) -> Arc<AppState> {
-        let config = test_config();
+        let agent = test_agent(tracker.clone());
+        make_app_state_with_agent(handlers, tracker, sqlite_tracker, agent)
+    }
+
+    fn make_app_state_with_agent(
+        handlers: WebhookHandlerRegistry,
+        tracker: Arc<dyn FixAttemptTracker>,
+        sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
+        agent: Arc<dyn AgentRunner>,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
-            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
-                crate::runner::ClaudeRunnerConfig::default(),
-                tracker.clone(),
-            )),
-            config,
+            agent,
+            config: test_config(),
             handlers,
             notifier: Arc::new(MockNotifier::new()),
             tracker,
@@ -2683,6 +2765,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         })
     }
@@ -2718,6 +2801,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(processing),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         })
     }
@@ -2752,6 +2836,7 @@ mod tests {
             github_handler,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         })
     }
@@ -2919,6 +3004,205 @@ mod tests {
         assert_eq!(response["status"], "accepted");
     }
 
+    const DRAIN_WAIT: Duration = Duration::from_secs(5);
+
+    #[derive(Default)]
+    struct MockAgent {
+        call_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentRunner for MockAgent {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn capabilities(&self) -> crate::runner::ProviderCapabilities {
+            crate::runner::ProviderCapabilities::default()
+        }
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> String {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            String::new()
+        }
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &std::path::Path,
+        ) -> crate::error::Result<crate::types::AgentResult> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Err(crate::error::Error::runner(
+                "webhook tests never run the agent",
+            ))
+        }
+    }
+
+    struct GatedHandler {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl WebhookHandler for GatedHandler {
+        fn source_name(&self) -> &str {
+            "gated"
+        }
+        fn verify_signature(&self, _body: &[u8], _headers: &HashMap<String, String>) -> bool {
+            true
+        }
+        async fn parse_payload(
+            &self,
+            _payload: &serde_json::Value,
+        ) -> crate::error::Result<Option<Issue>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Some(Issue::new(
+                "1",
+                "TEST-1",
+                "Test",
+                "https://test.com",
+                "gated",
+            )))
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("Test", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, _issue: &Issue) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_webhook_handler_refuses_new_runs_while_shutting_down() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state_with_agent(
+            handlers,
+            tracker.clone(),
+            Some(tracker.clone()),
+            Arc::new(MockAgent::default()),
+        );
+        state.runs.close();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("linear-delivery", "delivery-refused".parse().unwrap());
+
+        let response = serve_webhook(
+            State(state.clone()),
+            Path("test".to_string()),
+            headers,
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
+        assert!(
+            retry_after.is_some_and(|seconds| seconds > 0),
+            "the refusal should tell the sender how many seconds to wait before delivering \
+             again, but its Retry-After was {retry_after:?}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["reason"], "Shutting down");
+        assert!(state.runs.is_empty());
+        assert!(!tracker.has_attempted("test", "1").unwrap());
+        assert!(
+            tracker
+                .check_and_record_delivery("delivery-refused", "test")
+                .unwrap(),
+            "a refused delivery must stay unrecorded so the sender's retry is processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_webhook_sends_no_retry_after_unless_shutting_down() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(WebhookHandlerRegistry::new(), tracker, None);
+
+        let response = serve_webhook(
+            State(state),
+            Path("unknown".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers().get(header::RETRY_AFTER), None);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_handler_tracks_accepted_run() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent = Arc::new(MockAgent::default());
+        let state = make_app_state_with_agent(handlers, tracker, None, agent.clone());
+
+        let (status, _) = webhook_handler(
+            State(state.clone()),
+            Path("test".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(state.runs.len(), 1);
+
+        state.runs.close();
+        tokio::time::timeout(DRAIN_WAIT, state.runs.wait())
+            .await
+            .expect("the drain should finish once the accepted run completes");
+        assert_eq!(agent.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_handler_drain_waits_for_request_past_shutdown_check() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(GatedHandler {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent = Arc::new(MockAgent::default());
+        let state = make_app_state_with_agent(handlers, tracker, None, agent.clone());
+
+        let request = tokio::spawn(webhook_handler(
+            State(state.clone()),
+            Path("gated".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        ));
+        entered.notified().await;
+        state.runs.close();
+        assert!(
+            state.runs.wait().now_or_never().is_none(),
+            "the drain must wait for a request that passed the shutdown check"
+        );
+
+        release.notify_one();
+        let (status, _) = request.await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        tokio::time::timeout(DRAIN_WAIT, state.runs.wait())
+            .await
+            .expect("the drain should finish once the accepted run completes");
+        assert_eq!(agent.call_count.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn test_webhook_handler_duplicate_delivery_github_header() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -3027,6 +3311,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: Some(cache),
         });
 
@@ -3140,7 +3425,7 @@ mod tests {
             .route("/health", get(health_handler))
             .route(
                 "/webhook/{source}",
-                post(webhook_handler).layer(concurrency_layer),
+                post(serve_webhook).layer(concurrency_layer),
             )
             .with_state(state)
     }
@@ -3849,6 +4134,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -3894,6 +4180,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -3940,6 +4227,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -4098,6 +4386,7 @@ mod tests {
             github_handler: Some(github_handler),
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -4399,6 +4688,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -4535,6 +4825,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -4593,6 +4884,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -4738,6 +5030,7 @@ mod tests {
             github_handler: Some(github_handler),
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -4836,6 +5129,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -4877,6 +5171,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -5330,6 +5625,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -5515,6 +5811,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -5561,6 +5858,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -5606,6 +5904,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -5651,6 +5950,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -5696,6 +5996,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -5741,6 +6042,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -5786,6 +6088,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -5835,6 +6138,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -5883,6 +6187,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -5938,6 +6243,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -6032,6 +6338,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -6068,6 +6375,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -6209,6 +6517,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: Some(cache),
         });
 
@@ -6272,6 +6581,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: Some(cache),
         });
 
@@ -6651,6 +6961,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: Some(cache),
         });
 
@@ -6831,6 +7142,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(processing),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         });
 
@@ -6866,6 +7178,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -7069,6 +7382,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         };
 
@@ -7279,10 +7593,6 @@ mod tests {
         assert!(state.code_search_service.is_none());
     }
 
-    // -------------------------------------------------------------------
-    // webhook_verify_handler tests
-    // -------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_verify_handler_non_whatsapp_source_returns_method_not_allowed() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -7345,6 +7655,7 @@ mod tests {
             github_handler: None,
             qa_agent: None,
             processing: RwLock::new(HashMap::new()),
+            runs: TaskTracker::new(),
             suppression_regex_cache: None,
         })
     }
@@ -7417,10 +7728,6 @@ mod tests {
         // Should succeed with empty challenge body
         assert_eq!(resp.status(), StatusCode::OK);
     }
-
-    // -------------------------------------------------------------------
-    // Slack URL verification challenge
-    // -------------------------------------------------------------------
 
     /// Mock handler for Slack source that passes signature validation
     struct SlackMockHandler;
@@ -7544,10 +7851,6 @@ mod tests {
         assert!(response["error"].as_str().unwrap().contains("Invalid JSON"));
     }
 
-    // -------------------------------------------------------------------
-    // WebhookServer setter coverage
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_webhook_server_set_embedding_client_none() {
         let config = test_config();
@@ -7588,10 +7891,6 @@ mod tests {
         assert!(server.code_search_service.is_none());
     }
 
-    // -------------------------------------------------------------------
-    // WebhookVerifyQuery deserialization
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_webhook_verify_query_default() {
         let query = WebhookVerifyQuery::default();
@@ -7617,10 +7916,6 @@ mod tests {
         assert!(query.hub_verify_token.is_none());
         assert!(query.hub_challenge.is_none());
     }
-
-    // -------------------------------------------------------------------
-    // record_feedback_outcome tests
-    // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_record_feedback_outcome_success() {

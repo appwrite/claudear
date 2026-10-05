@@ -1400,6 +1400,33 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
+    fn mark_declined(&self, source: &str, issue_id: &str, reason: &str) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            "Marking fix attempt as declined"
+        );
+        let conn = self.acquire_lock()?;
+        // An outcome a run already reached outlives a declined rerun, so a
+        // review rerun refused at approval leaves its open PR watched
+        let rows_affected = conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'declined', error_message = ?
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL
+              AND status IN ('pending', 'failed', 'closed')
+            "#,
+            params![reason, source, issue_id],
+        )?;
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            rows_affected = rows_affected,
+            "Fix attempt marked as declined"
+        );
+        Ok(())
+    }
+
     /// Read the routing intent classified for an attempt, if one was stored.
     fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
         let conn = self.acquire_lock()?;
@@ -1560,7 +1587,21 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
-    fn release_orphaned_pending_attempts(&self) -> Result<usize> {
+    fn record_attempt_heartbeat(&self, source: &str, issue_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET heartbeat_at = datetime('now')
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL AND status = 'pending'
+            "#,
+            params![source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn release_orphaned_pending_attempts(&self, stale_after: Duration) -> Result<usize> {
+        let stale_before = format!("-{} seconds", stale_after.as_secs());
         let mut conn = self.acquire_lock()?;
         let tx = conn.transaction()?;
         // Cascade rows are resumed by record_cascade_attempt, so they stay pending
@@ -1571,9 +1612,10 @@ impl AttemptTracker for SqliteTracker {
                 error_message = 'Interrupted before completion (daemon restarted)',
                 retry_count = MAX(COALESCE(retry_count, 0) - 1, 0)
             WHERE status = 'pending' AND reset_at IS NULL AND cascade_repo IS NULL
+              AND MAX(attempted_at, COALESCE(heartbeat_at, attempted_at)) <= datetime('now', ?1)
               AND attempted_at > datetime('now', '-3 days')
             "#,
-            [],
+            params![stale_before],
         )?;
         // Older orphans are stale; retrying them would spend runs on dead issues,
         // so give them a terminal state that a manual reset can still undo
@@ -1583,9 +1625,10 @@ impl AttemptTracker for SqliteTracker {
             SET status = 'cannot_fix',
                 error_message = 'Interrupted before completion; too old to retry automatically'
             WHERE status = 'pending' AND reset_at IS NULL AND cascade_repo IS NULL
+              AND MAX(attempted_at, COALESCE(heartbeat_at, attempted_at)) <= datetime('now', ?1)
               AND attempted_at <= datetime('now', '-3 days')
             "#,
-            [],
+            params![stale_before],
         )?;
         tx.commit()?;
         Ok(released + closed)
@@ -2623,7 +2666,8 @@ impl ActivityStore for SqliteTracker {
 
     /// Upsert a PR record.
     ///
-    /// Creates a new record or updates an existing one based on pr_url.
+    /// Creates a new record or updates an existing one based on pr_url,
+    /// leaving an existing record's review cycle count as it is.
     fn upsert_pr(&self, pr: &claudear_core::types::PrRecord) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
@@ -2661,7 +2705,6 @@ impl ActivityStore for SqliteTracker {
                 last_review_at = COALESCE(excluded.last_review_at, prs.last_review_at),
                 time_to_first_review_mins = COALESCE(excluded.time_to_first_review_mins, prs.time_to_first_review_mins),
                 time_to_merge_mins = COALESCE(excluded.time_to_merge_mins, prs.time_to_merge_mins),
-                review_cycles = excluded.review_cycles,
                 files_changed = COALESCE(excluded.files_changed, prs.files_changed),
                 lines_added = COALESCE(excluded.lines_added, prs.lines_added),
                 lines_removed = COALESCE(excluded.lines_removed, prs.lines_removed)
@@ -2730,6 +2773,64 @@ impl ActivityStore for SqliteTracker {
 
         let result = stmt.query_row(params![pr_url], Self::row_to_pr_record).ok();
         Ok(result)
+    }
+
+    /// Count one review-driven rerun of a PR below `cap`, creating the PR's
+    /// record in the same transaction when it has none.
+    fn charge_pr_review_cycle(
+        &self,
+        pr: &claudear_core::types::PrRecord,
+        cap: i32,
+    ) -> Result<bool> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            r#"
+            INSERT INTO prs (
+                pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
+                status, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(pr_url) DO NOTHING
+            "#,
+            params![
+                pr.pr_url,
+                pr.scm_repo,
+                pr.pr_number,
+                pr.attempt_id,
+                pr.issue_id,
+                pr.issue_source,
+                pr.status,
+                pr.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+        let charged = transaction.execute(
+            r#"
+            UPDATE prs SET
+                review_cycles = COALESCE(review_cycles, 0) + 1,
+                last_review_at = datetime('now'),
+                updated_at = datetime('now')
+            WHERE pr_url = ?1 AND COALESCE(review_cycles, 0) < ?2
+            "#,
+            params![pr.pr_url, cap],
+        )?;
+        transaction.commit()?;
+        Ok(charged > 0)
+    }
+
+    /// Give back one counted review-driven rerun of a PR, never going below
+    /// zero.
+    fn refund_pr_review_cycle(&self, pr_url: &str) -> Result<()> {
+        let connection = self.acquire_lock()?;
+        connection.execute(
+            r#"
+            UPDATE prs SET
+                review_cycles = review_cycles - 1,
+                updated_at = datetime('now')
+            WHERE pr_url = ?1 AND review_cycles > 0
+            "#,
+            params![pr_url],
+        )?;
+        Ok(())
     }
 
     /// Update PR status.
@@ -10948,6 +11049,95 @@ mod tests {
     }
 
     #[test]
+    fn test_mark_declined_takes_attempts_out_of_the_sweep_and_the_retry_queue() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("sentry", "new", "CLOUD-1").unwrap();
+        tracker
+            .record_attempt("sentry", "retrying", "CLOUD-2")
+            .unwrap();
+        tracker
+            .mark_failed("sentry", "retrying", "agent crashed")
+            .unwrap();
+        age_attempt(&tracker, "new", 2 * 60 * 60);
+
+        for issue_id in ["new", "retrying"] {
+            tracker
+                .mark_declined("sentry", issue_id, "Approval declined")
+                .unwrap();
+        }
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            0,
+            "a declined attempt is no longer pending, so no sweep may release it"
+        );
+        assert!(
+            tracker.get_retryable_issues(2).unwrap().is_empty(),
+            "a declined attempt must never be queued for a retry"
+        );
+        for issue_id in ["new", "retrying"] {
+            let attempt = tracker.get_attempt("sentry", issue_id).unwrap().unwrap();
+            assert_eq!(attempt.status, FixAttemptStatus::Declined, "{issue_id}");
+            assert_eq!(
+                attempt.error_message.as_deref(),
+                Some("Approval declined"),
+                "{issue_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mark_declined_keeps_outcomes_a_run_already_reached() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("github", "open_pr", "GH-1").unwrap();
+        tracker
+            .mark_success("github", "open_pr", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.record_attempt("github", "merged", "GH-2").unwrap();
+        tracker
+            .mark_success("github", "merged", "https://github.com/org/repo/pull/2")
+            .unwrap();
+        tracker.mark_merged("github", "merged").unwrap();
+        tracker
+            .record_attempt("github", "answered", "GH-3")
+            .unwrap();
+        tracker
+            .mark_answered("github", "answered", "Use the v2 endpoint", None)
+            .unwrap();
+        tracker.record_attempt("github", "gave_up", "GH-4").unwrap();
+        tracker
+            .mark_cannot_fix("github", "gave_up", "Max retries (2) reached")
+            .unwrap();
+
+        for (issue_id, reached) in [
+            ("open_pr", FixAttemptStatus::Success),
+            ("merged", FixAttemptStatus::Merged),
+            ("answered", FixAttemptStatus::Answered),
+            ("gave_up", FixAttemptStatus::CannotFix),
+        ] {
+            tracker
+                .mark_declined("github", issue_id, "Approval declined")
+                .unwrap();
+            assert_eq!(
+                tracker
+                    .get_attempt("github", issue_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                reached,
+                "declining a rerun of {issue_id} must keep the outcome its attempt already reached"
+            );
+        }
+        assert_eq!(
+            tracker.get_pending_prs().unwrap().len(),
+            1,
+            "a review rerun declined at approval must leave its open PR watched"
+        );
+    }
+
+    #[test]
     fn test_get_retryable_issues() {
         let tracker = SqliteTracker::in_memory().unwrap();
 
@@ -11015,43 +11205,185 @@ mod tests {
         assert_eq!(attempt.retry_count, 0);
     }
 
+    /// How long the orphan-release tests treat a run as possibly live.
+    const ORPHANED_RUN_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+
+    /// Move the attempt rows of `issue_id` `seconds` into the past, as if
+    /// their runs started that long ago.
+    fn age_attempt(tracker: &SqliteTracker, issue_id: &str, seconds: u64) {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE fix_attempts SET attempted_at = datetime('now', ?1) WHERE issue_id = ?2",
+                params![format!("-{seconds} seconds"), issue_id],
+            )
+            .unwrap();
+    }
+
     #[test]
-    fn test_release_orphaned_pending_attempts_frees_recent_rows_only() {
+    fn test_release_orphaned_pending_attempts_frees_stale_rows_only() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker
-            .record_attempt("sentry", "fresh", "CLOUD-1")
+            .record_attempt("sentry", "orphaned", "CLOUD-1")
             .unwrap();
         tracker
-            .record_attempt("sentry", "stale", "CLOUD-2")
+            .record_attempt("sentry", "abandoned", "CLOUD-2")
             .unwrap();
         tracker.record_attempt("sentry", "done", "CLOUD-3").unwrap();
         tracker
             .mark_success("sentry", "done", "https://github.com/org/repo/pull/1")
             .unwrap();
-        {
-            let conn = tracker.acquire_lock().unwrap();
-            conn.execute(
-                "UPDATE fix_attempts SET attempted_at = datetime('now', '-30 days') WHERE issue_id = 'stale'",
-                [],
-            )
-            .unwrap();
-        }
+        age_attempt(&tracker, "orphaned", 2 * 60 * 60);
+        age_attempt(&tracker, "abandoned", 30 * 24 * 60 * 60);
 
-        tracker.release_orphaned_pending_attempts().unwrap();
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            2,
+            "both orphans must be released"
+        );
 
-        // A recent orphan goes back into the retry queue
         let retryable: Vec<String> = tracker
             .get_retryable_issues(2)
             .unwrap()
             .into_iter()
             .map(|a| a.issue_id)
             .collect();
-        assert_eq!(retryable, vec!["fresh".to_string()]);
-        // A stale one is closed out instead of staying pending forever
-        let stale = tracker.get_attempt("sentry", "stale").unwrap().unwrap();
-        assert_eq!(stale.status, FixAttemptStatus::CannotFix);
+        assert_eq!(
+            retryable,
+            vec!["orphaned".to_string()],
+            "an orphan from the last few days goes back into the retry queue"
+        );
+        let abandoned = tracker.get_attempt("sentry", "abandoned").unwrap().unwrap();
+        assert_eq!(
+            abandoned.status,
+            FixAttemptStatus::CannotFix,
+            "an older orphan is closed out instead of staying pending forever"
+        );
         let done = tracker.get_attempt("sentry", "done").unwrap().unwrap();
         assert_eq!(done.status, FixAttemptStatus::Success);
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_leaves_live_runs_alone() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "just_started", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "within_threshold", "CLOUD-2")
+            .unwrap();
+        age_attempt(&tracker, "within_threshold", 50 * 60);
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            0,
+            "a run younger than the threshold may still be live in another process"
+        );
+        for issue_id in ["just_started", "within_threshold"] {
+            let attempt = tracker.get_attempt("sentry", issue_id).unwrap().unwrap();
+            assert_eq!(attempt.status, FixAttemptStatus::Pending, "{issue_id}");
+            assert!(attempt.error_message.is_none(), "{issue_id}");
+        }
+    }
+
+    /// Set the heartbeat of `issue_id`'s attempt `seconds` into the past, as if
+    /// its run last showed it was alive then.
+    fn beat_attempt(tracker: &SqliteTracker, issue_id: &str, seconds: u64) {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE fix_attempts SET heartbeat_at = datetime('now', ?1) WHERE issue_id = ?2",
+                params![format!("-{seconds} seconds"), issue_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_leaves_runs_that_still_beat_alone() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "awaiting_approval", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "long_agent_run", "CLOUD-2")
+            .unwrap();
+        age_attempt(&tracker, "awaiting_approval", 2 * 24 * 60 * 60);
+        age_attempt(&tracker, "long_agent_run", 30 * 24 * 60 * 60);
+        beat_attempt(&tracker, "awaiting_approval", 0);
+        beat_attempt(&tracker, "long_agent_run", 0);
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            0,
+            "a run that still shows it is alive is live, however long ago it started"
+        );
+        for issue_id in ["awaiting_approval", "long_agent_run"] {
+            let attempt = tracker.get_attempt("sentry", issue_id).unwrap().unwrap();
+            assert_eq!(attempt.status, FixAttemptStatus::Pending, "{issue_id}");
+            assert!(attempt.error_message.is_none(), "{issue_id}");
+        }
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_frees_runs_that_stopped_beating() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "crashed", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "never_beat", "CLOUD-2")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "retried", "CLOUD-3")
+            .unwrap();
+        age_attempt(&tracker, "crashed", 3 * 60 * 60);
+        beat_attempt(&tracker, "crashed", 2 * 60 * 60);
+        age_attempt(&tracker, "never_beat", 2 * 60 * 60);
+        age_attempt(&tracker, "retried", 3 * 60 * 60);
+        beat_attempt(&tracker, "retried", 2 * 60 * 60);
+        tracker
+            .mark_failed("sentry", "retried", "agent crashed")
+            .unwrap();
+        tracker.prepare_for_retry("sentry", "retried").unwrap();
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            2,
+            "runs silent for longer than the window must be released"
+        );
+        let mut retryable: Vec<String> = tracker
+            .get_retryable_issues(2)
+            .unwrap()
+            .into_iter()
+            .map(|attempt| attempt.issue_id)
+            .collect();
+        retryable.sort();
+        assert_eq!(
+            retryable,
+            vec!["crashed".to_string(), "never_beat".to_string()],
+            "a run whose heartbeat went stale, or that never sent one since it was recorded \
+             long ago, goes back into the retry queue"
+        );
+        assert_eq!(
+            tracker
+                .get_attempt("sentry", "retried")
+                .unwrap()
+                .unwrap()
+                .status,
+            FixAttemptStatus::Pending,
+            "a retry that just started must not be swept for the heartbeat its previous run \
+             left behind"
+        );
     }
 
     #[test]
@@ -11066,16 +11398,24 @@ mod tests {
         let child = tracker
             .record_cascade_attempt("discord", "1", "D-1", parent.id, cascade)
             .unwrap();
+        age_attempt(&tracker, "1", 2 * 60 * 60);
 
-        tracker.release_orphaned_pending_attempts().unwrap();
+        tracker
+            .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+            .unwrap();
 
-        // Not pushed into the retry queue, which would rerun the whole parent issue
-        assert!(tracker.get_retryable_issues(2).unwrap().is_empty());
-        // The next cascade trigger resumes the same row and can finish it
+        assert!(
+            tracker.get_retryable_issues(2).unwrap().is_empty(),
+            "a cascade row must not be pushed into the retry queue, which would rerun the \
+             whole parent issue"
+        );
         let resumed = tracker
             .record_cascade_attempt("discord", "1", "D-1", parent.id, cascade)
             .unwrap();
-        assert_eq!(resumed, child);
+        assert_eq!(
+            resumed, child,
+            "the next cascade trigger must resume the same row"
+        );
         tracker
             .update_attempt_pr(resumed, "https://github.com/org/lib/pull/7", "org/lib", 7)
             .unwrap();
@@ -17777,6 +18117,110 @@ mod tests {
         assert_eq!(fetched.status, "merged");
         assert_eq!(fetched.approvals_count, 2);
         assert_eq!(fetched.comments_count, 5);
+    }
+
+    #[test]
+    fn test_upsert_pr_keeps_counted_review_cycles() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        tracker.upsert_pr(&pr).unwrap();
+        let mut stale = tracker.get_pr(&pr.pr_url).unwrap().unwrap();
+
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+        stale.status = "merged".to_string();
+        tracker.upsert_pr(&stale).unwrap();
+
+        let fetched = tracker.get_pr(&pr.pr_url).unwrap().unwrap();
+        assert_eq!(fetched.status, "merged");
+        assert_eq!(
+            fetched.review_cycles, 1,
+            "a stale copy of the record must not undo a counted review cycle"
+        );
+    }
+
+    #[test]
+    fn test_charge_pr_review_cycle_creates_a_missing_record() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = claudear_core::types::PrRecord::for_issue(
+            "https://github.com/org/repo/pull/1",
+            "org/repo",
+            1,
+            "linear",
+            "ISSUE-1",
+        );
+
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+
+        let fetched = tracker.get_pr(&pr.pr_url).unwrap().unwrap();
+        assert_eq!(fetched.scm_repo, "org/repo");
+        assert_eq!(fetched.pr_number, 1);
+        assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
+        assert_eq!(fetched.issue_id.as_deref(), Some("ISSUE-1"));
+        assert_eq!(fetched.status, "open");
+        assert_eq!(fetched.review_cycles, 1);
+        assert!(fetched.last_review_at.is_some());
+    }
+
+    #[test]
+    fn test_charge_pr_review_cycle_counts_nothing_past_the_cap() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        let cap = 2;
+
+        for _ in 0..cap {
+            assert!(tracker.charge_pr_review_cycle(&pr, cap).unwrap());
+        }
+
+        assert!(
+            !tracker.charge_pr_review_cycle(&pr, cap).unwrap(),
+            "a PR that used every review cycle must not be charged another"
+        );
+        assert_eq!(
+            tracker.get_pr(&pr.pr_url).unwrap().unwrap().review_cycles,
+            cap
+        );
+    }
+
+    #[test]
+    fn test_refund_pr_review_cycle_gives_back_one_cycle_and_stops_at_zero() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        let review_cycles = || tracker.get_pr(&pr.pr_url).unwrap().unwrap().review_cycles;
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+
+        tracker.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        assert_eq!(review_cycles(), 1);
+
+        tracker.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        tracker.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        assert_eq!(
+            review_cycles(),
+            0,
+            "a refund must never take the count below zero"
+        );
+    }
+
+    #[test]
+    fn test_review_cycles_are_shared_by_processes_on_one_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let daemon = SqliteTracker::new(&path).unwrap();
+        let webhook = SqliteTracker::new(path).unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+
+        assert!(daemon.charge_pr_review_cycle(&pr, 1).unwrap());
+        assert!(
+            !webhook.charge_pr_review_cycle(&pr, 1).unwrap(),
+            "a cycle the daemon counted must count against the webhook process's cap"
+        );
+
+        daemon.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        assert!(
+            webhook.charge_pr_review_cycle(&pr, 1).unwrap(),
+            "a cycle the daemon gave back must be free for the webhook process"
+        );
+        assert_eq!(daemon.get_pr(&pr.pr_url).unwrap().unwrap().review_cycles, 1);
     }
 
     #[test]
