@@ -428,8 +428,14 @@ pub struct Config {
     pub db_path: PathBuf,
     /// Maximum issues to process per poll cycle.
     pub max_issues_per_cycle: usize,
-    /// Maximum concurrent issue processing.
+    /// Maximum concurrent issue processing (per source, default for sources
+    /// without an explicit override).
     pub max_concurrent: usize,
+    /// Global ceiling on concurrent Claude sessions across every source and
+    /// path (fix, QA, retry, deploy-QA). Per-source `max_concurrent` bounds how
+    /// many a single source runs; this bounds the machine-wide total regardless
+    /// of how high the per-source limits are summed. Clamped to >= 1.
+    pub max_concurrent_sessions: usize,
     /// Delay between processing issues (ms).
     pub processing_delay_ms: u64,
     /// Maximum number of activity entries to keep in the IPC server (default: 10,000).
@@ -774,6 +780,7 @@ impl Default for Config {
             db_path: PathBuf::from("claudear.db"),
             max_issues_per_cycle: 5,
             max_concurrent: 1,
+            max_concurrent_sessions: 12,
             processing_delay_ms: 5000,
             max_activity_entries: 10_000,
             ipc_timeout_secs: 30,
@@ -1721,6 +1728,10 @@ pub struct GitHubConfig {
     /// GitHub App configuration (nested under [scm.github.app]).
     #[serde(default)]
     pub app: GitHubAppConfig,
+    /// Maximum concurrent issue processing for the GitHub source (overrides
+    /// global `max_concurrent`). Defaults to a wider worker since GitHub issues
+    /// frequently retry.
+    pub max_concurrent: Option<usize>,
 }
 
 impl Default for GitHubConfig {
@@ -1737,6 +1748,7 @@ impl Default for GitHubConfig {
             trigger_labels: Vec::new(),
             trigger_states: Vec::new(),
             app: GitHubAppConfig::default(),
+            max_concurrent: Some(6),
         }
     }
 }
@@ -1756,6 +1768,7 @@ impl GitHubConfig {
             trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
             trigger_states: vec!["open".to_string()],
             app: GitHubAppConfig::default(),
+            max_concurrent: Some(6),
         }
     }
 }
@@ -2034,7 +2047,9 @@ impl Default for SentryConfig {
             escalation_threshold_percent: 50,
             client_secret: None,
             max_issues_per_cycle: None,
-            max_concurrent: None,
+            // Sentry issues are high-volume and often need retries, so run a
+            // wider worker by default. Override in [issues.sentry] if needed.
+            max_concurrent: Some(6),
             poll_interval_ms: None,
         }
     }
@@ -3730,6 +3745,13 @@ impl Config {
                 .as_ref()
                 .and_then(|c| c.max_concurrent)
                 .unwrap_or(self.max_concurrent),
+            "github_issues" => self.scm.github.max_concurrent.unwrap_or(self.max_concurrent),
+            "helpscout" => self
+                .issues
+                .helpscout
+                .as_ref()
+                .and_then(|c| c.max_concurrent)
+                .unwrap_or(self.max_concurrent),
             _ => self.max_concurrent,
         }
     }
@@ -4774,6 +4796,8 @@ api_key = "key"
                 sentry: Some(SentryConfig {
                     auth_token: "tok".into(),
                     org_slug: "org".into(),
+                    // Opt out of the Sentry default (6) to exercise fallback.
+                    max_concurrent: None,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -4783,6 +4807,30 @@ api_key = "key"
         assert_eq!(config.max_concurrent_for("linear"), 4);
         assert_eq!(config.max_concurrent_for("sentry"), 4);
         assert_eq!(config.max_concurrent_for("unknown"), 4);
+    }
+
+    #[test]
+    fn test_default_worker_concurrency_for_heavy_sources() {
+        // Sentry and GitHub ship with a wider default worker; everything else
+        // falls back to the global max_concurrent (1 by default).
+        let config = Config {
+            issues: IssuesConfig {
+                sentry: Some(SentryConfig {
+                    auth_token: "tok".into(),
+                    org_slug: "org".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(config.max_concurrent, 1);
+        assert_eq!(config.max_concurrent_sessions, 12);
+        assert_eq!(config.max_concurrent_for("sentry"), 6);
+        // GitHub config is always present (not optional) and defaults to 6.
+        assert_eq!(config.max_concurrent_for("github_issues"), 6);
+        assert_eq!(config.max_concurrent_for("linear"), 1);
+        assert_eq!(config.max_concurrent_for("unknown"), 1);
     }
 
     #[test]

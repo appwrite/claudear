@@ -36,7 +36,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::futures::Notified;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::time::{interval, Duration};
 
 /// A candidate issue ready for dispatch: the issue, its match result, and the
@@ -303,6 +303,12 @@ pub struct Watcher {
     rate_limit_pause_until: RwLock<HashMap<String, DateTime<Utc>>>,
     /// Notifies waiters when a processing slot becomes available.
     slot_available: Notify,
+    /// Global ceiling on concurrent Claude sessions across every source and
+    /// path. Each `process_issue` call holds one permit for its whole lifetime,
+    /// so the total number of issues being worked on at once never exceeds
+    /// `config.max_concurrent_sessions`, no matter how high per-source
+    /// `max_concurrent` limits sum. Per-source limits still apply on top.
+    session_limiter: Semaphore,
     /// Optional LLM analyzer for enhanced analysis across the pipeline.
     llm_analyzer: Option<Arc<crate::llm_analyzer::LlmAnalyzerImpl>>,
     /// Intent classifier for QA-vs-fix routing. Backend selected by `qa.use_llm`:
@@ -377,6 +383,8 @@ impl Watcher {
                 ))
             };
 
+        let session_limit = options.config.max_concurrent_sessions.max(1);
+
         Self {
             agent: options.agent,
             qa_agent: options.qa_agent,
@@ -403,6 +411,7 @@ impl Watcher {
             last_seen_releases: RwLock::new(HashMap::new()),
             rate_limit_pause_until: RwLock::new(HashMap::new()),
             slot_available: Notify::new(),
+            session_limiter: Semaphore::new(session_limit),
             llm_analyzer,
             intent_classifier,
             spawn_handles: tokio::sync::Mutex::new(Vec::new()),
@@ -1075,6 +1084,10 @@ impl Watcher {
             self.config.max_issues_per_cycle
         );
         tracing::info!("  Max concurrent: {} (global)", self.config.max_concurrent);
+        tracing::info!(
+            "  Max concurrent sessions: {} (global ceiling)",
+            self.config.max_concurrent_sessions
+        );
         for source in &self.sources {
             let src_max_issues = self.config.max_issues_per_cycle_for(source.name());
             let src_max_concurrent = self.config.max_concurrent_for(source.name());
@@ -1146,65 +1159,68 @@ impl Watcher {
 
     /// Run the source polling loop.
     ///
-    /// Polls each source at its configured interval. Housekeeping is handled
-    /// separately by [`HousekeepingWorker`].
+    /// Each source gets its own long-lived worker task that polls that source
+    /// at its configured interval, independently of the others. A slow source
+    /// can no longer delay a fast one, and each source's own `max_concurrent`
+    /// budget (plus the global session ceiling) bounds how many fixes it runs.
+    /// Housekeeping is handled separately by [`HousekeepingWorker`].
     async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64) -> Result<()> {
-        // Build per-source timer state: (source index, interval_ms, last_poll)
-        let now = std::time::Instant::now();
-        let mut source_timers: Vec<(usize, u64, std::time::Instant)> = self
-            .sources
-            .iter()
-            .enumerate()
-            .map(|(i, source)| {
-                let src_interval = self.config.poll_interval_ms_for(source.name()).max(1);
-                tracing::info!(
-                    source = source.name(),
-                    interval_ms = src_interval,
-                    "Per-source poll interval"
-                );
-                (i, src_interval, now)
-            })
-            .collect();
+        let mut workers = Vec::with_capacity(self.sources.len());
+        for (idx, source) in self.sources.iter().enumerate() {
+            let src_interval = self.config.poll_interval_ms_for(source.name()).max(1000);
+            tracing::info!(
+                source = source.name(),
+                interval_ms = src_interval,
+                max_concurrent = self.config.max_concurrent_for(source.name()),
+                "Starting source worker"
+            );
+            let watcher = Arc::clone(self);
+            workers.push(tokio::spawn(async move {
+                watcher.run_source_worker(idx, src_interval).await;
+            }));
+        }
 
-        // Determine the base tick: minimum source interval or global, whichever is smallest.
-        // Cap at 1s to avoid busy-looping when all intervals are large.
-        let min_source_interval = source_timers
-            .iter()
-            .map(|(_, ms, _)| *ms)
-            .min()
-            .unwrap_or(poll_interval);
-        let base_tick_ms = min_source_interval.min(poll_interval).max(1000);
-        let mut base_timer = interval(Duration::from_millis(base_tick_ms));
-        base_timer.tick().await; // Skip immediate first tick
+        // Nothing configured: idle until stopped so the caller's select! still
+        // has a future to hold.
+        if workers.is_empty() {
+            let _ = poll_interval;
+            while self.is_running.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+            return Ok(());
+        }
+
+        for worker in workers {
+            let _ = worker.await;
+        }
+        Ok(())
+    }
+
+    /// Worker loop for a single source: poll it every `interval_ms` until the
+    /// watcher stops. The first poll fires one interval after start (the
+    /// initial fan-out poll already ran in [`Self::start`]).
+    async fn run_source_worker(self: Arc<Self>, source_idx: usize, interval_ms: u64) {
+        let mut timer = interval(Duration::from_millis(interval_ms));
+        timer.tick().await; // consume the immediate first tick
 
         while self.is_running.load(Ordering::SeqCst) {
-            base_timer.tick().await;
+            timer.tick().await;
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
             if self.is_rate_limit_paused().await {
                 continue;
             }
-
-            // Poll each source whose interval has elapsed
-            for (src_idx, src_interval_ms, last_poll) in &mut source_timers {
-                let src_interval = Duration::from_millis(*src_interval_ms);
-                if last_poll.elapsed() >= src_interval {
-                    let source = &self.sources[*src_idx];
-                    if let Err(e) = self.poll_source(source).await {
-                        tracing::error!(
-                            component = "watcher",
-                            source = source.name(),
-                            error = %e,
-                            "Error polling source"
-                        );
-                    }
-                    *last_poll = std::time::Instant::now();
-                }
+            let source = &self.sources[source_idx];
+            if let Err(e) = self.poll_source(source).await {
+                tracing::error!(
+                    component = "watcher",
+                    source = source.name(),
+                    error = %e,
+                    "Error polling source"
+                );
             }
         }
-
-        Ok(())
     }
 
     /// Stop the watcher.
@@ -4230,6 +4246,26 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
+        // Global session ceiling: hold one permit for the whole processing run.
+        // The per-source `_claim` above bounds how many of THIS source run at
+        // once; this bounds the machine-wide total across every source and path.
+        // The per-source claim is already held while we wait here, so no other
+        // item for this source can slip past its own budget meanwhile.
+        if self.session_limiter.available_permits() == 0 {
+            tracing::info!(
+                short_id = %issue.short_id,
+                limit = self.config.max_concurrent_sessions,
+                "Global session ceiling reached, waiting for a free Claude session slot"
+            );
+        }
+        let _session_permit = match self.session_limiter.acquire().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                tracing::error!(short_id = %issue.short_id, error = %e, "Session limiter closed, skipping issue");
+                return false;
+            }
+        };
+
         let intent_label = match intent {
             Some(Intent::Question) => "question",
             Some(Intent::Bug) => "bug",
@@ -5583,6 +5619,7 @@ mod tests {
             db_path: std::path::PathBuf::from(":memory:"),
             max_issues_per_cycle: 5,
             max_concurrent: 2,
+            max_concurrent_sessions: 12,
             processing_delay_ms: 1000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
@@ -5649,6 +5686,56 @@ mod tests {
             dry_run,
             llm_engine: None,
         }))
+    }
+
+    fn create_test_watcher_with_config(config: Config) -> Arc<Watcher> {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent: Arc<dyn claudear_integrations::runner::AgentRunner> =
+            Arc::new(claudear_integrations::runner::ClaudeAgentRunner::new(
+                claudear_integrations::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            ));
+        Arc::new(Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent,
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: false,
+            llm_engine: None,
+        }))
+    }
+
+    #[test]
+    fn test_session_limiter_sized_from_config() {
+        let mut config = test_config();
+        config.max_concurrent_sessions = 3;
+        let watcher = create_test_watcher_with_config(config);
+        assert_eq!(watcher.session_limiter.available_permits(), 3);
+    }
+
+    #[test]
+    fn test_session_limiter_clamps_zero_to_one() {
+        let mut config = test_config();
+        config.max_concurrent_sessions = 0;
+        let watcher = create_test_watcher_with_config(config);
+        // A zero ceiling would deadlock every issue, so it clamps to 1.
+        assert_eq!(watcher.session_limiter.available_permits(), 1);
     }
 
     #[test]
