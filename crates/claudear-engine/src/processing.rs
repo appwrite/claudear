@@ -726,6 +726,11 @@ pub struct IssueProcessor {
     /// provider, local-LLM-based when `agent.use_llm` is set. `None` falls back
     /// to the label/source heuristic.
     pub intent_classifier: Option<Arc<dyn IntentClassifier>>,
+    /// Shared global Claude-session ceiling. When set, detached agent work the
+    /// processor spawns (the retrieval-quality judge) acquires a permit per
+    /// session so it counts against the same limit as the main run. `None`
+    /// leaves that work ungated (callers without a watcher-level ceiling).
+    pub session_limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Everything the caller provides to `IssueProcessor::run()`.
@@ -3643,6 +3648,9 @@ impl IssueProcessor {
         let tracker = self.tracker.clone();
         let analyzer = self.llm_analyzer.clone();
         let agent = self.qa_agent.clone().unwrap_or_else(|| self.agent.clone());
+        // Each agent-backed score is a Claude session, so bound it by the same
+        // global ceiling as the main run (no-op for the local-LLM backend).
+        let session_limiter = self.session_limiter.clone();
         // Issue identity captured for the detached task's timeline events.
         let issue_id = issue.id.clone();
         let short_id = issue.short_id.clone();
@@ -3712,8 +3720,15 @@ impl IssueProcessor {
                     let tracker = &tracker;
                     let agent = agent.as_ref();
                     let scored = &scored;
+                    let session_limiter = session_limiter.as_ref();
                     futures::stream::iter(items.iter())
                         .for_each_concurrent(RETRIEVAL_JUDGE_CONCURRENCY, |item| async move {
+                            // Hold a global session permit for the scoring call so
+                            // these detached sessions never exceed the ceiling.
+                            let _session_permit = match session_limiter {
+                                Some(limiter) => limiter.acquire().await.ok(),
+                                None => None,
+                            };
                             if let Some(score) =
                                 crate::agent_classifier::score_chunk_relevance_via_agent(
                                     agent,
@@ -5242,6 +5257,7 @@ mod tests {
             github_client: None,
             llm_analyzer: None,
             intent_classifier: None,
+            session_limiter: None,
         };
 
         let input = ProcessingInput {
@@ -6356,6 +6372,7 @@ mod tests {
             github_client: None,
             llm_analyzer: None,
             intent_classifier: None,
+            session_limiter: None,
         }
     }
 
