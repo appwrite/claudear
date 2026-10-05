@@ -1,15 +1,29 @@
 //! Dependencies between repositories, discovered from the package manifests
 //! under configured paths and saved for cascades to follow.
 
+use crate::repo::index::expand_path_in;
 use crate::repo::relationships::dependency_type;
 use abnegate_vcs::DependencyDiscovery;
 use abnegate_vcs::DiscoveredDependency;
 use claudear_storage::RepoStore;
+use std::path::Path;
 use std::path::PathBuf;
 
-/// The dependencies on `known_orgs` declared under the configured `paths`.
+/// The dependencies on `known_orgs` declared under the configured `paths`,
+/// with `~` in them resolved the way the repository index resolves it.
 pub fn discover_configured(known_orgs: &[String], paths: &[String]) -> Vec<DiscoveredDependency> {
-    let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    discover_configured_in(known_orgs, paths, dirs::home_dir().as_deref())
+}
+
+fn discover_configured_in(
+    known_orgs: &[String],
+    paths: &[String],
+    home: Option<&Path>,
+) -> Vec<DiscoveredDependency> {
+    let paths: Vec<PathBuf> = paths
+        .iter()
+        .map(|path| expand_path_in(path, home))
+        .collect();
     DependencyDiscovery::new(known_orgs.to_vec()).scan_directories(&paths)
 }
 
@@ -171,5 +185,27 @@ mod tests {
         assert_eq!(dependencies.len(), 1, "{dependencies:?}");
         assert_eq!(dependencies[0].repository, "appwrite/appwrite");
         assert_eq!(dependencies[0].depends_on, "utopia-php/framework");
+    }
+
+    #[test]
+    fn test_a_configured_home_relative_path_is_scanned_in_the_home_directory() {
+        let home = TempDir::new().unwrap();
+        let checkouts = home.path().join("Local");
+        let cloud = checkouts.join("cloud");
+        write_manifest(
+            &cloud,
+            COMPOSER_MANIFEST,
+            serde_json::json!({
+                "name": "appwrite/cloud",
+                "require": { "utopia-php/database": "^1.0" },
+            }),
+        );
+
+        let dependencies =
+            discover_configured_in(&known_orgs(), &["~/Local".to_string()], Some(home.path()));
+
+        assert_eq!(dependencies.len(), 1, "{dependencies:?}");
+        assert_eq!(dependencies[0].depends_on, "utopia-php/database");
+        assert_eq!(dependencies[0].repository_path, cloud);
     }
 }
