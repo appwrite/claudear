@@ -3438,6 +3438,13 @@ Create a PR with your changes.{custom_instructions}"#,
                 .intent_classifier
                 .clone()
                 .expect("intent_classifier present (checked by qa_split_enabled)");
+            // The agent-based classifier launches a Claude session per call, so
+            // it must count against the global ceiling too; otherwise a worker
+            // could spawn classification sessions while every permit is held by
+            // fixes. The local-LLM backend runs no Claude session, so it is not
+            // gated. This happens before dispatch, so it never double-acquires
+            // with the permit `process_issue` holds for an actual run.
+            let gate_classification = !self.config.qa.use_llm;
             let mut intents: Vec<Intent> = Vec::with_capacity(ordered.len());
             for (issue, _) in &ordered {
                 // Ground the classification in the Discord reply thread (if any) so a
@@ -3453,12 +3460,17 @@ Create a PR with your changes.{custom_instructions}"#,
                     crate::processing::TranscriptTrust::ClaudearOnly,
                 )
                 .await;
-                intents.push(
+                let intent = if gate_classification {
+                    let _classify_permit = self.session_limiter.acquire().await.ok();
                     classifier
                         .classify_intent(issue, conversation.as_deref())
                         .await
-                        .unwrap_or(Intent::Fix),
-                );
+                } else {
+                    classifier
+                        .classify_intent(issue, conversation.as_deref())
+                        .await
+                };
+                intents.push(intent.unwrap_or(Intent::Fix));
             }
 
             // Partition preserving prioritisation order within each bucket. Only
@@ -4240,12 +4252,6 @@ Create a PR with your changes.{custom_instructions}"#,
             return false;
         };
 
-        if let Some(ref tip) = deploy_qa_tip {
-            if !self.claim_deploy_qa_tip(tip, &issue.short_id) {
-                return false;
-            }
-        }
-
         // Global session ceiling: hold one permit for the whole processing run.
         // The per-source `_claim` above bounds how many of THIS source run at
         // once; this bounds the machine-wide total across every source and path.
@@ -4265,6 +4271,24 @@ Create a PR with your changes.{custom_instructions}"#,
                 return false;
             }
         };
+
+        // Re-check the rate-limit pause after waiting for a permit: a pause can
+        // begin while queued here, and a saturated queue must not keep launching
+        // sessions through it. Bail before claiming the deploy_qa tip so a paused
+        // run never leaves a tip stuck in `Running`.
+        if self.is_rate_limit_paused().await {
+            tracing::info!(
+                short_id = %issue.short_id,
+                "Skipping issue: watcher paused for Claude rate limit while waiting for a session slot"
+            );
+            return false;
+        }
+
+        if let Some(ref tip) = deploy_qa_tip {
+            if !self.claim_deploy_qa_tip(tip, &issue.short_id) {
+                return false;
+            }
+        }
 
         let intent_label = match intent {
             Some(Intent::Question) => "question",
@@ -6718,6 +6742,88 @@ mod tests {
         // Clean up simulated work so test state remains consistent.
         watcher.lock_processing().remove("other:inflight");
         watcher.active_processing.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn test_session_ceiling_blocks_processing_and_frees_on_completion() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let issue = Issue::new("1", "CEIL-1", "Ceiling issue", "http://example.com/1", "mock");
+        let source = Arc::new(MockSource::with_issues("mock", vec![issue.clone()]))
+            as Arc<dyn IssueSource>;
+
+        let mut config = test_config();
+        config.max_concurrent_sessions = 1;
+        config.processing_delay_ms = 0;
+
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source.clone()],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(claudear_integrations::runner::ClaudeAgentRunner::new(
+                claudear_integrations::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: false,
+            llm_engine: None,
+        }));
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        // Saturate the global ceiling by holding its only session permit.
+        let held = watcher
+            .session_limiter
+            .try_acquire()
+            .expect("the single session permit should be free");
+        assert_eq!(watcher.session_limiter.available_permits(), 0);
+
+        // Start a real processing run. It must park on the session permit.
+        let w = Arc::clone(&watcher);
+        let handle = tokio::spawn(async move {
+            w.process_issue(
+                source,
+                issue,
+                MatchResult::matched("Test", MatchPriority::Normal),
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        // While the ceiling is saturated the run cannot proceed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !handle.is_finished(),
+            "processing ran even though the session ceiling was saturated"
+        );
+
+        // Freeing the slot lets the parked run proceed to completion.
+        drop(held);
+        let _ = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("processing did not complete after a session slot was freed");
+
+        // Completion returns the permit to the ceiling.
+        assert_eq!(
+            watcher.session_limiter.available_permits(),
+            1,
+            "completing a run must free its session slot"
+        );
     }
 
     #[tokio::test]
