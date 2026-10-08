@@ -1330,3 +1330,58 @@ hour = 9
 # High-recurrence threshold: minimum Sentry event_count for an issue to qualify.
 # Issues currently flagged escalating qualify regardless of this. (default: 50)
 min_event_count = 50
+
+[reports.support_digest]
+# Digest of Discord support forum threads that need a reply.
+#
+# Reads the forum from the Appwrite project the threads bot syncs Discord into
+# (github.com/appwrite-labs/threads), so Claudear needs no access to the forum.
+# Ranks open threads by how urgently they need a reply (no reply yet, how long
+# the poster has waited, bumps, production/billing/data-loss keywords, others
+# hitting the same problem) and posts the top ones to the Discord notifier,
+# mentioning notifiers.discord.user_id. Also lists threads whose poster said
+# it's fixed, so they can be closed. It only posts when a thread enters the
+# list, so an hourly scan stays quiet. Report-only: nothing is posted to the
+# forum and threads never enter the fix pipeline.
+
+# Enable the digest (default: false)
+enabled = false
+
+# The threads project. Appwrite's public one is
+# https://fra.cloud.appwrite.io/v1, project 656dd556812fe2e5f4ed, database main.
+endpoint = ""
+project_id = ""
+database_id = "main"
+
+# API key with rows.read; only needed when the tables are not public.
+api_key = ""
+
+# Discord server the forum belongs to, used to link threads
+# (Appwrite: 564160730845151244).
+guild_id = ""
+
+# Only threads active in the last N days (default: 14, at most 365)
+days = 14
+
+# How often to scan, in hours (default: 1.0, 0 = disable, at most 8760)
+interval_hours = 1.0
+
+# How many needs-reply threads to post (default: 10, at most 10)
+max_entries = 10
+
+# Replies from these Discord user ids count as the team's. Thread authors
+# holding one of team_roles count too, but the authors table only has people
+# who opened a thread, so list most staff here. With drafts on, include the
+# threads bot too: otherwise an answer it posts reads as a community reply and
+# the thread is drafted again.
+team_user_ids = []
+team_roles = ["Core"]
+
+# Write a suggested answer for listed threads to the project's `drafts` table,
+# using the QA agent with code search (default: false). Admins review, edit and
+# approve them on the dashboard's Support page; the threads project then posts
+# approved answers to the forum. Needs api_key with rows read/write.
+drafts = false
+
+# Most drafts written per scan (default: 3)
+max_drafts = 3

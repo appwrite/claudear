@@ -69,6 +69,14 @@ impl HousekeepingWorker {
         // daemon restarts during the target hour on the target weekday.
         let mut digest_schedule = self.watcher.repetitive_digest_schedule();
 
+        // Support forum digest, scanned on its own interval from the first tick.
+        // A scan pages through the threads project and may run the QA agent, so
+        // it runs as its own task rather than holding up this loop; a new one
+        // starts only once the last finished, and shutdown drains it.
+        let support_digest_interval = self.watcher.support_digest_interval();
+        let mut last_support_digest: Option<Instant> = None;
+        let mut support_digest_task: Option<tokio::task::JoinHandle<()>> = None;
+
         while self.watcher.is_running() {
             timer.tick().await;
             if !self.watcher.is_running() {
@@ -152,6 +160,24 @@ impl HousekeepingWorker {
                     }
                 }
             };
+
+            // Discord support forum digest (report-only).
+            if !self.watcher.is_dry_run() {
+                if let Some(interval) = support_digest_interval {
+                    let idle = support_digest_task
+                        .as_ref()
+                        .is_none_or(|task| task.is_finished());
+                    if idle && last_support_digest.is_none_or(|at| at.elapsed() >= interval) {
+                        let watcher = Arc::clone(&self.watcher);
+                        support_digest_task = Some(tokio::spawn(async move {
+                            if let Err(e) = watcher.send_support_digest().await {
+                                tracing::error!(component = "digest", error = %e, "Error sending support digest");
+                            }
+                        }));
+                        last_support_digest = Some(Instant::now());
+                    }
+                }
+            }
 
             let (_, _, housekeeping_ok, _, _) = tokio::join!(
                 auto_close_fut,

@@ -3,7 +3,7 @@
 use super::Notifier;
 use crate::ask_reply_inbox;
 use crate::discord::{CreateMessageParams, DiscordClient, DiscordMessageReference, MessageEmbed};
-use crate::reports::RepetitiveDigest;
+use crate::reports::{RepetitiveDigest, SupportDigest};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_config::config::DiscordConfig;
@@ -1205,6 +1205,103 @@ pub(crate) fn build_repetitive_digest_message(
     })
 }
 
+/// Most needs-reply threads a support digest message lists. Discord allows 25
+/// embed fields, but ten keeps the post readable.
+pub const SUPPORT_DIGEST_MAX_ENTRIES: usize = 10;
+
+/// Build the Discord message for the support threads digest.
+///
+/// Returns `None` when no thread needs a reply. Threads missing from the
+/// previous digest are marked new; the mention pings the on-call user.
+pub(crate) fn build_support_digest_message(
+    digest: &SupportDigest,
+    mention: Option<String>,
+) -> Option<DiscordMessage> {
+    if digest.needs_reply.is_empty() {
+        return None;
+    }
+
+    let mut fields: Vec<DiscordField> = digest
+        .needs_reply
+        .iter()
+        .take(SUPPORT_DIGEST_MAX_ENTRIES)
+        .map(|entry| {
+            let new = if entry.is_new { "\u{1F195} " } else { "" };
+            DiscordField {
+                name: truncate_string(
+                    &format!("{}{} \u{00B7} {}", new, entry.score, entry.title),
+                    200,
+                ),
+                value: truncate_string(
+                    &format!(
+                        "[Open thread]({})\n{}\n_{}: {}_",
+                        truncate_string(&entry.url, MAX_URL_LENGTH),
+                        entry.reasons.join(", "),
+                        entry.last_author,
+                        truncate_string(&entry.last_message, 120),
+                    ),
+                    1024,
+                ),
+                inline: Some(false),
+            }
+        })
+        .collect();
+
+    if !digest.likely_resolved.is_empty() {
+        let lines: Vec<String> = digest
+            .likely_resolved
+            .iter()
+            .take(5)
+            .map(|entry| {
+                format!(
+                    "[{}]({})",
+                    truncate_string(&entry.title, 60),
+                    truncate_string(&entry.url, MAX_URL_LENGTH)
+                )
+            })
+            .collect();
+        fields.push(DiscordField {
+            name: "Looks resolved \u{2014} close these".to_string(),
+            value: truncate_string(&lines.join("\n"), 1024),
+            inline: Some(false),
+        });
+    }
+
+    Some(DiscordMessage {
+        content: mention,
+        embeds: Some(vec![DiscordEmbed {
+            title: Some(format!(
+                "\u{1F9F5} {} support thread{} need{} a reply",
+                digest.needs_reply_total,
+                if digest.needs_reply_total == 1 { "" } else { "s" },
+                if digest.needs_reply_total == 1 { "s" } else { "" },
+            )),
+            description: Some(format!(
+                "Active in the last {} days \u{00B7} {} look resolved \u{00B7} {} waiting on the user{}",
+                digest.days,
+                digest.likely_resolved.len(),
+                digest.waiting_on_user,
+                if digest.drafts_to_review > 0 {
+                    format!(
+                        " \u{00B7} {} draft{} to review in the dashboard",
+                        digest.drafts_to_review,
+                        if digest.drafts_to_review == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                }
+            )),
+            url: None,
+            color: Some(0x3498db), // Blue
+            fields: Some(fields),
+            footer: Some(DiscordFooter {
+                text: "Claudear \u{2014} Support Digest".to_string(),
+            }),
+            timestamp: Some(timestamp()),
+        }]),
+    })
+}
+
 /// Build the Discord message for a human-in-the-loop question.
 pub(crate) fn build_ask_question_message(
     issue: &Issue,
@@ -1400,6 +1497,18 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             let _ = self.send(message).await?;
         }
         Ok(())
+    }
+
+    async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<bool> {
+        if !self.has_delivery_path() {
+            return Ok(false);
+        }
+        let mention = self.get_user_mention();
+        let Some(message) = build_support_digest_message(digest, mention) else {
+            return Ok(false);
+        };
+        let _ = self.send(message).await?;
+        Ok(true)
     }
 
     async fn ask_question(

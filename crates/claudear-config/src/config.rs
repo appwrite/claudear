@@ -832,6 +832,120 @@ impl Default for Config {
 pub struct ReportsConfig {
     /// Weekly digest of repetitive, non-actionable Sentry issues.
     pub repetitive_digest: RepetitiveDigestConfig,
+    /// Digest of Discord support forum threads that need a reply.
+    pub support_digest: SupportDigestConfig,
+}
+
+/// Digest of Discord support forum threads that need a reply.
+///
+/// Reads the forum from the Appwrite project that the threads bot syncs Discord
+/// into, so Claudear needs no access to the forum itself. Every `interval_hours`
+/// it ranks open threads by how urgently they need a reply and posts the
+/// ranking to the configured notifier(s) when a thread enters the top
+/// `max_entries`. Report-only: nothing is posted to the forum and threads are
+/// never fed into the fix pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SupportDigestConfig {
+    /// Whether the digest is enabled (default: false).
+    pub enabled: bool,
+    /// Appwrite endpoint of the threads project, e.g. "https://fra.cloud.appwrite.io/v1".
+    pub endpoint: String,
+    /// Appwrite project id of the threads project.
+    pub project_id: String,
+    /// Database holding the `threads`, `messages` and `authors` tables (default: "main").
+    pub database_id: String,
+    /// API key with `rows.read`; only needed when the tables are not public.
+    pub api_key: Option<SecretValue>,
+    /// Discord server id the forum belongs to, used to link threads.
+    pub guild_id: String,
+    /// Only threads active in the last N days (default: 14, at most 365).
+    pub days: i64,
+    /// How often to scan, in hours (default: 1.0, 0 = disable, at most 8760).
+    pub interval_hours: f64,
+    /// How many needs-reply threads to post (default: 10, at most 10).
+    pub max_entries: usize,
+    /// Discord user ids whose replies count as the team's.
+    pub team_user_ids: Vec<String>,
+    /// Discord role names; thread authors holding one count as team (default: ["Core"]).
+    pub team_roles: Vec<String>,
+    /// Write a suggested answer for listed threads to the project's `drafts`
+    /// table, for review in the dashboard (default: false). Needs `api_key`
+    /// with write access.
+    pub drafts: bool,
+    /// Most drafts written per scan (default: 3).
+    pub max_drafts: usize,
+}
+
+impl SupportDigestConfig {
+    /// Longest allowed scan interval: one year.
+    pub const MAX_INTERVAL_HOURS: f64 = 24.0 * 365.0;
+
+    /// Longest allowed activity window, in days.
+    pub const MAX_DAYS: i64 = 365;
+
+    /// Validate the threads project and the scan bounds.
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("endpoint", &self.endpoint),
+            ("project_id", &self.project_id),
+            ("database_id", &self.database_id),
+            ("guild_id", &self.guild_id),
+        ] {
+            if value.trim().is_empty() {
+                return Err(Error::config(format!(
+                    "reports.support_digest.{name} is required"
+                )));
+            }
+        }
+        if !self.interval_hours.is_finite()
+            || !(0.0..=Self::MAX_INTERVAL_HOURS).contains(&self.interval_hours)
+        {
+            return Err(Error::config(format!(
+                "reports.support_digest.interval_hours must be between 0 and {}, got {}",
+                Self::MAX_INTERVAL_HOURS,
+                self.interval_hours
+            )));
+        }
+        if self.drafts
+            && self
+                .api_key
+                .as_ref()
+                .is_none_or(|key| key.expose().trim().is_empty())
+        {
+            return Err(Error::config(
+                "reports.support_digest.api_key is required when drafts are enabled",
+            ));
+        }
+        if !(1..=Self::MAX_DAYS).contains(&self.days) {
+            return Err(Error::config(format!(
+                "reports.support_digest.days must be between 1 and {}, got {}",
+                Self::MAX_DAYS,
+                self.days
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for SupportDigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            project_id: String::new(),
+            database_id: "main".to_string(),
+            api_key: None,
+            guild_id: String::new(),
+            days: 14,
+            interval_hours: 1.0,
+            max_entries: 10,
+            team_user_ids: Vec::new(),
+            team_roles: vec!["Core".to_string()],
+            drafts: false,
+            max_drafts: 3,
+        }
+    }
 }
 
 /// Weekly digest of repetitive, non-actionable Sentry issues.
@@ -3554,6 +3668,10 @@ impl Config {
 
         if self.deploy_qa.enabled {
             self.deploy_qa.validate()?;
+        }
+
+        if self.reports.support_digest.enabled {
+            self.reports.support_digest.validate()?;
         }
 
         let has_github_token = self
