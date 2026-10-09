@@ -1,7 +1,9 @@
 //! GitHub Release API client.
 
-use claudear_core::error::{Error, Result};
-use claudear_core::http::{HttpClient, ReqwestHttpClient};
+use abnegate_http::HttpClient;
+use abnegate_http::ReqwestHttpClient;
+use claudear_core::error::Error;
+use claudear_core::error::Result;
 use serde::Deserialize;
 use std::cmp::Ordering;
 
@@ -58,6 +60,11 @@ pub struct GitHubTagCommit {
     pub sha: Option<String>,
 }
 
+/// The largest GitHub API response body read where a pull request's diff
+/// or a release comparison's commits and patches can arrive: eight times
+/// abnegate-http's default.
+pub const BODY_LIMIT: usize = 8 * ReqwestHttpClient::DEFAULT_BODY_LIMIT;
+
 /// GitHub Release API client.
 pub struct ReleaseClient<H: HttpClient = ReqwestHttpClient> {
     token: String,
@@ -67,9 +74,15 @@ pub struct ReleaseClient<H: HttpClient = ReqwestHttpClient> {
 impl ReleaseClient<ReqwestHttpClient> {
     /// Create a new release client with the default HTTP client.
     pub fn new(token: impl Into<String>) -> Self {
+        let transport = ReqwestHttpClient::new()
+            .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new()));
+        Self::with_transport(token, transport)
+    }
+
+    fn with_transport(token: impl Into<String>, transport: ReqwestHttpClient) -> Self {
         Self {
             token: token.into(),
-            http: ReqwestHttpClient::new(),
+            http: transport.with_body_limit(BODY_LIMIT),
         }
     }
 }
@@ -230,7 +243,7 @@ impl<H: HttpClient> ReleaseClient<H> {
             )));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// List recent tags for a repository (fallback when Releases is empty).
@@ -250,7 +263,7 @@ impl<H: HttpClient> ReleaseClient<H> {
             )));
         }
 
-        response.json()
+        Ok(response.json()?)
     }
 
     /// Get a specific release by tag.
@@ -817,8 +830,46 @@ pub struct PrDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::loopback_transport;
+    use crate::test_support::ok_response;
+    use crate::test_support::serve_once;
+    use abnegate_http::HttpResponse;
     use async_trait::async_trait;
-    use claudear_core::http::HttpResponse;
+
+    #[tokio::test]
+    async fn a_release_comparison_larger_than_the_crate_default_is_read() {
+        let size = ReqwestHttpClient::DEFAULT_BODY_LIMIT + 1;
+        let url = serve_once(ok_response(size, &vec![b'+'; size])).await;
+        let client = ReleaseClient::with_transport("test-token", loopback_transport());
+
+        let response = client
+            .http
+            .get(&url, Vec::new())
+            .await
+            .expect("a comparison under the body limit is read");
+
+        assert_eq!(response.body.len(), size);
+    }
+
+    #[tokio::test]
+    async fn a_release_comparison_over_the_body_limit_is_refused() {
+        let url = serve_once(ok_response(BODY_LIMIT + 1, b"")).await;
+        let client = ReleaseClient::with_transport("test-token", loopback_transport());
+
+        let error = client
+            .http
+            .get(&url, Vec::new())
+            .await
+            .expect_err("a declared length over the body limit is refused");
+
+        assert!(
+            matches!(
+                error,
+                abnegate_http::Error::OversizedBody { limit, .. } if limit == BODY_LIMIT
+            ),
+            "{error}"
+        );
+    }
 
     struct MockHttpClient {
         response: HttpResponse,
@@ -827,21 +878,19 @@ mod tests {
     impl MockHttpClient {
         fn new(status: u16, body: &str) -> Self {
             Self {
-                response: HttpResponse {
-                    status,
-                    body: body.to_string(),
-                },
+                response: HttpResponse::new(status, body.to_string()),
             }
         }
     }
 
     #[async_trait]
     impl HttpClient for MockHttpClient {
-        async fn get(&self, _url: &str, _headers: Vec<(&str, String)>) -> Result<HttpResponse> {
-            Ok(HttpResponse {
-                status: self.response.status,
-                body: self.response.body.clone(),
-            })
+        async fn get(
+            &self,
+            _url: &str,
+            _headers: Vec<(&str, String)>,
+        ) -> abnegate_http::Result<HttpResponse> {
+            Ok(self.response.clone())
         }
     }
 

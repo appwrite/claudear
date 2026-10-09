@@ -1,16 +1,27 @@
 //! Poll GitHub for new release tips and persist last-seen / attempt state.
 
-use crate::deploy_qa::playbook::{load_playbook, DEPLOY_QA_SOURCE};
-use crate::deploy_qa::probe::{
-    VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX, VERDICT_UNVERIFIED,
-};
-use crate::release::{GitHubRelease, GitHubTag, ReleaseClient};
-use claudear_config::config::{DeployQaConfig, DeployQaTagFilter, DeployQaTrackConfig};
+use crate::deploy_qa::playbook::load_playbook;
+use crate::deploy_qa::playbook::DEPLOY_QA_SOURCE;
+use crate::deploy_qa::probe::VERDICT_ALL_VERIFIED;
+use crate::deploy_qa::probe::VERDICT_FAIL;
+use crate::deploy_qa::probe::VERDICT_PREFIX;
+use crate::deploy_qa::probe::VERDICT_UNVERIFIED;
+use crate::release::GitHubRelease;
+use crate::release::GitHubTag;
+use crate::release::ReleaseClient;
+use abnegate_http::HttpClient;
+use abnegate_http::ReqwestHttpClient;
+use claudear_config::config::DeployQaConfig;
+use claudear_config::config::DeployQaTagFilter;
+use claudear_config::config::DeployQaTrackConfig;
 use claudear_core::error::Result;
-use claudear_core::http::{HttpClient, ReqwestHttpClient};
-use claudear_core::types::{
-    DeployQaTip, DeployQaTipStatus, Issue, IssuePriority, IssueStatus, MatchPriority, MatchResult,
-};
+use claudear_core::types::DeployQaTip;
+use claudear_core::types::DeployQaTipStatus;
+use claudear_core::types::Issue;
+use claudear_core::types::IssuePriority;
+use claudear_core::types::IssueStatus;
+use claudear_core::types::MatchPriority;
+use claudear_core::types::MatchResult;
 use claudear_storage::FixAttemptTracker;
 use std::path::Path;
 use std::sync::Arc;
@@ -328,9 +339,11 @@ pub fn deploy_qa_match_result(track: &str, tag: &str) -> MatchResult {
 mod tests {
     use super::*;
     use crate::deploy_qa::playbook::bundled_playbook;
-    use crate::deploy_qa::probe::{classify_deploy_qa_verdict, DeployQaVerdict};
+    use crate::deploy_qa::probe::classify_deploy_qa_verdict;
+    use crate::deploy_qa::probe::DeployQaVerdict;
+    use abnegate_http::HttpClient;
+    use abnegate_http::HttpResponse;
     use async_trait::async_trait;
-    use claudear_core::http::{HttpClient, HttpResponse};
     use claudear_storage::SqliteTracker;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -344,47 +357,36 @@ mod tests {
         fn new() -> Self {
             Self {
                 by_url: Mutex::new(HashMap::new()),
-                default: HttpResponse {
-                    status: 404,
-                    body: r#"{"message":"Not Found"}"#.to_string(),
-                },
+                default: HttpResponse::new(404, r#"{"message":"Not Found"}"#),
             }
         }
 
         fn on(self, url: &str, status: u16, body: &str) -> Self {
-            self.by_url.lock().unwrap().insert(
-                url.to_string(),
-                HttpResponse {
-                    status,
-                    body: body.to_string(),
-                },
-            );
+            self.by_url
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), HttpResponse::new(status, body.to_string()));
             self
         }
     }
 
     #[async_trait]
     impl HttpClient for MapMockHttp {
-        async fn get(&self, url: &str, _headers: Vec<(&str, String)>) -> Result<HttpResponse> {
+        async fn get(
+            &self,
+            url: &str,
+            _headers: Vec<(&str, String)>,
+        ) -> abnegate_http::Result<HttpResponse> {
             let map = self.by_url.lock().unwrap();
             if let Some(response) = map.get(url) {
-                return Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                });
+                return Ok(response.clone());
             }
             for (key, response) in map.iter() {
                 if url.starts_with(key) {
-                    return Ok(HttpResponse {
-                        status: response.status,
-                        body: response.body.clone(),
-                    });
+                    return Ok(response.clone());
                 }
             }
-            Ok(HttpResponse {
-                status: self.default.status,
-                body: self.default.body.clone(),
-            })
+            Ok(self.default.clone())
         }
     }
 

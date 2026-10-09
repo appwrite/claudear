@@ -1562,8 +1562,8 @@ mod tests {
     /// Shared state for the capturing mock, held via Arc so tests can
     /// inspect captured requests after passing the mock to the manager.
     struct CapturedRequests {
-        post_responses: std::sync::Mutex<HashMap<String, claudear_core::http::HttpResponse>>,
-        patch_responses: std::sync::Mutex<HashMap<String, claudear_core::http::HttpResponse>>,
+        post_responses: std::sync::Mutex<HashMap<String, abnegate_http::HttpResponse>>,
+        patch_responses: std::sync::Mutex<HashMap<String, abnegate_http::HttpResponse>>,
         captured_posts: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
         captured_patches: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
     }
@@ -1579,23 +1579,17 @@ mod tests {
         }
 
         fn mock_post(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
-            self.post_responses.lock().unwrap().insert(
-                url.into(),
-                claudear_core::http::HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            self.post_responses
+                .lock()
+                .unwrap()
+                .insert(url.into(), abnegate_http::HttpResponse::new(status, body));
         }
 
         fn mock_patch(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
-            self.patch_responses.lock().unwrap().insert(
-                url.into(),
-                claudear_core::http::HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            self.patch_responses
+                .lock()
+                .unwrap()
+                .insert(url.into(), abnegate_http::HttpResponse::new(status, body));
         }
 
         fn get_captured_posts(&self) -> Vec<(String, serde_json::Value)> {
@@ -1624,68 +1618,50 @@ mod tests {
         async fn get(
             &self,
             _url: &str,
-        ) -> claudear_core::error::Result<claudear_core::http::HttpResponse> {
-            Ok(claudear_core::http::HttpResponse {
-                status: 404,
-                body: "Not found".to_string(),
-            })
+        ) -> claudear_core::error::Result<abnegate_http::HttpResponse> {
+            Ok(abnegate_http::HttpResponse::new(404, "Not found"))
         }
 
         async fn post(
             &self,
             url: &str,
             body: serde_json::Value,
-        ) -> claudear_core::error::Result<claudear_core::http::HttpResponse> {
+        ) -> claudear_core::error::Result<abnegate_http::HttpResponse> {
             self.inner
                 .captured_posts
                 .lock()
                 .unwrap()
                 .push((url.to_string(), body));
             let responses = self.inner.post_responses.lock().unwrap();
-            if let Some(r) = responses.get(url) {
-                Ok(claudear_core::http::HttpResponse {
-                    status: r.status,
-                    body: r.body.clone(),
-                })
+            if let Some(response) = responses.get(url) {
+                Ok(response.clone())
             } else {
-                Ok(claudear_core::http::HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(abnegate_http::HttpResponse::new(404, "Not found"))
             }
         }
 
         async fn put_empty(
             &self,
             _url: &str,
-        ) -> claudear_core::error::Result<claudear_core::http::HttpResponse> {
-            Ok(claudear_core::http::HttpResponse {
-                status: 204,
-                body: String::new(),
-            })
+        ) -> claudear_core::error::Result<abnegate_http::HttpResponse> {
+            Ok(abnegate_http::HttpResponse::new(204, ""))
         }
 
         async fn patch(
             &self,
             url: &str,
             body: serde_json::Value,
-        ) -> claudear_core::error::Result<claudear_core::http::HttpResponse> {
+        ) -> claudear_core::error::Result<abnegate_http::HttpResponse> {
             self.inner
                 .captured_patches
                 .lock()
                 .unwrap()
                 .push((url.to_string(), body));
             let responses = self.inner.patch_responses.lock().unwrap();
-            if let Some(r) = responses.get(url) {
-                Ok(claudear_core::http::HttpResponse {
-                    status: r.status,
-                    body: r.body.clone(),
-                })
+            if let Some(response) = responses.get(url) {
+                Ok(response.clone())
             } else {
-                Ok(claudear_core::http::HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(abnegate_http::HttpResponse::new(404, "Not found"))
             }
         }
     }

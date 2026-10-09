@@ -2,13 +2,19 @@
 
 use super::Notifier;
 use crate::ask_reply_inbox;
+use abnegate_http::HttpResponse;
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::DateTime;
+use chrono::TimeZone;
+use chrono::Utc;
 use claudear_config::config::TelegramConfig;
 use claudear_config::users::UserRegistry;
-use claudear_core::error::{Error, Result};
-use claudear_core::http::HttpResponse;
-use claudear_core::types::{AskDelivery, AskReply, AskRequest, Issue};
+use claudear_core::error::Error;
+use claudear_core::error::Result;
+use claudear_core::types::AskDelivery;
+use claudear_core::types::AskReply;
+use claudear_core::types::AskRequest;
+use claudear_core::types::Issue;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::RwLock;
@@ -51,7 +57,7 @@ impl TelegramHttpClient for ReqwestTelegramClient {
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
 
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 
     async fn get_json(&self, url: &str) -> Result<HttpResponse> {
@@ -60,7 +66,7 @@ impl TelegramHttpClient for ReqwestTelegramClient {
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
 
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 }
 
@@ -670,19 +676,19 @@ mod tests {
                 .unwrap()
                 .push((url.to_string(), body.clone()));
 
-            Ok(HttpResponse {
-                status: self.post_response_status,
-                body: self.post_response_body.clone(),
-            })
+            Ok(HttpResponse::new(
+                self.post_response_status,
+                self.post_response_body.clone(),
+            ))
         }
 
         async fn get_json(&self, url: &str) -> Result<HttpResponse> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.get_calls.lock().unwrap().push(url.to_string());
-            Ok(HttpResponse {
-                status: self.get_response_status,
-                body: self.get_response_body.clone(),
-            })
+            Ok(HttpResponse::new(
+                self.get_response_status,
+                self.get_response_body.clone(),
+            ))
         }
     }
 
@@ -1825,10 +1831,7 @@ mod tests {
 
     #[test]
     fn test_http_response_fields() {
-        let response = HttpResponse {
-            status: 201,
-            body: "Created".to_string(),
-        };
+        let response = HttpResponse::new(201, "Created");
         assert_eq!(response.status, 201);
         assert_eq!(response.body, "Created");
     }

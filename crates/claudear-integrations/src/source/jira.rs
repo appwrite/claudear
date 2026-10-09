@@ -1,12 +1,18 @@
 //! Jira issue source adapter.
 
 use super::IssueSource;
+use abnegate_http::HttpResponse;
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use claudear_config::config::JiraConfig;
-use claudear_core::error::{Error, Result};
-use claudear_core::http::HttpResponse;
-use claudear_core::types::{Issue, IssuePriority, IssueStatus, MatchPriority, MatchResult};
+use claudear_core::error::Error;
+use claudear_core::error::Result;
+use claudear_core::types::Issue;
+use claudear_core::types::IssuePriority;
+use claudear_core::types::IssueStatus;
+use claudear_core::types::MatchPriority;
+use claudear_core::types::MatchResult;
 use serde::Deserialize;
 
 /// Trait for HTTP client operations to enable testing.
@@ -62,7 +68,7 @@ impl JiraHttpClient for ReqwestJiraClient {
             .await?;
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse::new(status, body))
     }
 
     async fn post(
@@ -80,10 +86,7 @@ impl JiraHttpClient for ReqwestJiraClient {
             .await?;
         let status = response.status().as_u16();
         let body_text = response.text().await.unwrap_or_default();
-        Ok(HttpResponse {
-            status,
-            body: body_text,
-        })
+        Ok(HttpResponse::new(status, body_text))
     }
 }
 
@@ -994,24 +997,12 @@ mod tests {
 
         pub fn mock_get(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
             let mut responses = self.get_responses.lock().unwrap();
-            responses.insert(
-                url.into(),
-                HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            responses.insert(url.into(), HttpResponse::new(status, body));
         }
 
         pub fn mock_post(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
             let mut responses = self.post_responses.lock().unwrap();
-            responses.insert(
-                url.into(),
-                HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            responses.insert(url.into(), HttpResponse::new(status, body));
         }
 
         #[expect(dead_code)]
@@ -1029,15 +1020,9 @@ mod tests {
                 .push(("GET".to_string(), url.to_string()));
             let responses = self.get_responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
 
@@ -1053,15 +1038,9 @@ mod tests {
                 .push(("POST".to_string(), url.to_string()));
             let responses = self.post_responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
     }
@@ -3060,8 +3039,6 @@ mod tests {
         );
     }
 
-    // --- Tests for create_issue coverage ---
-
     #[tokio::test]
     async fn test_create_issue_success() {
         let config = test_config();
@@ -3121,8 +3098,6 @@ mod tests {
             .contains("Failed to create issue"));
     }
 
-    // --- Tests for find_or_create_label coverage ---
-
     #[tokio::test]
     async fn test_find_or_create_label_returns_name() {
         let config = test_config();
@@ -3134,8 +3109,6 @@ mod tests {
         // Jira labels are plain strings, no ID resolution
         assert_eq!(label, "auto-implement");
     }
-
-    // --- Tests for list_open_issues coverage ---
 
     #[tokio::test]
     async fn test_list_open_issues_no_filter() {
@@ -3221,8 +3194,6 @@ mod tests {
             .contains("Failed to search issues"));
     }
 
-    // --- Tests for build_issue_context coverage ---
-
     #[tokio::test]
     async fn test_build_issue_context_delegates_to_format() {
         let config = test_config();
@@ -3248,8 +3219,6 @@ mod tests {
         assert!(context.contains("Some description"));
     }
 
-    // --- Tests for get_issue_status coverage ---
-
     #[tokio::test]
     async fn test_get_issue_status_api_error() {
         let config = test_config();
@@ -3261,8 +3230,6 @@ mod tests {
 
         assert!(result.is_err());
     }
-
-    // --- Tests for search_issues max_results cap ---
 
     #[tokio::test]
     async fn test_search_issues_caps_max_results_at_100() {
@@ -3290,8 +3257,6 @@ mod tests {
         assert!(issues.is_empty());
     }
 
-    // --- Tests for escape_jql_value edge cases ---
-
     #[test]
     fn test_escape_jql_value_multiple_backslashes() {
         type JS = JiraSource<MockJiraClient>;
@@ -3304,8 +3269,6 @@ mod tests {
         assert_eq!(JS::escape_jql_value(r#"\"#), r#"\\"#);
         assert_eq!(JS::escape_jql_value(r#"""#), r#"\""#);
     }
-
-    // --- Tests for parse_jira_datetime edge cases ---
 
     #[test]
     fn test_parse_jira_datetime_with_colon_offset() {
@@ -3324,8 +3287,6 @@ mod tests {
         let dt = parse_jira_datetime("2024-03-15T10:30:00.000-0500");
         assert!(dt.is_some());
     }
-
-    // --- Tests for map_issue dates ---
 
     #[test]
     fn test_map_issue_rfc3339_dates() {
@@ -3390,8 +3351,6 @@ mod tests {
         assert!(issue.created_at.is_none());
         assert!(issue.updated_at.is_none());
     }
-
-    // --- Tests for extract_adf_text edge cases ---
 
     #[test]
     fn test_extract_adf_text_ordered_list() {
@@ -3471,8 +3430,6 @@ mod tests {
         assert!(text.contains("Deep text"));
     }
 
-    // --- Tests for create_issue with trailing slash on base_url ---
-
     #[tokio::test]
     async fn test_create_issue_url_trailing_slash() {
         let mut config = test_config();
@@ -3492,8 +3449,6 @@ mod tests {
         assert_eq!(issue.url, "https://test.atlassian.net/browse/PROJ-30");
     }
 
-    // --- Tests for matches_criteria medium priority ---
-
     #[test]
     fn test_matches_criteria_medium_priority() {
         let config = test_config();
@@ -3509,8 +3464,6 @@ mod tests {
         assert!(result.matches);
         assert_eq!(result.priority, MatchPriority::Normal);
     }
-
-    // --- Test get_issue with trailing slash ---
 
     #[tokio::test]
     async fn test_get_issue_trailing_slash_base_url() {
@@ -3530,8 +3483,6 @@ mod tests {
         let issue = source.get_issue("PROJ-99").await.unwrap();
         assert_eq!(issue.short_id, "PROJ-99");
     }
-
-    // --- Test map_issue with assignee account_id null ---
 
     #[test]
     fn test_map_issue_assignee_no_account_id() {
@@ -3570,8 +3521,6 @@ mod tests {
             .is_none());
     }
 
-    // --- Test map_issue with labels but no assignee ---
-
     #[test]
     fn test_map_issue_labels_no_assignee() {
         let config = test_config();
@@ -3607,8 +3556,6 @@ mod tests {
         assert!(issue.get_metadata::<String>("assignee").is_none());
     }
 
-    // --- Test build_issue_context returns Ok ---
-
     #[tokio::test]
     async fn test_build_issue_context_returns_ok() {
         let config = test_config();
@@ -3619,16 +3566,12 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- Test extract_adf_text with object without type field ---
-
     #[test]
     fn test_extract_adf_text_object_no_type() {
         let value = serde_json::json!({"key": "value"});
         let text = extract_adf_text(&value);
         assert_eq!(text, "");
     }
-
-    // --- Test list_open_issues with title containing special JQL characters ---
 
     #[tokio::test]
     async fn test_list_open_issues_title_with_special_chars() {

@@ -741,8 +741,9 @@ mod tests {
     mod fetch_tests {
         use super::*;
         use crate::gitlab::GitLabClient;
+        use abnegate_http::HttpClient;
+        use abnegate_http::HttpResponse;
         use async_trait::async_trait;
-        use claudear_core::http::{HttpClient, HttpResponse};
         use std::collections::HashMap;
         use std::sync::Mutex;
 
@@ -758,13 +759,10 @@ mod tests {
             }
 
             fn mock_response(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
-                self.responses.lock().unwrap().insert(
-                    url.into(),
-                    HttpResponse {
-                        status,
-                        body: body.into(),
-                    },
-                );
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .insert(url.into(), HttpResponse::new(status, body));
             }
         }
 
@@ -774,18 +772,12 @@ mod tests {
                 &self,
                 url: &str,
                 _headers: Vec<(&str, String)>,
-            ) -> claudear_core::error::Result<HttpResponse> {
+            ) -> abnegate_http::Result<HttpResponse> {
                 let responses = self.responses.lock().unwrap();
                 if let Some(response) = responses.get(url) {
-                    Ok(HttpResponse {
-                        status: response.status,
-                        body: response.body.clone(),
-                    })
+                    Ok(response.clone())
                 } else {
-                    Ok(HttpResponse {
-                        status: 404,
-                        body: "Not found".to_string(),
-                    })
+                    Ok(HttpResponse::new(404, "Not found"))
                 }
             }
         }

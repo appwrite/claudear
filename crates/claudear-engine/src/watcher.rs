@@ -137,9 +137,9 @@ pub enum RetryOutcome {
 }
 
 /// Whether a retry that failed to start should get its retry back.
-fn retry_trigger_error_is_transient(e: &claudear_core::error::Error) -> bool {
+fn retry_trigger_error_is_transient(error: &claudear_core::error::Error) -> bool {
     use claudear_core::error::Error;
-    match e {
+    match error {
         Error::Http(_) | Error::Network(_) => true,
         Error::Source { message, .. } => message.contains("already being processed"),
         _ => false,
@@ -5961,6 +5961,39 @@ mod tests {
         fn get_call_count(&self) -> usize {
             self.call_count.load(AtomicOrdering::SeqCst)
         }
+    }
+
+    #[test]
+    fn a_json_error_from_the_http_client_does_not_give_the_retry_back() {
+        let parse = serde_json::from_str::<serde_json::Value>("not json")
+            .expect_err("the body is not JSON");
+
+        let error = claudear_core::error::Error::from(abnegate_http::Error::from(parse));
+
+        assert!(!retry_trigger_error_is_transient(&error), "{error:?}");
+    }
+
+    #[test]
+    fn an_oversized_body_from_the_http_client_does_not_give_the_retry_back() {
+        let error = claudear_core::error::Error::from(abnegate_http::Error::oversized_body(16));
+
+        assert!(!retry_trigger_error_is_transient(&error), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_from_the_http_client_gives_the_retry_back() {
+        let transport = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a client without a proxy builds")
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+
+        let error = claudear_core::error::Error::from(abnegate_http::Error::from(transport));
+
+        assert!(retry_trigger_error_is_transient(&error), "{error:?}");
     }
 
     #[test]

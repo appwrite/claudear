@@ -8,5 +8,11 @@
 mod github;
 mod tracker;
 
-pub use github::{GitHubRelease, GitHubTag, PrDetails, ReleaseAuthor, ReleaseClient};
-pub use tracker::{ReleaseTracker, ReleaseTrackerConfig};
+pub use github::GitHubRelease;
+pub use github::GitHubTag;
+pub use github::PrDetails;
+pub use github::ReleaseAuthor;
+pub use github::ReleaseClient;
+pub use github::BODY_LIMIT;
+pub use tracker::ReleaseTracker;
+pub use tracker::ReleaseTrackerConfig;

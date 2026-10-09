@@ -16,3 +16,5 @@ pub mod qa;
 pub mod regression;
 pub mod release;
 pub mod repo;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;

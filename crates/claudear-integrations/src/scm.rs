@@ -5,14 +5,20 @@
 
 use async_trait::async_trait;
 use claudear_core::error::Result;
-use claudear_core::types::{
-    ActivityLogEntry, FixAttempt, IssueType, PrReviewRecord, RegressionWatch,
-};
+use claudear_core::types::ActivityLogEntry;
+use claudear_core::types::FixAttempt;
+use claudear_core::types::IssueType;
+use claudear_core::types::PrReviewRecord;
+use claudear_core::types::RegressionWatch;
 use claudear_storage::FixAttemptTracker;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use std::sync::Arc;
 
-pub use claudear_core::types::{PrReviewState, ReviewComment, ReviewUser};
+pub use claudear_analysis::release::BODY_LIMIT;
+pub use claudear_core::types::PrReviewState;
+pub use claudear_core::types::ReviewComment;
+pub use claudear_core::types::ReviewUser;
 
 /// Check whether a bot user should be skipped based on the allowed-bots list.
 ///
@@ -6524,8 +6530,6 @@ mod tests {
         }
     }
 
-    // --- comment_is_after_cursor tests ---
-
     #[test]
     fn comment_is_after_cursor_no_cursor() {
         let comment = make_review_comment("src/main.rs", "fix", Some(1));
@@ -6606,8 +6610,6 @@ mod tests {
         ));
     }
 
-    // --- ScmRelease serde ---
-
     #[test]
     fn scm_release_serialization_round_trip() {
         let release = ScmRelease {
@@ -6658,8 +6660,6 @@ mod tests {
         assert_eq!(cloned.name, release.name);
     }
 
-    // --- RemoteRepo serde ---
-
     #[test]
     fn remote_repo_serialization_round_trip() {
         let repo = RemoteRepo {
@@ -6697,8 +6697,6 @@ mod tests {
         let repo: RemoteRepo = serde_json::from_str(json).unwrap();
         assert_eq!(repo.ssh_url, "");
     }
-
-    // --- ReviewComment serde ---
 
     #[test]
     fn review_comment_serialization_round_trip() {
@@ -6765,8 +6763,6 @@ mod tests {
         assert!(deserialized.user.user_type.is_none());
     }
 
-    // --- CodeReview serde ---
-
     #[test]
     fn code_review_serialization_round_trip() {
         let review = CodeReview {
@@ -6793,8 +6789,6 @@ mod tests {
         );
     }
 
-    // --- PrSummary serde ---
-
     #[test]
     fn pr_summary_serialization_round_trip() {
         let summary = PrSummary {
@@ -6810,8 +6804,6 @@ mod tests {
         assert_eq!(deserialized.branch, "fix/auth-bug");
         assert_eq!(deserialized.url, "https://github.com/org/repo/pull/42");
     }
-
-    // --- ReviewUser serde ---
 
     #[test]
     fn review_user_serialization_round_trip() {
@@ -6837,8 +6829,6 @@ mod tests {
         assert_eq!(user.login, "dependabot[bot]");
     }
 
-    // --- PostReviewAction ---
-
     #[test]
     fn post_review_action_equality() {
         assert_eq!(PostReviewAction::Comment, PostReviewAction::Comment);
@@ -6859,8 +6849,6 @@ mod tests {
         );
         assert_eq!(format!("{:?}", PostReviewAction::Approve), "Approve");
     }
-
-    // --- PrStatusUpdate ---
 
     #[test]
     fn pr_status_update_fields() {
@@ -6896,8 +6884,6 @@ mod tests {
         assert!(update.regression_watch_id.is_none());
     }
 
-    // --- InlineReviewComment ---
-
     #[test]
     fn inline_review_comment_fields() {
         let comment = InlineReviewComment {
@@ -6919,8 +6905,6 @@ mod tests {
         };
         assert!(comment.position.is_none());
     }
-
-    // --- ReviewEvent requires_action for case-insensitive states (extended) ---
 
     #[test]
     fn review_event_requires_action_lowercase_changes_requested_2() {
@@ -6969,8 +6953,6 @@ mod tests {
         };
         assert!(!event.requires_action());
     }
-
-    // --- PrReviewState serde with all-None cursors ---
 
     #[test]
     fn pr_review_state_serde_none_cursors() {

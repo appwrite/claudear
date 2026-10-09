@@ -27,7 +27,6 @@
 
 // Re-exported from claudear-core
 pub use claudear_core::error;
-pub use claudear_core::http;
 pub use claudear_core::secret;
 pub use claudear_core::templates;
 pub use claudear_core::types;

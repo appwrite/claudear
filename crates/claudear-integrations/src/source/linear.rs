@@ -1,12 +1,18 @@
 //! Linear issue source adapter.
 
 use super::IssueSource;
+use abnegate_http::HttpResponse;
 use async_trait::async_trait;
 use claudear_config::config::LinearConfig;
-use claudear_core::error::{Error, Result};
-use claudear_core::http::HttpResponse;
-use claudear_core::types::{Issue, IssuePriority, IssueStatus, MatchPriority, MatchResult};
-use serde::{Deserialize, Serialize};
+use claudear_core::error::Error;
+use claudear_core::error::Result;
+use claudear_core::types::Issue;
+use claudear_core::types::IssuePriority;
+use claudear_core::types::IssueStatus;
+use claudear_core::types::MatchPriority;
+use claudear_core::types::MatchResult;
+use serde::Deserialize;
+use serde::Serialize;
 
 /// Trait for GraphQL client operations to enable testing.
 #[async_trait]
@@ -60,10 +66,7 @@ impl LinearHttpClient for ReqwestLinearClient {
             .await?;
         let status = response.status().as_u16();
         let body_text = response.text().await.unwrap_or_default();
-        Ok(HttpResponse {
-            status,
-            body: body_text,
-        })
+        Ok(HttpResponse::new(status, body_text))
     }
 }
 
@@ -917,13 +920,7 @@ mod tests {
 
         pub fn mock_response(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
             let mut responses = self.responses.lock().unwrap();
-            responses.insert(
-                url.into(),
-                HttpResponse {
-                    status,
-                    body: body.into(),
-                },
-            );
+            responses.insert(url.into(), HttpResponse::new(status, body));
         }
 
         pub fn get_requests(&self) -> Vec<(String, serde_json::Value)> {
@@ -942,30 +939,18 @@ mod tests {
             self.requests.lock().unwrap().push((url.to_string(), body));
             let responses = self.responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
-                Ok(HttpResponse {
-                    status: response.status,
-                    body: response.body.clone(),
-                })
+                Ok(response.clone())
             } else {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: "Not found".to_string(),
-                })
+                Ok(HttpResponse::new(404, "Not found"))
             }
         }
     }
 
     #[test]
     fn test_http_response_is_success() {
-        let response = HttpResponse {
-            status: 200,
-            body: "{}".to_string(),
-        };
+        let response = HttpResponse::new(200, "{}");
         assert!(response.is_success());
-        let response = HttpResponse {
-            status: 404,
-            body: "{}".to_string(),
-        };
+        let response = HttpResponse::new(404, "{}");
         assert!(!response.is_success());
     }
 
@@ -2249,37 +2234,18 @@ mod tests {
 
     #[test]
     fn test_http_response_json_parse_failure() {
-        let response = HttpResponse {
-            status: 200,
-            body: "not valid json".to_string(),
-        };
-        let result: Result<serde_json::Value> = response.json();
+        let response = HttpResponse::new(200, "not valid json");
+        let result: Result<serde_json::Value> = response.json().map_err(Error::from);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("JSON parse error"));
     }
 
     #[test]
     fn test_http_response_boundary_status_codes() {
-        assert!(!HttpResponse {
-            status: 199,
-            body: String::new()
-        }
-        .is_success());
-        assert!(HttpResponse {
-            status: 200,
-            body: String::new()
-        }
-        .is_success());
-        assert!(HttpResponse {
-            status: 299,
-            body: String::new()
-        }
-        .is_success());
-        assert!(!HttpResponse {
-            status: 300,
-            body: String::new()
-        }
-        .is_success());
+        assert!(!HttpResponse::new(199, "").is_success());
+        assert!(HttpResponse::new(200, "").is_success());
+        assert!(HttpResponse::new(299, "").is_success());
+        assert!(!HttpResponse::new(300, "").is_success());
     }
 
     #[test]
@@ -2467,8 +2433,6 @@ mod tests {
         assert!(response.errors.is_none());
     }
 
-    // --- New tests for coverage ---
-
     /// Sequential mock HTTP client that returns queued responses in order.
     pub struct SequentialMockLinearClient {
         responses: Mutex<Vec<HttpResponse>>,
@@ -2482,10 +2446,7 @@ mod tests {
                     responses
                         .into_iter()
                         .rev() // Reverse so we can pop from the end
-                        .map(|(status, body)| HttpResponse {
-                            status,
-                            body: body.to_string(),
-                        })
+                        .map(|(status, body)| HttpResponse::new(status, body.to_string()))
                         .collect(),
                 ),
                 requests: Mutex::new(Vec::new()),
@@ -2506,10 +2467,7 @@ mod tests {
             if let Some(response) = responses.pop() {
                 Ok(response)
             } else {
-                Ok(HttpResponse {
-                    status: 500,
-                    body: "No more mock responses".to_string(),
-                })
+                Ok(HttpResponse::new(500, "No more mock responses"))
             }
         }
     }
@@ -4423,8 +4381,6 @@ mod tests {
         assert!(config.trigger_assignee.is_none());
     }
 
-    // --- Tests for create_issue coverage ---
-
     #[tokio::test]
     async fn test_create_issue_success() {
         let mock = SequentialMockLinearClient::new(vec![
@@ -4558,8 +4514,6 @@ mod tests {
             .to_string()
             .contains("returned no issue"));
     }
-
-    // --- Tests for find_or_create_label coverage ---
 
     #[tokio::test]
     async fn test_find_or_create_label_existing_label() {
@@ -4733,8 +4687,6 @@ mod tests {
             .to_string()
             .contains("returned no label"));
     }
-
-    // --- Tests for list_open_issues coverage ---
 
     #[tokio::test]
     async fn test_list_open_issues_no_filter() {

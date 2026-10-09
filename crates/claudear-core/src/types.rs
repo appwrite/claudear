@@ -3454,7 +3454,7 @@ pub fn normalize_text(input: &str) -> String {
 #[async_trait::async_trait]
 pub trait SentryHttpClient: Send + Sync {
     /// Perform a GET request with bearer auth.
-    async fn get(&self, url: &str, auth_token: &str) -> crate::Result<crate::http::HttpResponse>;
+    async fn get(&self, url: &str, auth_token: &str) -> crate::Result<abnegate_http::HttpResponse>;
 
     /// Perform a PUT request with bearer auth and JSON body.
     async fn put(
@@ -3462,7 +3462,7 @@ pub trait SentryHttpClient: Send + Sync {
         url: &str,
         auth_token: &str,
         body: serde_json::Value,
-    ) -> crate::Result<crate::http::HttpResponse>;
+    ) -> crate::Result<abnegate_http::HttpResponse>;
 }
 
 /// timeline for metadata of an issue
