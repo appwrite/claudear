@@ -1,14 +1,25 @@
 //! The `.env` file that webhook setup and the GitHub App callback write secrets to.
 
+#[cfg(unix)]
+mod mount_table;
+#[cfg(unix)]
+mod refusal;
+#[cfg(unix)]
+mod replacement;
+
 use abnegate_config::EnvironmentFile;
 use claudear_core::error::{Error, Result};
 use std::collections::BTreeMap;
 use std::error::Error as StandardError;
 use std::fs;
+use std::fs::File;
 use std::io;
 use std::iter;
 use std::path::Path;
 use tempfile::NamedTempFile;
+
+#[cfg(unix)]
+use replacement::Replacement;
 
 pub const DISCORD_WEBHOOK_URL: &str = "DISCORD_WEBHOOK_URL";
 pub const GITHUB_APP_BASE_URL: &str = "GITHUB_APP_BASE_URL";
@@ -52,10 +63,15 @@ pub fn update(path: &Path, values: &BTreeMap<String, String>) -> Result<()> {
         .map_err(|error| Error::config(describe(&error)))
 }
 
-/// Fails the way [`update`] would, without changing anything: the file, if it
-/// exists, must be readable, and the directory its replacement is renamed from
-/// must accept a new file. When that directory does not exist yet, the nearest
-/// existing ancestor is checked instead, since [`update`] creates it there.
+/// Fails the way [`update`] would, without changing anything.
+///
+/// The file, if it exists, must be readable. Its directory must let a sibling
+/// temporary file be renamed over another file and then be synced, which is
+/// how [`update`] replaces it. A file a rename cannot replace is refused: a
+/// mount point, such as a single file bind-mounted into a container, or
+/// another user's file in a sticky directory. When the directory does not
+/// exist yet, the nearest existing ancestor must accept a new entry instead,
+/// since [`update`] creates the directory there.
 pub fn probe(path: &Path) -> Result<()> {
     match fs::read_to_string(path) {
         Ok(_) => {}
@@ -68,22 +84,63 @@ pub fn probe(path: &Path) -> Result<()> {
         }
     }
 
-    NamedTempFile::new_in(nearest_existing_directory(path))
-        .map(drop)
+    let directory = directory_of(path);
+    let rehearsal = if directory.is_dir() {
+        rehearse_replacement(path, directory)
+    } else {
+        NamedTempFile::new_in(nearest_existing_ancestor(directory)).map(drop)
+    };
+
+    rehearsal
         .map_err(|error| Error::config(format!("Failed to write '{}': {error}", path.display())))
 }
 
-fn nearest_existing_directory(path: &Path) -> &Path {
-    let current = Path::new(".");
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(current);
+fn rehearse_replacement(destination: &Path, directory: &Path) -> io::Result<()> {
+    let temporary = NamedTempFile::new_in(directory)?;
+    let scratch = NamedTempFile::new_in(directory)?.into_temp_path();
 
-    parent
+    refuse_unreplaceable(destination, directory, temporary.as_file())?;
+    temporary.persist(&scratch)?;
+
+    sync(directory)
+}
+
+#[cfg(unix)]
+fn refuse_unreplaceable(destination: &Path, directory: &Path, created: &File) -> io::Result<()> {
+    match Replacement::inspect(destination, directory, created)?
+        .and_then(|replacement| replacement.refusal())
+    {
+        Some(refusal) => Err(io::Error::other(refusal.to_string())),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn refuse_unreplaceable(_destination: &Path, _directory: &Path, _created: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync(directory: &Path) -> io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync(_directory: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn directory_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn nearest_existing_ancestor(directory: &Path) -> &Path {
+    directory
         .ancestors()
         .find(|ancestor| !ancestor.as_os_str().is_empty() && ancestor.exists())
-        .unwrap_or(current)
+        .unwrap_or(Path::new("."))
 }
 
 fn describe(error: &(dyn StandardError + 'static)) -> String {

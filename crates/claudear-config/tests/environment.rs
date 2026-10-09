@@ -277,3 +277,64 @@ fn test_probe_fails_like_update_when_the_directory_is_read_only() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn test_probe_fails_like_update_when_the_directory_cannot_be_opened_to_sync_the_rename() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new().unwrap();
+    let unlistable = directory.path().join("unlistable");
+    fs::create_dir(&unlistable).unwrap();
+    let path = unlistable.join(".env");
+    fs::write(&path, "EXISTING=value\n").unwrap();
+    fs::set_permissions(&unlistable, fs::Permissions::from_mode(0o300)).unwrap();
+
+    if fs::read_dir(&unlistable).is_ok() {
+        fs::set_permissions(&unlistable, fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!("skipped: this user can list a 0300 directory");
+        return;
+    }
+
+    let probed = environment::probe(&path);
+    let updated = environment::update(
+        &path,
+        &values(&[(environment::GITHUB_WEBHOOK_SECRET, "secret")]),
+    );
+
+    fs::set_permissions(&unlistable, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        updated.is_err(),
+        "update succeeded, so the probe has nothing to catch"
+    );
+    match probed {
+        Err(Error::Config(message)) => {
+            assert!(message.contains("Failed to write"), "{message}");
+            assert!(message.contains("Permission denied"), "{message}");
+        }
+        other => panic!("expected a config error, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_probe_accepts_a_file_this_user_owns_in_a_sticky_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new().unwrap();
+    let sticky = directory.path().join("sticky");
+    fs::create_dir(&sticky).unwrap();
+    fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1700)).unwrap();
+    let path = sticky.join(".env");
+    fs::write(&path, "EXISTING=value\n").unwrap();
+
+    environment::probe(&path).unwrap();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "EXISTING=value\n");
+    assert_eq!(fs::read_dir(&sticky).unwrap().count(), 1);
+    environment::update(
+        &path,
+        &values(&[(environment::GITHUB_WEBHOOK_SECRET, "secret")]),
+    )
+    .unwrap();
+}
