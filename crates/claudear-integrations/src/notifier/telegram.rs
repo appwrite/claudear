@@ -1,5 +1,6 @@
 //! Telegram notifier via Telegram Bot API.
 
+use super::html;
 use super::Notifier;
 use crate::ask_reply_inbox;
 use abnegate_http::HttpResponse;
@@ -18,6 +19,9 @@ use claudear_core::types::Issue;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::RwLock;
+
+const MAXIMUM_TEXT_LENGTH: usize = 4096;
+const TRUNCATION_MARKER: &str = "...";
 
 /// Trait for HTTP client used by Telegram notifier.
 #[async_trait]
@@ -387,12 +391,13 @@ impl<H: TelegramHttpClient> TelegramNotifier<H> {
 
         let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
 
-        // Truncate message to Telegram limit (4096 chars)
-        let truncated_text = if text.len() > 4096 {
-            format!("{}...", &text[..text.floor_char_boundary(4093)])
+        let truncated_text = if text.len() > MAXIMUM_TEXT_LENGTH {
+            let kept = text.floor_char_boundary(MAXIMUM_TEXT_LENGTH - TRUNCATION_MARKER.len());
+            format!("{}{TRUNCATION_MARKER}", &text[..kept])
         } else {
             text.to_string()
         };
+        let escaped_text = html::escape(&truncated_text);
 
         let recipients = self.resolve_recipients(issue);
 
@@ -401,7 +406,7 @@ impl<H: TelegramHttpClient> TelegramNotifier<H> {
         for chat_id in &recipients {
             let body = serde_json::json!({
                 "chat_id": chat_id,
-                "text": truncated_text,
+                "text": escaped_text,
                 "parse_mode": "HTML"
             });
 
@@ -758,8 +763,6 @@ mod tests {
         }
     }
 
-    // --- Basic trait tests ---
-
     #[test]
     fn test_name() {
         let notifier = TelegramNotifier::new(disabled_config(), empty_registry());
@@ -787,8 +790,6 @@ mod tests {
             TelegramNotifier::new(config_with_to_chat_ids_only(), empty_registry()).is_enabled()
         );
     }
-
-    // --- Disabled config tests (no HTTP calls) ---
 
     #[tokio::test]
     async fn test_notify_start_disabled() {
@@ -890,8 +891,6 @@ mod tests {
         let notifier = TelegramNotifier::new(multi_recipient_config(), empty_registry());
         assert!(notifier.is_enabled());
     }
-
-    // --- Mock-based tests for HTTP-dependent functionality ---
 
     #[tokio::test]
     async fn test_send_message_success() {
@@ -1526,6 +1525,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_notify_start_escapes_html_in_title() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new(
+            "1",
+            "SEN-42",
+            "<script>alert(1)</script> & \"co\"",
+            "https://sentry.io/42",
+            "sentry",
+        );
+        notifier.notify_start(&issue).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        assert_eq!(
+            calls[0].1["text"],
+            "[Claudear] Processing SEN-42 from sentry - &lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;co&quot;"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_escapes_html_in_error() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "SEN-42", "Title", "https://sentry.io/42", "sentry");
+        notifier
+            .notify_failed(&issue, "expected `Vec<u8>` & got `<none>`")
+            .await
+            .unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        assert_eq!(
+            calls[0].1["text"],
+            "[Claudear] FAILED SEN-42: expected `Vec&lt;u8&gt;` &amp; got `&lt;none&gt;`"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_message_truncates_before_escaping() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        notifier.notify_status(&"&".repeat(5000)).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].1["text"].as_str().unwrap();
+        let body = text
+            .strip_prefix("[Claudear] ")
+            .and_then(|rest| rest.strip_suffix("..."))
+            .expect("truncated text keeps its prefix and marker");
+        let kept = 4093 - "[Claudear] ".len();
+        assert_eq!(body.matches("&amp;").count(), kept);
+        assert_eq!(body.len(), kept * "&amp;".len());
+    }
+
+    #[tokio::test]
     async fn test_notify_failed_short_error_not_truncated() {
         let mock = MockTelegramClient::success();
         let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
@@ -1590,8 +1643,6 @@ mod tests {
         assert_eq!(calls[0].1["chat_id"], "999999999");
     }
 
-    // --- Tests for cascade success message ---
-
     #[tokio::test]
     async fn test_notify_success_cascade_message_format() {
         let mock = MockTelegramClient::success();
@@ -1612,8 +1663,6 @@ mod tests {
         assert!(text.contains("https://github.com/downstream/repo/pull/5"));
     }
 
-    // --- Tests for PR update success message ---
-
     #[tokio::test]
     async fn test_notify_success_pr_update_message_format() {
         let mock = MockTelegramClient::success();
@@ -1633,8 +1682,6 @@ mod tests {
         assert!(text.contains("https://github.com/org/repo/pull/77"));
     }
 
-    // --- Tests for regression resolved completed message ---
-
     #[tokio::test]
     async fn test_notify_completed_regression_resolved_message_format() {
         let mock = MockTelegramClient::success();
@@ -1650,8 +1697,6 @@ mod tests {
         assert!(text.contains("SEN-1"));
         assert!(text.contains("no regression"));
     }
-
-    // --- Tests for regression detected failed message ---
 
     #[tokio::test]
     async fn test_notify_failed_regression_detected_message_format() {
@@ -1672,8 +1717,6 @@ mod tests {
         assert!(text.contains("Tests failing again"));
     }
 
-    // --- Tests for cascade failed message ---
-
     #[tokio::test]
     async fn test_notify_failed_cascade_message_format() {
         let mock = MockTelegramClient::success();
@@ -1690,8 +1733,6 @@ mod tests {
         assert!(text.contains("downstream/repo"));
         assert!(text.contains("Build error"));
     }
-
-    // --- Tests for notify_merged and notify_closed ---
 
     #[tokio::test]
     async fn test_notify_merged_message_format() {
@@ -1729,8 +1770,6 @@ mod tests {
         assert!(text.contains("https://github.com/org/repo/pull/43"));
     }
 
-    // --- Test failed cascade with long error truncation ---
-
     #[tokio::test]
     async fn test_notify_failed_cascade_truncates_long_error() {
         let mock = MockTelegramClient::success();
@@ -1747,8 +1786,6 @@ mod tests {
         assert!(text.contains("..."));
     }
 
-    // --- Test regression with long error truncation ---
-
     #[tokio::test]
     async fn test_notify_failed_regression_truncates_long_error() {
         let mock = MockTelegramClient::success();
@@ -1764,8 +1801,6 @@ mod tests {
         assert!(text.contains("REGRESSION"));
         assert!(text.contains("..."));
     }
-
-    // --- Test parse_mode is always HTML ---
 
     #[tokio::test]
     async fn test_all_messages_use_html_parse_mode() {
@@ -1792,8 +1827,6 @@ mod tests {
         }
     }
 
-    // --- Test multiple recipients get the same text ---
-
     #[tokio::test]
     async fn test_multiple_recipients_receive_same_text() {
         let mock = MockTelegramClient::success();
@@ -1813,8 +1846,6 @@ mod tests {
         assert_eq!(calls[2].1["chat_id"], "333333333");
     }
 
-    // --- Test config with only to_chat_ids (no primary chat_id) ---
-
     #[tokio::test]
     async fn test_config_with_only_to_chat_ids() {
         let mock = MockTelegramClient::success();
@@ -1827,16 +1858,12 @@ mod tests {
         assert_eq!(calls[0].1["chat_id"], "444444444");
     }
 
-    // --- Test http_response_fields ---
-
     #[test]
     fn test_http_response_fields() {
         let response = HttpResponse::new(201, "Created");
         assert_eq!(response.status, 201);
         assert_eq!(response.body, "Created");
     }
-
-    // --- Additional coverage tests ---
 
     #[tokio::test]
     async fn test_notify_merged_disabled() {
