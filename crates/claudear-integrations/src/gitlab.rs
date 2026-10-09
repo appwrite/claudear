@@ -116,12 +116,13 @@ pub struct GitLabIssue {
 impl GitLabClient<ReqwestHttpClient> {
     /// Create a new GitLab client with the default HTTP client.
     pub fn new(config: GitLabConfig) -> Self {
-        Self {
-            config,
-            http: ReqwestHttpClient::new()
-                .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new()))
-                .with_body_limit(BODY_LIMIT),
-        }
+        let transport = ReqwestHttpClient::new()
+            .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new()));
+        Self::with_transport(config, transport)
+    }
+
+    fn with_transport(config: GitLabConfig, transport: ReqwestHttpClient) -> Self {
+        Self::with_http_client(config, transport.with_body_limit(BODY_LIMIT))
     }
 }
 
@@ -1033,10 +1034,10 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::loopback_transport;
-    use crate::test_support::ok_response;
-    use crate::test_support::serve_once;
     use abnegate_http::HttpResponse;
+    use claudear_analysis::test_support::loopback_transport;
+    use claudear_analysis::test_support::ok_response;
+    use claudear_analysis::test_support::serve_once;
     use claudear_config::config::GitLabConfig;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1177,23 +1178,11 @@ mod tests {
         config
     }
 
-    #[test]
-    fn the_default_transport_reads_up_to_the_scm_limit() {
-        let client = GitLabClient::new(test_config());
-
-        let transport = format!("{:?}", client.http);
-
-        assert!(
-            transport.contains(&format!("body_limit: {BODY_LIMIT}")),
-            "{transport}"
-        );
-    }
-
     #[tokio::test]
     async fn the_scm_limit_admits_a_diff_larger_than_the_crate_default() {
         let size = ReqwestHttpClient::DEFAULT_BODY_LIMIT + 1;
         let url = serve_once(ok_response(size, &vec![b'+'; size])).await;
-        let client = GitLabClient::with_http_client(test_config(), loopback_transport(BODY_LIMIT));
+        let client = GitLabClient::with_transport(test_config(), loopback_transport());
 
         let response = client
             .http
@@ -1207,7 +1196,7 @@ mod tests {
     #[tokio::test]
     async fn the_scm_limit_refuses_a_larger_body() {
         let url = serve_once(ok_response(BODY_LIMIT + 1, b"")).await;
-        let client = GitLabClient::with_http_client(test_config(), loopback_transport(BODY_LIMIT));
+        let client = GitLabClient::with_transport(test_config(), loopback_transport());
 
         let error = client
             .http

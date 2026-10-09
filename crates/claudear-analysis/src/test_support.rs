@@ -46,12 +46,12 @@ pub fn ok_response(length: usize, body: &[u8]) -> Vec<u8> {
     response
 }
 
-/// A transport that reaches loopback directly, whatever proxy the
-/// environment configures, and reads bodies up to `body_limit` bytes.
-pub fn loopback_transport(body_limit: usize) -> ReqwestHttpClient {
+/// A transport with the crate's default body limit that reaches loopback
+/// directly, whatever proxy the environment configures.
+pub fn loopback_transport() -> ReqwestHttpClient {
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
         .expect("a client without a proxy builds");
-    ReqwestHttpClient::from(client).with_body_limit(body_limit)
+    ReqwestHttpClient::from(client)
 }

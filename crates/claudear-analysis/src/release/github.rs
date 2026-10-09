@@ -74,11 +74,15 @@ pub struct ReleaseClient<H: HttpClient = ReqwestHttpClient> {
 impl ReleaseClient<ReqwestHttpClient> {
     /// Create a new release client with the default HTTP client.
     pub fn new(token: impl Into<String>) -> Self {
+        let transport = ReqwestHttpClient::new()
+            .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new()));
+        Self::with_transport(token, transport)
+    }
+
+    fn with_transport(token: impl Into<String>, transport: ReqwestHttpClient) -> Self {
         Self {
             token: token.into(),
-            http: ReqwestHttpClient::new()
-                .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new()))
-                .with_body_limit(BODY_LIMIT),
+            http: transport.with_body_limit(BODY_LIMIT),
         }
     }
 }
@@ -826,18 +830,44 @@ pub struct PrDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::loopback_transport;
+    use crate::test_support::ok_response;
+    use crate::test_support::serve_once;
     use abnegate_http::HttpResponse;
     use async_trait::async_trait;
 
-    #[test]
-    fn the_default_transport_reads_a_release_comparison_up_to_the_body_limit() {
-        let client = ReleaseClient::new("test-token");
+    #[tokio::test]
+    async fn a_release_comparison_larger_than_the_crate_default_is_read() {
+        let size = ReqwestHttpClient::DEFAULT_BODY_LIMIT + 1;
+        let url = serve_once(ok_response(size, &vec![b'+'; size])).await;
+        let client = ReleaseClient::with_transport("test-token", loopback_transport());
 
-        let transport = format!("{:?}", client.http);
+        let response = client
+            .http
+            .get(&url, Vec::new())
+            .await
+            .expect("a comparison under the body limit is read");
+
+        assert_eq!(response.body.len(), size);
+    }
+
+    #[tokio::test]
+    async fn a_release_comparison_over_the_body_limit_is_refused() {
+        let url = serve_once(ok_response(BODY_LIMIT + 1, b"")).await;
+        let client = ReleaseClient::with_transport("test-token", loopback_transport());
+
+        let error = client
+            .http
+            .get(&url, Vec::new())
+            .await
+            .expect_err("a declared length over the body limit is refused");
 
         assert!(
-            transport.contains(&format!("body_limit: {BODY_LIMIT}")),
-            "{transport}"
+            matches!(
+                error,
+                abnegate_http::Error::OversizedBody { limit, .. } if limit == BODY_LIMIT
+            ),
+            "{error}"
         );
     }
 

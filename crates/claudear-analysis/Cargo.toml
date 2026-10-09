@@ -10,6 +10,7 @@ workspace = true
 default = []
 sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite"]
 cuda = ["ort/cuda"]
+test-support = []
 
 [dependencies]
 abnegate-http = { workspace = true }

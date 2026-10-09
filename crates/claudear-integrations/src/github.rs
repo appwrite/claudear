@@ -86,13 +86,13 @@ pub struct GitHubLabel {
 impl GitHubClient<ReqwestHttpClient> {
     /// Create a new GitHub client with the default HTTP client.
     pub fn new(config: GitHubConfig) -> Self {
-        Self {
-            config,
-            http: ReqwestHttpClient::new()
-                .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new()))
-                .with_body_limit(BODY_LIMIT),
-            self_login: std::sync::OnceLock::new(),
-        }
+        let transport = ReqwestHttpClient::new()
+            .unwrap_or_else(|_| ReqwestHttpClient::from(reqwest::Client::new()));
+        Self::with_transport(config, transport)
+    }
+
+    fn with_transport(config: GitHubConfig, transport: ReqwestHttpClient) -> Self {
+        Self::with_http_client(config, transport.with_body_limit(BODY_LIMIT))
     }
 }
 
@@ -1173,10 +1173,10 @@ impl<H: HttpClient> ScmProvider for GitHubClient<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::loopback_transport;
-    use crate::test_support::ok_response;
-    use crate::test_support::serve_once;
     use abnegate_http::HttpResponse;
+    use claudear_analysis::test_support::loopback_transport;
+    use claudear_analysis::test_support::ok_response;
+    use claudear_analysis::test_support::serve_once;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -4022,23 +4022,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_default_transport_reads_up_to_the_scm_limit() {
-        let client = GitHubClient::new(test_config());
-
-        let transport = format!("{:?}", client.http);
-
-        assert!(
-            transport.contains(&format!("body_limit: {BODY_LIMIT}")),
-            "{transport}"
-        );
-    }
-
     #[tokio::test]
     async fn the_scm_limit_admits_a_diff_larger_than_the_crate_default() {
         let size = ReqwestHttpClient::DEFAULT_BODY_LIMIT + 1;
         let url = serve_once(ok_response(size, &vec![b'+'; size])).await;
-        let client = GitHubClient::with_http_client(test_config(), loopback_transport(BODY_LIMIT));
+        let client = GitHubClient::with_transport(test_config(), loopback_transport());
 
         let response = client
             .http
@@ -4052,7 +4040,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_cut_short_is_a_transient_error_rather_than_an_empty_success() {
         let url = serve_once(ok_response(100, b"short")).await;
-        let client = GitHubClient::with_http_client(test_config(), loopback_transport(BODY_LIMIT));
+        let client = GitHubClient::with_transport(test_config(), loopback_transport());
 
         let error = client
             .http
@@ -4068,7 +4056,7 @@ mod tests {
     #[tokio::test]
     async fn the_scm_limit_refuses_a_larger_body() {
         let url = serve_once(ok_response(BODY_LIMIT + 1, b"")).await;
-        let client = GitHubClient::with_http_client(test_config(), loopback_transport(BODY_LIMIT));
+        let client = GitHubClient::with_transport(test_config(), loopback_transport());
 
         let error = client
             .http
