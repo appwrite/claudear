@@ -34,7 +34,6 @@ pub use claudear_core::types;
 
 // Re-exported from claudear-config
 pub use claudear_config::config;
-pub use claudear_config::env_writer;
 pub use claudear_config::users;
 
 // Re-exported from claudear-storage

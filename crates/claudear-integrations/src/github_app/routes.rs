@@ -11,9 +11,10 @@
 use crate::github_app::manifest::AppManifest;
 use axum::extract::Query;
 use axum::response::{Html, Redirect};
-use claudear_config::env_writer::update_env_file;
+use claudear_config::environment;
 use claudear_core::error::{Error, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -276,46 +277,50 @@ async fn exchange_code_for_credentials(code: &str) -> Result<ManifestConversionR
 }
 
 /// Save the App credentials to disk.
-fn save_credentials(creds: &ManifestConversionResponse, base_url: &str) -> Result<()> {
-    // Save private key to PEM file
+fn save_credentials(credentials: &ManifestConversionResponse, base_url: &str) -> Result<()> {
     let pem_path = "github-app-key.pem";
-    fs::write(pem_path, &creds.pem).map_err(|e| {
+    fs::write(pem_path, &credentials.pem).map_err(|error| {
         Error::config(format!(
             "Failed to write private key to {}: {}",
-            pem_path, e
+            pem_path, error
         ))
     })?;
 
-    // Set restrictive permissions on the PEM file (Unix only)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(pem_path, perms).ok();
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(pem_path, permissions).ok();
     }
 
-    // Update .env file
-    let env_path = Path::new(".env");
-    let mut updates = HashMap::new();
-    updates.insert("GITHUB_APP_ID".to_string(), creds.id.to_string());
-    updates.insert(
-        "GITHUB_APP_PRIVATE_KEY_PATH".to_string(),
-        pem_path.to_string(),
-    );
-    updates.insert(
-        "GITHUB_APP_WEBHOOK_SECRET".to_string(),
-        creds.webhook_secret.clone(),
-    );
-    updates.insert("GITHUB_APP_CLIENT_ID".to_string(), creds.client_id.clone());
-    updates.insert(
-        "GITHUB_APP_CLIENT_SECRET".to_string(),
-        creds.client_secret.clone(),
-    );
-    updates.insert("GITHUB_APP_BASE_URL".to_string(), base_url.to_string());
+    let updates = BTreeMap::from([
+        (
+            environment::GITHUB_APP_ID.to_string(),
+            credentials.id.to_string(),
+        ),
+        (
+            environment::GITHUB_APP_PRIVATE_KEY_PATH.to_string(),
+            pem_path.to_string(),
+        ),
+        (
+            environment::GITHUB_APP_WEBHOOK_SECRET.to_string(),
+            credentials.webhook_secret.clone(),
+        ),
+        (
+            environment::GITHUB_APP_CLIENT_ID.to_string(),
+            credentials.client_id.clone(),
+        ),
+        (
+            environment::GITHUB_APP_CLIENT_SECRET.to_string(),
+            credentials.client_secret.clone(),
+        ),
+        (
+            environment::GITHUB_APP_BASE_URL.to_string(),
+            base_url.to_string(),
+        ),
+    ]);
 
-    update_env_file(env_path, &updates)?;
-
-    Ok(())
+    environment::update(Path::new(".env"), &updates)
 }
 
 /// Escape HTML special characters to prevent XSS.
