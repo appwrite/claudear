@@ -49,6 +49,7 @@ pub mod ask_orchestrator;
 mod console;
 mod discord;
 mod email;
+mod html;
 mod push;
 mod slack;
 mod sms;
