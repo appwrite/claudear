@@ -5,7 +5,7 @@
 //! - `tracing::warn!` on error, then propagates the `Err`
 
 use crate::notifier::Notifier;
-use crate::reports::Report;
+use crate::reports::{Report, SupportDigest};
 use crate::runner::{AgentRunner, ProviderCapabilities};
 use crate::scm::{
     CodeReview, PostReviewAction, PrInfo, PrStatus, PrSummary, RemoteRepo, ReviewComment,
@@ -279,6 +279,21 @@ impl Notifier for InstrumentedNotifier {
             }
             Err(e) => {
                 tracing::warn!(component = self.inner.name(), error = %e, "Failed to notify report");
+                Err(e)
+            }
+        }
+    }
+
+    async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<bool> {
+        match self.inner.notify_support_digest(digest).await {
+            Ok(v) => {
+                if v {
+                    tracing::info!(component = self.inner.name(), "Notified support digest");
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                tracing::warn!(component = self.inner.name(), error = %e, "Failed to notify support digest");
                 Err(e)
             }
         }

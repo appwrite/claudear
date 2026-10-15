@@ -218,6 +218,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Daily, weekly, and monthly automated status reports
 - Breakdown of attempts, success/failure rates, PR metrics, pending work
 - Delivered via all configured notification channels
+- Support digest: reads Discord support forum threads from the threads bot's Appwrite project, ranks the ones that need a reply and posts them to Claudear's Discord channel when one enters the list; it can also draft answers for admins to review on the dashboard's Support page; approved answers are posted by the threads project, never by Claudear (`[reports.support_digest]`)
 
 ### Daemon Mode & IPC
 - Runs as a background service with full IPC control

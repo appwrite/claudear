@@ -18,4 +18,5 @@ pub mod processing;
 pub mod repo_index;
 pub mod retry;
 pub mod shutdown;
+pub mod support_digest;
 pub mod watcher;
