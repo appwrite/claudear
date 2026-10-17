@@ -3055,6 +3055,7 @@ mod tests {
             db_path: ":memory:".into(),
             max_issues_per_cycle: 5,
             max_concurrent: 1,
+            max_concurrent_sessions: 12,
             processing_delay_ms: 5000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,

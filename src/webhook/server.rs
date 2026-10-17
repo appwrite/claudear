@@ -1183,6 +1183,7 @@ async fn process_issue(
         github_client: None,
         llm_analyzer: None,
         intent_classifier: None,
+        session_limiter: None,
     };
 
     let input = ProcessingInput {
@@ -1374,6 +1375,7 @@ mod tests {
             db_path: std::path::PathBuf::from(":memory:"),
             max_issues_per_cycle: 5,
             max_concurrent: 2,
+            max_concurrent_sessions: 12,
             processing_delay_ms: 1000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,

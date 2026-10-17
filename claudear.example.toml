@@ -23,8 +23,17 @@ poll_interval_ms = 300000
 # Max issues to process per poll cycle (default: 5)
 max_issues_per_cycle = 5
 
-# Max concurrent issue processing (default: 1)
+# Max concurrent issue processing PER SOURCE for sources without an explicit
+# override (default: 1). Each source runs its own worker that polls and fixes
+# independently; this caps how many fixes a single source runs at once.
 max_concurrent = 1
+
+# Global ceiling on concurrent Claude sessions across EVERY source and path
+# (fix, QA, retry, deploy-QA), regardless of how high per-source max_concurrent
+# limits sum (default: 12). This is the machine-wide safety bound. Clamped to
+# >= 1. The built-in Sentry and GitHub sources default to a per-source
+# max_concurrent of 6; all other sources default to the global max_concurrent.
+max_concurrent_sessions = 12
 
 # Delay between processing issues in ms (default: 5000)
 processing_delay_ms = 5000
@@ -301,6 +310,10 @@ poll_interval_ms = 60000
 # Auto-resolve issues on Linear/Sentry when PRs merge (default: false)
 auto_resolve_on_merge = false
 
+# Max concurrent fixes for the GitHub source worker (default: 6). GitHub issues
+# frequently retry, so it ships with a wider worker than the global default.
+# max_concurrent = 6
+
 # Optional: Webhook secret for verifying GitHub webhook signatures
 # Set via GITHUB_WEBHOOK_SECRET env var for security
 webhook_secret = ""
@@ -475,7 +488,9 @@ escalation_threshold_percent = 50
 # Set via SENTRY_CLIENT_SECRET env var for security
 client_secret = ""
 
-# Per-source rate limiting (overrides global values if set)
+# Per-source rate limiting (overrides global values if set).
+# The Sentry worker defaults to max_concurrent = 6 when omitted (wider than the
+# global default since Sentry is high-volume and retry-heavy).
 max_issues_per_cycle = 2
 max_concurrent = 4
 
@@ -1065,8 +1080,9 @@ use_llm = false
 # Max questions answered concurrently per source, independent of the fix-lane
 # concurrency budget (max_concurrent / [sources.<name>].max_concurrent). Increase
 # this to answer more questions in parallel without affecting fix throughput.
-# Clamped to 1 if set to 0 to avoid deadlock. (default: 1)
-max_concurrent = 1
+# Still bounded by the global max_concurrent_sessions ceiling.
+# Clamped to 1 if set to 0 to avoid deadlock. (default: 6)
+max_concurrent = 6
 
 # ============================================
 # Reply Action
