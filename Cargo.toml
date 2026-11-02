@@ -150,7 +150,7 @@ mailparse = "0.16"
 tempfile = "3"
 
 # Dev/test
-mockall = "0.14"
+mockall = "0.15"
 http-body-util = "0.1"
 
 # Shared infrastructure
