@@ -41,7 +41,7 @@ jobs:
         run: cargo binstall --no-confirm cargo-tarpaulin
 
       - name: Restore cargo cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
@@ -58,7 +58,7 @@ jobs:
         run: cargo tarpaulin --workspace --all-features --skip-clean --no-run
 
       - name: Save compiled cache
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: |
             ~/.cargo/bin
@@ -83,7 +83,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Restore compiled cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/bin
@@ -125,7 +125,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Restore compiled cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/bin
@@ -139,7 +139,7 @@ jobs:
       - name: Cache fastembed model
         if: matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
         id: fastembed-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
           key: fastembed-nomic-embed-text-v1.5
@@ -221,7 +221,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -262,7 +262,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -273,7 +273,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Cache fastembed model
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}\.cache\fastembed
           key: fastembed-nomic-v15-windows

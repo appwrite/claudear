@@ -84,7 +84,7 @@ jobs:
           SENTRY_RELEASE: "claudear-dashboard@${{ steps.version.outputs.version }}"
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
