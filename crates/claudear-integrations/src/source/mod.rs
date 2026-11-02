@@ -3,6 +3,7 @@
 mod deploy_qa;
 mod discord;
 mod github;
+mod github_code_scanning;
 mod gitlab;
 mod helpscout;
 mod jira;
@@ -15,6 +16,7 @@ mod whatsapp;
 pub use deploy_qa::DeployQaSource;
 pub use discord::DiscordSource;
 pub use github::GitHubSource;
+pub use github_code_scanning::GitHubCodeScanningSource;
 pub use gitlab::GitLabSource;
 pub(crate) use gitlab::{format_gitlab_context, gitlab_matches_criteria};
 pub use helpscout::HelpScoutSource;
