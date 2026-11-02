@@ -117,7 +117,7 @@ rayon = "1"
 
 # File system utilities
 walkdir = "2"
-dirs = "6"
+dirs = "7"
 
 # URL encoding/parsing
 urlencoding = "2"
