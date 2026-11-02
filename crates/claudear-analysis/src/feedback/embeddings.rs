@@ -16,7 +16,9 @@ pub struct EmbeddingConfig {
     pub show_download_progress: bool,
     /// Custom cache directory (uses system default if None).
     pub cache_dir: Option<String>,
-    /// Number of model instances in the pool (defaults to available CPUs).
+    /// Number of model instances in the pool. Defaults to one: each instance
+    /// already runs inference across every core, so extra CPU instances only
+    /// multiply memory and oversubscribe threads.
     pub pool_size: usize,
     /// ONNX Runtime execution providers (e.g. CUDA). Empty = CPU only.
     pub execution_providers: Vec<ExecutionProviderDispatch>,
@@ -24,11 +26,7 @@ pub struct EmbeddingConfig {
     pub sub_batch_size: usize,
 }
 
-fn default_pool_size() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2)
-}
+const DEFAULT_POOL_SIZE: usize = 1;
 
 impl Default for EmbeddingConfig {
     fn default() -> Self {
@@ -36,7 +34,7 @@ impl Default for EmbeddingConfig {
             model: EmbeddingModel::NomicEmbedTextV15,
             show_download_progress: true,
             cache_dir: None,
-            pool_size: default_pool_size(),
+            pool_size: DEFAULT_POOL_SIZE,
             execution_providers: Vec::new(),
             sub_batch_size: 0,
         }
@@ -62,7 +60,7 @@ impl EmbeddingConfig {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or_else(default_pool_size);
+            .unwrap_or(DEFAULT_POOL_SIZE);
 
         Self {
             model,
@@ -80,7 +78,7 @@ impl EmbeddingConfig {
             model: EmbeddingModel::AllMiniLML6V2,
             show_download_progress: true,
             cache_dir: None,
-            pool_size: default_pool_size(),
+            pool_size: DEFAULT_POOL_SIZE,
             execution_providers: Vec::new(),
             sub_batch_size: 0,
         }
@@ -132,51 +130,35 @@ impl EmbeddingClient {
 
         let has_gpu_providers = !config.execution_providers.is_empty();
 
-        let mut first_model = {
-            let mut init_options = InitOptions::new(config.model.clone())
-                .with_show_download_progress(config.show_download_progress);
-            if let Some(ref cache_dir) = config.cache_dir {
-                init_options = init_options.with_cache_dir(cache_dir.into());
-            }
-            if !config.execution_providers.is_empty() {
-                init_options =
-                    init_options.with_execution_providers(config.execution_providers.clone());
-            }
-            TextEmbedding::try_new(init_options)
-                .map_err(|e| Error::Other(format!("Failed to initialize embedding model: {}", e)))?
-        };
+        let mut first_model = Self::load_model(&config)?;
 
-        // Run a warmup inference so the ONNX Runtime arena is allocated before
-        // we measure memory.  Without this, per_instance only captures model
-        // weights and misses the arena buffers.
+        // Run a warmup inference before measuring memory so per_instance
+        // covers inference buffers, not just model weights.
         let _ = first_model.embed(vec!["warmup"], None);
 
         sys.refresh_memory();
         let mem_after = sys.available_memory();
         let per_instance_loaded = mem_before.saturating_sub(mem_after);
 
-        // ONNX Runtime uses arena allocation that grows with
-        // batch_size × sequence_length² (attention matrices) and is never
-        // released.  The warmup above only allocates a minimal arena for a
-        // single short text.  Apply a 3× multiplier to account for realistic
-        // inference workloads (batch=8-32 texts of 1000-2000 tokens each).
+        // Inference memory grows with batch_size × sequence_length²
+        // (attention matrices).  The warmup above only covers a single short
+        // text.  Apply a 3× multiplier to account for realistic inference
+        // workloads (batch=8-32 texts of 1000-2000 tokens each).
         let per_instance_bytes = per_instance_loaded.saturating_mul(3);
 
         // --- Pool size: min(desired, RAM budget) ----------------------------
-        let nproc = default_pool_size();
         // Budget: 60% of the memory that was available *before* we loaded
         // the first instance (so the first instance counts against it).
         let budget = mem_before * 6 / 10;
         let pool_size = if let Some(quotient) = budget.checked_div(per_instance_bytes) {
             let max_from_memory = quotient.max(1) as usize;
-            // Cap at the requested pool size (or nproc if not explicitly set).
+            // Cap at the requested pool size.
             let capped = max_from_memory.min(desired_pool_size);
             tracing::info!(
                 per_instance_mb = per_instance_loaded / (1024 * 1024),
                 estimated_with_arena_mb = per_instance_bytes / (1024 * 1024),
                 available_mb = mem_before / (1024 * 1024),
                 budget_mb = budget / (1024 * 1024),
-                nproc = nproc,
                 desired = desired_pool_size,
                 max_from_memory = max_from_memory,
                 capped = capped,
@@ -194,21 +176,7 @@ impl EmbeddingClient {
         pool.push(Arc::new(Mutex::new(first_model)));
 
         for _ in 1..pool_size {
-            let mut init_options = InitOptions::new(config.model.clone())
-                .with_show_download_progress(config.show_download_progress);
-
-            if let Some(ref cache_dir) = config.cache_dir {
-                init_options = init_options.with_cache_dir(cache_dir.into());
-            }
-            if !config.execution_providers.is_empty() {
-                init_options =
-                    init_options.with_execution_providers(config.execution_providers.clone());
-            }
-
-            let model = TextEmbedding::try_new(init_options).map_err(|e| {
-                Error::Other(format!("Failed to initialize embedding model: {}", e))
-            })?;
-            pool.push(Arc::new(Mutex::new(model)));
+            pool.push(Arc::new(Mutex::new(Self::load_model(&config)?)));
         }
 
         let ep_label = if has_gpu_providers {
@@ -234,6 +202,28 @@ impl EmbeddingClient {
             sub_batch_override,
             gpu: has_gpu_providers,
         })
+    }
+
+    fn load_model(config: &EmbeddingConfig) -> Result<TextEmbedding> {
+        let mut init_options = InitOptions::new(config.model.clone())
+            .with_show_download_progress(config.show_download_progress)
+            .with_execution_providers(Self::execution_providers(config));
+        if let Some(ref cache_dir) = config.cache_dir {
+            init_options = init_options.with_cache_dir(cache_dir.into());
+        }
+        TextEmbedding::try_new(init_options)
+            .map_err(|e| Error::Other(format!("Failed to initialize embedding model: {}", e)))
+    }
+
+    /// The configured GPU providers, or the CPU provider with ONNX Runtime's
+    /// memory arena disabled. The arena keeps the high-water mark of every
+    /// input shape it has seen for the life of the session, so each pooled
+    /// instance pins gigabytes after a few batches of long code chunks.
+    fn execution_providers(config: &EmbeddingConfig) -> Vec<ExecutionProviderDispatch> {
+        if !config.execution_providers.is_empty() {
+            return config.execution_providers.clone();
+        }
+        vec![ort::ep::CPU::default().with_arena_allocator(false).build()]
     }
 
     /// Round-robin acquire a model instance from the pool.
@@ -785,11 +775,19 @@ mod tests {
         assert!((4..=256).contains(&result));
     }
 
-    // === Coverage: default_pool_size ===
+    #[test]
+    fn test_default_pool_is_a_single_session() {
+        assert_eq!(EmbeddingConfig::default().pool_size, 1);
+    }
 
     #[test]
-    fn test_default_pool_size_at_least_one() {
-        let size = default_pool_size();
-        assert!(size >= 1);
+    fn test_cpu_sessions_register_the_cpu_provider() {
+        let providers = EmbeddingClient::execution_providers(&EmbeddingConfig::default());
+        assert_eq!(providers.len(), 1);
+        let provider = format!("{:?}", providers[0]);
+        assert!(
+            provider.starts_with("CPUExecutionProvider"),
+            "expected the CPU provider that disables the memory arena, got {provider}"
+        );
     }
 }
