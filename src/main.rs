@@ -1094,6 +1094,10 @@ fn create_sources(
         }
     }
 
+    if let Some(source) = claudear::build_github_issues_source(config) {
+        sources.push(source);
+    }
+
     if let Some(source) = claudear::build_github_code_scanning_source(config) {
         sources.push(source);
     }
