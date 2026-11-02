@@ -23,7 +23,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 
 # Database
-rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.41", features = ["bundled", "load_extension"] }
 
 # Embeddings
 fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls"] }
