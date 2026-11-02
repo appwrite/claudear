@@ -305,6 +305,8 @@ pub struct IssuesConfig {
     pub slack: Option<SlackSourceConfig>,
     /// HelpScout as an issue source (support conversations from one or more mailboxes).
     pub helpscout: Option<HelpScoutConfig>,
+    /// GitHub code-scanning alerts as an issue source (uses the `[scm.github]` token).
+    pub github_code_scanning: Option<GitHubCodeScanningConfig>,
 }
 
 /// Notifier configuration group.
@@ -1948,6 +1950,114 @@ impl Default for HelpScoutConfig {
     }
 }
 
+/// Severity of a GitHub code-scanning alert.
+///
+/// Covers both `rule.security_severity_level` (`critical`, `high`, `medium`, `low`)
+/// and the fallback `rule.severity` (`error`, `warning`, `note`, `none`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodeScanningSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Error,
+    Warning,
+    Note,
+    None,
+}
+
+impl CodeScanningSeverity {
+    /// Every severity, in descending order of urgency.
+    pub const ALL: [Self; 8] = [
+        Self::Critical,
+        Self::High,
+        Self::Medium,
+        Self::Low,
+        Self::Error,
+        Self::Warning,
+        Self::Note,
+        Self::None,
+    ];
+
+    /// The name GitHub uses for this severity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Note => "note",
+            Self::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for CodeScanningSeverity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for CodeScanningSeverity {
+    type Err = String;
+
+    fn from_str(name: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|severity| severity.as_str().eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("Unknown code-scanning severity '{}'", name))
+    }
+}
+
+/// GitHub code-scanning alerts source configuration.
+///
+/// Authenticates with the `[scm.github]` token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitHubCodeScanningConfig {
+    /// Whether this source is enabled.
+    pub enabled: bool,
+    /// Repositories to poll for open alerts (e.g., ["owner/repo"]).
+    pub repos: Vec<String>,
+    /// Analysis tool names to include (e.g., ["CodeQL"]). Empty includes every tool.
+    pub tool_names: Vec<String>,
+    /// Severities to include, matched against `rule.security_severity_level`,
+    /// falling back to `rule.severity`.
+    pub severities: Vec<CodeScanningSeverity>,
+    /// Maximum issues to process per poll cycle for this source (overrides global).
+    pub max_issues_per_cycle: Option<usize>,
+    /// Maximum concurrent issue processing for this source (overrides global).
+    pub max_concurrent: Option<usize>,
+    /// Polling interval in milliseconds for this source (overrides global).
+    pub poll_interval_ms: Option<u64>,
+}
+
+impl GitHubCodeScanningConfig {
+    /// Name of the issue source this section configures.
+    pub const SOURCE_NAME: &'static str = "github_code_scanning";
+}
+
+impl Default for GitHubCodeScanningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repos: Vec::new(),
+            tool_names: Vec::new(),
+            severities: vec![
+                CodeScanningSeverity::Critical,
+                CodeScanningSeverity::High,
+                CodeScanningSeverity::Medium,
+            ],
+            max_issues_per_cycle: None,
+            max_concurrent: None,
+            poll_interval_ms: None,
+        }
+    }
+}
+
 /// Time period for fetching top Sentry issues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -3500,6 +3610,11 @@ impl Config {
             .as_ref()
             .is_some_and(|s| s.bot_token.is_some());
         let has_deploy_qa = self.deploy_qa.enabled && !self.deploy_qa.tracks.is_empty();
+        let has_github_code_scanning = self
+            .issues
+            .github_code_scanning
+            .as_ref()
+            .is_some_and(|c| c.enabled && !c.repos.is_empty());
 
         if !has_linear
             && !has_sentry
@@ -3508,9 +3623,10 @@ impl Config {
             && !has_slack
             && !has_discord
             && !has_deploy_qa
+            && !has_github_code_scanning
         {
             return Err(Error::config(
-                "No sources configured. Configure linear, sentry, jira, gitlab, slack, discord, or deploy_qa tracks in config file with valid API credentials.",
+                "No sources configured. Configure linear, sentry, jira, gitlab, slack, discord, github_code_scanning, or deploy_qa tracks in config file with valid API credentials.",
             ));
         }
 
@@ -3565,6 +3681,12 @@ impl Config {
             return Err(Error::config(
                 "deploy_qa requires a GitHub token to poll release tips. \
                  Set scm.github.token or CLAUDEAR_GITHUB_TOKEN, or disable deploy_qa.",
+            ));
+        }
+        if has_github_code_scanning && !has_github_token {
+            return Err(Error::config(
+                "issues.github_code_scanning requires a GitHub token to poll alerts. \
+                 Set scm.github.token or CLAUDEAR_GITHUB_TOKEN, or disable github_code_scanning.",
             ));
         }
 
@@ -3666,6 +3788,11 @@ impl Config {
     /// Accessor: get reference to HelpScoutConfig.
     pub fn helpscout(&self) -> Option<&HelpScoutConfig> {
         self.issues.helpscout.as_ref()
+    }
+
+    /// Accessor: get reference to GitHubCodeScanningConfig.
+    pub fn github_code_scanning(&self) -> Option<&GitHubCodeScanningConfig> {
+        self.issues.github_code_scanning.as_ref()
     }
 
     /// Accessor: reply-action configuration, sourced from `[notifiers.helpscout]`.
@@ -3776,6 +3903,12 @@ impl Config {
                 .as_ref()
                 .and_then(|c| c.max_issues_per_cycle)
                 .unwrap_or(self.max_issues_per_cycle),
+            GitHubCodeScanningConfig::SOURCE_NAME => self
+                .issues
+                .github_code_scanning
+                .as_ref()
+                .and_then(|c| c.max_issues_per_cycle)
+                .unwrap_or(self.max_issues_per_cycle),
             _ => self.max_issues_per_cycle,
         }
     }
@@ -3805,6 +3938,12 @@ impl Config {
             "gitlab" => self
                 .scm
                 .gitlab
+                .as_ref()
+                .and_then(|c| c.max_concurrent)
+                .unwrap_or(self.max_concurrent),
+            GitHubCodeScanningConfig::SOURCE_NAME => self
+                .issues
+                .github_code_scanning
                 .as_ref()
                 .and_then(|c| c.max_concurrent)
                 .unwrap_or(self.max_concurrent),
@@ -3849,6 +3988,12 @@ impl Config {
             "gitlab" => self
                 .scm
                 .gitlab
+                .as_ref()
+                .and_then(|c| c.poll_interval_ms)
+                .unwrap_or(self.poll_interval_ms),
+            GitHubCodeScanningConfig::SOURCE_NAME => self
+                .issues
+                .github_code_scanning
                 .as_ref()
                 .and_then(|c| c.poll_interval_ms)
                 .unwrap_or(self.poll_interval_ms),
@@ -4063,6 +4208,91 @@ mod tests {
         assert!(hs.enabled);
         assert_eq!(hs.mailbox_ids, vec!["100".to_string(), "200".to_string()]);
         assert_eq!(hs.reply_as, ReplyAs::Reply);
+    }
+
+    #[test]
+    fn test_github_code_scanning_config_parses_from_toml() {
+        let toml = r#"
+            [issues.github_code_scanning]
+            enabled = true
+            repos = ["appwrite/appwrite"]
+            tool_names = ["ureview security review"]
+            severities = ["critical", "error"]
+            max_issues_per_cycle = 2
+            max_concurrent = 1
+        "#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        let code_scanning = config
+            .github_code_scanning()
+            .expect("github_code_scanning config");
+        assert!(code_scanning.enabled);
+        assert_eq!(code_scanning.repos, vec!["appwrite/appwrite".to_string()]);
+        assert_eq!(
+            code_scanning.tool_names,
+            vec!["ureview security review".to_string()]
+        );
+        assert_eq!(
+            code_scanning.severities,
+            vec![CodeScanningSeverity::Critical, CodeScanningSeverity::Error]
+        );
+        assert_eq!(
+            config.max_issues_per_cycle_for(GitHubCodeScanningConfig::SOURCE_NAME),
+            2
+        );
+        assert_eq!(
+            config.max_concurrent_for(GitHubCodeScanningConfig::SOURCE_NAME),
+            1
+        );
+    }
+
+    #[test]
+    fn test_github_code_scanning_config_defaults() {
+        let toml = r#"
+            [issues.github_code_scanning]
+            enabled = true
+        "#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        let code_scanning = config
+            .github_code_scanning()
+            .expect("github_code_scanning config");
+        assert!(code_scanning.repos.is_empty());
+        assert!(code_scanning.tool_names.is_empty());
+        assert_eq!(
+            code_scanning.severities,
+            vec![
+                CodeScanningSeverity::Critical,
+                CodeScanningSeverity::High,
+                CodeScanningSeverity::Medium,
+            ]
+        );
+        assert_eq!(
+            config.max_issues_per_cycle_for(GitHubCodeScanningConfig::SOURCE_NAME),
+            config.max_issues_per_cycle
+        );
+        assert_eq!(
+            config.poll_interval_ms_for(GitHubCodeScanningConfig::SOURCE_NAME),
+            config.poll_interval_ms
+        );
+    }
+
+    #[test]
+    fn test_code_scanning_severity_names_match_serde() {
+        for severity in CodeScanningSeverity::ALL {
+            let serialized = serde_json::to_value(severity).expect("serialize");
+            assert_eq!(serialized, serde_json::json!(severity.as_str()));
+            assert_eq!(
+                severity.as_str().parse::<CodeScanningSeverity>(),
+                Ok(severity)
+            );
+            assert_eq!(
+                severity
+                    .as_str()
+                    .to_uppercase()
+                    .parse::<CodeScanningSeverity>(),
+                Ok(severity)
+            );
+        }
+        assert!("severe".parse::<CodeScanningSeverity>().is_err());
     }
 
     // All environment variables that Config reads
@@ -8426,6 +8656,39 @@ sms_number = "+1111111111"
             },
             ..ScmConfig::default()
         }
+    }
+
+    fn issues_with_github_code_scanning() -> IssuesConfig {
+        IssuesConfig {
+            github_code_scanning: Some(GitHubCodeScanningConfig {
+                enabled: true,
+                repos: vec!["appwrite/appwrite".to_string()],
+                ..GitHubCodeScanningConfig::default()
+            }),
+            ..IssuesConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_validation_github_code_scanning_counts_as_source() {
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            issues: issues_with_github_code_scanning(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_github_code_scanning_requires_github_token() {
+        let config = Config {
+            scm: scm_with_github_token(None),
+            issues: issues_with_github_code_scanning(),
+            ..Config::default()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("github_code_scanning"), "{error}");
+        assert!(error.contains("GitHub token"), "{error}");
     }
 
     #[test]

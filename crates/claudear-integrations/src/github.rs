@@ -83,6 +83,65 @@ pub struct GitHubLabel {
     pub name: String,
 }
 
+/// A code-scanning alert from the Code Scanning API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningAlert {
+    pub number: i64,
+    pub state: String,
+    pub html_url: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub rule: CodeScanningRule,
+    pub tool: CodeScanningTool,
+    pub most_recent_instance: Option<CodeScanningInstance>,
+}
+
+/// The rule that raised a code-scanning alert.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningRule {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub full_description: Option<String>,
+    pub severity: Option<String>,
+    pub security_severity_level: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub help: Option<String>,
+    pub help_uri: Option<String>,
+}
+
+/// The analysis tool that raised a code-scanning alert.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningTool {
+    pub name: String,
+    pub version: Option<String>,
+}
+
+/// The most recent occurrence of a code-scanning alert.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningInstance {
+    #[serde(rename = "ref")]
+    pub reference: Option<String>,
+    pub commit_sha: Option<String>,
+    pub message: Option<CodeScanningMessage>,
+    pub location: Option<CodeScanningLocation>,
+}
+
+/// The message attached to a code-scanning alert instance.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningMessage {
+    pub text: Option<String>,
+}
+
+/// The source location of a code-scanning alert instance.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningLocation {
+    pub path: Option<String>,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
+}
+
 impl GitHubClient<ReqwestHttpClient> {
     /// Create a new GitHub client with the default HTTP client.
     pub fn new(config: GitHubConfig) -> Self {
@@ -983,6 +1042,95 @@ impl<H: HttpClient> GitHubClient<H> {
             )));
         }
         Ok(())
+    }
+
+    /// List open code-scanning alerts for a repository, optionally for one tool.
+    pub async fn list_code_scanning_alerts(
+        &self,
+        repo: &str,
+        tool_name: Option<&str>,
+    ) -> Result<Vec<CodeScanningAlert>> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let mut alerts = Vec::new();
+        let mut page = 1usize;
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 10;
+
+        loop {
+            let mut url = format!(
+                "https://api.github.com/repos/{}/code-scanning/alerts?state=open&per_page={}&page={}",
+                repo, PER_PAGE, page
+            );
+            if let Some(tool_name) = tool_name {
+                url.push_str(&format!("&tool_name={}", urlencoding::encode(tool_name)));
+            }
+
+            let headers = self.build_headers(token);
+            let response = self.http.get(&url, headers).await?;
+
+            if !response.is_success() {
+                return Err(Error::Other(format!(
+                    "GitHub API error listing code-scanning alerts for {}: {}",
+                    repo, response.body
+                )));
+            }
+
+            let page_alerts: Vec<CodeScanningAlert> = response.json()?;
+            let count = page_alerts.len();
+            alerts.extend(page_alerts);
+
+            if count < PER_PAGE {
+                break;
+            }
+
+            page += 1;
+            if page > MAX_PAGES {
+                tracing::warn!(repo = %repo, "Hit pagination limit for code-scanning alerts");
+                break;
+            }
+        }
+
+        Ok(alerts)
+    }
+
+    /// Fetch a single code-scanning alert by number.
+    pub async fn get_code_scanning_alert(
+        &self,
+        repo: &str,
+        alert_number: i64,
+    ) -> Result<CodeScanningAlert> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let url = format!(
+            "https://api.github.com/repos/{}/code-scanning/alerts/{}",
+            repo, alert_number
+        );
+        let headers = self.build_headers(token);
+        let response = self.http.get(&url, headers).await?;
+
+        if response.is_not_found() {
+            return Err(Error::Other(format!(
+                "Code-scanning alert not found: {}/code-scanning/alerts/{}",
+                repo, alert_number
+            )));
+        }
+
+        if !response.is_success() {
+            return Err(Error::Other(format!("GitHub API error: {}", response.body)));
+        }
+
+        Ok(response.json()?)
     }
 
     pub async fn get_default_branch(&self, repo: &str) -> Result<String> {

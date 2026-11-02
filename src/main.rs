@@ -1094,6 +1094,10 @@ fn create_sources(
         }
     }
 
+    if let Some(source) = claudear::build_github_code_scanning_source(config) {
+        sources.push(source);
+    }
+
     let discord = config.discord_merged();
     if discord.source_enabled {
         if discord.bot_token.is_some()

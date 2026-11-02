@@ -398,6 +398,32 @@ pub fn build_deploy_qa_source(
     }
 }
 
+/// Build the GitHub code-scanning alerts issue source.
+///
+/// Returns `None` when `[issues.github_code_scanning]` is absent or disabled, or
+/// when it has no repos or there is no `[scm.github]` token to authenticate with.
+/// The source is returned unwrapped; callers add telemetry instrumentation.
+pub fn build_github_code_scanning_source(config: &Config) -> Option<Arc<dyn source::IssueSource>> {
+    let code_scanning = config.github_code_scanning().filter(|c| c.enabled)?;
+    let has_github_token = config
+        .github()
+        .token
+        .as_ref()
+        .is_some_and(|token| !token.is_empty());
+    if !has_github_token || code_scanning.repos.is_empty() {
+        tracing::warn!(
+            "GitHub code-scanning enabled but missing scm.github.token or repos; skipping"
+        );
+        return None;
+    }
+
+    tracing::info!("GitHub code-scanning source initialized");
+    Some(Arc::new(source::GitHubCodeScanningSource::new(
+        code_scanning.clone(),
+        config.github().clone(),
+    )))
+}
+
 /// Redactor for live-QA reports. Masks every credential in `config` and the
 /// value of every secret-named variable the agent can read: `environment`
 /// (the daemon's, which the agent inherits minus Claudear's own `CLAUDEAR_*`
@@ -497,6 +523,10 @@ fn build_sources(config: &Config) -> Vec<Arc<dyn source::IssueSource>> {
         if jira_config.enabled {
             sources.push(Arc::new(JiraSource::new(jira_config.clone())));
         }
+    }
+
+    if let Some(source) = build_github_code_scanning_source(config) {
+        sources.push(source);
     }
 
     let discord = config.discord_merged();
@@ -667,6 +697,40 @@ mod tests {
         });
         let sources = build_sources(&config);
         assert_eq!(sources.len(), 1);
+    }
+
+    fn github_code_scanning_config(token: Option<&str>, repos: &[&str]) -> Config {
+        let mut config = Config::default();
+        config.github_mut().token = token.map(secret::SecretValue::new);
+        config.issues.github_code_scanning = Some(config::GitHubCodeScanningConfig {
+            enabled: true,
+            repos: repos.iter().map(|repo| repo.to_string()).collect(),
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    fn build_sources_with_github_code_scanning_enabled() {
+        let config = github_code_scanning_config(Some("ghp_token"), &["appwrite/appwrite"]);
+        let sources = build_sources(&config);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name(), "github_code_scanning");
+    }
+
+    #[test]
+    fn build_sources_skips_github_code_scanning_without_token_or_repos() {
+        let without_token = github_code_scanning_config(None, &["appwrite/appwrite"]);
+        assert!(build_sources(&without_token).is_empty());
+
+        let without_repos = github_code_scanning_config(Some("ghp_token"), &[]);
+        assert!(build_sources(&without_repos).is_empty());
+
+        let mut disabled = github_code_scanning_config(Some("ghp_token"), &["appwrite/appwrite"]);
+        if let Some(code_scanning) = disabled.issues.github_code_scanning.as_mut() {
+            code_scanning.enabled = false;
+        }
+        assert!(build_sources(&disabled).is_empty());
     }
 
     #[test]
