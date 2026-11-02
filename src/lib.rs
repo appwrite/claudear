@@ -398,6 +398,29 @@ pub fn build_deploy_qa_source(
     }
 }
 
+/// Build the GitHub Issues source.
+///
+/// Returns `None` when `[scm.github]` has no repos or trigger labels, or there is
+/// no token to authenticate with. Trigger labels are required so the source never
+/// picks up every open issue in a repository.
+/// The source is returned unwrapped; callers add telemetry instrumentation.
+pub fn build_github_issues_source(config: &Config) -> Option<Arc<dyn source::IssueSource>> {
+    let github = config.github();
+    if github.repos.is_empty() {
+        return None;
+    }
+    let has_github_token = github.token.as_ref().is_some_and(|token| !token.is_empty());
+    if !has_github_token || github.trigger_labels.is_empty() {
+        tracing::warn!(
+            "scm.github.repos set but missing scm.github.token or trigger_labels; skipping GitHub Issues source"
+        );
+        return None;
+    }
+
+    tracing::info!("GitHub Issues source initialized");
+    Some(Arc::new(source::GitHubSource::new(github.clone())))
+}
+
 /// Build the GitHub code-scanning alerts issue source.
 ///
 /// Returns `None` when `[issues.github_code_scanning]` is absent or disabled, or
@@ -523,6 +546,10 @@ fn build_sources(config: &Config) -> Vec<Arc<dyn source::IssueSource>> {
         if jira_config.enabled {
             sources.push(Arc::new(JiraSource::new(jira_config.clone())));
         }
+    }
+
+    if let Some(source) = build_github_issues_source(config) {
+        sources.push(source);
     }
 
     if let Some(source) = build_github_code_scanning_source(config) {
@@ -697,6 +724,40 @@ mod tests {
         });
         let sources = build_sources(&config);
         assert_eq!(sources.len(), 1);
+    }
+
+    fn github_issues_config(token: Option<&str>, repos: &[&str], labels: &[&str]) -> Config {
+        let mut config = Config::default();
+        let github = config.github_mut();
+        github.token = token.map(secret::SecretValue::new);
+        github.repos = repos.iter().map(|repo| repo.to_string()).collect();
+        github.trigger_labels = labels.iter().map(|label| label.to_string()).collect();
+        config
+    }
+
+    #[test]
+    fn build_sources_with_github_issues_enabled() {
+        let config = github_issues_config(
+            Some("ghp_token"),
+            &["appwrite-labs/cloud"],
+            &["security-review"],
+        );
+        let sources = build_sources(&config);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name(), "github_issues");
+    }
+
+    #[test]
+    fn build_sources_skips_github_issues_without_token_repos_or_labels() {
+        let without_token =
+            github_issues_config(None, &["appwrite-labs/cloud"], &["security-review"]);
+        assert!(build_sources(&without_token).is_empty());
+
+        let without_repos = github_issues_config(Some("ghp_token"), &[], &["security-review"]);
+        assert!(build_sources(&without_repos).is_empty());
+
+        let without_labels = github_issues_config(Some("ghp_token"), &["appwrite-labs/cloud"], &[]);
+        assert!(build_sources(&without_labels).is_empty());
     }
 
     fn github_code_scanning_config(token: Option<&str>, repos: &[&str]) -> Config {
