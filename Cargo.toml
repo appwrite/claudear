@@ -14,7 +14,7 @@ axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls-no-provider", "charset", "http2"] }
 tower = { version = "0.5", features = ["limit"] }
-tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "fs", "limit"] }
 
 # TLS (ring crypto provider for all rustls consumers)
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
