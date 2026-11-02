@@ -14,7 +14,7 @@ axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls-no-provider", "charset", "http2"] }
 tower = { version = "0.5", features = ["limit"] }
-tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "fs", "limit"] }
 
 # TLS (ring crypto provider for all rustls consumers)
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
@@ -23,7 +23,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 
 # Database
-rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.41", features = ["bundled", "load_extension"] }
 
 # Embeddings
 fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls"] }
@@ -58,7 +58,7 @@ thiserror = "2"
 anyhow = "1"
 
 # Crypto
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 hmac = "0.12"
 sha2 = "0.10"
 sha1 = "0.10"
@@ -117,7 +117,7 @@ rayon = "1"
 
 # File system utilities
 walkdir = "2"
-dirs = "6"
+dirs = "7"
 
 # URL encoding/parsing
 urlencoding = "2"
@@ -127,7 +127,7 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 # Base64 encoding
-base64 = "0.22"
+base64 = "0.23"
 
 # Semantic versioning
 semver = "1"
@@ -144,13 +144,13 @@ tower-cookies = "0.11"
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder"] }
 imap = "2.4"
 native-tls = "0.2"
-mailparse = "0.16"
+mailparse = "0.18"
 
 # tempfile
 tempfile = "3"
 
 # Dev/test
-mockall = "0.14"
+mockall = "0.15"
 http-body-util = "0.1"
 
 # Shared infrastructure

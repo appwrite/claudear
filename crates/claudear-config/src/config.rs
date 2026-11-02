@@ -665,8 +665,8 @@ pub struct EmbeddingModelConfig {
     pub gpu: bool,
     /// CUDA device index (default: 0).
     pub device_id: i32,
-    /// Override model instance pool size (0 = auto-detect from available CPUs/RAM).
-    /// GPU should typically use 1 to avoid wasting VRAM.
+    /// Override model instance pool size (0 = one instance, capped by available RAM).
+    /// Each instance already uses every core, so larger CPU pools only add memory.
     pub pool_size: u32,
     /// Override sub-batch size (0 = auto-detect from available memory).
     /// GPU can handle larger batches (64-256) than CPU (4-16).
