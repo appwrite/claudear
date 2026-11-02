@@ -199,6 +199,9 @@ jobs:
       # The workflow-level RUSTFLAGS ask rustc for clang + mold, which neither
       # the macOS nor the MSVC toolchain has.
       RUSTFLAGS: "-Dwarnings"
+      # llama.cpp's vendored cpp-httplib does not compile against Homebrew's
+      # OpenSSL 4 (const X509_NAME), and Claudear never needs its HTTPS client.
+      CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:

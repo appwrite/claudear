@@ -96,6 +96,10 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          # llama.cpp's vendored cpp-httplib does not compile against Homebrew's
+          # OpenSSL 4 (const X509_NAME), and Claudear never needs its HTTPS client.
+          CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: ${{ matrix.os == 'macos-latest' }}
 
       - name: Package binary (Unix)
         if: runner.os != 'Windows'
