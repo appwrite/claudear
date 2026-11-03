@@ -21931,4 +21931,690 @@ mod tests {
         let watches = tracker.get_all_regression_watches().unwrap();
         assert!(watches.is_empty());
     }
+
+    mod vector_index_regression {
+        use super::*;
+        use crate::vectorlite::require_vectorlite_for_tests;
+        use claudear_core::types::{CodeChunk, Language};
+
+        const CODE_CHUNK_VECTORS: &str = "code_chunk_vectors";
+        const DISCORD_MESSAGE_CHUNK_VECTORS: &str = "discord_message_chunk_vectors";
+        const MODEL: &str = "test-model";
+
+        fn vector_exists(tracker: &SqliteTracker, table: &str, rowid: i64) -> bool {
+            let connection = tracker.acquire_lock().unwrap();
+            let lookup = connection
+                .query_row(
+                    &format!("SELECT rowid FROM {table} WHERE rowid = ?1"),
+                    params![rowid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional();
+            match lookup {
+                Ok(found) => found.is_some(),
+                Err(error) if error.to_string().contains("no such table") => false,
+                Err(error) => panic!("looking up rowid {rowid} in {table} failed: {error}"),
+            }
+        }
+
+        fn axis_embedding(axis: usize) -> Vec<f32> {
+            let mut embedding = vec![0.0f32; 4];
+            embedding[axis % 4] = 1.0;
+            embedding
+        }
+
+        fn spread_embedding(index: usize) -> Vec<f32> {
+            vec![1.0, index as f32, 0.5, 0.25]
+        }
+
+        fn database_path(directory: &tempfile::TempDir) -> PathBuf {
+            directory.path().join("claudear.db")
+        }
+
+        fn legacy_vector_table(table: &str) -> String {
+            format!(
+                "CREATE VIRTUAL TABLE {table} USING vectorlite(embedding float32[4] cosine, hnsw(max_elements=4, ef_construction=200, M=16))"
+            )
+        }
+
+        fn sample_code_chunk(repository_id: i64, file_path: &str, start_line: usize) -> CodeChunk {
+            CodeChunk {
+                id: None,
+                repo_id: repository_id,
+                file_path: file_path.to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: Some(format!("function_{start_line}")),
+                language: Language::Rust,
+                start_line,
+                end_line: start_line + 1,
+                chunk_text: format!("fn function_{start_line}() {{}}"),
+                context_text: String::new(),
+                file_hash: format!("hash-{file_path}"),
+                content_hash: None,
+            }
+        }
+
+        fn embedding_ids(tracker: &SqliteTracker, table: &str, chunk_ids: &[i64]) -> Vec<i64> {
+            let connection = tracker.acquire_lock().unwrap();
+            chunk_ids
+                .iter()
+                .map(|chunk_id| {
+                    connection
+                        .query_row(
+                            &format!("SELECT id FROM {table} WHERE chunk_id = ?1"),
+                            params![chunk_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        fn assert_indexed(tracker: &SqliteTracker, table: &str, embedding_ids: &[i64]) {
+            for &embedding_id in embedding_ids {
+                assert!(
+                    vector_exists(tracker, table, embedding_id),
+                    "embedding {embedding_id} must be in {table} before the operation under test"
+                );
+            }
+        }
+
+        fn assert_removed(tracker: &SqliteTracker, table: &str, embedding_ids: &[i64]) {
+            for &embedding_id in embedding_ids {
+                assert!(
+                    !vector_exists(tracker, table, embedding_id),
+                    "the vector for deleted embedding {embedding_id} is still in {table}"
+                );
+            }
+        }
+
+        fn index_code_chunks(
+            tracker: &SqliteTracker,
+            repository_id: i64,
+            file_paths: &[&str],
+        ) -> (Vec<i64>, Vec<i64>) {
+            let chunks: Vec<CodeChunk> = file_paths
+                .iter()
+                .enumerate()
+                .map(|(index, file_path)| sample_code_chunk(repository_id, file_path, index + 1))
+                .collect();
+            let chunk_ids = tracker.save_code_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(axis_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker.save_code_chunk_embeddings(&pairs, MODEL).unwrap();
+            let embedding_ids = embedding_ids(tracker, "code_chunk_embeddings", &chunk_ids);
+            assert_indexed(tracker, CODE_CHUNK_VECTORS, &embedding_ids);
+            (chunk_ids, embedding_ids)
+        }
+
+        fn index_discord_chunks(
+            tracker: &SqliteTracker,
+            chunks: &[(&str, &str)],
+        ) -> (Vec<i64>, Vec<i64>) {
+            let chunks: Vec<claudear_core::types::DiscordMessageChunk> = chunks
+                .iter()
+                .map(|(channel_id, start_id)| sample_discord_chunk(channel_id, start_id))
+                .collect();
+            let chunk_ids = tracker.save_discord_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(axis_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker
+                .save_discord_chunk_embeddings(&pairs, MODEL)
+                .unwrap();
+            let embedding_ids =
+                embedding_ids(tracker, "discord_message_chunk_embeddings", &chunk_ids);
+            assert_indexed(tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids);
+            (chunk_ids, embedding_ids)
+        }
+
+        #[test]
+        fn test_code_chunk_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = writer.get_or_create_repo_id("org/repo").unwrap();
+            let (chunk_ids, _) =
+                index_code_chunks(&writer, repository_id, &["src/a.rs", "src/b.rs"]);
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let results = reader
+                .search_code_chunks(&[0.9, 0.1, 0.0, 0.0], None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_ids[0]),
+                "a reopened tracker must search vectors written before it opened; got {} results",
+                results.len()
+            );
+        }
+
+        #[test]
+        fn test_discord_message_chunk_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let (chunk_ids, _) = index_discord_chunks(&writer, &[("100", "1001"), ("200", "2001")]);
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let results = reader
+                .search_discord_message_chunks(&[0.9, 0.1, 0.0, 0.0], None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_ids[0]),
+                "a reopened tracker must search vectors written before it opened; got {} results",
+                results.len()
+            );
+        }
+
+        #[test]
+        fn test_qa_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let mut entry = make_qa_entry(
+                "linear",
+                Some("org/repo"),
+                "issue-1",
+                "How do I reset my password?",
+                "Use the reset link on the sign-in page.",
+                "correlation-1",
+            );
+            entry.question_embedding = Some(axis_embedding(0));
+            let qa_id = writer.store_qa_knowledge(&entry).unwrap();
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let matches = reader
+                .find_similar_qa_global(
+                    "a question sharing no normalized text with any entry",
+                    Some(&axis_embedding(0)),
+                    0.5,
+                    5,
+                )
+                .unwrap();
+            assert_eq!(
+                matches.first().map(|found| found.entry.id),
+                Some(qa_id),
+                "a reopened tracker must search Q&A vectors written before it opened; got {} matches",
+                matches.len()
+            );
+        }
+
+        #[test]
+        fn test_issue_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let issue = IssueEmbedding {
+                id: 0,
+                source: "linear".to_string(),
+                issue_id: "issue-1".to_string(),
+                short_id: Some("LIN-1".to_string()),
+                title: Some("Login fails after password reset".to_string()),
+                description: None,
+                url: None,
+                priority: None,
+                status: None,
+                labels: None,
+                embedding: Some(axis_embedding(0)),
+                embedding_model: Some(MODEL.to_string()),
+                created_at: Utc::now(),
+                updated_at: None,
+            };
+            let issue_row_id = writer.store_embedding(&issue).unwrap();
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let similar = reader
+                .find_similar_issues_vector(&axis_embedding(0), "linear", None, 0.5, 5)
+                .unwrap()
+                .expect("vectorlite is loaded, so the vector search must run");
+            assert_eq!(
+                similar.first().map(|(found, _)| found.id),
+                Some(issue_row_id),
+                "a reopened tracker must search issue vectors written before it opened; got {} results",
+                similar.len()
+            );
+        }
+
+        #[test]
+        fn test_outcome_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            writer.record_attempt("linear", "issue-1", "LIN-1").unwrap();
+            let attempt = writer.get_attempt("linear", "issue-1").unwrap().unwrap();
+            let outcome = FixOutcome {
+                id: 0,
+                attempt_id: attempt.id,
+                source: "linear".to_string(),
+                issue_id: "issue-1".to_string(),
+                issue_text: "Null pointer in handler".to_string(),
+                prompt_used: "Fix the null pointer".to_string(),
+                outcome: Outcome::CannotFix,
+                error_type: Some("null_reference".to_string()),
+                learnings: None,
+                keywords: vec!["null".to_string()],
+                embedding: Some(axis_embedding(0)),
+                created_at: Utc::now(),
+            };
+            let outcome_id = writer.store_feedback_outcome(&outcome).unwrap();
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let similar = reader
+                .find_similar_outcomes_vector(&axis_embedding(0), 0.5, 5)
+                .unwrap()
+                .expect("vectorlite is loaded, so the vector search must run");
+            assert_eq!(
+                similar.first().map(|(found, _)| found.id),
+                Some(outcome_id),
+                "a reopened tracker must search outcome vectors written before it opened; got {} results",
+                similar.len()
+            );
+        }
+
+        #[test]
+        fn test_code_chunk_embeddings_retry_after_rolled_back_batch() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let chunk = sample_code_chunk(repository_id, "src/a.rs", 1);
+            let chunk_id = tracker
+                .save_code_chunks(std::slice::from_ref(&chunk))
+                .unwrap()[0];
+            let embedding = axis_embedding(0);
+            let missing_chunk_id = chunk_id + 1_000;
+
+            assert!(
+                tracker
+                    .save_code_chunk_embeddings(
+                        &[
+                            (chunk_id, embedding.as_slice()),
+                            (missing_chunk_id, embedding.as_slice()),
+                        ],
+                        MODEL,
+                    )
+                    .is_err(),
+                "an embedding for a missing chunk must fail and roll back the whole batch"
+            );
+            tracker
+                .save_code_chunk_embeddings(&[(chunk_id, embedding.as_slice())], MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("retrying the rolled-back embedding must succeed: {error}")
+                });
+
+            let results = tracker.search_code_chunks(&embedding, None, 5).unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_id),
+                "the retried embedding must be searchable"
+            );
+            assert!(
+                tracker
+                    .code_chunk_hash_matches(repository_id, &chunk.file_path, &chunk.file_hash)
+                    .unwrap(),
+                "the retried chunk must count as fully embedded"
+            );
+        }
+
+        #[test]
+        fn test_discord_message_chunk_embeddings_retry_after_rolled_back_batch() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let chunk = sample_discord_chunk("100", "1001");
+            let chunk_id = tracker
+                .save_discord_chunks(std::slice::from_ref(&chunk))
+                .unwrap()[0];
+            let embedding = axis_embedding(0);
+            let missing_chunk_id = chunk_id + 1_000;
+
+            assert!(
+                tracker
+                    .save_discord_chunk_embeddings(
+                        &[
+                            (chunk_id, embedding.as_slice()),
+                            (missing_chunk_id, embedding.as_slice()),
+                        ],
+                        MODEL,
+                    )
+                    .is_err(),
+                "an embedding for a missing chunk must fail and roll back the whole batch"
+            );
+            tracker
+                .save_discord_chunk_embeddings(&[(chunk_id, embedding.as_slice())], MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("retrying the rolled-back embedding must succeed: {error}")
+                });
+
+            let results = tracker
+                .search_discord_message_chunks(&embedding, None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_id),
+                "the retried embedding must be searchable"
+            );
+            let content_hash = chunk.content_hash.as_deref().unwrap();
+            assert!(
+                tracker
+                    .discord_chunk_hash_matches(&chunk.channel_id, content_hash)
+                    .unwrap(),
+                "the retried chunk must count as fully embedded"
+            );
+        }
+
+        #[test]
+        fn test_code_chunk_vectors_outgrow_legacy_capacity() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            drop(SqliteTracker::new(&path).unwrap());
+            {
+                let connection = Connection::open(&path).unwrap();
+                if !require_vectorlite_for_tests(&connection) {
+                    return;
+                }
+                connection
+                    .execute_batch(&legacy_vector_table(CODE_CHUNK_VECTORS))
+                    .unwrap();
+            }
+
+            let tracker = SqliteTracker::new(&path).unwrap();
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let chunks: Vec<CodeChunk> = (1..=10)
+                .map(|line| sample_code_chunk(repository_id, "src/a.rs", line))
+                .collect();
+            let chunk_ids = tracker.save_code_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(spread_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker
+                .save_code_chunk_embeddings(&pairs, MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("ten embeddings must fit despite a legacy max_elements=4 table: {error}")
+                });
+
+            let results = tracker
+                .search_code_chunks(&embeddings[0], None, 10)
+                .unwrap();
+            assert_eq!(results.len(), 10, "every embedding must be searchable");
+            assert!(
+                tracker
+                    .code_chunk_hash_matches(repository_id, "src/a.rs", &chunks[0].file_hash)
+                    .unwrap(),
+                "every chunk must count as fully embedded"
+            );
+        }
+
+        #[test]
+        fn test_discord_message_chunk_vectors_outgrow_legacy_capacity() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            drop(SqliteTracker::new(&path).unwrap());
+            {
+                let connection = Connection::open(&path).unwrap();
+                if !require_vectorlite_for_tests(&connection) {
+                    return;
+                }
+                connection
+                    .execute_batch(&legacy_vector_table(DISCORD_MESSAGE_CHUNK_VECTORS))
+                    .unwrap();
+            }
+
+            let tracker = SqliteTracker::new(&path).unwrap();
+            let chunks: Vec<claudear_core::types::DiscordMessageChunk> = (1..=10)
+                .map(|index| sample_discord_chunk("100", &format!("{}", 1000 + index)))
+                .collect();
+            let chunk_ids = tracker.save_discord_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(spread_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker
+                .save_discord_chunk_embeddings(&pairs, MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("ten embeddings must fit despite a legacy max_elements=4 table: {error}")
+                });
+
+            let results = tracker
+                .search_discord_message_chunks(&embeddings[0], None, 10)
+                .unwrap();
+            assert_eq!(results.len(), 10, "every embedding must be searchable");
+            for chunk in &chunks {
+                let content_hash = chunk.content_hash.as_deref().unwrap();
+                assert!(
+                    tracker
+                        .discord_chunk_hash_matches("100", content_hash)
+                        .unwrap(),
+                    "chunk {content_hash} must count as fully embedded"
+                );
+            }
+        }
+
+        #[test]
+        fn test_delete_code_chunks_by_ids_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (chunk_ids, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker.delete_code_chunks_by_ids(&chunk_ids[..1]).unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_delete_code_data_for_file_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker
+                .delete_code_data_for_file(repository_id, "src/a.rs")
+                .unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_code_data_removes_vectors_for_stale_paths() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/stale.rs", "src/kept.rs"]);
+
+            tracker
+                .cleanup_stale_code_data(repository_id, &["src/kept.rs".to_string()])
+                .unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_code_data_removes_all_vectors_when_no_paths_remain() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker.cleanup_stale_code_data(repository_id, &[]).unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids);
+        }
+
+        #[test]
+        fn test_delete_all_code_data_for_repo_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let deleted_repository_id = tracker.get_or_create_repo_id("org/deleted").unwrap();
+            let kept_repository_id = tracker.get_or_create_repo_id("org/kept").unwrap();
+            let (_, deleted_embedding_ids) =
+                index_code_chunks(&tracker, deleted_repository_id, &["src/a.rs", "src/b.rs"]);
+            let (_, kept_embedding_ids) =
+                index_code_chunks(&tracker, kept_repository_id, &["src/a.rs"]);
+
+            tracker
+                .delete_all_code_data_for_repo(deleted_repository_id)
+                .unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &deleted_embedding_ids);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &kept_embedding_ids);
+        }
+
+        #[test]
+        fn test_clear_repositories_removes_code_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker.clear_repositories().unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids);
+        }
+
+        #[test]
+        fn test_delete_discord_message_chunks_by_ids_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (chunk_ids, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("100", "1002")]);
+
+            tracker
+                .delete_discord_message_chunks_by_ids(&chunk_ids[..1])
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_delete_discord_message_data_for_channel_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (_, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("200", "2001")]);
+
+            tracker
+                .delete_discord_message_data_for_channel("100")
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_discord_message_data_removes_stale_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (_, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("100", "1002")]);
+
+            tracker
+                .cleanup_stale_discord_message_data("100", &["hash-1002".to_string()])
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_discord_message_data_removes_all_vectors_when_no_hashes_remain() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (_, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("100", "1002")]);
+
+            tracker
+                .cleanup_stale_discord_message_data("100", &[])
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids);
+        }
+
+        #[test]
+        fn test_discord_message_chunk_vectors_work_after_delete_all_discord_message_data() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            index_discord_chunks(&tracker, &[("100", "1001")]);
+
+            tracker.delete_all_discord_message_data().unwrap();
+
+            let (chunk_ids, _) = index_discord_chunks(&tracker, &[("200", "2001")]);
+            let results = tracker
+                .search_discord_message_chunks(&axis_embedding(0), None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_ids[0]),
+                "embeddings saved after a full delete must be searchable"
+            );
+        }
+    }
 }
