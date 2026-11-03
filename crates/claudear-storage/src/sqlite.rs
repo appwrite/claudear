@@ -1,5 +1,7 @@
 //! SQLite-based fix attempt tracker and analytics storage.
 
+mod handoff;
+
 use super::types::{
     ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
     DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,
@@ -22,6 +24,7 @@ use claudear_core::types::{
     IssueEmbedding, IssueTimeline, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment,
     QaKnowledgeEntry, QaMatch, RetrievalUsageRecord, SimilarIssue, SourceStats, TimelineEvent,
 };
+use handoff::Handoff;
 use rand::RngExt;
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
@@ -100,6 +103,7 @@ fn generate_token_id() -> String {
 /// held across await points since all trait methods are synchronous.
 pub struct SqliteTracker {
     connection: Mutex<Connection>,
+    handoff: Handoff,
     indexing_sender: tokio::sync::watch::Sender<IndexingProgress>,
     vector_indexes: Catalog,
 }
@@ -111,6 +115,7 @@ impl SqliteTracker {
         let (indexing_sender, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
             connection: Mutex::new(connection),
+            handoff: Handoff::default(),
             indexing_sender,
             vector_indexes: Catalog::new(),
         };
@@ -124,6 +129,7 @@ impl SqliteTracker {
         let (indexing_sender, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
             connection: Mutex::new(connection),
+            handoff: Handoff::default(),
             indexing_sender,
             vector_indexes: Catalog::new(),
         };
@@ -146,8 +152,9 @@ impl SqliteTracker {
         }
     }
 
-    /// Rebuild every vector index on this connection from its embedding table, releasing the
-    /// connection lock between bounded batches so other database work can interleave.
+    /// Rebuild every vector index on this connection from its embedding table, handing the
+    /// connection lock to any waiting thread between bounded batches so other database work
+    /// interleaves instead of stalling behind the whole rebuild.
     pub fn rebuild_vector_indexes(&self) {
         for index in self.vector_indexes.all() {
             let started = Instant::now();
@@ -167,7 +174,7 @@ impl SqliteTracker {
                 match step {
                     Ok(Progress::Pending { rows: batch }) => {
                         rows += batch;
-                        std::thread::yield_now();
+                        self.handoff.yield_to_waiters();
                     }
                     Ok(Progress::Complete { rows: batch }) => {
                         rows += batch;
@@ -220,19 +227,21 @@ impl SqliteTracker {
 
     /// Acquire a lock on the database connection, handling poisoned mutex gracefully.
     fn acquire_lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.connection.lock().map_err(|e| {
-            claudear_core::error::Error::Storage(format!("Failed to acquire database lock: {}", e))
+        self.handoff.lock(&self.connection).map_err(|error| {
+            claudear_core::error::Error::Storage(format!(
+                "Failed to acquire database lock: {error}"
+            ))
         })
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
         // These settings optimize SQLite for better throughput in our use case:
         // - Concurrent reads/writes from webhook server and watcher
         // - Moderate write workload with analytics/metrics
         // - BLOB storage for embeddings
-        conn.execute_batch(
+        connection.execute_batch(
             r#"
             -- WAL mode: biggest win for concurrent reads + writes
             -- Note: In-memory DBs will stay in "memory" mode which is fine
@@ -259,16 +268,16 @@ impl SqliteTracker {
         )?;
 
         // Run versioned SQL migrations (tracked in schema_migrations table).
-        super::migrator::run(&conn).map_err(claudear_core::error::Error::Database)?;
+        super::migrator::run(&connection).map_err(claudear_core::error::Error::Database)?;
 
         // Reset any stuck "running" indexing progress rows from a previous crash
-        conn.execute(
+        connection.execute(
             "UPDATE indexing_progress SET status = 'idle' WHERE status = 'running'",
             [],
         )?;
 
         // Update query planner statistics after schema creation
-        conn.execute("ANALYZE", [])?;
+        connection.execute("ANALYZE", [])?;
 
         Ok(())
     }
@@ -21572,6 +21581,7 @@ mod tests {
 
         const MODEL: &str = "test-model";
         const TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
+        const MAXIMUM_BATCHES_BETWEEN_WAITS: usize = 1;
 
         fn sample_code_chunk(repository_id: i64, index: usize) -> CodeChunk {
             CodeChunk {
@@ -21655,10 +21665,11 @@ mod tests {
         }
 
         #[test]
-        fn test_rebuild_vector_indexes_releases_the_lock_between_batches() {
+        fn test_rebuild_vector_indexes_hands_the_lock_to_a_waiting_thread_after_each_batch() {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("claudear.db");
-            let count = 16 * REBUILD_BATCH_SIZE;
+            let batches = 64;
+            let count = batches * REBUILD_BATCH_SIZE;
 
             let writer = SqliteTracker::new(&path).unwrap();
             if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
@@ -21679,43 +21690,71 @@ mod tests {
             drop(writer);
 
             let tracker = Arc::new(SqliteTracker::new(&path).unwrap());
-            let (first, last): (i64, i64) = {
+            let first: i64 = {
                 let connection = tracker.acquire_lock().unwrap();
                 assert!(require_vectorlite_for_tests(&connection));
                 connection
-                    .query_row(
-                        "SELECT min(id), max(id) FROM code_chunk_embeddings",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
+                    .query_row("SELECT min(id) FROM code_chunk_embeddings", [], |row| {
+                        row.get(0)
+                    })
                     .unwrap()
             };
-
-            let rebuilding = Arc::clone(&tracker);
-            let rebuild = std::thread::spawn(move || rebuilding.rebuild_vector_indexes());
-            let mut interleaved = false;
-            while !interleaved && !rebuild.is_finished() {
+            let batch_size = i64::try_from(REBUILD_BATCH_SIZE).unwrap();
+            let indexed_batches = || {
                 let connection = tracker.acquire_lock().unwrap();
                 let mut lookup = connection
                     .prepare_cached("SELECT rowid FROM code_chunk_vectors WHERE rowid = ?1")
                     .unwrap();
-                let mut indexed = |rowid: i64| {
-                    lookup
+                let (mut low, mut high) = (0, batches);
+                while low < high {
+                    let middle = (low + high) / 2;
+                    let rowid = first + i64::try_from(middle).unwrap() * batch_size;
+                    let indexed = lookup
                         .query_row(params![rowid], |row| row.get::<_, i64>(0))
                         .optional()
                         .unwrap()
-                        .is_some()
-                };
-                interleaved = indexed(first) && !indexed(last);
-                drop(lookup);
-                drop(connection);
-                std::thread::yield_now();
+                        .is_some();
+                    if indexed {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                (low, tracker.handoff.granted())
+            };
+
+            let rebuilding = Arc::clone(&tracker);
+            let rebuild = std::thread::spawn(move || rebuilding.rebuild_vector_indexes());
+            let mut observed = 0;
+            let mut queued_promptly = false;
+            let mut advances = Vec::new();
+            let mut observe = || {
+                let (indexed, grant) = indexed_batches();
+                if indexed > observed {
+                    if queued_promptly {
+                        advances.push(indexed - observed);
+                    }
+                    observed = indexed;
+                }
+                tracker.handoff.yield_to_waiters();
+                queued_promptly = tracker.handoff.granted() <= grant + 1;
+            };
+            while !rebuild.is_finished() {
+                observe();
             }
             rebuild.join().unwrap();
+            observe();
 
+            assert_eq!(observed, batches, "the rebuild left batches unindexed");
             assert!(
-                interleaved,
-                "another thread never acquired the connection lock between rebuild batches"
+                advances
+                    .iter()
+                    .all(|&advance| advance <= MAXIMUM_BATCHES_BETWEEN_WAITS),
+                "a thread waiting on the connection lock sat out more than {MAXIMUM_BATCHES_BETWEEN_WAITS} rebuild batches; batches indexed between its acquisitions: {advances:?}"
+            );
+            assert!(
+                advances.len() >= batches / 2,
+                "too few acquisitions queued while the rebuild held the lock to judge the handoff: {advances:?}"
             );
         }
 
