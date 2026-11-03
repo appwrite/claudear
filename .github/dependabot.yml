@@ -7,25 +7,21 @@ multi-ecosystem-groups:
       day: "monday"
     labels:
       - "dependencies"
+    commit-message:
+      prefix: "chore(deps)"
 
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
     patterns: ["*"]
     multi-ecosystem-group: "dependencies"
-    commit-message:
-      prefix: "chore(deps)"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     patterns: ["*"]
     multi-ecosystem-group: "dependencies"
-    commit-message:
-      prefix: "chore(deps)"
 
   - package-ecosystem: "docker"
     directory: "/"
     patterns: ["*"]
     multi-ecosystem-group: "dependencies"
-    commit-message:
-      prefix: "chore(deps)"
