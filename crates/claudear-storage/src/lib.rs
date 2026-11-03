@@ -16,7 +16,7 @@ pub use analytics::{
     classify_error, compute_error_hash, AnalyticsService, TimePeriod, TrendAnalysis, TrendDirection,
 };
 #[cfg(feature = "sqlite")]
-pub use sqlite::SqliteTracker;
+pub use sqlite::{SqliteTracker, VectorIndexRebuilder};
 pub use types::{
     ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
     DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,

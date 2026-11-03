@@ -3635,8 +3635,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     } = cli.command
     {
         let tracker = create_tracker(&config);
-        let warmup = Arc::clone(&tracker);
-        tokio::task::spawn_blocking(move || warmup.rebuild_vector_indexes());
+        let rebuilder = tracker.spawn_vector_index_rebuilder()?;
         let server = if let Some(dir) = dashboard_dir {
             ApiServer::with_dashboard(
                 config,
@@ -3665,6 +3664,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             result = server.start() => result?,
             _ = shutdown => {}
         }
+        rebuilder.stop();
 
         return Ok(());
     }
@@ -3714,7 +3714,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let mode_str = modes.join("+");
 
         let deps = build_watcher_deps(&config, &tracker).await?;
-        tokio::task::spawn_blocking(move || database.rebuild_vector_indexes());
+        let rebuilder = database.spawn_vector_index_rebuilder()?;
         let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
         let sources = deps.sources;
         if sources.is_empty() {
@@ -3911,6 +3911,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             "outcome": summary.outcome.label(),
         }));
         tracker.record_activity(&activity).ok();
+        rebuilder.stop();
 
         return summary.error.map_or(Ok(()), Err);
     }

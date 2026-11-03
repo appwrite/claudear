@@ -17,3 +17,12 @@ pub(crate) enum State {
     },
     Unavailable,
 }
+
+impl State {
+    pub(crate) fn needs_rebuild(&self) -> bool {
+        matches!(
+            self,
+            Self::Unbuilt | Self::Building { .. } | Self::Stale { .. }
+        )
+    }
+}
