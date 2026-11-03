@@ -31,13 +31,10 @@ use std::time::Duration;
 
 const DEFAULT_LOG_DIR: &str = "./logs";
 const AUDIT_LOG_SUBDIR: &str = "audit";
-const QA_VECTOR_TABLE: &str = "qa_question_embeddings";
 const QA_VECTOR_EF_SEARCH: usize = 200;
 const QA_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const ISSUE_VECTOR_TABLE: &str = "issue_embedding_vectors";
 const ISSUE_VECTOR_EF_SEARCH: usize = 200;
 const ISSUE_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const OUTCOME_VECTOR_TABLE: &str = "outcome_embedding_vectors";
 const OUTCOME_VECTOR_EF_SEARCH: usize = 200;
 const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
@@ -401,271 +398,32 @@ impl SqliteTracker {
         Ok(exists.is_some())
     }
 
-    fn ensure_qa_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite extension for Q&A search");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, QA_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=10000, ef_construction=200, M=16)
-            )
-            "#,
-            table = QA_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                let backfill_sql = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, question_embedding
-                    FROM qa_knowledge
-                    WHERE question_embedding IS NOT NULL
-                      AND length(question_embedding) = ?1
-                    "#,
-                    table = QA_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill Q&A vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create Q&A vector table");
-                Ok(false)
-            }
-        }
-    }
-
-    fn upsert_qa_vector_embedding(conn: &Connection, qa_id: i64, embedding: &[f32]) -> Result<()> {
-        if embedding.is_empty() {
-            return Ok(());
-        }
-
-        if !Self::ensure_qa_vector_table(conn, embedding.len())? {
-            return Ok(());
-        }
-
-        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", QA_VECTOR_TABLE);
-        let insert_sql = format!(
-            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-            QA_VECTOR_TABLE
-        );
-
-        conn.execute(&delete_sql, params![qa_id])?;
-        conn.execute(&insert_sql, params![qa_id, vector_blob])?;
-        Ok(())
-    }
-
-    /// Ensure the HNSW vector table for issue embeddings exists.
-    /// Returns `true` if the table is available, `false` if vectorlite is not installed.
-    fn ensure_issue_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite extension for issue embeddings");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, ISSUE_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=10000, ef_construction=200, M=16)
-            )
-            "#,
-            table = ISSUE_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                let backfill_sql = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM issues
-                    WHERE embedding IS NOT NULL
-                      AND length(embedding) = ?1
-                    "#,
-                    table = ISSUE_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill issue vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create issue vector table");
-                Ok(false)
-            }
-        }
-    }
-
-    /// Upsert an issue embedding into the HNSW vector table.
-    fn upsert_issue_vector_embedding(
-        conn: &Connection,
-        issue_emb_id: i64,
-        embedding: &[f32],
-    ) -> Result<()> {
-        if embedding.is_empty() {
-            return Ok(());
-        }
-
-        if !Self::ensure_issue_vector_table(conn, embedding.len())? {
-            return Ok(());
-        }
-
-        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", ISSUE_VECTOR_TABLE);
-        let insert_sql = format!(
-            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-            ISSUE_VECTOR_TABLE
-        );
-
-        conn.execute(&delete_sql, params![issue_emb_id])?;
-        conn.execute(&insert_sql, params![issue_emb_id, vector_blob])?;
-        Ok(())
-    }
-
-    /// Ensure the HNSW vector table for outcome embeddings exists.
-    fn ensure_outcome_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite extension for outcome embeddings");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, OUTCOME_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=10000, ef_construction=200, M=16)
-            )
-            "#,
-            table = OUTCOME_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                let backfill_sql = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM feedback_outcomes
-                    WHERE embedding IS NOT NULL
-                      AND length(embedding) = ?1
-                    "#,
-                    table = OUTCOME_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill outcome vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create outcome vector table");
-                Ok(false)
-            }
-        }
-    }
-
-    /// Upsert an outcome embedding into the HNSW vector table.
-    fn upsert_outcome_vector_embedding(
-        conn: &Connection,
-        outcome_id: i64,
-        embedding: &[f32],
-    ) -> Result<()> {
-        if embedding.is_empty() {
-            return Ok(());
-        }
-
-        if !Self::ensure_outcome_vector_table(conn, embedding.len())? {
-            return Ok(());
-        }
-
-        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", OUTCOME_VECTOR_TABLE);
-        let insert_sql = format!(
-            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-            OUTCOME_VECTOR_TABLE
-        );
-
-        conn.execute(&delete_sql, params![outcome_id])?;
-        conn.execute(&insert_sql, params![outcome_id, vector_blob])?;
-        Ok(())
-    }
-
     fn query_qa_matches_vector_scoped(
-        conn: &Connection,
+        &self,
+        connection: &Connection,
         source: &str,
         repo: Option<&str>,
         question_embedding: &[f32],
         threshold: f64,
         limit: usize,
-        candidate_limit: usize,
     ) -> Result<Option<Vec<QaMatch>>> {
-        if question_embedding.is_empty() || limit == 0 || candidate_limit == 0 {
+        if question_embedding.is_empty() || limit == 0 {
             return Ok(Some(Vec::new()));
         }
 
-        if !Self::ensure_qa_vector_table(conn, question_embedding.len())? {
+        if !self
+            .vector_indexes
+            .qa
+            .prepare_search(connection, question_embedding.len())?
+        {
             return Ok(None);
         }
 
         let query_blob: Vec<u8> = question_embedding
             .iter()
-            .flat_map(|f| f.to_le_bytes())
+            .flat_map(|value| value.to_le_bytes())
             .collect();
+        let candidate_limit = limit.saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER);
 
         let sql = format!(
             r#"
@@ -710,18 +468,18 @@ impl SqliteTracker {
             ORDER BY final_score DESC, answered_at DESC
             LIMIT ?7
             "#,
-            table = QA_VECTOR_TABLE
+            table = self.vector_indexes.qa.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare scoped Q&A vector ranking query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare scoped Q&A vector ranking query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -734,8 +492,8 @@ impl SqliteTracker {
             Self::row_to_qa_match,
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Scoped Q&A vector ranking query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Scoped Q&A vector ranking query failed");
                 return Ok(None);
             }
         };
@@ -743,8 +501,8 @@ impl SqliteTracker {
         let mut matches = Vec::new();
         for row in rows {
             match row {
-                Ok(m) => matches.push(m),
-                Err(e) => tracing::debug!(error = %e, "Failed to read scoped Q&A vector row"),
+                Ok(qa_match) => matches.push(qa_match),
+                Err(error) => tracing::debug!(%error, "Failed to read scoped Q&A vector row"),
             }
         }
 
@@ -752,24 +510,29 @@ impl SqliteTracker {
     }
 
     fn query_qa_matches_vector_global(
-        conn: &Connection,
+        &self,
+        connection: &Connection,
         question_embedding: &[f32],
         threshold: f64,
         limit: usize,
-        candidate_limit: usize,
     ) -> Result<Option<Vec<QaMatch>>> {
-        if question_embedding.is_empty() || limit == 0 || candidate_limit == 0 {
+        if question_embedding.is_empty() || limit == 0 {
             return Ok(Some(Vec::new()));
         }
 
-        if !Self::ensure_qa_vector_table(conn, question_embedding.len())? {
+        if !self
+            .vector_indexes
+            .qa
+            .prepare_search(connection, question_embedding.len())?
+        {
             return Ok(None);
         }
 
         let query_blob: Vec<u8> = question_embedding
             .iter()
-            .flat_map(|f| f.to_le_bytes())
+            .flat_map(|value| value.to_le_bytes())
             .collect();
+        let candidate_limit = limit.saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER);
 
         let sql = format!(
             r#"
@@ -812,18 +575,18 @@ impl SqliteTracker {
             ORDER BY final_score DESC, answered_at DESC
             LIMIT ?5
             "#,
-            table = QA_VECTOR_TABLE
+            table = self.vector_indexes.qa.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare global Q&A vector ranking query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare global Q&A vector ranking query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -834,8 +597,8 @@ impl SqliteTracker {
             Self::row_to_qa_match,
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Global Q&A vector ranking query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Global Q&A vector ranking query failed");
                 return Ok(None);
             }
         };
@@ -843,8 +606,8 @@ impl SqliteTracker {
         let mut matches = Vec::new();
         for row in rows {
             match row {
-                Ok(m) => matches.push(m),
-                Err(e) => tracing::debug!(error = %e, "Failed to read global Q&A vector row"),
+                Ok(qa_match) => matches.push(qa_match),
+                Err(error) => tracing::debug!(%error, "Failed to read global Q&A vector row"),
             }
         }
 
@@ -3516,22 +3279,22 @@ impl EmbeddingStore for SqliteTracker {
 
     /// Store an issue embedding.
     fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
         // Serialize the embedding vector to bytes if present
-        let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|emb| {
-            let mut bytes = Vec::with_capacity(emb.len() * 4);
-            for f in emb {
-                bytes.extend_from_slice(&f.to_le_bytes());
+        let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|values| {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
             }
             bytes
         });
 
-        let updated_at_str = embedding
+        let updated_at = embedding
             .updated_at
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+            .map(|date| date.format("%Y-%m-%d %H:%M:%S").to_string());
 
-        conn.execute(
+        connection.execute(
             r#"
             INSERT INTO issues (source, issue_id, short_id, title, description, url, priority, status, labels, embedding, embedding_model, created_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -3560,20 +3323,19 @@ impl EmbeddingStore for SqliteTracker {
                 embedding_bytes,
                 embedding.embedding_model,
                 embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                updated_at_str,
+                updated_at,
             ],
         )?;
 
-        // Dual-write: upsert into HNSW vector table (get row ID reliably via SELECT)
-        let row_id: i64 = conn.query_row(
+        let row_id: i64 = connection.query_row(
             "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
             params![embedding.source, embedding.issue_id],
             |row| row.get(0),
         )?;
-        if let Some(ref emb) = embedding.embedding {
-            if let Err(e) = Self::upsert_issue_vector_embedding(&conn, row_id, emb) {
-                tracing::debug!(error = %e, "Failed to upsert issue vector embedding");
-            }
+        if let Some(values) = &embedding.embedding {
+            self.vector_indexes
+                .issue
+                .upsert(&connection, row_id, values);
         }
 
         Ok(row_id)
@@ -3587,11 +3349,12 @@ impl EmbeddingStore for SqliteTracker {
         if embeddings.is_empty() {
             return Ok(());
         }
-        let mut conn = self.acquire_lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut vectors: Vec<(i64, &[f32])> = Vec::new();
 
         {
-            let mut stmt = tx.prepare_cached(
+            let mut statement = transaction.prepare_cached(
                 r#"
                 INSERT INTO issues (source, issue_id, short_id, title, description, url, priority, status, labels, embedding, embedding_model, created_at, updated_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -3610,19 +3373,19 @@ impl EmbeddingStore for SqliteTracker {
             )?;
 
             for embedding in embeddings {
-                let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|emb| {
-                    let mut bytes = Vec::with_capacity(emb.len() * 4);
-                    for f in emb {
-                        bytes.extend_from_slice(&f.to_le_bytes());
+                let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|values| {
+                    let mut bytes = Vec::with_capacity(values.len() * 4);
+                    for value in values {
+                        bytes.extend_from_slice(&value.to_le_bytes());
                     }
                     bytes
                 });
 
-                let updated_at_str = embedding
+                let updated_at = embedding
                     .updated_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                    .map(|date| date.format("%Y-%m-%d %H:%M:%S").to_string());
 
-                stmt.execute(params![
+                statement.execute(params![
                     embedding.source,
                     embedding.issue_id,
                     embedding.short_id,
@@ -3635,24 +3398,26 @@ impl EmbeddingStore for SqliteTracker {
                     embedding_bytes,
                     embedding.embedding_model,
                     embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    updated_at_str,
+                    updated_at,
                 ])?;
 
-                // Dual-write: upsert into HNSW vector table
-                let row_id: i64 = tx.query_row(
-                    "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
-                    params![embedding.source, embedding.issue_id],
-                    |row| row.get(0),
-                )?;
-                if let Some(ref emb) = embedding.embedding {
-                    if let Err(e) = Self::upsert_issue_vector_embedding(&tx, row_id, emb) {
-                        tracing::debug!(error = %e, "Failed to upsert issue vector embedding in batch");
-                    }
+                if let Some(values) = &embedding.embedding {
+                    let row_id: i64 = transaction.query_row(
+                        "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
+                        params![embedding.source, embedding.issue_id],
+                        |row| row.get(0),
+                    )?;
+                    vectors.push((row_id, values));
                 }
             }
         }
 
-        tx.commit()?;
+        transaction.commit()?;
+        for (row_id, values) in vectors {
+            self.vector_indexes
+                .issue
+                .upsert(&connection, row_id, values);
+        }
         Ok(())
     }
 
@@ -3759,9 +3524,10 @@ impl EmbeddingStore for SqliteTracker {
             return Ok(Some(Vec::new()));
         }
 
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.issue;
 
-        if !Self::ensure_issue_vector_table(&conn, query_embedding.len())? {
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(None);
         }
 
@@ -3790,18 +3556,18 @@ impl EmbeddingStore for SqliteTracker {
             ORDER BY c.similarity DESC
             LIMIT ?7
             "#,
-            table = ISSUE_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare issue vector search query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare issue vector search query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -3812,14 +3578,14 @@ impl EmbeddingStore for SqliteTracker {
                 limit as i64
             ],
             |row| {
-                let ie = Self::row_to_issue_embedding(row, 9)?;
+                let issue = Self::row_to_issue_embedding(row, 9)?;
                 let similarity: f64 = row.get(8)?;
-                Ok((ie, similarity))
+                Ok((issue, similarity))
             },
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Issue vector search query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Issue vector search query failed");
                 return Ok(None);
             }
         };
@@ -3827,8 +3593,8 @@ impl EmbeddingStore for SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read issue vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read issue vector row"),
             }
         }
 
@@ -3849,9 +3615,10 @@ impl EmbeddingStore for SqliteTracker {
             return Ok(Some(Vec::new()));
         }
 
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.outcome;
 
-        if !Self::ensure_outcome_vector_table(&conn, query_embedding.len())? {
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(None);
         }
 
@@ -3878,18 +3645,18 @@ impl EmbeddingStore for SqliteTracker {
             ORDER BY c.similarity DESC
             LIMIT ?5
             "#,
-            table = OUTCOME_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare outcome vector search query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare outcome vector search query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -3898,9 +3665,9 @@ impl EmbeddingStore for SqliteTracker {
                 limit as i64
             ],
             |row| {
-                let outcome_str: String = row.get(6)?;
-                let keywords_str: Option<String> = row.get(9)?;
-                let created_at_str: String = row.get(10)?;
+                let outcome: String = row.get(6)?;
+                let keywords: Option<String> = row.get(9)?;
+                let created_at: String = row.get(10)?;
 
                 // Deserialize embedding BLOB if present
                 let embedding_blob: Option<Vec<u8>> = row.get(11)?;
@@ -3917,29 +3684,29 @@ impl EmbeddingStore for SqliteTracker {
                     )
                 });
 
-                let fo = FixOutcome {
+                let fix_outcome = FixOutcome {
                     id: row.get(0)?,
                     attempt_id: row.get(1)?,
                     source: row.get(2)?,
                     issue_id: row.get(3)?,
                     issue_text: row.get(4)?,
                     prompt_used: row.get(5)?,
-                    outcome: Outcome::parse(&outcome_str).unwrap_or(Outcome::Failed),
+                    outcome: Outcome::parse(&outcome).unwrap_or(Outcome::Failed),
                     error_type: row.get(7)?,
                     learnings: row.get(8)?,
-                    keywords: keywords_str
-                        .and_then(|s| serde_json::from_str(&s).ok())
+                    keywords: keywords
+                        .and_then(|keywords| serde_json::from_str(&keywords).ok())
                         .unwrap_or_default(),
                     embedding,
-                    created_at: Self::parse_datetime(&created_at_str)?,
+                    created_at: Self::parse_datetime(&created_at)?,
                 };
                 let similarity: f64 = row.get(12)?;
-                Ok((fo, similarity))
+                Ok((fix_outcome, similarity))
             },
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Outcome vector search query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Outcome vector search query failed");
                 return Ok(None);
             }
         };
@@ -3947,8 +3714,8 @@ impl EmbeddingStore for SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read outcome vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read outcome vector row"),
             }
         }
 
@@ -5729,16 +5496,18 @@ impl SqliteTracker {
 
     /// Store a feedback outcome to the database.
     pub fn store_feedback_outcome(&self, outcome: &FixOutcome) -> Result<i64> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         let keywords_json = serde_json::to_string(&outcome.keywords).unwrap_or_default();
 
         // Serialize embedding to BLOB if present
-        let embedding_blob: Option<Vec<u8>> = outcome
-            .embedding
-            .as_ref()
-            .map(|emb| emb.iter().flat_map(|f| f.to_le_bytes()).collect());
+        let embedding_blob: Option<Vec<u8>> = outcome.embedding.as_ref().map(|values| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        });
 
-        conn.execute(
+        connection.execute(
             r#"
             INSERT INTO feedback_outcomes (attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at, embedding)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -5757,13 +5526,12 @@ impl SqliteTracker {
                 embedding_blob,
             ],
         )?;
-        let row_id = conn.last_insert_rowid();
+        let row_id = connection.last_insert_rowid();
 
-        // Dual-write: upsert into HNSW vector table if embedding is present
-        if let Some(ref emb) = outcome.embedding {
-            if let Err(e) = Self::upsert_outcome_vector_embedding(&conn, row_id, emb) {
-                tracing::debug!(error = %e, "Failed to upsert outcome vector embedding");
-            }
+        if let Some(values) = &outcome.embedding {
+            self.vector_indexes
+                .outcome
+                .upsert(&connection, row_id, values);
         }
 
         Ok(row_id)
@@ -5829,9 +5597,9 @@ impl SqliteTracker {
 
     /// Store a Q&A knowledge entry.
     pub fn store_qa_knowledge(&self, entry: &QaKnowledgeEntry) -> Result<i64> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
-        conn.execute(
+        connection.execute(
             r#"
             INSERT INTO qa_knowledge (
                 source, repo, issue_id, short_id, question_text, question_norm, question_embedding,
@@ -5859,21 +5627,17 @@ impl SqliteTracker {
                 entry.failure_count,
                 entry
                     .last_used_at
-                    .map(|v| v.format("%Y-%m-%d %H:%M:%S").to_string()),
-                entry.metadata.as_ref().map(|m| m.to_string()),
+                    .map(|date| date.format("%Y-%m-%d %H:%M:%S").to_string()),
+                entry.metadata.as_ref().map(|metadata| metadata.to_string()),
             ],
         )?;
 
-        let qa_id = conn.last_insert_rowid();
+        let qa_id = connection.last_insert_rowid();
 
         if let Some(question_embedding) = entry.question_embedding.as_deref() {
-            if let Err(e) = Self::upsert_qa_vector_embedding(&conn, qa_id, question_embedding) {
-                tracing::debug!(
-                    qa_id = qa_id,
-                    error = %e,
-                    "Failed to sync Q&A vector embedding; falling back to SQL ranking"
-                );
-            }
+            self.vector_indexes
+                .qa
+                .upsert(&connection, qa_id, question_embedding);
         }
 
         Ok(qa_id)
@@ -5889,20 +5653,16 @@ impl SqliteTracker {
         threshold: f64,
         limit: usize,
     ) -> Result<Vec<QaMatch>> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
         if let Some(query_embedding) = question_embedding {
-            let candidate_limit = limit
-                .saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER)
-                .max(limit);
-            if let Some(vector_matches) = Self::query_qa_matches_vector_scoped(
-                &conn,
+            if let Some(vector_matches) = self.query_qa_matches_vector_scoped(
+                &connection,
                 source,
                 repo,
                 query_embedding,
                 threshold,
                 limit,
-                candidate_limit,
             )? {
                 if !vector_matches.is_empty() {
                     return Ok(vector_matches);
@@ -5910,7 +5670,14 @@ impl SqliteTracker {
             }
         }
 
-        Self::query_qa_matches_exact_scoped(&conn, source, repo, question_norm, threshold, limit)
+        Self::query_qa_matches_exact_scoped(
+            &connection,
+            source,
+            repo,
+            question_norm,
+            threshold,
+            limit,
+        )
     }
 
     /// Find semantically similar Q&A entries globally.
@@ -5921,26 +5688,19 @@ impl SqliteTracker {
         threshold: f64,
         limit: usize,
     ) -> Result<Vec<QaMatch>> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
         if let Some(query_embedding) = question_embedding {
-            let candidate_limit = limit
-                .saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER)
-                .max(limit);
-            if let Some(vector_matches) = Self::query_qa_matches_vector_global(
-                &conn,
-                query_embedding,
-                threshold,
-                limit,
-                candidate_limit,
-            )? {
+            if let Some(vector_matches) =
+                self.query_qa_matches_vector_global(&connection, query_embedding, threshold, limit)?
+            {
                 if !vector_matches.is_empty() {
                     return Ok(vector_matches);
                 }
             }
         }
 
-        Self::query_qa_matches_exact_global(&conn, question_norm, threshold, limit)
+        Self::query_qa_matches_exact_global(&connection, question_norm, threshold, limit)
     }
 
     /// Record usage of a Q&A entry for an attempt.
