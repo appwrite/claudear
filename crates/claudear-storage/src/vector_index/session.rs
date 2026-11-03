@@ -1,13 +1,15 @@
+use super::signal::Signal;
 use crate::vectorlite::{is_vectorlite_available, try_load_vectorlite};
 use claudear_core::error::Result;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) struct Session {
     extension: OnceLock<bool>,
     schema_version: AtomicI64,
     generation: AtomicU64,
+    signal: Arc<Signal>,
 }
 
 impl Session {
@@ -16,6 +18,7 @@ impl Session {
             extension: OnceLock::new(),
             schema_version: AtomicI64::new(i64::MIN),
             generation: AtomicU64::new(0),
+            signal: Arc::default(),
         }
     }
 
@@ -23,6 +26,10 @@ impl Session {
         *self
             .extension
             .get_or_init(|| Self::attempt_load(connection))
+    }
+
+    pub(crate) fn signal(&self) -> &Arc<Signal> {
+        &self.signal
     }
 
     pub(crate) fn generation(&self, connection: &Connection) -> Result<u64> {

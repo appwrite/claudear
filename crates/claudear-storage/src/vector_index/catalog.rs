@@ -1,5 +1,6 @@
 use super::definition::Definition;
 use super::session::Session;
+use super::signal::Signal;
 use super::VectorIndex;
 use rusqlite::Connection;
 use std::sync::Arc;
@@ -33,6 +34,14 @@ impl Catalog {
         self.session.load_extension(connection)
     }
 
+    pub(crate) fn signal(&self) -> Arc<Signal> {
+        Arc::clone(self.session.signal())
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.session.signal().is_stopped()
+    }
+
     pub(crate) fn all(&self) -> [&VectorIndex; 5] {
         [
             &self.qa,
@@ -46,5 +55,11 @@ impl Catalog {
     #[cfg(test)]
     pub(crate) fn session(&self) -> &Arc<Session> {
         &self.session
+    }
+}
+
+impl Drop for Catalog {
+    fn drop(&mut self) {
+        self.session.signal().stop();
     }
 }

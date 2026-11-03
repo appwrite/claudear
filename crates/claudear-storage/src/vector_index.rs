@@ -7,6 +7,7 @@ pub(crate) mod definition;
 pub(crate) mod lookup;
 pub(crate) mod progress;
 pub(crate) mod session;
+pub(crate) mod signal;
 pub(crate) mod state;
 
 use access::Access;
@@ -19,8 +20,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 use session::Session;
 use state::State;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 pub(crate) const REBUILD_BATCH_SIZE: usize = 256;
+
+/// Catches schema changes no write or search on this connection noticed, such as another
+/// process dropping a vector table.
+pub(crate) const REBUILD_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Upper bound on an embedding dimension, so malformed data cannot generate unbounded DDL.
 /// Covers all common embedding models (up to 8192 dimensions).
@@ -82,13 +88,14 @@ impl VectorIndex {
             return Ok(false);
         }
         validate_dimension(dimension)?;
-        let mut state = self.lock();
-        self.refresh(&mut state, connection)?;
-        if !self.ensure(&mut state, connection, dimension, Access::Read)? {
-            return Ok(false);
-        }
-        self.advance(&mut state, connection, REBUILD_BATCH_SIZE)?;
-        Ok(true)
+        self.transition(|state| {
+            self.refresh(state, connection)?;
+            if !self.ensure(state, connection, dimension, Access::Read)? {
+                return Ok(false);
+            }
+            self.advance(state, connection, REBUILD_BATCH_SIZE)?;
+            Ok(true)
+        })
     }
 
     pub(crate) fn upsert(&self, connection: &Connection, rowid: i64, embedding: &[f32]) {
@@ -99,49 +106,51 @@ impl VectorIndex {
             tracing::warn!(table = self.table(), rowid, %error, "Skipped indexing a vector with an unsupported dimension");
             return;
         }
-        let mut state = self.lock();
-        if let Err(error) = self.refresh(&mut state, connection) {
-            tracing::warn!(table = self.table(), rowid, %error, "Failed to check the vector index generation; rebuilding on next use");
-            Self::invalidate(&mut state);
-            return;
-        }
-        match self.ensure(&mut state, connection, embedding.len(), Access::Write) {
-            Ok(true) => {}
-            Ok(false) => return,
-            Err(error) => {
-                tracing::warn!(table = self.table(), rowid, %error, "Failed to prepare the vector index; rebuilding on next use");
-                Self::invalidate(&mut state);
+        self.transition(|state| {
+            if let Err(error) = self.refresh(state, connection) {
+                tracing::warn!(table = self.table(), rowid, %error, "Failed to check the vector index generation; rebuilding it in the background");
+                Self::invalidate(state);
                 return;
             }
-        }
-        if let Err(error) = self.write(connection, rowid, &embedding_blob(embedding)) {
-            tracing::warn!(table = self.table(), rowid, %error, "Failed to write vector; rebuilding the index on next use");
-            *state = State::Stale {
-                dimension: embedding.len(),
-            };
-        }
+            match self.ensure(state, connection, embedding.len(), Access::Write) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    tracing::warn!(table = self.table(), rowid, %error, "Failed to prepare the vector index; rebuilding it in the background");
+                    Self::invalidate(state);
+                    return;
+                }
+            }
+            if let Err(error) = self.write(connection, rowid, &embedding_blob(embedding)) {
+                tracing::warn!(table = self.table(), rowid, %error, "Failed to write vector; rebuilding the index in the background");
+                *state = State::Stale {
+                    dimension: embedding.len(),
+                };
+            }
+        });
     }
 
     pub(crate) fn remove(&self, connection: &Connection, rowids: &[i64]) {
         if rowids.is_empty() {
             return;
         }
-        let mut state = self.lock();
-        if let Err(error) = self.refresh(&mut state, connection) {
-            tracing::warn!(table = self.table(), %error, "Failed to check the vector index generation; rebuilding on next use");
-            Self::invalidate(&mut state);
-            return;
-        }
-        let dimension = match *state {
-            State::Unbuilt | State::Unavailable => return,
-            State::Building { dimension, .. }
-            | State::Built { dimension, .. }
-            | State::Stale { dimension } => dimension,
-        };
-        if let Err(error) = self.delete(connection, rowids) {
-            tracing::warn!(table = self.table(), %error, "Failed to remove vectors; rebuilding the index on next use");
-            *state = State::Stale { dimension };
-        }
+        self.transition(|state| {
+            if let Err(error) = self.refresh(state, connection) {
+                tracing::warn!(table = self.table(), %error, "Failed to check the vector index generation; rebuilding it in the background");
+                Self::invalidate(state);
+                return;
+            }
+            let dimension = match *state {
+                State::Unbuilt | State::Unavailable => return,
+                State::Building { dimension, .. }
+                | State::Built { dimension, .. }
+                | State::Stale { dimension } => dimension,
+            };
+            if let Err(error) = self.delete(connection, rowids) {
+                tracing::warn!(table = self.table(), %error, "Failed to remove vectors; rebuilding the index in the background");
+                *state = State::Stale { dimension };
+            }
+        });
     }
 
     pub(crate) fn rebuild_step(
@@ -153,7 +162,7 @@ impl VectorIndex {
         self.refresh(&mut state, connection)?;
         match *state {
             State::Unavailable => return Ok(Progress::Unavailable),
-            State::Built { .. } => return Ok(Progress::Complete { rows: 0 }),
+            State::Built { .. } => return Ok(Progress::Current),
             State::Building { .. } => {}
             State::Unbuilt | State::Stale { .. } => {
                 let Some(length) = self.newest_length(connection)? else {
@@ -178,21 +187,35 @@ impl VectorIndex {
     }
 
     pub(crate) fn reset(&self, connection: &Connection) {
-        let mut state = self.lock();
-        if let Err(error) = self.refresh(&mut state, connection) {
-            tracing::warn!(table = self.table(), %error, "Failed to check the vector index generation before reset");
-            Self::invalidate(&mut state);
-        }
-        if matches!(*state, State::Unbuilt | State::Unavailable) {
-            return;
-        }
-        if let Err(error) = self.drop_table(&mut state, connection) {
-            tracing::warn!(table = self.table(), %error, "Failed to record the vector index reset");
-        }
+        self.transition(|state| {
+            if let Err(error) = self.refresh(state, connection) {
+                tracing::warn!(table = self.table(), %error, "Failed to check the vector index generation before reset");
+                Self::invalidate(state);
+            }
+            if matches!(*state, State::Unbuilt | State::Unavailable) {
+                return;
+            }
+            if let Err(error) = self.drop_table(state, connection) {
+                tracing::warn!(table = self.table(), %error, "Failed to record the vector index reset");
+            }
+        });
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Runs `operation` on the locked state and wakes the background rebuilder when it leaves
+    /// the index needing a rebuild. `rebuild_step` locks directly instead, so the rebuilder
+    /// never wakes itself into a retry loop over a failing table.
+    fn transition<T>(&self, operation: impl FnOnce(&mut State) -> T) -> T {
+        let mut state = self.lock();
+        let before = *state;
+        let outcome = operation(&mut state);
+        if *state != before && state.needs_rebuild() {
+            self.session.signal().raise();
+        }
+        outcome
     }
 
     fn refresh(&self, state: &mut State, connection: &Connection) -> Result<()> {
@@ -212,7 +235,8 @@ impl VectorIndex {
 
     /// Makes the table ready to hold `dimension` vectors, running at most one drop and create
     /// and never indexing rows: only searches and `rebuild_step` advance a rebuild, so a save
-    /// that writes many rows under the connection lock does bounded work per row.
+    /// that writes many rows under the connection lock does bounded work per row while the
+    /// background rebuilder it wakes catches the index up.
     fn ensure(
         &self,
         state: &mut State,
@@ -747,7 +771,7 @@ mod tests {
         assert!(matches!(state(&index), State::Built { dimension: 4, .. }));
         assert_eq!(
             index.rebuild_step(&connection, 2).unwrap(),
-            Progress::Complete { rows: 0 }
+            Progress::Current
         );
     }
 
@@ -889,6 +913,50 @@ mod tests {
         assert!(index.prepare_search(&connection, 4).unwrap());
         assert!(declared(&connection, TABLE).capacity >= 10);
         assert!((1..=5).all(|rowid| vector_exists(&connection, TABLE, rowid)));
+    }
+
+    #[test]
+    fn test_vector_index_raises_the_rebuild_signal_only_outside_rebuild_steps() {
+        let connection = Connection::open_in_memory().unwrap();
+        if !require_vectorlite_for_tests(&connection) {
+            return;
+        }
+        create_source(&connection, SOURCE);
+        let index = index();
+        let signal = Arc::clone(index.session.signal());
+        for rowid in 1..=5 {
+            insert_source(&connection, SOURCE, rowid, &embedding(rowid, 4));
+            index.upsert(&connection, rowid, &embedding(rowid, 4));
+        }
+        assert_eq!(state(&index), State::Stale { dimension: 4 });
+        assert!(signal.is_raised(), "an overflow must wake the rebuilder");
+        signal.wait(Duration::ZERO);
+
+        rebuild(&index, &connection);
+        assert!(matches!(state(&index), State::Built { .. }));
+        assert!(
+            !signal.is_raised(),
+            "rebuild steps must never wake the rebuilder that runs them"
+        );
+
+        insert_source(&connection, SOURCE, 6, &embedding(6, 4));
+        index.upsert(&connection, 6, &embedding(6, 4));
+        assert!(matches!(state(&index), State::Built { .. }));
+        assert!(
+            !signal.is_raised(),
+            "a write into a built index must not wake the rebuilder"
+        );
+
+        connection
+            .execute_batch(&format!("DROP TABLE {TABLE}"))
+            .unwrap();
+        insert_source(&connection, SOURCE, 7, &embedding(7, 4));
+        index.upsert(&connection, 7, &embedding(7, 4));
+        assert!(matches!(state(&index), State::Building { cursor: 0, .. }));
+        assert!(
+            signal.is_raised(),
+            "a write that recreates the index empty must wake the rebuilder"
+        );
     }
 
     #[test]

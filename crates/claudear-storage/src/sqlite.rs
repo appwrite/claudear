@@ -33,6 +33,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+mod vector_index_rebuilder;
+
+pub use vector_index_rebuilder::VectorIndexRebuilder;
+
 const DEFAULT_LOG_DIR: &str = "./logs";
 const AUDIT_LOG_SUBDIR: &str = "audit";
 const QA_VECTOR_EF_SEARCH: usize = 200;
@@ -161,6 +165,9 @@ impl SqliteTracker {
             let mut batches: usize = 0;
             let mut rows: usize = 0;
             loop {
+                if self.vector_indexes.is_stopped() {
+                    return;
+                }
                 let connection = match self.acquire_lock() {
                     Ok(connection) => connection,
                     Err(error) => {
@@ -209,6 +216,7 @@ impl SqliteTracker {
                         );
                         break;
                     }
+                    Ok(Progress::Current) => break,
                     Err(error) => {
                         tracing::warn!(
                             table = index.table(),
