@@ -927,6 +927,7 @@ dependencies = [
  "rayon",
  "regex-lite",
  "reqwest 0.13.5",
+ "rusqlite",
  "semver",
  "serde",
  "serde_json",

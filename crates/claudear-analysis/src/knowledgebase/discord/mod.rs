@@ -239,18 +239,19 @@ impl DiscordIndexer {
                     .collect();
 
                 let model_name = self.embedding_client.model();
-                self.tracker
-                    .save_discord_chunk_embeddings(&pairs, model_name)?;
+                if let Err(error) = self
+                    .tracker
+                    .save_discord_chunk_embeddings(&pairs, model_name)
+                {
+                    self.discard_chunks(&chunk_ids);
+                    chunks.clear();
+                    return Err(error);
+                }
                 tracing::debug!(embeddings = pairs.len(), "Saved Discord chunk embeddings");
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to embed Discord chunks");
-                if let Err(del_err) = self
-                    .tracker
-                    .delete_discord_message_chunks_by_ids(&chunk_ids)
-                {
-                    tracing::warn!(error = %del_err, "Failed to delete unembedded Discord chunks");
-                }
+                self.discard_chunks(&chunk_ids);
                 // Propagate the failure so callers don't advance their cursor past
                 // these messages — otherwise a transient embedding outage would
                 // permanently skip them (the chunks were just deleted).
@@ -261,6 +262,12 @@ impl DiscordIndexer {
 
         chunks.clear();
         Ok(())
+    }
+
+    fn discard_chunks(&self, chunk_ids: &[i64]) {
+        if let Err(delete_error) = self.tracker.delete_discord_message_chunks_by_ids(chunk_ids) {
+            tracing::warn!(%delete_error, "Failed to delete Discord chunks without embeddings");
+        }
     }
 
     fn more_than_10_minutes_apart(ts1: &str, ts2: &str) -> bool {
@@ -582,6 +589,49 @@ mod tests {
         let stats2 = indexer.index("chan1", false, inputs).await.unwrap();
         assert_eq!(stats2.messages_processed, 0);
         assert_eq!(stats2.messages_skipped, 3);
+    }
+
+    #[tokio::test]
+    async fn test_index_deletes_chunks_when_embeddings_fail_to_save() {
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("tracker.db");
+        let tracker: Arc<dyn FixAttemptTracker> =
+            Arc::new(claudear_storage::SqliteTracker::new(&database_path).unwrap());
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER abort_embeddings BEFORE INSERT ON discord_message_chunk_embeddings \
+                 BEGIN SELECT RAISE(ABORT, 'forced embedding failure'); END",
+            )
+            .unwrap();
+        let indexer = DiscordIndexer::new(tracker, embedding_client);
+        let inputs = vec![
+            input("1", "alice", "2024-01-01T10:00:00Z"),
+            input("2", "bob", "2024-01-01T10:05:00Z"),
+        ];
+
+        let result = indexer.index("chan1", false, inputs).await;
+        assert!(
+            result.is_err(),
+            "A failed embedding save must fail the index run"
+        );
+
+        let orphans: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM discord_message_chunks c \
+                 LEFT JOIN discord_message_chunk_embeddings e ON e.chunk_id = c.id \
+                 WHERE e.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphans, 0,
+            "Chunks whose embeddings failed to save must be deleted"
+        );
     }
 
     #[tokio::test]
