@@ -62,13 +62,15 @@ impl VectorIndex {
     pub(crate) fn prepare_search(&self, connection: &Connection, dimension: usize) -> Result<bool> {
         let mut state = self.lock();
         self.refresh(&mut state, connection)?;
-        self.ensure(
-            &mut state,
-            connection,
-            dimension,
-            Access::Read,
-            REBUILD_BATCH_SIZE,
-        )
+        Ok(self
+            .ensure(
+                &mut state,
+                connection,
+                dimension,
+                Access::Read,
+                REBUILD_BATCH_SIZE,
+            )?
+            .is_some())
     }
 
     pub(crate) fn upsert(&self, connection: &Connection, rowid: i64, embedding: &[f32]) {
@@ -85,8 +87,8 @@ impl VectorIndex {
             Access::Write,
             REBUILD_BATCH_SIZE,
         ) {
-            Ok(true) => {}
-            Ok(false) => return,
+            Ok(Some(_)) => {}
+            Ok(None) => return,
             Err(error) => {
                 tracing::warn!(table = self.table(), rowid, %error, "Failed to prepare the vector index; rebuilding on next use");
                 Self::invalidate(&mut state);
@@ -131,14 +133,14 @@ impl VectorIndex {
         let mut state = self.lock();
         self.refresh(&mut state, connection)?;
         match *state {
-            State::Unavailable | State::Built { .. } => Ok(Progress::Complete),
+            State::Unavailable | State::Built { .. } => Ok(Progress::Complete { rows: 0 }),
             State::Building { .. } => {
-                self.advance(&mut state, connection, batch_size)?;
-                Ok(Self::progress(&state))
+                let rows = self.advance(&mut state, connection, batch_size)?;
+                Ok(Self::progress(&state, rows))
             }
             State::Unbuilt | State::Stale { .. } => {
                 let Some(length) = self.newest_length(connection)? else {
-                    return Ok(Progress::Complete);
+                    return Ok(Progress::Complete { rows: 0 });
                 };
                 let Some(dimension) = Self::dimension_of(length) else {
                     tracing::warn!(
@@ -146,12 +148,11 @@ impl VectorIndex {
                         length,
                         "Newest embedding has a length that is not a whole number of float32 components; skipping rebuild"
                     );
-                    return Ok(Progress::Complete);
+                    return Ok(Progress::Complete { rows: 0 });
                 };
-                if self.ensure(&mut state, connection, dimension, Access::Write, batch_size)? {
-                    Ok(Self::progress(&state))
-                } else {
-                    Ok(Progress::Complete)
+                match self.ensure(&mut state, connection, dimension, Access::Write, batch_size)? {
+                    Some(rows) => Ok(Self::progress(&state, rows)),
+                    None => Ok(Progress::Complete { rows: 0 }),
                 }
             }
         }
@@ -197,26 +198,25 @@ impl VectorIndex {
         dimension: usize,
         access: Access,
         batch_size: usize,
-    ) -> Result<bool> {
+    ) -> Result<Option<usize>> {
         if dimension == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         validate_dimension(dimension)?;
         if !self.session.load_extension(connection) {
             *state = State::Unavailable;
-            return Ok(false);
+            return Ok(None);
         }
         match *state {
-            State::Unavailable => return Ok(false),
+            State::Unavailable => return Ok(None),
             State::Built {
                 dimension: built, ..
-            } if built == dimension => return Ok(true),
+            } if built == dimension => return Ok(Some(0)),
             State::Building {
                 dimension: building,
                 ..
             } if building == dimension => {
-                self.advance(state, connection, batch_size)?;
-                return Ok(true);
+                return Ok(Some(self.advance(state, connection, batch_size)?));
             }
             _ => {}
         }
@@ -228,12 +228,12 @@ impl VectorIndex {
                 "Table name is taken by something other than a vectorlite table; vector search is disabled for it"
             );
             *state = State::Unavailable;
-            return Ok(false);
+            return Ok(None);
         }
         if access == Access::Read
             && self.authoritative_dimension(state, lookup, connection)? != Some(dimension)
         {
-            return Ok(false);
+            return Ok(None);
         }
 
         let required = self
@@ -251,7 +251,7 @@ impl VectorIndex {
             }
             Lookup::Absent => {
                 if !self.create_table(state, connection, dimension, required)? {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 required
             }
@@ -259,7 +259,7 @@ impl VectorIndex {
                 if !self.drop_table(state, connection)?
                     || !self.create_table(state, connection, dimension, required)?
                 {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 required
             }
@@ -271,8 +271,7 @@ impl VectorIndex {
             cursor: 0,
             generation: self.session.generation(connection)?,
         };
-        self.advance(state, connection, batch_size)?;
-        Ok(true)
+        Ok(Some(self.advance(state, connection, batch_size)?))
     }
 
     fn authoritative_dimension(
@@ -330,7 +329,12 @@ impl VectorIndex {
         Ok(true)
     }
 
-    fn advance(&self, state: &mut State, connection: &Connection, batch_size: usize) -> Result<()> {
+    fn advance(
+        &self,
+        state: &mut State,
+        connection: &Connection,
+        batch_size: usize,
+    ) -> Result<usize> {
         let State::Building {
             dimension,
             capacity,
@@ -338,7 +342,7 @@ impl VectorIndex {
             generation,
         } = *state
         else {
-            return Ok(());
+            return Ok(0);
         };
         let limit = batch_size.max(1);
         let Definition {
@@ -384,7 +388,7 @@ impl VectorIndex {
                 generation,
             }
         };
-        Ok(())
+        Ok(rows.len())
     }
 
     fn write(&self, connection: &Connection, rowid: i64, blob: &[u8]) -> rusqlite::Result<()> {
@@ -459,10 +463,10 @@ impl VectorIndex {
             .collect()
     }
 
-    fn progress(state: &State) -> Progress {
+    fn progress(state: &State, rows: usize) -> Progress {
         match state {
-            State::Building { .. } => Progress::Pending,
-            _ => Progress::Complete,
+            State::Building { .. } => Progress::Pending { rows },
+            _ => Progress::Complete { rows },
         }
     }
 }
@@ -587,7 +591,10 @@ mod tests {
     }
 
     fn rebuild(index: &VectorIndex, connection: &Connection) {
-        while index.rebuild_step(connection, REBUILD_BATCH_SIZE).unwrap() == Progress::Pending {}
+        while matches!(
+            index.rebuild_step(connection, REBUILD_BATCH_SIZE).unwrap(),
+            Progress::Pending { .. }
+        ) {}
     }
 
     fn create_raw(connection: &Connection, table: &str, dimension: usize, capacity: usize) {
@@ -650,7 +657,7 @@ mod tests {
 
         assert_eq!(
             index.rebuild_step(&connection, 2).unwrap(),
-            Progress::Complete
+            Progress::Complete { rows: 0 }
         );
         assert_eq!(state(&index), State::Unavailable);
         let attempted = index.session.extension();
@@ -658,7 +665,7 @@ mod tests {
 
         assert_eq!(
             index.rebuild_step(&connection, 2).unwrap(),
-            Progress::Complete
+            Progress::Complete { rows: 0 }
         );
         assert_eq!(state(&index), State::Unavailable);
         assert_eq!(index.session.extension(), attempted);
@@ -711,9 +718,9 @@ mod tests {
         let index = index();
 
         for (expected, indexed) in [
-            (Progress::Pending, 2),
-            (Progress::Pending, 4),
-            (Progress::Complete, 5),
+            (Progress::Pending { rows: 2 }, 2),
+            (Progress::Pending { rows: 2 }, 4),
+            (Progress::Complete { rows: 1 }, 5),
         ] {
             assert_eq!(index.rebuild_step(&connection, 2).unwrap(), expected);
             for rowid in 1..=5 {
@@ -727,7 +734,7 @@ mod tests {
         assert!(matches!(state(&index), State::Built { dimension: 4, .. }));
         assert_eq!(
             index.rebuild_step(&connection, 2).unwrap(),
-            Progress::Complete
+            Progress::Complete { rows: 0 }
         );
     }
 
@@ -995,7 +1002,7 @@ mod tests {
 
         assert_eq!(
             index.rebuild_step(&connection, 2).unwrap(),
-            Progress::Complete
+            Progress::Complete { rows: 0 }
         );
         assert_eq!(state(&index), State::Unbuilt);
         assert!(master_sql(&connection, TABLE).is_none());

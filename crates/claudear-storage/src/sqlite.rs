@@ -152,6 +152,7 @@ impl SqliteTracker {
         for index in self.vector_indexes.all() {
             let started = Instant::now();
             let mut batches: usize = 0;
+            let mut rows: usize = 0;
             loop {
                 let connection = match self.acquire_lock() {
                     Ok(connection) => connection,
@@ -164,10 +165,15 @@ impl SqliteTracker {
                 drop(connection);
                 batches += 1;
                 match step {
-                    Ok(Progress::Pending) => std::thread::yield_now(),
-                    Ok(Progress::Complete) => {
+                    Ok(Progress::Pending { rows: batch }) => {
+                        rows += batch;
+                        std::thread::yield_now();
+                    }
+                    Ok(Progress::Complete { rows: batch }) => {
+                        rows += batch;
                         tracing::info!(
                             table = index.table(),
+                            rows,
                             batches,
                             batch_size = REBUILD_BATCH_SIZE,
                             elapsed = ?started.elapsed(),
@@ -178,6 +184,7 @@ impl SqliteTracker {
                     Err(error) => {
                         tracing::warn!(
                             table = index.table(),
+                            rows,
                             batches,
                             elapsed = ?started.elapsed(),
                             %error,

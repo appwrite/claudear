@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Progress {
-    Pending,
-    Complete,
+    Pending { rows: usize },
+    Complete { rows: usize },
 }
