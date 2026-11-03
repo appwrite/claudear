@@ -85,3 +85,28 @@ pub fn try_load_vectorlite(conn: &Connection) -> Result<bool> {
 pub fn is_vectorlite_available(conn: &Connection) -> bool {
     conn.execute_batch("SELECT vectorlite_info()").is_ok()
 }
+
+/// Load vectorlite from `CLAUDEAR_VECTORLITE_PATH` for a test that needs it.
+///
+/// Returns `false` (and prints a skip line) when the variable is unset, so the
+/// test can return early. Panics when the variable is set but the extension
+/// cannot be loaded, so a broken setup never passes as a skip.
+#[cfg(test)]
+pub(crate) fn require_vectorlite_for_tests(connection: &Connection) -> bool {
+    const PATH_VARIABLE: &str = "CLAUDEAR_VECTORLITE_PATH";
+
+    let Some(path) = std::env::var(PATH_VARIABLE)
+        .ok()
+        .filter(|path| !path.is_empty())
+    else {
+        eprintln!("skipping: {PATH_VARIABLE} is not set, so vectorlite is unavailable");
+        return false;
+    };
+    if is_vectorlite_available(connection) {
+        return true;
+    }
+    if let Err(error) = load_vectorlite_extension(connection, Path::new(&path)) {
+        panic!("{PATH_VARIABLE}={path} is set but vectorlite failed to load: {error}");
+    }
+    true
+}
