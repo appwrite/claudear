@@ -6630,8 +6630,8 @@ impl SqliteTracker {
     /// Start indexing progress tracking.
     pub fn start_indexing_progress(&self, total_repos: usize) -> Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let conn = self.acquire_lock()?;
-        conn.execute(
+        let connection = self.acquire_lock()?;
+        connection.execute(
             r#"
             UPDATE indexing_progress SET
                 status = 'running',
@@ -6646,7 +6646,7 @@ impl SqliteTracker {
             "#,
             params![total_repos as i64, &now],
         )?;
-        drop(conn);
+        drop(connection);
         let new_value = IndexingProgress {
             status: "running".to_string(),
             total_repos,
@@ -6674,15 +6674,15 @@ impl SqliteTracker {
         total_files_indexed: usize,
     ) -> Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         // Read total_repos and started_at from DB (avoid borrowing the watch channel
-        // while the conn lock is held).
-        let (db_total_repos, db_started_at): (i64, Option<String>) = conn.query_row(
+        // while the connection lock is held).
+        let (db_total_repos, db_started_at): (i64, Option<String>) = connection.query_row(
             "SELECT total_repos, started_at FROM indexing_progress WHERE id = 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        conn.execute(
+        connection.execute(
             r#"
             UPDATE indexing_progress SET
                 indexed_repos = ?1,
@@ -6700,7 +6700,7 @@ impl SqliteTracker {
                 &now,
             ],
         )?;
-        drop(conn);
+        drop(connection);
         let new_value = IndexingProgress {
             status: "running".to_string(),
             total_repos: db_total_repos as usize,
@@ -6725,15 +6725,15 @@ impl SqliteTracker {
     /// Mark indexing as complete.
     pub fn finish_indexing_progress(&self) -> Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         // Read values from DB before the UPDATE (avoid borrowing the watch channel
-        // while the conn lock is held).
-        let db_total_repos: i64 = conn.query_row(
+        // while the connection lock is held).
+        let db_total_repos: i64 = connection.query_row(
             "SELECT total_repos FROM indexing_progress WHERE id = 1",
             [],
             |row| row.get(0),
         )?;
-        conn.execute(
+        connection.execute(
             r#"
             UPDATE indexing_progress SET
                 status = 'idle',
@@ -6747,7 +6747,7 @@ impl SqliteTracker {
             "#,
             params![&now],
         )?;
-        drop(conn);
+        drop(connection);
         let new_value = IndexingProgress {
             status: "idle".to_string(),
             total_repos: db_total_repos as usize,
@@ -12134,8 +12134,8 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init - verify by trying to query
-        let conn = tracker.connection.lock().unwrap();
-        let result = conn.execute("SELECT 1 FROM regression_watches LIMIT 1", []);
+        let connection = tracker.connection.lock().unwrap();
+        let result = connection.execute("SELECT 1 FROM regression_watches LIMIT 1", []);
         // Should succeed (table exists) or return empty result, not error
         assert!(result.is_ok() || result.is_err());
     }
@@ -12145,8 +12145,8 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init
-        let conn = tracker.connection.lock().unwrap();
-        let result = conn.execute("SELECT 1 FROM release_tracking LIMIT 1", []);
+        let connection = tracker.connection.lock().unwrap();
+        let result = connection.execute("SELECT 1 FROM release_tracking LIMIT 1", []);
         assert!(result.is_ok() || result.is_err());
     }
 
@@ -12155,8 +12155,8 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init
-        let conn = tracker.connection.lock().unwrap();
-        let result = conn.execute("SELECT 1 FROM regression_checks LIMIT 1", []);
+        let connection = tracker.connection.lock().unwrap();
+        let result = connection.execute("SELECT 1 FROM regression_checks LIMIT 1", []);
         assert!(result.is_ok() || result.is_err());
     }
 
