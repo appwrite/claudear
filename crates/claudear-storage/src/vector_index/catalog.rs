@@ -1,9 +1,11 @@
 use super::definition::Definition;
 use super::session::Session;
 use super::VectorIndex;
+use rusqlite::Connection;
 use std::sync::Arc;
 
 pub(crate) struct Catalog {
+    session: Arc<Session>,
     pub(crate) qa: VectorIndex,
     pub(crate) issue: VectorIndex,
     pub(crate) outcome: VectorIndex,
@@ -19,8 +21,16 @@ impl Catalog {
             issue: VectorIndex::new(Definition::ISSUE, Arc::clone(&session)),
             outcome: VectorIndex::new(Definition::OUTCOME, Arc::clone(&session)),
             code_chunk: VectorIndex::new(Definition::CODE_CHUNK, Arc::clone(&session)),
-            discord_message_chunk: VectorIndex::new(Definition::DISCORD_MESSAGE_CHUNK, session),
+            discord_message_chunk: VectorIndex::new(
+                Definition::DISCORD_MESSAGE_CHUNK,
+                Arc::clone(&session),
+            ),
+            session,
         }
+    }
+
+    pub(crate) fn load_extension(&self, connection: &Connection) -> bool {
+        self.session.load_extension(connection)
     }
 
     pub(crate) fn all(&self) -> [&VectorIndex; 5] {
@@ -31,5 +41,10 @@ impl Catalog {
             &self.code_chunk,
             &self.discord_message_chunk,
         ]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session(&self) -> &Arc<Session> {
+        &self.session
     }
 }

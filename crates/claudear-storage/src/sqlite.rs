@@ -7,13 +7,13 @@ use super::types::{
     StoredRepository, UserRow,
 };
 use super::{
-    try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore,
-    EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
-    SimilarityStore, UserStore, WebhookStore,
+    ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
+    EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore, SimilarityStore,
+    UserStore, WebhookStore,
 };
 use crate::vector_index::catalog::Catalog;
 use crate::vector_index::progress::Progress;
-use crate::vector_index::REBUILD_BATCH_SIZE;
+use crate::vector_index::{embedding_blob, embedding_from_blob, REBUILD_BATCH_SIZE};
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::types::{
@@ -141,7 +141,7 @@ impl SqliteTracker {
     /// results without it, so callers/tests can gate on this.
     pub fn vectorlite_available(&self) -> bool {
         match self.acquire_lock() {
-            Ok(conn) => try_load_vectorlite(&conn).unwrap_or(false),
+            Ok(connection) => self.vector_indexes.load_extension(&connection),
             Err(_) => false,
         }
     }
@@ -178,6 +178,27 @@ impl SqliteTracker {
                             batch_size = REBUILD_BATCH_SIZE,
                             elapsed = ?started.elapsed(),
                             "Rebuilt vector index"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Skipped) => {
+                        tracing::debug!(
+                            table = index.table(),
+                            "Skipped vector index rebuild; no usable embeddings"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Deferred) => {
+                        tracing::debug!(
+                            table = index.table(),
+                            "Deferred vector index rebuild; it rebuilds on next use"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Unavailable) => {
+                        tracing::debug!(
+                            table = index.table(),
+                            "Skipped vector index rebuild; the index is unavailable on this connection"
                         );
                         break;
                     }
@@ -276,22 +297,13 @@ impl SqliteTracker {
         match bytes {
             None => Ok(None),
             Some(b) if b.is_empty() => Ok(None),
-            Some(b) => {
-                if b.len() % 4 != 0 {
-                    return Err(rusqlite::Error::InvalidColumnType(
-                        col,
-                        "embedding".to_string(),
-                        rusqlite::types::Type::Blob,
-                    ));
-                }
-                let embedding: Vec<f32> = b
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|chunk| f32::from_le_bytes(*chunk))
-                    .collect();
-                Ok(Some(embedding))
-            }
+            Some(b) => embedding_from_blob(&b).map(Some).ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(
+                    col,
+                    "embedding".to_string(),
+                    rusqlite::types::Type::Blob,
+                )
+            }),
         }
     }
 
@@ -413,27 +425,11 @@ impl SqliteTracker {
     }
 
     fn embedding_to_blob(embedding: Option<&[f32]>) -> Option<Vec<u8>> {
-        embedding.map(|values| {
-            let mut blob = Vec::with_capacity(values.len() * 4);
-            for f in values {
-                blob.extend_from_slice(&f.to_le_bytes());
-            }
-            blob
-        })
+        embedding.map(embedding_blob)
     }
 
     fn blob_to_embedding(blob: Option<Vec<u8>>) -> Option<Vec<f32>> {
-        let blob = blob?;
-        if !blob.len().is_multiple_of(4) {
-            return None;
-        }
-        Some(
-            blob.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
-                .collect(),
-        )
+        embedding_from_blob(&blob?)
     }
 
     fn query_qa_matches_vector_scoped(
@@ -457,10 +453,7 @@ impl SqliteTracker {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = question_embedding
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(question_embedding);
         let candidate_limit = limit.saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER);
 
         let sql = format!(
@@ -566,10 +559,7 @@ impl SqliteTracker {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = question_embedding
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(question_embedding);
         let candidate_limit = limit.saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER);
 
         let sql = format!(
@@ -3319,14 +3309,7 @@ impl EmbeddingStore for SqliteTracker {
     fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
         let connection = self.acquire_lock()?;
 
-        // Serialize the embedding vector to bytes if present
-        let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|values| {
-            let mut bytes = Vec::with_capacity(values.len() * 4);
-            for value in values {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-            bytes
-        });
+        let embedding_bytes = embedding.embedding.as_deref().map(embedding_blob);
 
         let updated_at = embedding
             .updated_at
@@ -3411,13 +3394,7 @@ impl EmbeddingStore for SqliteTracker {
             )?;
 
             for embedding in embeddings {
-                let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|values| {
-                    let mut bytes = Vec::with_capacity(values.len() * 4);
-                    for value in values {
-                        bytes.extend_from_slice(&value.to_le_bytes());
-                    }
-                    bytes
-                });
+                let embedding_bytes = embedding.embedding.as_deref().map(embedding_blob);
 
                 let updated_at = embedding
                     .updated_at
@@ -3569,10 +3546,7 @@ impl EmbeddingStore for SqliteTracker {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * ISSUE_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
@@ -3660,10 +3634,7 @@ impl EmbeddingStore for SqliteTracker {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * OUTCOME_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
@@ -3707,20 +3678,8 @@ impl EmbeddingStore for SqliteTracker {
                 let keywords: Option<String> = row.get(9)?;
                 let created_at: String = row.get(10)?;
 
-                // Deserialize embedding BLOB if present
-                let embedding_blob: Option<Vec<u8>> = row.get(11)?;
-                let embedding = embedding_blob.and_then(|blob| {
-                    if blob.len() % 4 != 0 {
-                        return None;
-                    }
-                    Some(
-                        blob.as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|chunk| f32::from_le_bytes(*chunk))
-                            .collect(),
-                    )
-                });
+                let blob: Option<Vec<u8>> = row.get(11)?;
+                let embedding = blob.as_deref().and_then(embedding_from_blob);
 
                 let fix_outcome = FixOutcome {
                     id: row.get(0)?,
@@ -5537,13 +5496,7 @@ impl SqliteTracker {
         let connection = self.acquire_lock()?;
         let keywords_json = serde_json::to_string(&outcome.keywords).unwrap_or_default();
 
-        // Serialize embedding to BLOB if present
-        let embedding_blob: Option<Vec<u8>> = outcome.embedding.as_ref().map(|values| {
-            values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect()
-        });
+        let blob = outcome.embedding.as_deref().map(embedding_blob);
 
         connection.execute(
             r#"
@@ -5561,7 +5514,7 @@ impl SqliteTracker {
                 outcome.learnings,
                 keywords_json,
                 outcome.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                embedding_blob,
+                blob,
             ],
         )?;
         let row_id = connection.last_insert_rowid();
@@ -5975,20 +5928,8 @@ impl SqliteTracker {
         let keywords_str: Option<String> = row.get(9)?;
         let created_at_str: String = row.get(10)?;
 
-        // Deserialize embedding BLOB if present (column 11)
-        let embedding_blob: Option<Vec<u8>> = row.get(11).unwrap_or(None);
-        let embedding = embedding_blob.and_then(|blob| {
-            if blob.len() % 4 != 0 {
-                return None;
-            }
-            Some(
-                blob.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|chunk| f32::from_le_bytes(*chunk))
-                    .collect(),
-            )
-        });
+        let blob: Option<Vec<u8>> = row.get(11).unwrap_or(None);
+        let embedding = blob.as_deref().and_then(embedding_from_blob);
 
         Ok(FixOutcome {
             id: row.get(0)?,
@@ -9283,8 +9224,7 @@ impl SqliteTracker {
                 "INSERT INTO code_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
             )?;
             for &(chunk_id, embedding) in pairs {
-                let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-                statement.execute(params![chunk_id, blob, model_name])?;
+                statement.execute(params![chunk_id, embedding_blob(embedding), model_name])?;
                 embedding_ids.push(transaction.last_insert_rowid());
             }
         }
@@ -9321,10 +9261,7 @@ impl SqliteTracker {
             return Ok(Vec::new());
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
@@ -9469,8 +9406,7 @@ impl SqliteTracker {
                 "INSERT INTO discord_message_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
             )?;
             for &(chunk_id, embedding) in pairs {
-                let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-                statement.execute(params![chunk_id, blob, model_name])?;
+                statement.execute(params![chunk_id, embedding_blob(embedding), model_name])?;
                 saved.push((transaction.last_insert_rowid(), embedding));
             }
         }
@@ -9538,10 +9474,7 @@ impl SqliteTracker {
             return Ok(Vec::new());
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
@@ -21611,6 +21544,7 @@ mod tests {
         use crate::vectorlite::require_vectorlite_for_tests;
         use claudear_core::types::{CodeChunk, Language};
         use std::sync::mpsc;
+        use std::sync::Arc;
 
         const MODEL: &str = "test-model";
         const TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -21634,13 +21568,6 @@ mod tests {
 
         fn sample_embedding(index: usize) -> Vec<f32> {
             vec![1.0, index as f32, 0.5, 0.25]
-        }
-
-        fn embedding_blob(embedding: &[f32]) -> Vec<u8> {
-            embedding
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect()
         }
 
         #[test]
@@ -21700,6 +21627,71 @@ mod tests {
                 "rebuild_vector_indexes left {} of {count} embeddings out of code_chunk_vectors, starting with {:?}",
                 missing.len(),
                 missing.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn test_rebuild_vector_indexes_releases_the_lock_between_batches() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let count = 16 * REBUILD_BATCH_SIZE;
+
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = writer.get_or_create_repo_id("org/repo").unwrap();
+            let chunks: Vec<CodeChunk> = (0..count)
+                .map(|index| sample_code_chunk(repository_id, index))
+                .collect();
+            let chunk_ids = writer.save_code_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..count).map(sample_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            writer.save_code_chunk_embeddings(&pairs, MODEL).unwrap();
+            drop(writer);
+
+            let tracker = Arc::new(SqliteTracker::new(&path).unwrap());
+            let (first, last): (i64, i64) = {
+                let connection = tracker.acquire_lock().unwrap();
+                assert!(require_vectorlite_for_tests(&connection));
+                connection
+                    .query_row(
+                        "SELECT min(id), max(id) FROM code_chunk_embeddings",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap()
+            };
+
+            let rebuilding = Arc::clone(&tracker);
+            let rebuild = std::thread::spawn(move || rebuilding.rebuild_vector_indexes());
+            let mut interleaved = false;
+            while !interleaved && !rebuild.is_finished() {
+                let connection = tracker.acquire_lock().unwrap();
+                let mut lookup = connection
+                    .prepare_cached("SELECT rowid FROM code_chunk_vectors WHERE rowid = ?1")
+                    .unwrap();
+                let mut indexed = |rowid: i64| {
+                    lookup
+                        .query_row(params![rowid], |row| row.get::<_, i64>(0))
+                        .optional()
+                        .unwrap()
+                        .is_some()
+                };
+                interleaved = indexed(first) && !indexed(last);
+                drop(lookup);
+                drop(connection);
+                std::thread::yield_now();
+            }
+            rebuild.join().unwrap();
+
+            assert!(
+                interleaved,
+                "another thread never acquired the connection lock between rebuild batches"
             );
         }
 

@@ -28,7 +28,25 @@ const MAX_EMBEDDING_DIMENSION: usize = 16384;
 
 const BYTES_PER_COMPONENT: usize = size_of::<f32>();
 
-pub(crate) fn validate_dimension(dimension: usize) -> Result<()> {
+pub(crate) fn embedding_blob(embedding: &[f32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(embedding.len() * BYTES_PER_COMPONENT);
+    for component in embedding {
+        blob.extend_from_slice(&component.to_le_bytes());
+    }
+    blob
+}
+
+pub(crate) fn embedding_from_blob(blob: &[u8]) -> Option<Vec<f32>> {
+    let (components, remainder) = blob.as_chunks::<BYTES_PER_COMPONENT>();
+    remainder.is_empty().then(|| {
+        components
+            .iter()
+            .map(|component| f32::from_le_bytes(*component))
+            .collect()
+    })
+}
+
+fn validate_dimension(dimension: usize) -> Result<()> {
     if dimension == 0 || dimension > MAX_EMBEDDING_DIMENSION {
         return Err(Error::storage(format!(
             "Embedding dimension {} is out of valid range (1..={})",
@@ -60,42 +78,43 @@ impl VectorIndex {
     }
 
     pub(crate) fn prepare_search(&self, connection: &Connection, dimension: usize) -> Result<bool> {
+        if dimension == 0 {
+            return Ok(false);
+        }
+        validate_dimension(dimension)?;
         let mut state = self.lock();
         self.refresh(&mut state, connection)?;
-        Ok(self
-            .ensure(
-                &mut state,
-                connection,
-                dimension,
-                Access::Read,
-                REBUILD_BATCH_SIZE,
-            )?
-            .is_some())
+        if !self.ensure(&mut state, connection, dimension, Access::Read)? {
+            return Ok(false);
+        }
+        self.advance(&mut state, connection, REBUILD_BATCH_SIZE)?;
+        Ok(true)
     }
 
     pub(crate) fn upsert(&self, connection: &Connection, rowid: i64, embedding: &[f32]) {
+        if embedding.is_empty() {
+            return;
+        }
+        if let Err(error) = validate_dimension(embedding.len()) {
+            tracing::warn!(table = self.table(), rowid, %error, "Skipped indexing a vector with an unsupported dimension");
+            return;
+        }
         let mut state = self.lock();
         if let Err(error) = self.refresh(&mut state, connection) {
             tracing::warn!(table = self.table(), rowid, %error, "Failed to check the vector index generation; rebuilding on next use");
             Self::invalidate(&mut state);
             return;
         }
-        match self.ensure(
-            &mut state,
-            connection,
-            embedding.len(),
-            Access::Write,
-            REBUILD_BATCH_SIZE,
-        ) {
-            Ok(Some(_)) => {}
-            Ok(None) => return,
+        match self.ensure(&mut state, connection, embedding.len(), Access::Write) {
+            Ok(true) => {}
+            Ok(false) => return,
             Err(error) => {
                 tracing::warn!(table = self.table(), rowid, %error, "Failed to prepare the vector index; rebuilding on next use");
                 Self::invalidate(&mut state);
                 return;
             }
         }
-        if let Err(error) = self.write(connection, rowid, &Self::blob(embedding)) {
+        if let Err(error) = self.write(connection, rowid, &embedding_blob(embedding)) {
             tracing::warn!(table = self.table(), rowid, %error, "Failed to write vector; rebuilding the index on next use");
             *state = State::Stale {
                 dimension: embedding.len(),
@@ -133,14 +152,12 @@ impl VectorIndex {
         let mut state = self.lock();
         self.refresh(&mut state, connection)?;
         match *state {
-            State::Unavailable | State::Built { .. } => Ok(Progress::Complete { rows: 0 }),
-            State::Building { .. } => {
-                let rows = self.advance(&mut state, connection, batch_size)?;
-                Ok(Self::progress(&state, rows))
-            }
+            State::Unavailable => return Ok(Progress::Unavailable),
+            State::Built { .. } => return Ok(Progress::Complete { rows: 0 }),
+            State::Building { .. } => {}
             State::Unbuilt | State::Stale { .. } => {
                 let Some(length) = self.newest_length(connection)? else {
-                    return Ok(Progress::Complete { rows: 0 });
+                    return Ok(Progress::Skipped);
                 };
                 let Some(dimension) = Self::dimension_of(length) else {
                     tracing::warn!(
@@ -148,14 +165,16 @@ impl VectorIndex {
                         length,
                         "Newest embedding has a length that is not a whole number of float32 components; skipping rebuild"
                     );
-                    return Ok(Progress::Complete { rows: 0 });
+                    return Ok(Progress::Skipped);
                 };
-                match self.ensure(&mut state, connection, dimension, Access::Write, batch_size)? {
-                    Some(rows) => Ok(Self::progress(&state, rows)),
-                    None => Ok(Progress::Complete { rows: 0 }),
+                validate_dimension(dimension)?;
+                if !self.ensure(&mut state, connection, dimension, Access::Write)? {
+                    return Ok(Self::idle(&state));
                 }
             }
         }
+        let rows = self.advance(&mut state, connection, batch_size)?;
+        Ok(Self::progress(&state, rows))
     }
 
     pub(crate) fn reset(&self, connection: &Connection) {
@@ -191,32 +210,29 @@ impl VectorIndex {
         }
     }
 
+    /// Makes the table ready to hold `dimension` vectors, running at most one drop and create
+    /// and never indexing rows: only searches and `rebuild_step` advance a rebuild, so a save
+    /// that writes many rows under the connection lock does bounded work per row.
     fn ensure(
         &self,
         state: &mut State,
         connection: &Connection,
         dimension: usize,
         access: Access,
-        batch_size: usize,
-    ) -> Result<Option<usize>> {
-        if dimension == 0 {
-            return Ok(None);
-        }
-        validate_dimension(dimension)?;
+    ) -> Result<bool> {
         if !self.session.load_extension(connection) {
             *state = State::Unavailable;
-            return Ok(None);
+            return Ok(false);
         }
         match *state {
-            State::Unavailable => return Ok(None),
-            State::Built {
-                dimension: built, ..
-            } if built == dimension => return Ok(Some(0)),
+            State::Unavailable => return Ok(false),
             State::Building {
-                dimension: building,
-                ..
-            } if building == dimension => {
-                return Ok(Some(self.advance(state, connection, batch_size)?));
+                dimension: current, ..
+            }
+            | State::Built {
+                dimension: current, ..
+            } if current == dimension => {
+                return Ok(true);
             }
             _ => {}
         }
@@ -228,19 +244,18 @@ impl VectorIndex {
                 "Table name is taken by something other than a vectorlite table; vector search is disabled for it"
             );
             *state = State::Unavailable;
-            return Ok(None);
+            return Ok(false);
         }
         if access == Access::Read
             && self.authoritative_dimension(state, lookup, connection)? != Some(dimension)
         {
-            return Ok(None);
+            return Ok(false);
         }
 
         let required = self
             .definition
             .minimum_capacity
             .max(self.count(connection, dimension)?.saturating_mul(2));
-        self.session.generation(connection)?;
 
         let stale = matches!(*state, State::Stale { .. });
         let capacity = match lookup {
@@ -251,7 +266,7 @@ impl VectorIndex {
             }
             Lookup::Absent => {
                 if !self.create_table(state, connection, dimension, required)? {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 required
             }
@@ -259,7 +274,7 @@ impl VectorIndex {
                 if !self.drop_table(state, connection)?
                     || !self.create_table(state, connection, dimension, required)?
                 {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 required
             }
@@ -271,7 +286,7 @@ impl VectorIndex {
             cursor: 0,
             generation: self.session.generation(connection)?,
         };
-        Ok(Some(self.advance(state, connection, batch_size)?))
+        Ok(true)
     }
 
     fn authoritative_dimension(
@@ -297,6 +312,7 @@ impl VectorIndex {
     }
 
     fn drop_table(&self, state: &mut State, connection: &Connection) -> Result<bool> {
+        self.session.generation(connection)?;
         if let Err(error) =
             connection.execute_batch(&format!("DROP TABLE IF EXISTS {}", self.table()))
         {
@@ -320,6 +336,7 @@ impl VectorIndex {
             dimension,
             capacity,
         };
+        self.session.generation(connection)?;
         if let Err(error) = connection.execute_batch(&declaration.create_statement(self.table())) {
             tracing::warn!(table = self.table(), dimension, capacity, %error, "Failed to create vector index; retrying on next use");
             Self::invalidate(state);
@@ -456,11 +473,11 @@ impl VectorIndex {
         i64::try_from(dimension * BYTES_PER_COMPONENT).unwrap_or(i64::MAX)
     }
 
-    fn blob(embedding: &[f32]) -> Vec<u8> {
-        embedding
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect()
+    fn idle(state: &State) -> Progress {
+        match state {
+            State::Unavailable => Progress::Unavailable,
+            _ => Progress::Deferred,
+        }
     }
 
     fn progress(state: &State, rows: usize) -> Progress {
@@ -474,7 +491,7 @@ impl VectorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vectorlite::load_vectorlite_extension;
+    use crate::vectorlite::require_vectorlite_for_tests;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -493,16 +510,6 @@ mod tests {
 
     fn index() -> VectorIndex {
         VectorIndex::new(definition(TABLE, SOURCE), Arc::new(Session::new()))
-    }
-
-    fn load(connection: &Connection) -> bool {
-        let Ok(path) = std::env::var("CLAUDEAR_VECTORLITE_PATH") else {
-            eprintln!("skipping: CLAUDEAR_VECTORLITE_PATH is not set");
-            return false;
-        };
-        load_vectorlite_extension(connection, Path::new(&path))
-            .unwrap_or_else(|error| panic!("failed to load vectorlite from {path}: {error}"));
-        true
     }
 
     fn database() -> (TempDir, PathBuf) {
@@ -539,7 +546,7 @@ mod tests {
         connection
             .execute(
                 &format!("INSERT INTO {source}(id, embedding) VALUES (?1, ?2)"),
-                params![id, VectorIndex::blob(embedding)],
+                params![id, embedding_blob(embedding)],
             )
             .unwrap();
     }
@@ -597,6 +604,12 @@ mod tests {
         ) {}
     }
 
+    fn schema_version(connection: &Connection) -> i64 {
+        connection
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
     fn create_raw(connection: &Connection, table: &str, dimension: usize, capacity: usize) {
         connection
             .execute_batch(
@@ -643,7 +656,7 @@ mod tests {
         );
         assert!(indexes
             .iter()
-            .all(|index| Arc::ptr_eq(&index.session, &catalog.qa.session)));
+            .all(|index| Arc::ptr_eq(&index.session, catalog.session())));
     }
 
     #[test]
@@ -657,7 +670,7 @@ mod tests {
 
         assert_eq!(
             index.rebuild_step(&connection, 2).unwrap(),
-            Progress::Complete { rows: 0 }
+            Progress::Unavailable
         );
         assert_eq!(state(&index), State::Unavailable);
         let attempted = index.session.extension();
@@ -665,7 +678,7 @@ mod tests {
 
         assert_eq!(
             index.rebuild_step(&connection, 2).unwrap(),
-            Progress::Complete { rows: 0 }
+            Progress::Unavailable
         );
         assert_eq!(state(&index), State::Unavailable);
         assert_eq!(index.session.extension(), attempted);
@@ -679,7 +692,7 @@ mod tests {
     #[test]
     fn test_vector_index_creates_with_capacity_from_row_count() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         insert_rows(&connection, SOURCE, 1..=1, 4);
@@ -711,7 +724,7 @@ mod tests {
     #[test]
     fn test_vector_index_rebuild_step_is_bounded() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         insert_rows(&connection, SOURCE, 1..=5, 4);
@@ -742,7 +755,7 @@ mod tests {
     fn test_vector_index_second_connection_rebuilds() {
         let (_directory, path) = database();
         let first = open(&path);
-        if !load(&first) {
+        if !require_vectorlite_for_tests(&first) {
             return;
         }
         insert_rows(&first, SOURCE, 1..=5, 4);
@@ -751,7 +764,7 @@ mod tests {
         assert!((1..=5).all(|rowid| vector_exists(&first, TABLE, rowid)));
 
         let second = open(&path);
-        load(&second);
+        assert!(require_vectorlite_for_tests(&second));
         let second_index = index();
         assert_eq!(state(&second_index), State::Unbuilt);
         assert!(!vector_exists(&second, TABLE, 1));
@@ -764,7 +777,7 @@ mod tests {
     fn test_vector_index_foreign_ddl_triggers_rebuild() {
         let (_directory, path) = database();
         let first = open(&path);
-        if !load(&first) {
+        if !require_vectorlite_for_tests(&first) {
             return;
         }
         insert_rows(&first, SOURCE, 1..=3, 4);
@@ -783,7 +796,7 @@ mod tests {
     #[test]
     fn test_vector_index_own_ddl_keeps_sibling_built() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         let session = Arc::new(Session::new());
@@ -814,7 +827,7 @@ mod tests {
     #[test]
     fn test_vector_index_recreates_undersized_table() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         create_raw(&connection, TABLE, 4, 2);
@@ -835,7 +848,7 @@ mod tests {
     #[test]
     fn test_vector_index_upsert_replaces_existing_rowid() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         create_source(&connection, SOURCE);
@@ -844,24 +857,24 @@ mod tests {
         index.upsert(&connection, 1, &embedding(1, 4));
         index.upsert(&connection, 1, &embedding(2, 4));
         assert!(vector_exists(&connection, TABLE, 1));
-        assert!(matches!(state(&index), State::Built { .. }));
+        assert!(matches!(state(&index), State::Building { .. }));
 
         connection
             .execute(
                 &format!("INSERT INTO {TABLE}(rowid, embedding) VALUES (?1, ?2)"),
-                params![2, VectorIndex::blob(&embedding(2, 4))],
+                params![2, embedding_blob(&embedding(2, 4))],
             )
             .unwrap();
         insert_source(&connection, SOURCE, 2, &embedding(2, 4));
         index.upsert(&connection, 2, &embedding(2, 4));
         assert!(vector_exists(&connection, TABLE, 2));
-        assert!(matches!(state(&index), State::Built { .. }));
+        assert!(matches!(state(&index), State::Building { .. }));
     }
 
     #[test]
     fn test_vector_index_overflow_marks_stale_and_recreates() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         create_source(&connection, SOURCE);
@@ -881,7 +894,7 @@ mod tests {
     #[test]
     fn test_vector_index_remove() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         insert_rows(&connection, SOURCE, 1..=3, 4);
@@ -903,7 +916,7 @@ mod tests {
     #[test]
     fn test_vector_index_writer_switches_dimension() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         insert_rows(&connection, SOURCE, 1..=2, 4);
@@ -918,7 +931,10 @@ mod tests {
         insert_source(&connection, SOURCE, 3, &embedding(3, 8));
         index.upsert(&connection, 3, &embedding(3, 8));
         assert_eq!(declared(&connection, TABLE).dimension, 8);
-        assert!(matches!(state(&index), State::Built { dimension: 8, .. }));
+        assert!(matches!(
+            state(&index),
+            State::Building { dimension: 8, .. }
+        ));
         assert!(vector_exists(&connection, TABLE, 3));
         assert!(!vector_exists(&connection, TABLE, 1));
     }
@@ -926,7 +942,7 @@ mod tests {
     #[test]
     fn test_vector_index_reader_never_switches_unbuilt_dimension() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         create_raw(&connection, TABLE, 4, 10);
@@ -942,7 +958,7 @@ mod tests {
     #[test]
     fn test_vector_index_reader_without_rows_runs_no_ddl() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         create_source(&connection, SOURCE);
@@ -955,7 +971,7 @@ mod tests {
     #[test]
     fn test_vector_index_excludes_wrong_dimension_rows() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         create_source(&connection, SOURCE);
@@ -987,7 +1003,7 @@ mod tests {
     #[test]
     fn test_vector_index_rebuild_skips_partial_component_length() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         create_source(&connection, SOURCE);
@@ -1002,7 +1018,7 @@ mod tests {
 
         assert_eq!(
             index.rebuild_step(&connection, 2).unwrap(),
-            Progress::Complete { rows: 0 }
+            Progress::Skipped
         );
         assert_eq!(state(&index), State::Unbuilt);
         assert!(master_sql(&connection, TABLE).is_none());
@@ -1011,7 +1027,7 @@ mod tests {
     #[test]
     fn test_vector_index_reset_drops_built_table() {
         let connection = Connection::open_in_memory().unwrap();
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         insert_rows(&connection, SOURCE, 1..=2, 4);
@@ -1027,7 +1043,7 @@ mod tests {
     fn test_vector_index_reset_while_unbuilt_leaves_table() {
         let (_directory, path) = database();
         let loader = open(&path);
-        if !load(&loader) {
+        if !require_vectorlite_for_tests(&loader) {
             return;
         }
         create_raw(&loader, TABLE, 4, 10);
@@ -1045,7 +1061,7 @@ mod tests {
     fn test_vector_index_failed_ddl_is_retried() {
         let (_directory, path) = database();
         let connection = open(&path);
-        if !load(&connection) {
+        if !require_vectorlite_for_tests(&connection) {
             return;
         }
         insert_rows(&connection, SOURCE, 1..=2, 4);
@@ -1054,11 +1070,157 @@ mod tests {
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         let index = index();
 
+        assert_eq!(
+            index.rebuild_step(&connection, 2).unwrap(),
+            Progress::Deferred
+        );
         assert!(!index.prepare_search(&connection, 4).unwrap());
         assert_eq!(state(&index), State::Unbuilt);
 
         blocker.execute_batch("COMMIT").unwrap();
         assert!(index.prepare_search(&connection, 4).unwrap());
         assert!((1..=2).all(|rowid| vector_exists(&connection, TABLE, rowid)));
+    }
+
+    #[test]
+    fn test_vector_index_embedding_blob_round_trips() {
+        let values = [1.5_f32, -2.25, 0.0, f32::MAX];
+        let blob = embedding_blob(&values);
+        assert_eq!(blob.len(), values.len() * BYTES_PER_COMPONENT);
+        assert_eq!(&blob[..BYTES_PER_COMPONENT], &1.5_f32.to_le_bytes());
+        assert_eq!(embedding_from_blob(&blob), Some(values.to_vec()));
+        assert_eq!(embedding_from_blob(&[]), Some(Vec::new()));
+        assert_eq!(embedding_from_blob(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn test_vector_index_writes_never_advance_a_rebuild() {
+        let connection = Connection::open_in_memory().unwrap();
+        if !require_vectorlite_for_tests(&connection) {
+            return;
+        }
+        let pending = i64::try_from(3 * REBUILD_BATCH_SIZE).unwrap();
+        insert_rows(&connection, SOURCE, 1..=pending, 4);
+        let index = index();
+        assert_eq!(
+            index.rebuild_step(&connection, REBUILD_BATCH_SIZE).unwrap(),
+            Progress::Pending {
+                rows: REBUILD_BATCH_SIZE
+            }
+        );
+        let building = state(&index);
+        assert!(matches!(building, State::Building { .. }));
+
+        for rowid in pending + 1..=pending + 10 {
+            insert_source(&connection, SOURCE, rowid, &embedding(rowid, 4));
+            index.upsert(&connection, rowid, &embedding(rowid, 4));
+        }
+
+        assert_eq!(state(&index), building);
+        assert!((pending + 1..=pending + 10).all(|rowid| vector_exists(&connection, TABLE, rowid)));
+        let next = i64::try_from(REBUILD_BATCH_SIZE).unwrap() + 1;
+        assert!(!vector_exists(&connection, TABLE, next));
+    }
+
+    #[test]
+    fn test_vector_index_stale_writes_recreate_once_without_rebuilding() {
+        let connection = Connection::open_in_memory().unwrap();
+        if !require_vectorlite_for_tests(&connection) {
+            return;
+        }
+        insert_rows(&connection, SOURCE, 1..=20, 4);
+        let index = index();
+        rebuild(&index, &connection);
+        *index.lock() = State::Stale { dimension: 4 };
+        let before = schema_version(&connection);
+
+        insert_source(&connection, SOURCE, 21, &embedding(21, 4));
+        index.upsert(&connection, 21, &embedding(21, 4));
+        let recreated = schema_version(&connection);
+        assert_ne!(recreated, before);
+        for rowid in 22..=30 {
+            insert_source(&connection, SOURCE, rowid, &embedding(rowid, 4));
+            index.upsert(&connection, rowid, &embedding(rowid, 4));
+        }
+
+        assert_eq!(schema_version(&connection), recreated);
+        assert!(matches!(
+            state(&index),
+            State::Building {
+                dimension: 4,
+                cursor: 0,
+                ..
+            }
+        ));
+        assert!((1..=20).all(|rowid| !vector_exists(&connection, TABLE, rowid)));
+        assert!((21..=30).all(|rowid| vector_exists(&connection, TABLE, rowid)));
+    }
+
+    #[test]
+    fn test_vector_index_reset_of_stale_index_keeps_foreign_ddl_visible() {
+        let (_directory, path) = database();
+        let first = open(&path);
+        if !require_vectorlite_for_tests(&first) {
+            return;
+        }
+        let session = Arc::new(Session::new());
+        let sibling = VectorIndex::new(
+            definition("sibling_vectors", "sibling_source"),
+            Arc::clone(&session),
+        );
+        let index = VectorIndex::new(definition(TABLE, SOURCE), session);
+        insert_rows(&first, "sibling_source", 1..=3, 4);
+        insert_rows(&first, SOURCE, 1..=3, 4);
+        assert!(sibling.prepare_search(&first, 4).unwrap());
+        assert!(matches!(state(&sibling), State::Built { .. }));
+        assert!(index.prepare_search(&first, 4).unwrap());
+        *index.lock() = State::Stale { dimension: 4 };
+
+        let second = open(&path);
+        second.execute_batch("CREATE TABLE unrelated(x)").unwrap();
+        assert!(!vector_exists(&first, "sibling_vectors", 1));
+
+        index.reset(&first);
+        assert!(sibling.prepare_search(&first, 4).unwrap());
+        assert!((1..=3).all(|rowid| vector_exists(&first, "sibling_vectors", rowid)));
+    }
+
+    #[test]
+    fn test_vector_index_invalid_dimension_leaves_built_index_healthy() {
+        let connection = Connection::open_in_memory().unwrap();
+        if !require_vectorlite_for_tests(&connection) {
+            return;
+        }
+        insert_rows(&connection, SOURCE, 1..=2, 4);
+        let index = index();
+        assert!(index.prepare_search(&connection, 4).unwrap());
+        let built = state(&index);
+        assert!(matches!(built, State::Built { .. }));
+
+        index.upsert(&connection, 3, &[1.0; MAX_EMBEDDING_DIMENSION + 1]);
+        assert_eq!(state(&index), built);
+        assert!(index
+            .prepare_search(&connection, MAX_EMBEDDING_DIMENSION + 1)
+            .is_err());
+        assert_eq!(state(&index), built);
+        assert!(!index.prepare_search(&connection, 0).unwrap());
+        assert_eq!(state(&index), built);
+    }
+
+    #[test]
+    fn test_vector_index_rebuild_step_skips_empty_source() {
+        let connection = Connection::open_in_memory().unwrap();
+        if !require_vectorlite_for_tests(&connection) {
+            return;
+        }
+        create_source(&connection, SOURCE);
+        let index = index();
+
+        assert_eq!(
+            index.rebuild_step(&connection, REBUILD_BATCH_SIZE).unwrap(),
+            Progress::Skipped
+        );
+        assert_eq!(state(&index), State::Unbuilt);
+        assert!(master_sql(&connection, TABLE).is_none());
     }
 }
