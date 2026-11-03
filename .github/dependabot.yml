@@ -1,49 +1,31 @@
 version: 2
+
+multi-ecosystem-groups:
+  dependencies:
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+
 updates:
-  # Rust dependencies
   - package-ecosystem: "cargo"
     directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 10
-    reviewers:
-      - "jakebarnby"
-    labels:
-      - "dependencies"
-      - "rust"
+    patterns: ["*"]
+    multi-ecosystem-group: "dependencies"
     commit-message:
       prefix: "chore(deps)"
-    groups:
-      rust-minor:
-        patterns:
-          - "*"
-        update-types:
-          - "minor"
-          - "patch"
 
-  # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "github-actions"
+    patterns: ["*"]
+    multi-ecosystem-group: "dependencies"
     commit-message:
-      prefix: "chore(ci)"
+      prefix: "chore(deps)"
 
-  # Docker
   - package-ecosystem: "docker"
     directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 3
-    labels:
-      - "dependencies"
-      - "docker"
+    patterns: ["*"]
+    multi-ecosystem-group: "dependencies"
     commit-message:
-      prefix: "chore(docker)"
+      prefix: "chore(deps)"
