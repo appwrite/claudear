@@ -98,4 +98,5 @@ dirs = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 tempfile = { workspace = true }
