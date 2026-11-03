@@ -40,7 +40,6 @@ const ISSUE_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const OUTCOME_VECTOR_TABLE: &str = "outcome_embedding_vectors";
 const OUTCOME_VECTOR_EF_SEARCH: usize = 200;
 const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
 const CODE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const DISCORD_MESSAGE_CHUNK_VECTOR_TABLE: &str = "discord_message_chunk_vectors";
@@ -6642,13 +6641,14 @@ impl SqliteTracker {
 
     /// Clear all repositories and dependencies from the database.
     pub fn clear_repositories(&self) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute_batch(
+        let connection = self.acquire_lock()?;
+        connection.execute_batch(
             r#"
             DELETE FROM repository_dependencies;
             DELETE FROM repositories;
             "#,
         )?;
+        self.vector_indexes.code_chunk.reset(&connection);
         Ok(())
     }
 
@@ -9256,18 +9256,22 @@ impl SqliteTracker {
 
     /// Delete all code symbols, chunks, and embeddings for a specific file.
     pub fn delete_code_data_for_file(&self, repo_id: i64, file_path: &str) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Embeddings are CASCADE-deleted via code_chunks FK.
-        tx.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids =
+            Self::code_chunk_embedding_ids_for_file(&transaction, repo_id, file_path)?;
+        transaction.execute(
             "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
             params![repo_id, file_path],
         )?;
-        tx.execute(
+        transaction.execute(
             "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
             params![repo_id, file_path],
         )?;
-        tx.commit()?;
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
@@ -9276,75 +9280,122 @@ impl SqliteTracker {
         if chunk_ids.is_empty() {
             return Ok(());
         }
-        let conn = self.acquire_lock()?;
-        let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
-        let sql = format!(
-            "DELETE FROM code_chunks WHERE id IN ({})",
-            placeholders.join(", ")
-        );
-        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        conn.execute(&sql, params.as_slice())?;
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids = Self::code_chunk_embedding_ids_for_chunks(&transaction, chunk_ids)?;
+        {
+            let mut statement = transaction.prepare("DELETE FROM code_chunks WHERE id = ?1")?;
+            for chunk_id in chunk_ids {
+                statement.execute(params![chunk_id])?;
+            }
+        }
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
     /// Remove code data for files that no longer exist in the repository.
     pub fn cleanup_stale_code_data(&self, repo_id: i64, current_paths: &[String]) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-
         if current_paths.is_empty() {
-            // No source files found — delete ALL code data for this repo.
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "DELETE FROM code_symbols WHERE repo_id = ?1",
-                params![repo_id],
-            )?;
-            tx.execute(
-                "DELETE FROM code_chunks WHERE repo_id = ?1",
-                params![repo_id],
-            )?;
-            tx.commit()?;
-            return Ok(());
+            return self.delete_all_code_data_for_repo(repo_id);
         }
 
-        // Get all file paths we have indexed for this repo.
-        // code_chunks is the primary artifact; stale symbols are cleaned up
-        // via delete_code_data_for_file which deletes both tables.
+        let mut connection = self.acquire_lock()?;
+
         let indexed_paths: Vec<String> = {
-            let mut stmt =
-                conn.prepare("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
-            let rows: Vec<String> = stmt
+            let mut statement = connection
+                .prepare("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
+            let rows: Vec<String> = statement
                 .query_map(params![repo_id], |row| row.get(0))?
-                .filter_map(|r| r.ok())
+                .filter_map(|row| row.ok())
                 .collect();
             rows
         };
 
-        let current_set: std::collections::HashSet<&str> =
-            current_paths.iter().map(|s| s.as_str()).collect();
+        let current_set: HashSet<&str> = current_paths.iter().map(String::as_str).collect();
 
         let stale_paths: Vec<&String> = indexed_paths
             .iter()
-            .filter(|p| !current_set.contains(p.as_str()))
+            .filter(|path| !current_set.contains(path.as_str()))
             .collect();
 
-        if !stale_paths.is_empty() {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            for path in &stale_paths {
-                tx.execute(
-                    "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
-                    params![repo_id, path],
-                )?;
-                tx.execute(
-                    "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
-                    params![repo_id, path],
-                )?;
-            }
-            tx.commit()?;
+        if stale_paths.is_empty() {
+            return Ok(());
         }
+
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut embedding_ids = Vec::new();
+        for path in &stale_paths {
+            embedding_ids.extend(Self::code_chunk_embedding_ids_for_file(
+                &transaction,
+                repo_id,
+                path,
+            )?);
+            transaction.execute(
+                "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
+                params![repo_id, path],
+            )?;
+            transaction.execute(
+                "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
+                params![repo_id, path],
+            )?;
+        }
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
+    }
+
+    fn code_chunk_embedding_ids_for_file(
+        connection: &Connection,
+        repository_id: i64,
+        file_path: &str,
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection.prepare(
+            "SELECT e.id FROM code_chunk_embeddings e
+             JOIN code_chunks c ON c.id = e.chunk_id
+             WHERE c.repo_id = ?1 AND c.file_path = ?2",
+        )?;
+        let ids = statement
+            .query_map(params![repository_id, file_path], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
+
+    fn code_chunk_embedding_ids_for_chunks(
+        connection: &Connection,
+        chunk_ids: &[i64],
+    ) -> Result<Vec<i64>> {
+        let mut statement =
+            connection.prepare("SELECT id FROM code_chunk_embeddings WHERE chunk_id = ?1")?;
+        let mut ids = Vec::with_capacity(chunk_ids.len());
+        for chunk_id in chunk_ids {
+            if let Some(id) = statement
+                .query_row(params![chunk_id], |row| row.get(0))
+                .optional()?
+            {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    fn code_chunk_embedding_ids_for_repository(
+        connection: &Connection,
+        repository_id: i64,
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection.prepare(
+            "SELECT e.id FROM code_chunk_embeddings e
+             JOIN code_chunks c ON c.id = e.chunk_id
+             WHERE c.repo_id = ?1",
+        )?;
+        let ids = statement
+            .query_map(params![repository_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
     }
 
     /// Batch-save extracted code symbols.
@@ -9425,99 +9476,27 @@ impl SqliteTracker {
             return Ok(());
         }
 
-        let mut conn = self.acquire_lock()?;
-
-        let dimension = pairs[0].1.len();
-        let _ = Self::ensure_code_chunk_vector_table(&conn, dimension);
-
-        let has_vector_table = Self::table_exists(&conn, CODE_CHUNK_VECTOR_TABLE)?;
-
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut embedding_ids = Vec::with_capacity(pairs.len());
         {
-            let mut stmt = tx.prepare(
+            let mut statement = transaction.prepare(
                 "INSERT INTO code_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
             )?;
-
             for &(chunk_id, embedding) in pairs {
                 let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-                stmt.execute(params![chunk_id, blob, model_name])?;
-
-                if has_vector_table {
-                    let emb_id = tx.last_insert_rowid();
-                    let insert_sql = format!(
-                        "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-                        CODE_CHUNK_VECTOR_TABLE
-                    );
-                    if let Err(e) = tx.execute(&insert_sql, params![emb_id, blob]) {
-                        tracing::warn!(error = %e, chunk_id, "Failed to insert into code chunk vector table — aborting batch");
-                        // Drop tx without commit to roll back the entire batch,
-                        // so embeddings and vector index stay consistent.
-                        return Err(e.into());
-                    }
-                }
+                statement.execute(params![chunk_id, blob, model_name])?;
+                embedding_ids.push(transaction.last_insert_rowid());
             }
         }
+        transaction.commit()?;
 
-        tx.commit()?;
+        for (embedding_id, &(_, embedding)) in embedding_ids.into_iter().zip(pairs) {
+            self.vector_indexes
+                .code_chunk
+                .upsert(&connection, embedding_id, embedding);
+        }
         Ok(())
-    }
-
-    /// Lazily create the HNSW vector table for code chunk embeddings.
-    fn ensure_code_chunk_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite for code chunk search");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, CODE_CHUNK_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=100000, ef_construction=200, M=16)
-            )
-            "#,
-            table = CODE_CHUNK_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                // Backfill existing embeddings.
-                let backfill = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM code_chunk_embeddings
-                    WHERE length(embedding) = ?1
-                    "#,
-                    table = CODE_CHUNK_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill code chunk vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create code chunk vector table");
-                Ok(false)
-            }
-        }
     }
 
     /// Search code chunks by vector similarity using HNSW index.
@@ -9536,10 +9515,10 @@ impl SqliteTracker {
         // Clamp limit to prevent excessive memory usage from the HNSW candidate multiplier.
         let limit = limit.min(1000);
 
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.code_chunk;
 
-        if !Self::ensure_code_chunk_vector_table(&conn, query_embedding.len())? {
-            // Vectorlite unavailable — fall back to empty results.
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(Vec::new());
         }
 
@@ -9552,7 +9531,7 @@ impl SqliteTracker {
         let sql = format!(
             r#"
             WITH candidates AS (
-                SELECT rowid AS emb_id,
+                SELECT rowid AS embedding_id,
                        MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
                 FROM {table}
                 WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
@@ -9562,24 +9541,24 @@ impl SqliteTracker {
                    ch.language, ch.start_line, ch.end_line, ch.chunk_text,
                    ch.context_text, ch.file_hash
             FROM candidates c
-            JOIN code_chunk_embeddings e ON e.id = c.emb_id
+            JOIN code_chunk_embeddings e ON e.id = c.embedding_id
             JOIN code_chunks ch ON ch.id = e.chunk_id
             WHERE (?4 IS NULL OR ch.repo_id = ?4)
             ORDER BY c.similarity DESC
             LIMIT ?5
             "#,
-            table = CODE_CHUNK_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare code chunk vector search");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare code chunk vector search");
                 return Ok(Vec::new());
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -9589,7 +9568,7 @@ impl SqliteTracker {
             ],
             |row| {
                 let similarity: f64 = row.get(0)?;
-                let lang_str: String = row.get(6)?;
+                let language: String = row.get(6)?;
                 let chunk_text: String = row.get(9)?;
                 let stored_prefix: String = row.get(10)?;
                 // Reconstruct full context_text from stored prefix + chunk_text.
@@ -9602,7 +9581,7 @@ impl SqliteTracker {
                         file_path: row.get(3)?,
                         chunk_type: row.get(4)?,
                         symbol_name: row.get(5)?,
-                        language: parse_language(&lang_str),
+                        language: parse_language(&language),
                         start_line: row.get::<_, i64>(7)? as usize,
                         end_line: row.get::<_, i64>(8)? as usize,
                         chunk_text,
@@ -9614,9 +9593,9 @@ impl SqliteTracker {
                 })
             },
         ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(error = %e, "Code chunk vector search failed");
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(%error, "Code chunk vector search failed");
                 return Ok(Vec::new());
             }
         };
@@ -9624,8 +9603,8 @@ impl SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read code chunk vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read code chunk vector row"),
             }
         }
 
@@ -10390,18 +10369,21 @@ impl SqliteTracker {
 
     /// Delete all code data (symbols, chunks, embeddings) for a repo.
     pub fn delete_all_code_data_for_repo(&self, repo_id: i64) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids = Self::code_chunk_embedding_ids_for_repository(&transaction, repo_id)?;
+        transaction.execute(
             "DELETE FROM code_symbols WHERE repo_id = ?1",
             params![repo_id],
         )?;
-        // Embeddings are CASCADE-deleted via code_chunks FK.
-        tx.execute(
+        transaction.execute(
             "DELETE FROM code_chunks WHERE repo_id = ?1",
             params![repo_id],
         )?;
-        tx.commit()?;
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
@@ -22499,6 +22481,46 @@ mod tests {
             tracker.clear_repositories().unwrap();
 
             assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids);
+        }
+
+        #[test]
+        fn test_clear_repositories_without_extension_keeps_code_vector_table() {
+            let directory = tempfile::tempdir().unwrap();
+            {
+                let tracker = SqliteTracker::new(database_path(&directory)).unwrap();
+                if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                    return;
+                }
+                let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+                index_code_chunks(&tracker, repository_id, &["src/a.rs"]);
+            }
+
+            let tracker = SqliteTracker::new(database_path(&directory)).unwrap();
+            tracker
+                .clear_repositories()
+                .expect("clearing repositories must not need the vectorlite extension");
+
+            let connection = tracker.acquire_lock().unwrap();
+            let vector_tables: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    params![CODE_CHUNK_VECTORS],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                vector_tables, 1,
+                "a tracker that never loaded vectorlite must leave {CODE_CHUNK_VECTORS} in place"
+            );
+            let embeddings: i64 = connection
+                .query_row("SELECT COUNT(*) FROM code_chunk_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                embeddings, 0,
+                "clearing repositories must cascade to embeddings"
+            );
         }
 
         #[test]
