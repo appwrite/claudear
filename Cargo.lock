@@ -166,6 +166,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -915,6 +921,7 @@ dependencies = [
  "dirs 7.0.0",
  "fastembed",
  "futures",
+ "hex",
  "ort",
  "rand 0.10.3",
  "rayon",
@@ -1843,6 +1850,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b65a7054d36362ab4c234d7b4b58f3f453e9ec73643283223f0b170554481906"
 dependencies = [
  "hf-hub",
+ "ndarray",
+ "ort",
+ "safetensors",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2267,7 +2277,11 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.2.0",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -4524,6 +4538,19 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "safetensors"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79b079b829cb27a1c3c374341345ed2e8b2c0c839034522cee576c140bd7f846"
+dependencies = [
+ "hashbrown 0.16.1",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "same-file"

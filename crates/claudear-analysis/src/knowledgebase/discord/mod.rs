@@ -412,7 +412,7 @@ pub fn format_discord_reference_links(results: &[DiscordSearchResult]) -> String
 fn sha256_hex(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]

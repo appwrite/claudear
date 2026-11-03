@@ -794,7 +794,7 @@ impl Watcher {
         if config.embedding.gpu {
             #[cfg(feature = "cuda")]
             {
-                let cuda_ep = ort::execution_providers::CUDA::default()
+                let cuda_ep = ort::ep::CUDA::default()
                     .with_device_id(config.embedding.device_id)
                     .build();
                 execution_providers.push(cuda_ep);

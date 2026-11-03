@@ -26,7 +26,7 @@ rustls-acme = { version = "0.15", default-features = false, features = ["axum", 
 rusqlite = { version = "0.41", features = ["bundled", "load_extension"] }
 
 # Embeddings
-fastembed = { version = "7", default-features = false, features = ["hf-hub-rustls-tls"] }
+fastembed = { version = "7", default-features = false, features = ["onnx", "hf-hub-rustls-tls"] }
 
 # ORT runtime (download binaries with rustls instead of native-tls)
 ort = { version = "=2.0.0-rc.15", features = ["download-binaries", "tls-rustls"] }
