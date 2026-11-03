@@ -89,6 +89,16 @@ fn effective_context_len(prompt_tokens: usize, max_tokens: u32, context_length: 
     needed.clamp(min, context_length)
 }
 
+fn decode_piece(decoder: &mut encoding_rs::Decoder, bytes: &[u8]) -> String {
+    let mut piece = String::with_capacity(
+        decoder
+            .max_utf8_buffer_length(bytes.len())
+            .unwrap_or(bytes.len()),
+    );
+    let _ = decoder.decode_to_string(bytes, &mut piece, false);
+    piece
+}
+
 impl LlmEngine {
     /// Per-call context window (see [`effective_context_len`]).
     fn effective_context_len(&self, prompt_tokens: usize, max_tokens: u32) -> u32 {
@@ -146,10 +156,7 @@ impl LlmEngine {
         use llama_cpp_2::sampling::LlamaSampler;
 
         // Tokenize and check length BEFORE creating the expensive context
-        let tokens = self
-            .model
-            .str_to_token(prompt, llama_cpp_2::model::AddBos::Always)
-            .map_err(|e| Error::Other(format!("Tokenization failed: {e}")))?;
+        let tokens = self.model.vocab().tokenize(prompt.as_bytes(), true, true);
 
         if tokens.len() as u32 >= self.context_length {
             return Err(Error::Other(format!(
@@ -233,15 +240,15 @@ impl LlmEngine {
             sampler.accept(new_token);
 
             // Check for end of generation
-            if self.model.is_eog_token(new_token) {
+            if self.model.vocab().is_eog(new_token) {
                 break;
             }
 
             // Decode token to string
-            let token_str = self
-                .model
-                .token_to_piece(new_token, &mut decoder, false, None)
-                .unwrap_or_default();
+            let token_str = decode_piece(
+                &mut decoder,
+                &self.model.vocab().token_to_piece(new_token, false, None),
+            );
 
             // Check stop sequences against accumulated output
             accumulated.push_str(&token_str);
@@ -286,10 +293,7 @@ impl LlmEngine {
         use llama_cpp_2::sampling::LlamaSampler;
 
         // Tokenize and check length BEFORE creating the expensive context
-        let tokens = self
-            .model
-            .str_to_token(prompt, llama_cpp_2::model::AddBos::Always)
-            .map_err(|e| Error::Other(format!("Tokenization failed: {e}")))?;
+        let tokens = self.model.vocab().tokenize(prompt.as_bytes(), true, true);
 
         if tokens.len() as u32 >= self.context_length {
             return Err(Error::Other(format!(
@@ -368,14 +372,14 @@ impl LlmEngine {
             let new_token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(new_token);
 
-            if self.model.is_eog_token(new_token) {
+            if self.model.vocab().is_eog(new_token) {
                 break;
             }
 
-            let token_str = self
-                .model
-                .token_to_piece(new_token, &mut decoder, false, None)
-                .unwrap_or_default();
+            let token_str = decode_piece(
+                &mut decoder,
+                &self.model.vocab().token_to_piece(new_token, false, None),
+            );
 
             accumulated.push_str(&token_str);
             let should_stop = params

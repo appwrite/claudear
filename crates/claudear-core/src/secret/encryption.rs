@@ -6,8 +6,8 @@
 //! - Warnings are logged when plaintext secrets are detected in config
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
-    AeadCore, Aes256Gcm, Nonce,
+    aead::{Aead, Generate, Nonce},
+    Aes256Gcm, Key, KeyInit,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ impl MasterKey {
 
     /// Generate a new random master key.
     pub fn generate() -> Self {
-        let key = Aes256Gcm::generate_key(OsRng);
+        let key = Key::<Aes256Gcm>::generate();
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&key);
         Self { key: bytes }
@@ -88,7 +88,7 @@ pub fn encrypt_value(plaintext: &str, master_key: &MasterKey) -> Result<String, 
     let cipher = Aes256Gcm::new_from_slice(master_key.as_bytes())
         .map_err(|e| format!("Failed to create cipher: {}", e))?;
 
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::<Aes256Gcm>::generate();
 
     let ciphertext = cipher
         .encrypt(&nonce, plaintext.as_bytes())
@@ -125,13 +125,14 @@ pub fn decrypt_value(value: &str, master_key: &MasterKey) -> Result<String, Stri
     }
 
     let (nonce_bytes, ciphertext) = combined.split_at(NONCE_SIZE);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes)
+        .map_err(|_| "Invalid nonce length".to_string())?;
 
     let cipher = Aes256Gcm::new_from_slice(master_key.as_bytes())
         .map_err(|e| format!("Failed to create cipher: {}", e))?;
 
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| "Decryption failed: invalid key or corrupted data".to_string())?;
 
     String::from_utf8(plaintext).map_err(|e| format!("Decrypted value is not valid UTF-8: {}", e))
