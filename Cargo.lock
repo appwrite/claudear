@@ -1131,6 +1131,8 @@ dependencies = [
  "chrono",
  "claudear-core",
  "hex",
+ "libc",
+ "parking_lot",
  "rand 0.10.3",
  "regex-lite",
  "rusqlite",
