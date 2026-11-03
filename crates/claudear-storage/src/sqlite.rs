@@ -99,19 +99,19 @@ fn generate_token_id() -> String {
 /// from async contexts without risking thread starvation. The mutex is never
 /// held across await points since all trait methods are synchronous.
 pub struct SqliteTracker {
-    conn: Mutex<Connection>,
-    indexing_tx: tokio::sync::watch::Sender<IndexingProgress>,
+    connection: Mutex<Connection>,
+    indexing_sender: tokio::sync::watch::Sender<IndexingProgress>,
     vector_indexes: Catalog,
 }
 
 impl SqliteTracker {
     /// Create a new SQLite tracker with the given database path.
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
-        let (indexing_tx, _) = tokio::sync::watch::channel(IndexingProgress::default());
+        let connection = Connection::open(db_path)?;
+        let (indexing_sender, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
-            conn: Mutex::new(conn),
-            indexing_tx,
+            connection: Mutex::new(connection),
+            indexing_sender,
             vector_indexes: Catalog::new(),
         };
         tracker.init()?;
@@ -120,11 +120,11 @@ impl SqliteTracker {
 
     /// Create an in-memory SQLite tracker (for testing).
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let (indexing_tx, _) = tokio::sync::watch::channel(IndexingProgress::default());
+        let connection = Connection::open_in_memory()?;
+        let (indexing_sender, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
-            conn: Mutex::new(conn),
-            indexing_tx,
+            connection: Mutex::new(connection),
+            indexing_sender,
             vector_indexes: Catalog::new(),
         };
         tracker.init()?;
@@ -133,7 +133,7 @@ impl SqliteTracker {
 
     /// Subscribe to real-time indexing progress updates.
     pub fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
-        self.indexing_tx.subscribe()
+        self.indexing_sender.subscribe()
     }
 
     /// Whether the vectorlite extension can be loaded for this tracker (and, as a
@@ -199,7 +199,7 @@ impl SqliteTracker {
 
     /// Acquire a lock on the database connection, handling poisoned mutex gracefully.
     fn acquire_lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|e| {
+        self.connection.lock().map_err(|e| {
             claudear_core::error::Error::Storage(format!("Failed to acquire database lock: {}", e))
         })
     }
@@ -3021,8 +3021,6 @@ impl ActivityStore for SqliteTracker {
             events: rows.into_iter().map(TimelineEvent::from).collect(),
         })
     }
-
-    // --- Code Indexing ---
 }
 
 impl KnowledgeStore for SqliteTracker {
@@ -3319,7 +3317,6 @@ impl EmbeddingStore for SqliteTracker {
     fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
         let connection = self.acquire_lock()?;
 
-        // Serialize the embedding vector to bytes if present
         let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|values| {
             let mut bytes = Vec::with_capacity(values.len() * 4);
             for value in values {
@@ -4078,8 +4075,6 @@ impl RepoStore for SqliteTracker {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
-
-    // --- Analytics ---
 
     fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
         SqliteTracker::get_or_create_repo_id(self, name)
@@ -5537,7 +5532,6 @@ impl SqliteTracker {
         let connection = self.acquire_lock()?;
         let keywords_json = serde_json::to_string(&outcome.keywords).unwrap_or_default();
 
-        // Serialize embedding to BLOB if present
         let embedding_blob: Option<Vec<u8>> = outcome.embedding.as_ref().map(|values| {
             values
                 .iter()
@@ -6717,7 +6711,7 @@ impl SqliteTracker {
             updated_at: Some(now),
             ..Default::default()
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -6774,7 +6768,7 @@ impl SqliteTracker {
             started_at: db_started_at,
             updated_at: Some(now),
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -6819,7 +6813,7 @@ impl SqliteTracker {
             updated_at: Some(now),
             ..Default::default()
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -10122,8 +10116,6 @@ impl SqliteTracker {
         Ok(())
     }
 
-    // --- Chat Session Store ---
-
     /// Create a new chat session.
     pub fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
         let conn = self.acquire_lock()?;
@@ -12204,7 +12196,7 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init - verify by trying to query
-        let conn = tracker.conn.lock().unwrap();
+        let conn = tracker.connection.lock().unwrap();
         let result = conn.execute("SELECT 1 FROM regression_watches LIMIT 1", []);
         // Should succeed (table exists) or return empty result, not error
         assert!(result.is_ok() || result.is_err());
@@ -12215,7 +12207,7 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init
-        let conn = tracker.conn.lock().unwrap();
+        let conn = tracker.connection.lock().unwrap();
         let result = conn.execute("SELECT 1 FROM release_tracking LIMIT 1", []);
         assert!(result.is_ok() || result.is_err());
     }
@@ -12225,7 +12217,7 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init
-        let conn = tracker.conn.lock().unwrap();
+        let conn = tracker.connection.lock().unwrap();
         let result = conn.execute("SELECT 1 FROM regression_checks LIMIT 1", []);
         assert!(result.is_ok() || result.is_err());
     }
@@ -20235,8 +20227,6 @@ mod tests {
         tracker.save_code_chunk_embeddings(&[], "test").unwrap();
     }
 
-    // --- Discord message chunks (vectorlite) ---
-
     fn sample_discord_chunk(
         channel_id: &str,
         start_id: &str,
@@ -20579,10 +20569,6 @@ mod tests {
         assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
     }
 
-    // =========================================================
-    // Tests for previously uncovered code paths
-    // =========================================================
-
     #[test]
     fn test_blob_to_embedding_none() {
         assert!(SqliteTracker::blob_to_embedding(None).is_none());
@@ -20710,8 +20696,6 @@ mod tests {
             .unwrap();
         assert!(result.is_none());
     }
-
-    // --- Chat Store Tests ---
 
     #[test]
     fn test_create_chat_session() {
@@ -20874,8 +20858,6 @@ mod tests {
         assert_eq!(sessions.len(), 1);
     }
 
-    // --- Code Index Meta Tests ---
-
     #[test]
     fn test_get_set_code_index_meta() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -20970,8 +20952,6 @@ mod tests {
         assert_eq!(model.as_deref(), Some("test-model-v1"));
     }
 
-    // --- Delete All Code Data ---
-
     #[test]
     fn test_delete_all_code_data_for_repo() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21027,8 +21007,6 @@ mod tests {
         tracker.delete_all_code_data_for_repo(repo_id).unwrap();
     }
 
-    // --- Indexing Progress ---
-
     #[test]
     fn test_get_indexing_progress_default() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21038,8 +21016,6 @@ mod tests {
         assert_eq!(progress.total_repos, 0);
         assert_eq!(progress.indexed_repos, 0);
     }
-
-    // --- Update user with no fields ---
 
     #[test]
     fn test_update_user_no_fields() {
@@ -21100,8 +21076,6 @@ mod tests {
         );
     }
 
-    // --- get_activities_for_issue (isolation) ---
-
     #[test]
     fn test_get_activities_for_issue_filters_by_source_and_id() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21158,8 +21132,6 @@ mod tests {
         assert!(activities.is_empty());
     }
 
-    // --- find_similar_issues_vector (without vectorlite) ---
-
     #[test]
     fn test_find_similar_issues_vector_empty_embedding() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21181,8 +21153,6 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    // --- find_similar_outcomes_vector (without vectorlite) ---
-
     #[test]
     fn test_find_similar_outcomes_vector_empty_embedding() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21201,8 +21171,6 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    // --- generate_session_token ---
-
     #[test]
     fn test_generate_session_token_length_and_uniqueness() {
         let t1 = generate_session_token();
@@ -21215,8 +21183,6 @@ mod tests {
         // Should be valid hex
         assert!(t1.chars().all(|c| c.is_ascii_hexdigit()));
     }
-
-    // --- record_release_tracking (edge case: no released_at) ---
 
     #[test]
     fn test_record_release_tracking_no_released_at() {
@@ -21250,8 +21216,6 @@ mod tests {
         let id = tracker.record_release_tracking(&tracking).unwrap();
         assert!(id > 0);
     }
-
-    // --- store_embeddings_batch with actual data ---
 
     #[test]
     fn test_store_embeddings_batch_with_embeddings() {
@@ -21299,16 +21263,12 @@ mod tests {
         assert_eq!(e2.description.as_deref(), Some("Desc"));
     }
 
-    // --- list_issues (tested indirectly but let's test count_issues with source) ---
-
     #[test]
     fn test_count_issues_no_data() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let count = tracker.count_issues(None).unwrap();
         assert_eq!(count, 0);
     }
-
-    // --- get_success_rate with mixed outcomes ---
 
     #[test]
     fn test_get_success_rate_with_data() {
@@ -21332,8 +21292,6 @@ mod tests {
         assert!((rate - 1.0 / 3.0).abs() < 0.01);
     }
 
-    // --- record_metrics_batch edge case ---
-
     #[test]
     fn test_record_metrics_batch_with_tags() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21349,8 +21307,6 @@ mod tests {
         let count = tracker.record_metrics_batch(&[metric]).unwrap();
         assert_eq!(count, 1);
     }
-
-    // --- subscribe_indexing_progress ---
 
     #[test]
     fn test_subscribe_indexing_progress_returns_receiver() {
