@@ -3,12 +3,12 @@
 //! Uses the Nomic Embed Text model for generating embeddings.
 
 use claudear_core::error::{Error, Result};
-use fastembed::{EmbeddingModel, ExecutionProviderDispatch, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, ExecutionProviderDispatch, TextEmbedding, TextInitOptions};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Configuration for the embedding service.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EmbeddingConfig {
     /// Model to use for embeddings.
     pub model: EmbeddingModel,
@@ -27,6 +27,25 @@ pub struct EmbeddingConfig {
 }
 
 const DEFAULT_POOL_SIZE: usize = 1;
+
+impl std::fmt::Debug for EmbeddingConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let providers: Vec<&str> = self
+            .execution_providers
+            .iter()
+            .map(ExecutionProviderDispatch::name)
+            .collect();
+        formatter
+            .debug_struct("EmbeddingConfig")
+            .field("model", &self.model)
+            .field("show_download_progress", &self.show_download_progress)
+            .field("cache_dir", &self.cache_dir)
+            .field("pool_size", &self.pool_size)
+            .field("execution_providers", &providers)
+            .field("sub_batch_size", &self.sub_batch_size)
+            .finish()
+    }
+}
 
 impl Default for EmbeddingConfig {
     fn default() -> Self {
@@ -124,9 +143,7 @@ impl EmbeddingClient {
         let desired_pool_size = config.pool_size.max(1);
 
         // --- Load first instance and measure its memory footprint -----------
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let mem_before = sys.available_memory();
+        let mem_before = Self::available_memory();
 
         let has_gpu_providers = !config.execution_providers.is_empty();
 
@@ -136,8 +153,7 @@ impl EmbeddingClient {
         // covers inference buffers, not just model weights.
         let _ = first_model.embed(vec!["warmup"], None);
 
-        sys.refresh_memory();
-        let mem_after = sys.available_memory();
+        let mem_after = Self::available_memory();
         let per_instance_loaded = mem_before.saturating_sub(mem_after);
 
         // Inference memory grows with batch_size × sequence_length²
@@ -205,7 +221,7 @@ impl EmbeddingClient {
     }
 
     fn load_model(config: &EmbeddingConfig) -> Result<TextEmbedding> {
-        let mut init_options = InitOptions::new(config.model.clone())
+        let mut init_options = TextInitOptions::new(config.model.clone())
             .with_show_download_progress(config.show_download_progress)
             .with_execution_providers(Self::execution_providers(config));
         if let Some(ref cache_dir) = config.cache_dir {
@@ -224,6 +240,15 @@ impl EmbeddingClient {
             return config.execution_providers.clone();
         }
         vec![ort::ep::CPU::default().with_arena_allocator(false).build()]
+    }
+
+    fn available_memory() -> u64 {
+        sysinfo::System::new()
+            .map(|mut system| {
+                system.refresh_memory();
+                system.available_memory()
+            })
+            .unwrap_or(0)
     }
 
     /// Round-robin acquire a model instance from the pool.
@@ -247,9 +272,7 @@ impl EmbeddingClient {
             return val;
         }
 
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let available_mb = sys.available_memory() / (1024 * 1024);
+        let available_mb = Self::available_memory() / (1024 * 1024);
 
         if available_mb == 0 {
             return 32;
@@ -784,9 +807,9 @@ mod tests {
     fn test_cpu_sessions_register_the_cpu_provider() {
         let providers = EmbeddingClient::execution_providers(&EmbeddingConfig::default());
         assert_eq!(providers.len(), 1);
-        let provider = format!("{:?}", providers[0]);
-        assert!(
-            provider.starts_with("CPUExecutionProvider"),
+        let provider = providers[0].name();
+        assert_eq!(
+            provider, "CPUExecutionProvider",
             "expected the CPU provider that disables the memory arena, got {provider}"
         );
     }

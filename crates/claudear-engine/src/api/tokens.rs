@@ -47,7 +47,7 @@ fn generate_secret() -> String {
 fn hash_secret(secret: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Normalize a caller-supplied expiry into a UTC `YYYY-MM-DD HH:MM:SS` string

@@ -32,7 +32,7 @@ jobs:
             binary_name: claudear.exe
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set version from tag (Unix)
         if: runner.os != 'Windows'
@@ -133,7 +133,7 @@ jobs:
     name: Publish Docker Image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set version from tag
         id: version
@@ -189,7 +189,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(github.ref_name, '-') }}  # Skip prereleases
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Get version
         id: version
@@ -245,7 +245,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             arch: arm64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set version from tag
         id: version
@@ -299,7 +299,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(github.ref_name, '-') }}  # Skip prereleases
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install APT repository tools
         run: |

@@ -24,7 +24,7 @@ jobs:
       FASTEMBED_CACHE_DIR: /home/runner/.cache/fastembed
       HF_HOME: /home/runner/.cache/fastembed
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: sudo apt-get install -y mold
@@ -72,7 +72,7 @@ jobs:
     needs: [compile]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: sudo apt-get install -y mold
@@ -116,7 +116,7 @@ jobs:
           - claudear-integrations
           - claudear
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: sudo apt-get install -y mold
@@ -184,7 +184,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: env.CODECOV_TOKEN != ''
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           fail_ci_if_error: true
           flags: ${{ matrix.crate }}
@@ -215,7 +215,7 @@ jobs:
             artifact: claudear-windows
             binary_path: target/release/claudear.exe
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -256,7 +256,7 @@ jobs:
       - name: Configure git
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -302,7 +302,7 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2

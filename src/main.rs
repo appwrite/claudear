@@ -495,6 +495,24 @@ enum UsersCommands {
 
 /// Initialize logging with both console and file output.
 /// Returns a guard that must be kept alive for the duration of the program.
+fn sentry_layer<S>() -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    use sentry::integrations::tracing::{BreadcrumbLayer, ErrorLayer, SpanLayer};
+    use tracing_subscriber::filter::filter_fn;
+
+    SpanLayer::new()
+        .with_filter(LevelFilter::INFO)
+        .and_then(BreadcrumbLayer::new().with_filter(filter_fn(|metadata| {
+            matches!(
+                *metadata.level(),
+                tracing::Level::WARN | tracing::Level::INFO
+            )
+        })))
+        .and_then(ErrorLayer::new().with_filter(LevelFilter::ERROR))
+}
+
 fn init_logging(
     log_dir: Option<&std::path::Path>,
     verbose: bool,
@@ -533,7 +551,7 @@ fn init_logging(
             tracing_subscriber::registry()
                 .with(filter)
                 .with(console_layer)
-                .with(sentry::integrations::tracing::layer())
+                .with(sentry_layer())
                 .init();
             return None;
         }
@@ -551,7 +569,7 @@ fn init_logging(
             .with(filter)
             .with(console_layer)
             .with(file_layer)
-            .with(sentry::integrations::tracing::layer())
+            .with(sentry_layer())
             .init();
 
         tracing::info!("Logging to file: {}/claudear.log", dir.display());
@@ -561,7 +579,7 @@ fn init_logging(
         tracing_subscriber::registry()
             .with(filter)
             .with(console_layer)
-            .with(sentry::integrations::tracing::layer())
+            .with(sentry_layer())
             .init();
         None
     }
@@ -2144,20 +2162,21 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Initialize Sentry before the async runtime to ensure proper flushing on shutdown
-    let sentry_guard = sentry::init((
-        std::env::var("CLAUDEAR_SENTRY_DSN").unwrap_or_default(),
-        sentry::ClientOptions {
-            release: std::env::var("CLAUDEAR_SENTRY_RELEASE")
+    let mut sentry_options = sentry::ClientOptions::new()
+        .maybe_release(
+            std::env::var("CLAUDEAR_SENTRY_RELEASE")
                 .ok()
-                .filter(|s| !s.is_empty())
+                .filter(|release| !release.is_empty())
                 .map(Into::into)
                 .or_else(|| sentry::release_name!()),
-            environment: std::env::var("CLAUDEAR_SENTRY_ENVIRONMENT")
-                .ok()
-                .map(Into::into),
-            traces_sample_rate: 0.2,
-            ..Default::default()
-        },
+        )
+        .traces_sample_rate(0.2);
+    if let Ok(environment) = std::env::var("CLAUDEAR_SENTRY_ENVIRONMENT") {
+        sentry_options = sentry_options.environment(environment);
+    }
+    let sentry_guard = sentry::init((
+        std::env::var("CLAUDEAR_SENTRY_DSN").unwrap_or_default(),
+        sentry_options,
     ));
 
     sentry::configure_scope(|scope| {
@@ -2792,7 +2811,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 if config.embedding.gpu {
                     #[cfg(feature = "cuda")]
                     {
-                        let cuda_ep = ort::execution_providers::CUDA::default()
+                        let cuda_ep = ort::ep::CUDA::default()
                             .with_device_id(config.embedding.device_id)
                             .build();
                         execution_providers.push(cuda_ep);

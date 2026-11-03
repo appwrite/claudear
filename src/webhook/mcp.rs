@@ -72,7 +72,7 @@ impl DiscordMessageLister for DiscordClient {
 pub(crate) fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Protocol versions this handler implements. The newest (first) is advertised

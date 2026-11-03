@@ -10,7 +10,7 @@ use base64::Engine;
 use claudear_config::config::HelpScoutConfig;
 use claudear_core::error::Result;
 use claudear_core::types::{Issue, MatchPriority, MatchResult};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;

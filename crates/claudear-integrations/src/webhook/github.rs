@@ -8,7 +8,7 @@
 use crate::scm::{is_skippable_bot, CodeReview, ReviewComment, ReviewUser, ReviewWatcher};
 use claudear_config::config::GitHubConfig;
 use claudear_core::error::Result;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -707,7 +707,7 @@ mod tests {
         let payload = b"test payload";
 
         // Compute expected signature
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(b"test_secret").unwrap();
         mac.update(payload);
@@ -769,7 +769,7 @@ mod tests {
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(b"app_secret").unwrap();
         mac.update(payload);
@@ -980,7 +980,7 @@ mod tests {
 
     /// Compute a valid HMAC-SHA256 signature for the given payload and secret.
     fn make_valid_signature(secret: &str, payload: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(payload);
