@@ -9051,8 +9051,7 @@ impl SqliteTracker {
     pub fn delete_code_data_for_file(&self, repo_id: i64, file_path: &str) -> Result<()> {
         let mut connection = self.acquire_lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let embedding_ids =
-            Self::code_chunk_embedding_ids_for_file(&transaction, repo_id, file_path)?;
+        let embedding_ids = Self::code_chunk_embedding_ids(&transaction, repo_id, Some(file_path))?;
         transaction.execute(
             "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
             params![repo_id, file_path],
@@ -9077,7 +9076,8 @@ impl SqliteTracker {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let embedding_ids = Self::code_chunk_embedding_ids_for_chunks(&transaction, chunk_ids)?;
         {
-            let mut statement = transaction.prepare("DELETE FROM code_chunks WHERE id = ?1")?;
+            let mut statement =
+                transaction.prepare_cached("DELETE FROM code_chunks WHERE id = ?1")?;
             for chunk_id in chunk_ids {
                 statement.execute(params![chunk_id])?;
             }
@@ -9095,45 +9095,29 @@ impl SqliteTracker {
             return self.delete_all_code_data_for_repo(repo_id);
         }
 
+        let current: HashSet<&str> = current_paths.iter().map(String::as_str).collect();
         let mut connection = self.acquire_lock()?;
-
-        let indexed_paths: Vec<String> = {
-            let mut statement = connection
-                .prepare("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
-            let rows: Vec<String> = statement
-                .query_map(params![repo_id], |row| row.get(0))?
-                .filter_map(|row| row.ok())
-                .collect();
-            rows
-        };
-
-        let current_set: HashSet<&str> = current_paths.iter().map(String::as_str).collect();
-
-        let stale_paths: Vec<&String> = indexed_paths
-            .iter()
-            .filter(|path| !current_set.contains(path.as_str()))
-            .collect();
-
-        if stale_paths.is_empty() {
+        if Self::stale_code_file_paths(&connection, repo_id, &current)?.is_empty() {
             return Ok(());
         }
 
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_paths = Self::stale_code_file_paths(&transaction, repo_id, &current)?;
         let mut embedding_ids = Vec::new();
-        for path in &stale_paths {
-            embedding_ids.extend(Self::code_chunk_embedding_ids_for_file(
-                &transaction,
-                repo_id,
-                path,
-            )?);
-            transaction.execute(
-                "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
-                params![repo_id, path],
-            )?;
-            transaction.execute(
-                "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
-                params![repo_id, path],
-            )?;
+        {
+            let mut delete_symbols = transaction
+                .prepare_cached("DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2")?;
+            let mut delete_chunks = transaction
+                .prepare_cached("DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2")?;
+            for path in &stale_paths {
+                embedding_ids.extend(Self::code_chunk_embedding_ids(
+                    &transaction,
+                    repo_id,
+                    Some(path),
+                )?);
+                delete_symbols.execute(params![repo_id, path])?;
+                delete_chunks.execute(params![repo_id, path])?;
+            }
         }
         transaction.commit()?;
         self.vector_indexes
@@ -9142,18 +9126,45 @@ impl SqliteTracker {
         Ok(())
     }
 
-    fn code_chunk_embedding_ids_for_file(
+    fn stale_code_file_paths(
         connection: &Connection,
         repository_id: i64,
-        file_path: &str,
+        current_paths: &HashSet<&str>,
+    ) -> Result<Vec<String>> {
+        let mut statement = connection
+            .prepare_cached("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
+        let mut stale = Vec::new();
+        for path in statement.query_map(params![repository_id], |row| row.get::<_, String>(0))? {
+            let path = path?;
+            if !current_paths.contains(path.as_str()) {
+                stale.push(path);
+            }
+        }
+        Ok(stale)
+    }
+
+    fn code_chunk_embedding_ids(
+        connection: &Connection,
+        repository_id: i64,
+        file_path: Option<&str>,
     ) -> Result<Vec<i64>> {
-        let mut statement = connection.prepare(
-            "SELECT e.id FROM code_chunk_embeddings e
-             JOIN code_chunks c ON c.id = e.chunk_id
-             WHERE c.repo_id = ?1 AND c.file_path = ?2",
-        )?;
-        let ids = statement
-            .query_map(params![repository_id, file_path], |row| row.get(0))?
+        let (sql, parameters) = match file_path {
+            Some(_) => (
+                "SELECT e.id FROM code_chunk_embeddings e
+                 JOIN code_chunks c ON c.id = e.chunk_id
+                 WHERE c.repo_id = ?1 AND c.file_path = ?2",
+                params![repository_id, file_path],
+            ),
+            None => (
+                "SELECT e.id FROM code_chunk_embeddings e
+                 JOIN code_chunks c ON c.id = e.chunk_id
+                 WHERE c.repo_id = ?1",
+                params![repository_id],
+            ),
+        };
+        let ids = connection
+            .prepare_cached(sql)?
+            .query_map(parameters, |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<i64>>>()?;
         Ok(ids)
     }
@@ -9162,8 +9173,8 @@ impl SqliteTracker {
         connection: &Connection,
         chunk_ids: &[i64],
     ) -> Result<Vec<i64>> {
-        let mut statement =
-            connection.prepare("SELECT id FROM code_chunk_embeddings WHERE chunk_id = ?1")?;
+        let mut statement = connection
+            .prepare_cached("SELECT id FROM code_chunk_embeddings WHERE chunk_id = ?1")?;
         let mut ids = Vec::with_capacity(chunk_ids.len());
         for chunk_id in chunk_ids {
             if let Some(id) = statement
@@ -9173,21 +9184,6 @@ impl SqliteTracker {
                 ids.push(id);
             }
         }
-        Ok(ids)
-    }
-
-    fn code_chunk_embedding_ids_for_repository(
-        connection: &Connection,
-        repository_id: i64,
-    ) -> Result<Vec<i64>> {
-        let mut statement = connection.prepare(
-            "SELECT e.id FROM code_chunk_embeddings e
-             JOIN code_chunks c ON c.id = e.chunk_id
-             WHERE c.repo_id = ?1",
-        )?;
-        let ids = statement
-            .query_map(params![repository_id], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<i64>>>()?;
         Ok(ids)
     }
 
@@ -9693,27 +9689,14 @@ impl SqliteTracker {
             return self.delete_discord_message_data_for_channel(channel_id);
         }
 
-        let mut connection = self.acquire_lock()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let indexed: Vec<(i64, Option<String>)> = transaction
-            .prepare_cached(
-                "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
-            )?
-            .query_map(params![channel_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-
         let current: HashSet<&str> = current_hashes.iter().map(String::as_str).collect();
-        let stale_ids: Vec<i64> = indexed
-            .into_iter()
-            .filter_map(|(id, hash)| match hash {
-                Some(hash) if !current.contains(hash.as_str()) => Some(id),
-                _ => None,
-            })
-            .collect();
-        if stale_ids.is_empty() {
+        let mut connection = self.acquire_lock()?;
+        if Self::stale_discord_message_chunk_ids(&connection, channel_id, &current)?.is_empty() {
             return Ok(());
         }
 
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_ids = Self::stale_discord_message_chunk_ids(&transaction, channel_id, &current)?;
         let embedding_ids =
             Self::discord_message_chunk_embedding_ids_for_chunks(&transaction, &stale_ids)?;
         {
@@ -9729,6 +9712,26 @@ impl SqliteTracker {
             .discord_message_chunk
             .remove(&connection, &embedding_ids);
         Ok(())
+    }
+
+    fn stale_discord_message_chunk_ids(
+        connection: &Connection,
+        channel_id: &str,
+        current_hashes: &HashSet<&str>,
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection.prepare_cached(
+            "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
+        )?;
+        let mut stale = Vec::new();
+        for row in statement.query_map(params![channel_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })? {
+            let (id, hash) = row?;
+            if hash.is_some_and(|hash| !current_hashes.contains(hash.as_str())) {
+                stale.push(id);
+            }
+        }
+        Ok(stale)
     }
 
     pub fn delete_all_discord_message_data(&self) -> Result<()> {
@@ -10100,7 +10103,7 @@ impl SqliteTracker {
     pub fn delete_all_code_data_for_repo(&self, repo_id: i64) -> Result<()> {
         let mut connection = self.acquire_lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let embedding_ids = Self::code_chunk_embedding_ids_for_repository(&transaction, repo_id)?;
+        let embedding_ids = Self::code_chunk_embedding_ids(&transaction, repo_id, None)?;
         transaction.execute(
             "DELETE FROM code_symbols WHERE repo_id = ?1",
             params![repo_id],
@@ -19742,6 +19745,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(keep_count, 1);
+    }
+
+    fn hold_write_lock(path: &Path, tracker: &SqliteTracker) -> Connection {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        let writer = Connection::open(path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writer
+    }
+
+    #[test]
+    fn test_cleanup_stale_discord_message_data_without_stale_chunks_skips_the_write_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let tracker = SqliteTracker::new(&path).unwrap();
+        tracker
+            .save_discord_chunks(&[
+                sample_discord_chunk("100", "1001"),
+                sample_discord_chunk("100", "1002"),
+            ])
+            .unwrap();
+        let _writer = hold_write_lock(&path, &tracker);
+
+        tracker
+            .cleanup_stale_discord_message_data(
+                "100",
+                &["hash-1001".to_string(), "hash-1002".to_string()],
+            )
+            .expect("a cleanup with nothing stale must not wait on another writer");
+    }
+
+    #[test]
+    fn test_cleanup_stale_code_data_without_stale_files_skips_the_write_lock() {
+        use claudear_core::types::Language;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let tracker = SqliteTracker::new(&path).unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+        tracker
+            .save_code_chunks(&[claudear_core::types::CodeChunk {
+                id: None,
+                repo_id,
+                file_path: "keep.rs".to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: None,
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 5,
+                chunk_text: "fn keep() {}".to_string(),
+                context_text: "".to_string(),
+                file_hash: "h1".to_string(),
+                content_hash: None,
+            }])
+            .unwrap();
+        let _writer = hold_write_lock(&path, &tracker);
+
+        tracker
+            .cleanup_stale_code_data(repo_id, &["keep.rs".to_string()])
+            .expect("a cleanup with nothing stale must not wait on another writer");
     }
 
     #[test]
