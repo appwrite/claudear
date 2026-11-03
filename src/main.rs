@@ -1354,7 +1354,7 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
     Arc::new(composite)
 }
 
-fn create_tracker(config: &Config) -> Arc<dyn FixAttemptTracker> {
+fn create_tracker(config: &Config) -> Arc<SqliteTracker> {
     Arc::new(SqliteTracker::new(&config.db_path).expect("Failed to initialize SQLite tracker"))
 }
 
@@ -3672,7 +3672,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     tracing::info!("Initializing...");
     let user_registry = UserRegistry::new(config.users.clone());
     let notifier = create_notifier(&config, user_registry.clone());
-    let tracker = create_tracker(&config);
+    let database = create_tracker(&config);
+    let tracker: Arc<dyn FixAttemptTracker> = database.clone();
 
     if let Commands::Start {
         port,
@@ -3711,6 +3712,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let mode_str = modes.join("+");
 
         let deps = build_watcher_deps(&config, &tracker).await?;
+        tokio::task::spawn_blocking(move || database.rebuild_vector_indexes());
         let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
         let sources = deps.sources;
         if sources.is_empty() {

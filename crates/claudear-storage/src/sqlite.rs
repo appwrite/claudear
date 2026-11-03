@@ -12,7 +12,9 @@ use super::{
     RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
 };
 use crate::vector_index::catalog::Catalog;
+use crate::vector_index::progress::Progress;
 use crate::vector_index::validate_dimension;
+use crate::vector_index::REBUILD_BATCH_SIZE;
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::types::{
@@ -27,7 +29,7 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_LOG_DIR: &str = "./logs";
 const AUDIT_LOG_SUBDIR: &str = "audit";
@@ -148,6 +150,50 @@ impl SqliteTracker {
         match self.acquire_lock() {
             Ok(conn) => try_load_vectorlite(&conn).unwrap_or(false),
             Err(_) => false,
+        }
+    }
+
+    /// Rebuild every vector index on this connection from its embedding table, releasing the
+    /// connection lock between bounded batches so other database work can interleave.
+    pub fn rebuild_vector_indexes(&self) {
+        for index in self.vector_indexes.all() {
+            let started = Instant::now();
+            let mut batches: usize = 0;
+            loop {
+                let connection = match self.acquire_lock() {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to lock the database to rebuild vector indexes");
+                        return;
+                    }
+                };
+                let step = index.rebuild_step(&connection, REBUILD_BATCH_SIZE);
+                drop(connection);
+                batches += 1;
+                match step {
+                    Ok(Progress::Pending) => std::thread::yield_now(),
+                    Ok(Progress::Complete) => {
+                        tracing::info!(
+                            table = index.table(),
+                            batches,
+                            batch_size = REBUILD_BATCH_SIZE,
+                            elapsed = ?started.elapsed(),
+                            "Rebuilt vector index"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            table = index.table(),
+                            batches,
+                            elapsed = ?started.elapsed(),
+                            %error,
+                            "Failed to rebuild vector index; it rebuilds on next use"
+                        );
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -21902,6 +21948,135 @@ mod tests {
         // Verify regression data is gone
         let watches = tracker.get_all_regression_watches().unwrap();
         assert!(watches.is_empty());
+    }
+
+    mod vector_index_rebuild {
+        use super::*;
+        use crate::vectorlite::require_vectorlite_for_tests;
+        use claudear_core::types::{CodeChunk, Language};
+        use std::sync::mpsc;
+
+        const MODEL: &str = "test-model";
+        const TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+        fn sample_code_chunk(repository_id: i64, index: usize) -> CodeChunk {
+            CodeChunk {
+                id: None,
+                repo_id: repository_id,
+                file_path: format!("src/file_{index}.rs"),
+                chunk_type: "function".to_string(),
+                symbol_name: Some(format!("function_{index}")),
+                language: Language::Rust,
+                start_line: index + 1,
+                end_line: index + 2,
+                chunk_text: format!("fn function_{index}() {{}}"),
+                context_text: String::new(),
+                file_hash: format!("hash-{index}"),
+                content_hash: None,
+            }
+        }
+
+        fn sample_embedding(index: usize) -> Vec<f32> {
+            vec![1.0, index as f32, 0.5, 0.25]
+        }
+
+        fn embedding_blob(embedding: &[f32]) -> Vec<u8> {
+            embedding
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        }
+
+        #[test]
+        fn test_rebuild_vector_indexes_restores_every_code_chunk_vector_after_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let count = 3 * REBUILD_BATCH_SIZE + 1;
+
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = writer.get_or_create_repo_id("org/repo").unwrap();
+            let chunks: Vec<CodeChunk> = (0..count)
+                .map(|index| sample_code_chunk(repository_id, index))
+                .collect();
+            let chunk_ids = writer.save_code_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..count).map(sample_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            writer.save_code_chunk_embeddings(&pairs, MODEL).unwrap();
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            assert!(require_vectorlite_for_tests(
+                &reader.acquire_lock().unwrap()
+            ));
+            reader.rebuild_vector_indexes();
+
+            let connection = reader.acquire_lock().unwrap();
+            let embedding_ids: Vec<i64> = connection
+                .prepare("SELECT id FROM code_chunk_embeddings ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(embedding_ids.len(), count);
+            let mut lookup = connection
+                .prepare("SELECT rowid FROM code_chunk_vectors WHERE rowid = ?1")
+                .unwrap();
+            let missing: Vec<i64> = embedding_ids
+                .into_iter()
+                .filter(|embedding_id| {
+                    lookup
+                        .query_row(params![embedding_id], |row| row.get::<_, i64>(0))
+                        .optional()
+                        .unwrap()
+                        .is_none()
+                })
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "rebuild_vector_indexes left {} of {count} embeddings out of code_chunk_vectors, starting with {:?}",
+                missing.len(),
+                missing.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn test_rebuild_vector_indexes_terminates_when_a_vector_table_name_is_taken() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let chunk_ids = tracker
+                .save_code_chunks(&[sample_code_chunk(repository_id, 0)])
+                .unwrap();
+            {
+                let connection = tracker.acquire_lock().unwrap();
+                connection
+                    .execute_batch("CREATE TABLE code_chunk_vectors(x)")
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO code_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
+                        params![chunk_ids[0], embedding_blob(&sample_embedding(0)), MODEL],
+                    )
+                    .unwrap();
+            }
+
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                tracker.rebuild_vector_indexes();
+                let _ = sender.send(());
+            });
+
+            receiver.recv_timeout(TERMINATION_TIMEOUT).expect(
+                "rebuild_vector_indexes must terminate when an ordinary table holds a vector index name",
+            );
+        }
     }
 
     mod vector_index_regression {
