@@ -1,8 +1,8 @@
 //! Vectorlite integration for HNSW-based similarity search.
 //!
 //! Uses the vectorlite SQLite extension for efficient approximate nearest neighbor search.
-//! The actual HNSW table creation and querying is done in `sqlite.rs` via
-//! `ensure_*_vector_table()` / `find_similar_*_vector()` methods.
+//! The HNSW tables are a per-connection cache of the embedding tables, created and rebuilt
+//! by `crate::vector_index` and queried from `sqlite.rs`.
 
 use claudear_core::error::{Error, Result};
 use rusqlite::Connection;

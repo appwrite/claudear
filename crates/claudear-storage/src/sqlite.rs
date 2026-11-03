@@ -11,6 +11,8 @@ use super::{
     DeployQaStore, DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
     RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
 };
+use crate::vector_index::catalog::Catalog;
+use crate::vector_index::validate_dimension;
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::types::{
@@ -44,21 +46,6 @@ const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const DISCORD_MESSAGE_CHUNK_VECTOR_TABLE: &str = "discord_message_chunk_vectors";
 const DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-
-/// Maximum allowed embedding dimension to prevent malformed data from generating
-/// unbounded DDL strings. Covers all common embedding models (up to 8192-dim).
-const MAX_EMBEDDING_DIMENSION: usize = 16384;
-
-/// Validate that an embedding dimension is within safe bounds for SQL DDL interpolation.
-fn validate_dimension(dimension: usize) -> Result<()> {
-    if dimension == 0 || dimension > MAX_EMBEDDING_DIMENSION {
-        return Err(claudear_core::error::Error::storage(format!(
-            "Embedding dimension {} is out of valid range (1..={})",
-            dimension, MAX_EMBEDDING_DIMENSION
-        )));
-    }
-    Ok(())
-}
 
 impl UserRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -118,6 +105,8 @@ fn generate_token_id() -> String {
 pub struct SqliteTracker {
     conn: Mutex<Connection>,
     indexing_tx: tokio::sync::watch::Sender<IndexingProgress>,
+    #[allow(dead_code)]
+    vector_indexes: Catalog,
 }
 
 impl SqliteTracker {
@@ -128,6 +117,7 @@ impl SqliteTracker {
         let tracker = Self {
             conn: Mutex::new(conn),
             indexing_tx,
+            vector_indexes: Catalog::new(),
         };
         tracker.init()?;
         Ok(tracker)
@@ -140,6 +130,7 @@ impl SqliteTracker {
         let tracker = Self {
             conn: Mutex::new(conn),
             indexing_tx,
+            vector_indexes: Catalog::new(),
         };
         tracker.init()?;
         Ok(tracker)
@@ -20874,25 +20865,6 @@ mod tests {
     // =========================================================
     // Tests for previously uncovered code paths
     // =========================================================
-
-    #[test]
-    fn test_validate_dimension_zero() {
-        let result = validate_dimension(0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_dimension_too_large() {
-        let result = validate_dimension(MAX_EMBEDDING_DIMENSION + 1);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_dimension_valid() {
-        assert!(validate_dimension(1).is_ok());
-        assert!(validate_dimension(128).is_ok());
-        assert!(validate_dimension(MAX_EMBEDDING_DIMENSION).is_ok());
-    }
 
     #[test]
     fn test_blob_to_embedding_none() {

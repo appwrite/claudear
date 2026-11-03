@@ -8,6 +8,8 @@ pub mod sqlite;
 pub mod tenant;
 pub mod types;
 #[cfg(feature = "sqlite")]
+pub(crate) mod vector_index;
+#[cfg(feature = "sqlite")]
 pub mod vectorlite;
 
 pub use analytics::{
