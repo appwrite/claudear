@@ -3635,6 +3635,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     } = cli.command
     {
         let tracker = create_tracker(&config);
+        let warmup = Arc::clone(&tracker);
+        tokio::task::spawn_blocking(move || warmup.rebuild_vector_indexes());
         let server = if let Some(dir) = dashboard_dir {
             ApiServer::with_dashboard(
                 config,
