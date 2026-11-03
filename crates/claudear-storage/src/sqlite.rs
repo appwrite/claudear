@@ -99,19 +99,19 @@ fn generate_token_id() -> String {
 /// from async contexts without risking thread starvation. The mutex is never
 /// held across await points since all trait methods are synchronous.
 pub struct SqliteTracker {
-    conn: Mutex<Connection>,
-    indexing_tx: tokio::sync::watch::Sender<IndexingProgress>,
+    connection: Mutex<Connection>,
+    indexing_sender: tokio::sync::watch::Sender<IndexingProgress>,
     vector_indexes: Catalog,
 }
 
 impl SqliteTracker {
     /// Create a new SQLite tracker with the given database path.
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
-        let (indexing_tx, _) = tokio::sync::watch::channel(IndexingProgress::default());
+        let connection = Connection::open(db_path)?;
+        let (indexing_sender, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
-            conn: Mutex::new(conn),
-            indexing_tx,
+            connection: Mutex::new(connection),
+            indexing_sender,
             vector_indexes: Catalog::new(),
         };
         tracker.init()?;
@@ -120,11 +120,11 @@ impl SqliteTracker {
 
     /// Create an in-memory SQLite tracker (for testing).
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let (indexing_tx, _) = tokio::sync::watch::channel(IndexingProgress::default());
+        let connection = Connection::open_in_memory()?;
+        let (indexing_sender, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
-            conn: Mutex::new(conn),
-            indexing_tx,
+            connection: Mutex::new(connection),
+            indexing_sender,
             vector_indexes: Catalog::new(),
         };
         tracker.init()?;
@@ -133,7 +133,7 @@ impl SqliteTracker {
 
     /// Subscribe to real-time indexing progress updates.
     pub fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
-        self.indexing_tx.subscribe()
+        self.indexing_sender.subscribe()
     }
 
     /// Whether the vectorlite extension can be loaded for this tracker (and, as a
@@ -220,7 +220,7 @@ impl SqliteTracker {
 
     /// Acquire a lock on the database connection, handling poisoned mutex gracefully.
     fn acquire_lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|e| {
+        self.connection.lock().map_err(|e| {
             claudear_core::error::Error::Storage(format!("Failed to acquire database lock: {}", e))
         })
     }
@@ -3011,8 +3011,6 @@ impl ActivityStore for SqliteTracker {
             events: rows.into_iter().map(TimelineEvent::from).collect(),
         })
     }
-
-    // --- Code Indexing ---
 }
 
 impl KnowledgeStore for SqliteTracker {
@@ -4037,8 +4035,6 @@ impl RepoStore for SqliteTracker {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
-
-    // --- Analytics ---
 
     fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
         SqliteTracker::get_or_create_repo_id(self, name)
@@ -6658,7 +6654,7 @@ impl SqliteTracker {
             updated_at: Some(now),
             ..Default::default()
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -6715,7 +6711,7 @@ impl SqliteTracker {
             started_at: db_started_at,
             updated_at: Some(now),
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -6760,7 +6756,7 @@ impl SqliteTracker {
             updated_at: Some(now),
             ..Default::default()
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -8998,8 +8994,7 @@ impl SqliteTracker {
     pub fn delete_code_data_for_file(&self, repo_id: i64, file_path: &str) -> Result<()> {
         let mut connection = self.acquire_lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let embedding_ids =
-            Self::code_chunk_embedding_ids_for_file(&transaction, repo_id, file_path)?;
+        let embedding_ids = Self::code_chunk_embedding_ids(&transaction, repo_id, Some(file_path))?;
         transaction.execute(
             "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
             params![repo_id, file_path],
@@ -9024,7 +9019,8 @@ impl SqliteTracker {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let embedding_ids = Self::code_chunk_embedding_ids_for_chunks(&transaction, chunk_ids)?;
         {
-            let mut statement = transaction.prepare("DELETE FROM code_chunks WHERE id = ?1")?;
+            let mut statement =
+                transaction.prepare_cached("DELETE FROM code_chunks WHERE id = ?1")?;
             for chunk_id in chunk_ids {
                 statement.execute(params![chunk_id])?;
             }
@@ -9042,45 +9038,29 @@ impl SqliteTracker {
             return self.delete_all_code_data_for_repo(repo_id);
         }
 
+        let current: HashSet<&str> = current_paths.iter().map(String::as_str).collect();
         let mut connection = self.acquire_lock()?;
-
-        let indexed_paths: Vec<String> = {
-            let mut statement = connection
-                .prepare("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
-            let rows: Vec<String> = statement
-                .query_map(params![repo_id], |row| row.get(0))?
-                .filter_map(|row| row.ok())
-                .collect();
-            rows
-        };
-
-        let current_set: HashSet<&str> = current_paths.iter().map(String::as_str).collect();
-
-        let stale_paths: Vec<&String> = indexed_paths
-            .iter()
-            .filter(|path| !current_set.contains(path.as_str()))
-            .collect();
-
-        if stale_paths.is_empty() {
+        if Self::stale_code_file_paths(&connection, repo_id, &current)?.is_empty() {
             return Ok(());
         }
 
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_paths = Self::stale_code_file_paths(&transaction, repo_id, &current)?;
         let mut embedding_ids = Vec::new();
-        for path in &stale_paths {
-            embedding_ids.extend(Self::code_chunk_embedding_ids_for_file(
-                &transaction,
-                repo_id,
-                path,
-            )?);
-            transaction.execute(
-                "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
-                params![repo_id, path],
-            )?;
-            transaction.execute(
-                "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
-                params![repo_id, path],
-            )?;
+        {
+            let mut delete_symbols = transaction
+                .prepare_cached("DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2")?;
+            let mut delete_chunks = transaction
+                .prepare_cached("DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2")?;
+            for path in &stale_paths {
+                embedding_ids.extend(Self::code_chunk_embedding_ids(
+                    &transaction,
+                    repo_id,
+                    Some(path),
+                )?);
+                delete_symbols.execute(params![repo_id, path])?;
+                delete_chunks.execute(params![repo_id, path])?;
+            }
         }
         transaction.commit()?;
         self.vector_indexes
@@ -9089,18 +9069,45 @@ impl SqliteTracker {
         Ok(())
     }
 
-    fn code_chunk_embedding_ids_for_file(
+    fn stale_code_file_paths(
         connection: &Connection,
         repository_id: i64,
-        file_path: &str,
+        current_paths: &HashSet<&str>,
+    ) -> Result<Vec<String>> {
+        let mut statement = connection
+            .prepare_cached("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
+        let mut stale = Vec::new();
+        for path in statement.query_map(params![repository_id], |row| row.get::<_, String>(0))? {
+            let path = path?;
+            if !current_paths.contains(path.as_str()) {
+                stale.push(path);
+            }
+        }
+        Ok(stale)
+    }
+
+    fn code_chunk_embedding_ids(
+        connection: &Connection,
+        repository_id: i64,
+        file_path: Option<&str>,
     ) -> Result<Vec<i64>> {
-        let mut statement = connection.prepare(
-            "SELECT e.id FROM code_chunk_embeddings e
-             JOIN code_chunks c ON c.id = e.chunk_id
-             WHERE c.repo_id = ?1 AND c.file_path = ?2",
-        )?;
-        let ids = statement
-            .query_map(params![repository_id, file_path], |row| row.get(0))?
+        let (sql, parameters) = match file_path {
+            Some(_) => (
+                "SELECT e.id FROM code_chunk_embeddings e
+                 JOIN code_chunks c ON c.id = e.chunk_id
+                 WHERE c.repo_id = ?1 AND c.file_path = ?2",
+                params![repository_id, file_path],
+            ),
+            None => (
+                "SELECT e.id FROM code_chunk_embeddings e
+                 JOIN code_chunks c ON c.id = e.chunk_id
+                 WHERE c.repo_id = ?1",
+                params![repository_id],
+            ),
+        };
+        let ids = connection
+            .prepare_cached(sql)?
+            .query_map(parameters, |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<i64>>>()?;
         Ok(ids)
     }
@@ -9109,8 +9116,8 @@ impl SqliteTracker {
         connection: &Connection,
         chunk_ids: &[i64],
     ) -> Result<Vec<i64>> {
-        let mut statement =
-            connection.prepare("SELECT id FROM code_chunk_embeddings WHERE chunk_id = ?1")?;
+        let mut statement = connection
+            .prepare_cached("SELECT id FROM code_chunk_embeddings WHERE chunk_id = ?1")?;
         let mut ids = Vec::with_capacity(chunk_ids.len());
         for chunk_id in chunk_ids {
             if let Some(id) = statement
@@ -9120,21 +9127,6 @@ impl SqliteTracker {
                 ids.push(id);
             }
         }
-        Ok(ids)
-    }
-
-    fn code_chunk_embedding_ids_for_repository(
-        connection: &Connection,
-        repository_id: i64,
-    ) -> Result<Vec<i64>> {
-        let mut statement = connection.prepare(
-            "SELECT e.id FROM code_chunk_embeddings e
-             JOIN code_chunks c ON c.id = e.chunk_id
-             WHERE c.repo_id = ?1",
-        )?;
-        let ids = statement
-            .query_map(params![repository_id], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<i64>>>()?;
         Ok(ids)
     }
 
@@ -9632,27 +9624,14 @@ impl SqliteTracker {
             return self.delete_discord_message_data_for_channel(channel_id);
         }
 
-        let mut connection = self.acquire_lock()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let indexed: Vec<(i64, Option<String>)> = transaction
-            .prepare_cached(
-                "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
-            )?
-            .query_map(params![channel_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-
         let current: HashSet<&str> = current_hashes.iter().map(String::as_str).collect();
-        let stale_ids: Vec<i64> = indexed
-            .into_iter()
-            .filter_map(|(id, hash)| match hash {
-                Some(hash) if !current.contains(hash.as_str()) => Some(id),
-                _ => None,
-            })
-            .collect();
-        if stale_ids.is_empty() {
+        let mut connection = self.acquire_lock()?;
+        if Self::stale_discord_message_chunk_ids(&connection, channel_id, &current)?.is_empty() {
             return Ok(());
         }
 
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_ids = Self::stale_discord_message_chunk_ids(&transaction, channel_id, &current)?;
         let embedding_ids =
             Self::discord_message_chunk_embedding_ids_for_chunks(&transaction, &stale_ids)?;
         {
@@ -9668,6 +9647,26 @@ impl SqliteTracker {
             .discord_message_chunk
             .remove(&connection, &embedding_ids);
         Ok(())
+    }
+
+    fn stale_discord_message_chunk_ids(
+        connection: &Connection,
+        channel_id: &str,
+        current_hashes: &HashSet<&str>,
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection.prepare_cached(
+            "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
+        )?;
+        let mut stale = Vec::new();
+        for row in statement.query_map(params![channel_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })? {
+            let (id, hash) = row?;
+            if hash.is_some_and(|hash| !current_hashes.contains(hash.as_str())) {
+                stale.push(id);
+            }
+        }
+        Ok(stale)
     }
 
     pub fn delete_all_discord_message_data(&self) -> Result<()> {
@@ -10039,7 +10038,7 @@ impl SqliteTracker {
     pub fn delete_all_code_data_for_repo(&self, repo_id: i64) -> Result<()> {
         let mut connection = self.acquire_lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let embedding_ids = Self::code_chunk_embedding_ids_for_repository(&transaction, repo_id)?;
+        let embedding_ids = Self::code_chunk_embedding_ids(&transaction, repo_id, None)?;
         transaction.execute(
             "DELETE FROM code_symbols WHERE repo_id = ?1",
             params![repo_id],
@@ -10054,8 +10053,6 @@ impl SqliteTracker {
             .remove(&connection, &embedding_ids);
         Ok(())
     }
-
-    // --- Chat Session Store ---
 
     /// Create a new chat session.
     pub fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
@@ -12137,7 +12134,7 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init - verify by trying to query
-        let conn = tracker.conn.lock().unwrap();
+        let conn = tracker.connection.lock().unwrap();
         let result = conn.execute("SELECT 1 FROM regression_watches LIMIT 1", []);
         // Should succeed (table exists) or return empty result, not error
         assert!(result.is_ok() || result.is_err());
@@ -12148,7 +12145,7 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init
-        let conn = tracker.conn.lock().unwrap();
+        let conn = tracker.connection.lock().unwrap();
         let result = conn.execute("SELECT 1 FROM release_tracking LIMIT 1", []);
         assert!(result.is_ok() || result.is_err());
     }
@@ -12158,7 +12155,7 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init
-        let conn = tracker.conn.lock().unwrap();
+        let conn = tracker.connection.lock().unwrap();
         let result = conn.execute("SELECT 1 FROM regression_checks LIMIT 1", []);
         assert!(result.is_ok() || result.is_err());
     }
@@ -19685,6 +19682,69 @@ mod tests {
         assert_eq!(keep_count, 1);
     }
 
+    fn hold_write_lock(path: &Path, tracker: &SqliteTracker) -> Connection {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        let writer = Connection::open(path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writer
+    }
+
+    #[test]
+    fn test_cleanup_stale_discord_message_data_without_stale_chunks_skips_the_write_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let tracker = SqliteTracker::new(&path).unwrap();
+        tracker
+            .save_discord_chunks(&[
+                sample_discord_chunk("100", "1001"),
+                sample_discord_chunk("100", "1002"),
+            ])
+            .unwrap();
+        let _writer = hold_write_lock(&path, &tracker);
+
+        tracker
+            .cleanup_stale_discord_message_data(
+                "100",
+                &["hash-1001".to_string(), "hash-1002".to_string()],
+            )
+            .expect("a cleanup with nothing stale must not wait on another writer");
+    }
+
+    #[test]
+    fn test_cleanup_stale_code_data_without_stale_files_skips_the_write_lock() {
+        use claudear_core::types::Language;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let tracker = SqliteTracker::new(&path).unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+        tracker
+            .save_code_chunks(&[claudear_core::types::CodeChunk {
+                id: None,
+                repo_id,
+                file_path: "keep.rs".to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: None,
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 5,
+                chunk_text: "fn keep() {}".to_string(),
+                context_text: "".to_string(),
+                file_hash: "h1".to_string(),
+                content_hash: None,
+            }])
+            .unwrap();
+        let _writer = hold_write_lock(&path, &tracker);
+
+        tracker
+            .cleanup_stale_code_data(repo_id, &["keep.rs".to_string()])
+            .expect("a cleanup with nothing stale must not wait on another writer");
+    }
+
     #[test]
     fn test_get_repo_knowledge_all() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -20168,8 +20228,6 @@ mod tests {
         tracker.save_code_chunk_embeddings(&[], "test").unwrap();
     }
 
-    // --- Discord message chunks (vectorlite) ---
-
     fn sample_discord_chunk(
         channel_id: &str,
         start_id: &str,
@@ -20512,10 +20570,6 @@ mod tests {
         assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
     }
 
-    // =========================================================
-    // Tests for previously uncovered code paths
-    // =========================================================
-
     #[test]
     fn test_blob_to_embedding_none() {
         assert!(SqliteTracker::blob_to_embedding(None).is_none());
@@ -20643,8 +20697,6 @@ mod tests {
             .unwrap();
         assert!(result.is_none());
     }
-
-    // --- Chat Store Tests ---
 
     #[test]
     fn test_create_chat_session() {
@@ -20807,8 +20859,6 @@ mod tests {
         assert_eq!(sessions.len(), 1);
     }
 
-    // --- Code Index Meta Tests ---
-
     #[test]
     fn test_get_set_code_index_meta() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -20903,8 +20953,6 @@ mod tests {
         assert_eq!(model.as_deref(), Some("test-model-v1"));
     }
 
-    // --- Delete All Code Data ---
-
     #[test]
     fn test_delete_all_code_data_for_repo() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -20960,8 +21008,6 @@ mod tests {
         tracker.delete_all_code_data_for_repo(repo_id).unwrap();
     }
 
-    // --- Indexing Progress ---
-
     #[test]
     fn test_get_indexing_progress_default() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -20971,8 +21017,6 @@ mod tests {
         assert_eq!(progress.total_repos, 0);
         assert_eq!(progress.indexed_repos, 0);
     }
-
-    // --- Update user with no fields ---
 
     #[test]
     fn test_update_user_no_fields() {
@@ -21033,8 +21077,6 @@ mod tests {
         );
     }
 
-    // --- get_activities_for_issue (isolation) ---
-
     #[test]
     fn test_get_activities_for_issue_filters_by_source_and_id() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21091,8 +21133,6 @@ mod tests {
         assert!(activities.is_empty());
     }
 
-    // --- find_similar_issues_vector (without vectorlite) ---
-
     #[test]
     fn test_find_similar_issues_vector_empty_embedding() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21114,8 +21154,6 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    // --- find_similar_outcomes_vector (without vectorlite) ---
-
     #[test]
     fn test_find_similar_outcomes_vector_empty_embedding() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21134,8 +21172,6 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    // --- generate_session_token ---
-
     #[test]
     fn test_generate_session_token_length_and_uniqueness() {
         let t1 = generate_session_token();
@@ -21148,8 +21184,6 @@ mod tests {
         // Should be valid hex
         assert!(t1.chars().all(|c| c.is_ascii_hexdigit()));
     }
-
-    // --- record_release_tracking (edge case: no released_at) ---
 
     #[test]
     fn test_record_release_tracking_no_released_at() {
@@ -21183,8 +21217,6 @@ mod tests {
         let id = tracker.record_release_tracking(&tracking).unwrap();
         assert!(id > 0);
     }
-
-    // --- store_embeddings_batch with actual data ---
 
     #[test]
     fn test_store_embeddings_batch_with_embeddings() {
@@ -21232,16 +21264,12 @@ mod tests {
         assert_eq!(e2.description.as_deref(), Some("Desc"));
     }
 
-    // --- list_issues (tested indirectly but let's test count_issues with source) ---
-
     #[test]
     fn test_count_issues_no_data() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let count = tracker.count_issues(None).unwrap();
         assert_eq!(count, 0);
     }
-
-    // --- get_success_rate with mixed outcomes ---
 
     #[test]
     fn test_get_success_rate_with_data() {
@@ -21265,8 +21293,6 @@ mod tests {
         assert!((rate - 1.0 / 3.0).abs() < 0.01);
     }
 
-    // --- record_metrics_batch edge case ---
-
     #[test]
     fn test_record_metrics_batch_with_tags() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21282,8 +21308,6 @@ mod tests {
         let count = tracker.record_metrics_batch(&[metric]).unwrap();
         assert_eq!(count, 1);
     }
-
-    // --- subscribe_indexing_progress ---
 
     #[test]
     fn test_subscribe_indexing_progress_returns_receiver() {
