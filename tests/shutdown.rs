@@ -37,6 +37,7 @@ const STOPPED: &str = "Daemon stopped.";
 const ALREADY_RUNNING: &str = "Another claudear daemon is already running";
 const FORCED_NOTICE: &str = "Shutdown forced";
 const ISSUE_KEY: &str = "SANDBOX-1";
+const ADDRESS_IN_USE: &str = "Address already in use";
 
 /// The Jira issue [`ISSUE_KEY`], as Jira's REST API returns it.
 const ISSUE: &str = r#"{
@@ -93,65 +94,120 @@ impl Sandbox {
     }
 
     /// Starts the daemon the way `claudear start` does by default: forked into a session of its
-    /// own, away from this test, which learns its PID from the PID file once it answers IPC.
+    /// own, away from this test, which learns its PID from the PID file once it answers IPC and
+    /// HTTP.
     async fn start_detached(&self) -> Detached {
-        let port = free_port().to_string();
-        let started = timeout(
-            STARTUP_WAIT,
-            self.claudear(DETACHED, &["start", "--port", &port])
-                .status(),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "claudear start did not return within {}s\n{}",
-                STARTUP_WAIT.as_secs(),
-                self.diagnostics()
-            )
-        })
-        .expect("run claudear start");
-        assert!(
-            started.success(),
-            "claudear start failed with {started}\n{}",
-            self.diagnostics()
-        );
+        self.start_detached_on(std::iter::repeat_with(free_port))
+            .await
+    }
+
+    /// [`Self::start_detached`] on the first of `ports` that the daemon manages to bind: a port
+    /// is free only until something else binds it, so the daemon may find it taken and exit,
+    /// and then starts again on the next.
+    async fn start_detached_on(&self, mut ports: impl Iterator<Item = u16>) -> Detached {
         let deadline = Instant::now() + STARTUP_WAIT;
-        loop {
-            if UnixStream::connect(self.socket()).await.is_ok() {
-                if let Some(pid) = self.daemon_pid() {
-                    return Detached { pid };
-                }
-            }
+        'ports: loop {
+            let port = ports.next().expect("another port to try");
+            let collisions = self.address_in_use_reports();
+            let started = timeout(
+                STARTUP_WAIT,
+                self.claudear(DETACHED, &["start", "--port", &port.to_string()])
+                    .status(),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "claudear start did not return within {}s\n{}",
+                    STARTUP_WAIT.as_secs(),
+                    self.diagnostics()
+                )
+            })
+            .expect("run claudear start");
             assert!(
-                Instant::now() < deadline,
-                "the detached daemon did not accept IPC connections within {}s\n{}",
-                STARTUP_WAIT.as_secs(),
+                started.success(),
+                "claudear start failed with {started}\n{}",
                 self.diagnostics()
             );
-            sleep(POLL_INTERVAL).await;
+            loop {
+                if self.address_in_use_reports() > collisions {
+                    self.wait_until_unlocked(deadline).await;
+                    continue 'ports;
+                }
+                if UnixStream::connect(self.socket()).await.is_ok() && serves_http(port).await {
+                    if let Some(pid) = self.daemon_pid() {
+                        return Detached { pid };
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the detached daemon did not answer IPC and HTTP on port {port} within {}s\n{}",
+                    STARTUP_WAIT.as_secs(),
+                    self.diagnostics()
+                );
+                sleep(POLL_INTERVAL).await;
+            }
         }
     }
 
-    /// Spawns claudear with `arguments` and waits until it answers HTTP on `port`.
-    async fn serve(&self, name: &str, arguments: &[&str], port: u16) -> Child {
-        let mut claudear = self
-            .claudear(name, arguments)
-            .spawn()
-            .expect("spawn claudear");
+    /// Spawns claudear with `arguments` followed by a free port and waits until it answers HTTP
+    /// on that port.
+    async fn serve(&self, name: &str, arguments: &[&str]) -> Child {
+        self.serve_on(name, arguments, std::iter::repeat_with(free_port))
+            .await
+    }
+
+    /// [`Self::serve`] on the first of `ports` that claudear manages to bind: a port is free only
+    /// until something else binds it, so claudear may find it taken and exit, and then starts
+    /// again on the next.
+    async fn serve_on(
+        &self,
+        name: &str,
+        arguments: &[&str],
+        mut ports: impl Iterator<Item = u16>,
+    ) -> Child {
         let deadline = Instant::now() + STARTUP_WAIT;
-        loop {
-            if let Some(status) = claudear.try_wait().expect("check on claudear") {
-                panic!(
-                    "claudear exited during startup with {status}\n{}",
+        'ports: loop {
+            let port = ports.next().expect("another port to try");
+            let port_argument = port.to_string();
+            let mut claudear = self
+                .claudear(name, &[arguments, &[port_argument.as_str()]].concat())
+                .spawn()
+                .expect("spawn claudear");
+            loop {
+                if let Some(status) = claudear.try_wait().expect("check on claudear") {
+                    if self.read(name).contains(ADDRESS_IN_USE) {
+                        continue 'ports;
+                    }
+                    panic!(
+                        "claudear exited during startup with {status}\n{}",
+                        self.diagnostics()
+                    );
+                }
+                if serves_http(port).await {
+                    return claudear;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "claudear did not answer HTTP on port {port} within {}s\n{}",
+                    STARTUP_WAIT.as_secs(),
                     self.diagnostics()
                 );
+                sleep(POLL_INTERVAL).await;
             }
-            if serves_http(port).await {
-                return claudear;
-            }
+        }
+    }
+
+    /// How often a daemon has logged that its port was taken.
+    fn address_in_use_reports(&self) -> usize {
+        self.log().matches(ADDRESS_IN_USE).count()
+    }
+
+    /// Waits until no daemon holds the lock, as once a daemon that failed to start has exited.
+    async fn wait_until_unlocked(&self, deadline: Instant) {
+        while File::open(self.lock_file()).is_ok_and(|lock| lock.try_lock().is_err()) {
             assert!(
                 Instant::now() < deadline,
-                "claudear did not answer HTTP on port {port} within {}s\n{}",
+                "the daemon that found its port taken did not exit within {}s\n{}",
                 STARTUP_WAIT.as_secs(),
                 self.diagnostics()
             );
@@ -564,6 +620,32 @@ fn set_disposition(signals: &[libc::c_int], disposition: libc::sighandler_t) -> 
     Ok(())
 }
 
+/// A port that is taken for as long as it lives: it accepts connections and closes them at once,
+/// so a check for HTTP on it fails fast.
+struct TakenPort {
+    port: u16,
+    accepting: tokio::task::JoinHandle<()>,
+}
+
+impl TakenPort {
+    async fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("take a port");
+        let port = listener.local_addr().expect("read the taken port").port();
+        let accepting = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        Self { port, accepting }
+    }
+}
+
+impl Drop for TakenPort {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
+}
+
 /// Whether something answers HTTP on `port`, which claudear does only once its services run, by
 /// which point it has installed its signal handlers.
 async fn serves_http(port: u16) -> bool {
@@ -784,6 +866,29 @@ async fn second_signal_forces_the_exit_after_flushing_the_log() {
 }
 
 #[tokio::test]
+async fn a_daemon_started_in_the_background_starts_again_when_its_port_is_taken() {
+    let sandbox = Sandbox::new();
+    let taken = TakenPort::new().await;
+
+    let daemon = sandbox
+        .start_detached_on(
+            [taken.port]
+                .into_iter()
+                .chain(std::iter::repeat_with(free_port)),
+        )
+        .await;
+
+    assert!(
+        sandbox.address_in_use_reports() > 0,
+        "the daemon never tried the taken port {}, so this proves nothing\n{}",
+        taken.port,
+        sandbox.diagnostics()
+    );
+    daemon.terminate(&sandbox).await;
+    sandbox.assert_files_removed();
+}
+
+#[tokio::test]
 async fn sigterm_drains_a_daemon_started_in_the_background() {
     let sandbox = Sandbox::new();
     let daemon = sandbox.start_detached().await;
@@ -794,12 +899,28 @@ async fn sigterm_drains_a_daemon_started_in_the_background() {
 }
 
 #[tokio::test]
+async fn webhook_mode_starts_again_when_its_port_is_taken() {
+    let sandbox = Sandbox::new();
+    let taken = TakenPort::new().await;
+
+    let mut claudear = sandbox
+        .serve_on(
+            WEBHOOK,
+            &["webhook"],
+            [taken.port]
+                .into_iter()
+                .chain(std::iter::repeat_with(free_port)),
+        )
+        .await;
+
+    let status = sandbox.stop_with(&mut claudear, libc::SIGTERM).await;
+    assert_exited_cleanly(status, &sandbox);
+}
+
+#[tokio::test]
 async fn sigterm_drains_webhook_mode() {
     let sandbox = Sandbox::new();
-    let port = free_port();
-    let mut claudear = sandbox
-        .serve(WEBHOOK, &["webhook", &port.to_string()], port)
-        .await;
+    let mut claudear = sandbox.serve(WEBHOOK, &["webhook"]).await;
 
     let status = sandbox.stop_with(&mut claudear, libc::SIGTERM).await;
 
@@ -809,10 +930,7 @@ async fn sigterm_drains_webhook_mode() {
 #[tokio::test]
 async fn sigterm_drains_poll_mode() {
     let sandbox = Sandbox::new();
-    let port = free_port();
-    let mut claudear = sandbox
-        .serve(POLL, &["poll", "--port", &port.to_string()], port)
-        .await;
+    let mut claudear = sandbox.serve(POLL, &["poll", "--port"]).await;
 
     let status = sandbox.stop_with(&mut claudear, libc::SIGTERM).await;
 
