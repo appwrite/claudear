@@ -43,7 +43,6 @@ const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
 const CODE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const DISCORD_MESSAGE_CHUNK_VECTOR_TABLE: &str = "discord_message_chunk_vectors";
 const DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
@@ -9683,124 +9682,59 @@ impl SqliteTracker {
             return Ok(());
         }
 
-        let mut conn = self.acquire_lock()?;
-
-        let dimension = pairs[0].1.len();
-        let _ = Self::ensure_discord_chunk_vector_table(&conn, dimension);
-
-        let has_vector_table = Self::table_exists(&conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)?;
-
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut saved = Vec::with_capacity(pairs.len());
         {
-            let mut stmt = tx.prepare(
+            let mut statement = transaction.prepare(
                 "INSERT INTO discord_message_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
             )?;
-
             for &(chunk_id, embedding) in pairs {
                 let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-                stmt.execute(params![chunk_id, blob, model_name])?;
-
-                if has_vector_table {
-                    let emb_id = tx.last_insert_rowid();
-                    let insert_sql = format!(
-                        "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-                        DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-                    );
-                    if let Err(e) = tx.execute(&insert_sql, params![emb_id, blob]) {
-                        tracing::warn!(error = %e, chunk_id, "Failed to insert into discord chunk vector table — aborting batch");
-                        // Drop tx without commit to roll back the entire batch,
-                        // so embeddings and vector index stay consistent.
-                        return Err(e.into());
-                    }
-                }
+                statement.execute(params![chunk_id, blob, model_name])?;
+                saved.push((transaction.last_insert_rowid(), embedding));
             }
         }
+        transaction.commit()?;
 
-        tx.commit()?;
+        for (embedding_id, embedding) in saved {
+            self.vector_indexes
+                .discord_message_chunk
+                .upsert(&connection, embedding_id, embedding);
+        }
         Ok(())
     }
 
-    /// Lazily create the HNSW vector table for Discord message chunk embeddings.
-    fn ensure_discord_chunk_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
+    fn discord_message_chunk_embedding_ids_for_channel(
+        connection: &Connection,
+        channel_id: &str,
+    ) -> Result<Vec<i64>> {
+        let ids = connection
+            .prepare_cached(
+                "SELECT e.id FROM discord_message_chunk_embeddings e JOIN discord_message_chunks c ON c.id = e.chunk_id WHERE c.channel_id = ?1",
+            )?
+            .query_map(params![channel_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
 
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite for discord chunk search");
-                    return Ok(false);
-                }
+    fn discord_message_chunk_embedding_ids_for_chunks(
+        connection: &Connection,
+        chunk_ids: &[i64],
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection.prepare_cached(
+            "SELECT id FROM discord_message_chunk_embeddings WHERE chunk_id = ?1",
+        )?;
+        let mut ids = Vec::with_capacity(chunk_ids.len());
+        for chunk_id in chunk_ids {
+            if let Some(id) = statement
+                .query_row(params![chunk_id], |row| row.get(0))
+                .optional()?
+            {
+                ids.push(id);
             }
         }
-
-        if Self::table_exists(conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)? {
-            // Reuse the existing table only if its declared dimension matches.
-            // After an embedding-model upgrade the vector length can change, so a
-            // stale `float32[N]` table must be dropped and recreated — otherwise
-            // inserts of the new blobs fail and searches see stale vectors.
-            let existing_sql: Option<String> = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    params![DISCORD_MESSAGE_CHUNK_VECTOR_TABLE],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            let matches = existing_sql
-                .as_deref()
-                .map(|sql| sql.contains(&format!("float32[{}]", dimension)))
-                .unwrap_or(false);
-            if matches {
-                return Ok(true);
-            }
-            tracing::info!(
-                dimension,
-                "Discord chunk vector table dimension changed — recreating"
-            );
-            conn.execute_batch(&format!(
-                "DROP TABLE IF EXISTS {}",
-                DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-            ))?;
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=100000, ef_construction=200, M=16)
-            )
-            "#,
-            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                // Backfill existing embeddings.
-                let backfill = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM discord_message_chunk_embeddings
-                    WHERE length(embedding) = ?1
-                    "#,
-                    table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill discord chunk vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create discord chunk vector table");
-                Ok(false)
-            }
-        }
+        Ok(ids)
     }
 
     /// Search Discord message chunks by vector similarity using the HNSW index.
@@ -9819,10 +9753,9 @@ impl SqliteTracker {
         // Clamp limit to prevent excessive memory usage from the HNSW candidate multiplier.
         let limit = limit.min(1000);
 
-        let conn = self.acquire_lock()?;
-
-        if !Self::ensure_discord_chunk_vector_table(&conn, query_embedding.len())? {
-            // Vectorlite unavailable — fall back to empty results.
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.discord_message_chunk;
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(Vec::new());
         }
 
@@ -9835,7 +9768,7 @@ impl SqliteTracker {
         let sql = format!(
             r#"
             WITH candidates AS (
-                SELECT rowid AS emb_id,
+                SELECT rowid AS embedding_id,
                        MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
                 FROM {table}
                 WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
@@ -9846,24 +9779,24 @@ impl SqliteTracker {
                    ch.start_message_time, ch.end_message_time,
                    ch.chunk_text, ch.context_text, ch.content_hash
             FROM candidates c
-            JOIN discord_message_chunk_embeddings e ON e.id = c.emb_id
+            JOIN discord_message_chunk_embeddings e ON e.id = c.embedding_id
             JOIN discord_message_chunks ch ON ch.id = e.chunk_id
             WHERE (?4 IS NULL OR ch.channel_id = ?4)
             ORDER BY c.similarity DESC
             LIMIT ?5
             "#,
-            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare discord chunk vector search");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare discord chunk vector search");
                 return Ok(Vec::new());
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -9873,19 +9806,20 @@ impl SqliteTracker {
             ],
             |row| {
                 let similarity: f64 = row.get(0)?;
-                let kind_int: i64 = row.get(4)?;
+                let kind: i64 = row.get(4)?;
                 let participants: Option<String> = row.get(7)?;
                 Ok(DiscordSearchResult {
                     chunk: DiscordMessageChunk {
                         id: row.get(1)?,
                         guild_id: row.get(2)?,
                         channel_id: row.get(3)?,
-                        channel_kind: DiscordChannelKind::from_i64(kind_int),
+                        channel_kind: DiscordChannelKind::from_i64(kind),
                         start_message_id: row.get(5)?,
                         end_message_id: row.get(6)?,
-                        participant_ids: participants.map(|s| {
-                            s.split(',')
-                                .filter(|x| !x.is_empty())
+                        participant_ids: participants.map(|participants| {
+                            participants
+                                .split(',')
+                                .filter(|participant| !participant.is_empty())
                                 .map(String::from)
                                 .collect()
                         }),
@@ -9899,9 +9833,9 @@ impl SqliteTracker {
                 })
             },
         ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(error = %e, "Discord chunk vector search failed");
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(%error, "Discord chunk vector search failed");
                 return Ok(Vec::new());
             }
         };
@@ -9909,8 +9843,8 @@ impl SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read discord chunk vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read discord chunk vector row"),
             }
         }
 
@@ -9936,13 +9870,19 @@ impl SqliteTracker {
 
     /// Delete all indexed chunks (and CASCADE-deleted embeddings) for a channel/thread.
     pub fn delete_discord_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-
-        // embeddings will be deleted via the cascade delete
-        conn.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids =
+            Self::discord_message_chunk_embedding_ids_for_channel(&transaction, channel_id)?;
+        transaction.execute(
             "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        transaction.commit()?;
+
+        self.vector_indexes
+            .discord_message_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
@@ -9950,19 +9890,23 @@ impl SqliteTracker {
     pub fn delete_discord_message_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
         if chunk_ids.is_empty() {
             return Ok(());
-        };
-        let conn = self.acquire_lock()?;
-        let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
-        let sql = format!(
-            "DELETE FROM discord_message_chunks WHERE id IN ({})",
-            placeholders.join(", ")
-        );
-        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        // embeddings will be deleted via the cascade delete
-        conn.execute(&sql, params.as_slice())?;
+        }
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids =
+            Self::discord_message_chunk_embedding_ids_for_chunks(&transaction, chunk_ids)?;
+        {
+            let mut statement =
+                transaction.prepare_cached("DELETE FROM discord_message_chunks WHERE id = ?1")?;
+            for chunk_id in chunk_ids {
+                statement.execute(params![chunk_id])?;
+            }
+        }
+        transaction.commit()?;
+
+        self.vector_indexes
+            .discord_message_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
@@ -9972,67 +9916,58 @@ impl SqliteTracker {
         channel_id: &str,
         current_hashes: &[String],
     ) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-
         if current_hashes.is_empty() {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
-                params![channel_id],
-            )?;
-            tx.commit()?;
-            return Ok(());
+            return self.delete_discord_message_data_for_channel(channel_id);
         }
 
-        let indexed: Vec<(i64, Option<String>)> = {
-            let mut stmt = conn.prepare(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let indexed: Vec<(i64, Option<String>)> = transaction
+            .prepare_cached(
                 "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
-            )?;
-            let rows: Vec<(i64, Option<String>)> = stmt
-                .query_map(params![channel_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        };
+            )?
+            .query_map(params![channel_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
 
-        let current_set: std::collections::HashSet<&str> =
-            current_hashes.iter().map(|s| s.as_str()).collect();
-
+        let current: HashSet<&str> = current_hashes.iter().map(String::as_str).collect();
         let stale_ids: Vec<i64> = indexed
             .into_iter()
             .filter_map(|(id, hash)| match hash {
-                Some(h) if !current_set.contains(h.as_str()) => Some(id),
+                Some(hash) if !current.contains(hash.as_str()) => Some(id),
                 _ => None,
             })
             .collect();
-
-        if !stale_ids.is_empty() {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            for id in &stale_ids {
-                tx.execute(
-                    "DELETE FROM discord_message_chunks WHERE id = ?1",
-                    params![id],
-                )?;
-            }
-            tx.commit()?;
+        if stale_ids.is_empty() {
+            return Ok(());
         }
+
+        let embedding_ids =
+            Self::discord_message_chunk_embedding_ids_for_chunks(&transaction, &stale_ids)?;
+        {
+            let mut statement =
+                transaction.prepare_cached("DELETE FROM discord_message_chunks WHERE id = ?1")?;
+            for id in &stale_ids {
+                statement.execute(params![id])?;
+            }
+        }
+        transaction.commit()?;
+
+        self.vector_indexes
+            .discord_message_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
     pub fn delete_all_discord_message_data(&self) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        // Embeddings CASCADE via the discord_message_chunks FK.
-        conn.execute("DELETE FROM discord_message_chunks", [])?;
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM discord_message_chunks", [])?;
         // Reset the channel registry/cursors so a forced full re-index re-backfills
         // history instead of resuming incrementally from a now-stale cursor.
-        conn.execute("DELETE FROM discord_channels", [])?;
-        // Drop the HNSW vector table so it is recreated fresh — clears stale vectors
-        // and lets a new embedding model's dimension take effect. Best-effort: it may
-        // not exist, or vectorlite may be unavailable on this connection.
-        let _ = conn.execute_batch(&format!(
-            "DROP TABLE IF EXISTS {}",
-            DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-        ));
+        transaction.execute("DELETE FROM discord_channels", [])?;
+        transaction.commit()?;
+
+        self.vector_indexes.discord_message_chunk.reset(&connection);
         Ok(())
     }
 
