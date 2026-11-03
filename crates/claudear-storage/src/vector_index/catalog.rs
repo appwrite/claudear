@@ -3,7 +3,6 @@ use super::session::Session;
 use super::VectorIndex;
 use std::sync::Arc;
 
-#[allow(dead_code)]
 pub(crate) struct Catalog {
     pub(crate) qa: VectorIndex,
     pub(crate) issue: VectorIndex,
@@ -12,7 +11,6 @@ pub(crate) struct Catalog {
     pub(crate) discord_message_chunk: VectorIndex,
 }
 
-#[allow(dead_code)]
 impl Catalog {
     pub(crate) fn new() -> Self {
         let session = Arc::new(Session::new());

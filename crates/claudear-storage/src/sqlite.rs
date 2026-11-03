@@ -7,13 +7,12 @@ use super::types::{
     StoredRepository, UserRow,
 };
 use super::{
-    is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
-    DeployQaStore, DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
-    RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
+    try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore,
+    EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
+    SimilarityStore, UserStore, WebhookStore,
 };
 use crate::vector_index::catalog::Catalog;
 use crate::vector_index::progress::Progress;
-use crate::vector_index::validate_dimension;
 use crate::vector_index::REBUILD_BATCH_SIZE;
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
@@ -102,7 +101,6 @@ fn generate_token_id() -> String {
 pub struct SqliteTracker {
     conn: Mutex<Connection>,
     indexing_tx: tokio::sync::watch::Sender<IndexingProgress>,
-    #[allow(dead_code)]
     vector_indexes: Catalog,
 }
 
@@ -429,17 +427,6 @@ impl SqliteTracker {
                 .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect(),
         )
-    }
-
-    fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
-        let exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1 LIMIT 1",
-                params![table_name],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(exists.is_some())
     }
 
     fn query_qa_matches_vector_scoped(
@@ -20615,21 +20602,6 @@ mod tests {
         let blob = SqliteTracker::embedding_to_blob(Some(&original));
         let restored = SqliteTracker::blob_to_embedding(blob);
         assert_eq!(restored, Some(original));
-    }
-
-    #[test]
-    fn test_table_exists_true() {
-        let tracker = SqliteTracker::in_memory().unwrap();
-        let conn = tracker.acquire_lock().unwrap();
-        // fix_attempts is created by migrations
-        assert!(SqliteTracker::table_exists(&conn, "fix_attempts").unwrap());
-    }
-
-    #[test]
-    fn test_table_exists_false() {
-        let tracker = SqliteTracker::in_memory().unwrap();
-        let conn = tracker.acquire_lock().unwrap();
-        assert!(!SqliteTracker::table_exists(&conn, "nonexistent_table_xyz").unwrap());
     }
 
     #[test]

@@ -46,7 +46,6 @@ pub(crate) struct VectorIndex {
     state: Mutex<State>,
 }
 
-#[allow(dead_code)]
 impl VectorIndex {
     pub(crate) fn new(definition: Definition, session: Arc<Session>) -> Self {
         Self {
