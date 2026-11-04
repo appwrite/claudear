@@ -1923,6 +1923,12 @@ pub trait UserStore: Send + Sync {
         Ok(None)
     }
 
+    /// The expiry of every user's newest open invite, keyed by user id, in one query;
+    /// the bulk form of [`Self::get_open_invite_for_user`].
+    fn open_invite_expiries(&self) -> Result<HashMap<i64, String>> {
+        Ok(HashMap::new())
+    }
+
     /// The invite behind a token hash if it is open: not accepted, not revoked,
     /// not expired, and its user is still invited.
     fn find_open_invite(&self, _token_hash: &str) -> Result<Option<(InviteRow, UserRow)>> {

@@ -665,11 +665,21 @@ pub async fn list_users_handler(
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<UserResponse>>, ApiError> {
     let users = state.tracker.list_users().map_err(ApiError::storage)?;
+    let mut expiries = state
+        .tracker
+        .open_invite_expiries()
+        .map_err(ApiError::storage)?;
 
     let response = users
         .into_iter()
-        .map(|user| user_response(&state, user))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|user| {
+            let invite_expires_at = match user.status {
+                UserStatus::Active => None,
+                UserStatus::Invited => expiries.remove(&user.id),
+            };
+            UserResponse::new(user, invite_expires_at)
+        })
+        .collect();
 
     Ok(Json(response))
 }

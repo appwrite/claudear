@@ -558,12 +558,10 @@ fn find_user(state: &ApiState, user_id: i64) -> Result<UserRow, ApiError> {
 }
 
 fn console_entry(state: &ApiState, user_id: i64) -> Result<Option<ConsoleIdentity>, ApiError> {
-    Ok(state
+    state
         .tracker
-        .list_user_identities()
-        .map_err(ApiError::storage)?
-        .into_iter()
-        .find(|entry| entry.user_id == user_id))
+        .get_user_identities(user_id)
+        .map_err(ApiError::storage)
 }
 
 #[cfg(test)]

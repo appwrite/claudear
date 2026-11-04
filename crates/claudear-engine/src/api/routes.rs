@@ -9717,6 +9717,21 @@ mod tests {
             assert_eq!(active["status"], "active");
             assert!(active["invite"].is_null());
             assert!(active["invite_expires_at"].is_null());
+
+            let (status, users) = app.as_admin(Method::GET, "/api/users", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let expiry_of = |user_id: &Value| {
+                users
+                    .as_array()
+                    .expect("users")
+                    .iter()
+                    .find(|user| &user["id"] == user_id)
+                    .map(|user| user["invite_expires_at"].clone())
+                    .expect("user listed")
+            };
+            assert_eq!(expiry_of(&json!(id)), body["invite"]["expires_at"]);
+            assert!(expiry_of(&active["id"]).is_null());
+            assert!(expiry_of(&json!(app.admin.id)).is_null());
         }
 
         #[tokio::test]

@@ -4753,6 +4753,22 @@ impl UserStore for SqliteTracker {
         Ok(invite)
     }
 
+    fn open_invite_expiries(&self) -> Result<HashMap<i64, String>> {
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(
+            "SELECT i.user_id, i.expires_at FROM user_invites i
+             WHERE i.accepted_at IS NULL AND i.revoked_at IS NULL
+             ORDER BY i.created_at, i.rowid",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut expiries = HashMap::new();
+        for row in rows {
+            let (user_id, expires_at): (i64, String) = row?;
+            expiries.insert(user_id, expires_at);
+        }
+        Ok(expiries)
+    }
+
     fn find_open_invite(&self, token_hash: &str) -> Result<Option<(InviteRow, UserRow)>> {
         let connection = self.acquire_lock()?;
         let found = connection
@@ -23620,6 +23636,45 @@ mod tests {
             );
             assert!(tracker.find_open_invite("hash_first").unwrap().is_none());
             assert!(tracker.find_open_invite("hash_second").unwrap().is_some());
+        }
+
+        #[test]
+        fn test_open_invite_expiries_match_each_users_newest_open_invite() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let reissued = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+            let accepted = invited_with_invite(&tracker, "bob@example.com", "hash_bob");
+            let revoked = invited_with_invite(&tracker, "cy@example.com", "hash_cy");
+            let pending = invited_with_invite(&tracker, "dee@example.com", "hash_dee");
+            let admin = tracker
+                .get_user_by_email("admin@example.com")
+                .unwrap()
+                .unwrap()
+                .id;
+            tracker
+                .issue_invite(reissued, "hash_amy_again", "2099-06-01 00:00:00", admin)
+                .unwrap();
+            tracker.accept_invite("hash_bob", PASSWORD_HASH).unwrap();
+            assert!(tracker.revoke_invite(revoked).unwrap());
+
+            let expiries = tracker.open_invite_expiries().unwrap();
+
+            assert_eq!(
+                expiries,
+                HashMap::from([
+                    (reissued, "2099-06-01 00:00:00".to_string()),
+                    (pending, FUTURE.to_string()),
+                ])
+            );
+            for user_id in [reissued, accepted, revoked, pending] {
+                assert_eq!(
+                    expiries.get(&user_id).cloned(),
+                    tracker
+                        .get_open_invite_for_user(user_id)
+                        .unwrap()
+                        .map(|invite| invite.expires_at),
+                    "user {user_id}"
+                );
+            }
         }
 
         #[test]
