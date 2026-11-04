@@ -125,6 +125,19 @@ describe('validateDeployQaSettings', () => {
     expect(issues).toEqual([{ path: 'tracks[0].name', message: 'Track name is required.' }])
   })
 
+  test('rejects a name with leading or trailing whitespace', () => {
+    for (const name of [' cloud', 'cloud ', '\tcloud', 'cloud\n']) {
+      expect(validateDeployQaSettings(settingsWith([{ name, repo: 'appwrite/cloud', tag_filter: 'any' }]), kinds, separator))
+        .toEqual([{ path: 'tracks[0].name', message: 'Track name must not start or end with whitespace.' }])
+    }
+  })
+
+  test('allows inner whitespace in a name', () => {
+    expect(
+      validateDeployQaSettings(settingsWith([{ name: 'cloud main', repo: 'appwrite/cloud', tag_filter: 'any' }]), kinds, separator),
+    ).toEqual([])
+  })
+
   test('rejects a name containing the separator from the API', () => {
     const settings = settingsWith([{ name: 'cloud:main', repo: 'appwrite/cloud', tag_filter: 'any' }])
     expect(validateDeployQaSettings(settings, kinds, separator)).toEqual([
