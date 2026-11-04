@@ -744,8 +744,9 @@ struct WatcherDeps {
 async fn build_watcher_deps(
     config: &Config,
     tracker: &Arc<dyn FixAttemptTracker>,
+    user_registry: &UserRegistry,
 ) -> anyhow::Result<WatcherDeps> {
-    let sources = create_sources(config, tracker);
+    let sources = create_sources(config, tracker, user_registry);
 
     // GitHub client for API-based repo discovery
     let github_client = GitHubClient::new(config.github().clone());
@@ -1072,6 +1073,7 @@ fn create_review_watcher(
 fn create_sources(
     config: &Config,
     tracker: &Arc<dyn FixAttemptTracker>,
+    user_registry: &UserRegistry,
 ) -> Vec<Arc<dyn IssueSource>> {
     let mut sources: Vec<Arc<dyn IssueSource>> = Vec::new();
 
@@ -1170,7 +1172,9 @@ fn create_sources(
         }
     }
 
-    if let Some(source) = claudear::build_deploy_qa_source(config, tracker.clone()) {
+    if let Some(source) =
+        claudear::build_deploy_qa_source(config, tracker.clone(), user_registry.clone())
+    {
         sources.push(source);
     }
 
@@ -3713,7 +3717,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
         let mode_str = modes.join("+");
 
-        let deps = build_watcher_deps(&config, &tracker).await?;
+        let deps = build_watcher_deps(&config, &tracker, &user_registry).await?;
         let rebuilder = database.spawn_vector_index_rebuilder()?;
         let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
         let sources = deps.sources;
@@ -3924,7 +3928,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         let github_client = GitHubClient::new(config.github().clone());
         let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
-        let sources = create_sources(&config, &tracker);
+        let sources = create_sources(&config, &tracker, &user_registry);
         let pr_monitor = if config.regression.enabled {
             PrMonitor::with_regression_tracking(
                 provider,
@@ -4176,7 +4180,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         println!("\nProcessing {} retries...", ready.len());
 
-        let sources = create_sources(&config, &tracker);
+        let sources = create_sources(&config, &tracker, &user_registry);
         if sources.is_empty() {
             anyhow::bail!("No sources were initialized");
         }
@@ -4402,7 +4406,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             let handlers = create_webhook_handlers(&config);
 
-            let deps = build_watcher_deps(&config, &tracker).await?;
+            let deps = build_watcher_deps(&config, &tracker, &user_registry).await?;
             let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
             let github_webhook_handler =
                 create_github_webhook_handler(&config, deps.review_watcher.clone());
@@ -4475,7 +4479,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let regression_handle = start_regression_monitoring(
                 &config,
                 tracker.clone(),
-                create_sources(&config, &tracker),
+                create_sources(&config, &tracker, &user_registry),
                 notifier.clone(),
             );
             if regression_handle.is_some() {
@@ -4525,7 +4529,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         _ => {
             tracing::info!("Initializing sources...");
-            let sources = create_sources(&config, &tracker);
+            let sources = create_sources(&config, &tracker, &user_registry);
 
             if sources.is_empty() {
                 anyhow::bail!("No sources were initialized");

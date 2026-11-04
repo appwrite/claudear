@@ -1,11 +1,13 @@
 //! Discord `#releases` posting for `[deploy_qa]` outcomes.
 //!
 //! All verified or unverified: reply under the automated release announcement
-//! (no @). FAIL: post in the announcement's thread and `@` the mapped releaser.
+//! (no @). FAIL: post in the announcement's thread and `@` the releaser, found
+//! in the user directory first and the GitHub↔Discord map second.
 
 use claudear_analysis::deploy_qa::{
     classify_deploy_qa_verdict, DeployQaVerdict, GitHubDiscordMap, DEPLOY_QA_SOURCE,
 };
+use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::secret::Redactor;
 use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
@@ -39,6 +41,7 @@ const ELLIPSIS: char = '…';
 pub struct DeployQaDiscord<H: DiscordHttpClient = ReqwestDiscordClient> {
     client: DiscordClient<H>,
     channel_id: String,
+    registry: UserRegistry,
     map: GitHubDiscordMap,
     redactor: Redactor,
 }
@@ -48,12 +51,14 @@ impl DeployQaDiscord<ReqwestDiscordClient> {
     pub fn new(
         bot_token: impl Into<String>,
         channel_id: impl Into<String>,
+        registry: UserRegistry,
         map: GitHubDiscordMap,
         redactor: Redactor,
     ) -> Result<Self> {
         Ok(Self {
             client: DiscordClient::new(bot_token)?,
             channel_id: channel_id.into(),
+            registry,
             map,
             redactor,
         })
@@ -65,12 +70,14 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
     pub fn with_client(
         client: DiscordClient<H>,
         channel_id: impl Into<String>,
+        registry: UserRegistry,
         map: GitHubDiscordMap,
         redactor: Redactor,
     ) -> Self {
         Self {
             client,
             channel_id: channel_id.into(),
+            registry,
             map,
             redactor,
         }
@@ -222,12 +229,16 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
             );
             return None;
         };
-        let mention = self.map.mention_for(login);
+        let mention = self
+            .registry
+            .discord_id_for_github(login)
+            .map(|id| format!("<@{id}>"))
+            .or_else(|| self.map.mention_for(login));
         if mention.is_none() {
             tracing::warn!(
                 login,
                 tag = %tip.tag,
-                "deploy_qa: releaser is not in the GitHub↔Discord map; posting FAIL without @releaser"
+                "deploy_qa: releaser is not in the user directory or the GitHub↔Discord map; posting FAIL without @releaser"
             );
         }
         mention
@@ -448,15 +459,16 @@ fn truncate_report(report: &str) -> String {
 pub fn try_build_discord(
     bot_token: Option<&str>,
     channel_id: Option<&str>,
+    registry: UserRegistry,
     map: GitHubDiscordMap,
     redactor: Redactor,
 ) -> Result<Option<DeployQaDiscord>> {
     let token = bot_token.filter(|token| !token.is_empty());
     let channel = channel_id.filter(|channel| !channel.is_empty());
     match (token, channel) {
-        (Some(token), Some(channel)) => {
-            Ok(Some(DeployQaDiscord::new(token, channel, map, redactor)?))
-        }
+        (Some(token), Some(channel)) => Ok(Some(DeployQaDiscord::new(
+            token, channel, registry, map, redactor,
+        )?)),
         _ => Ok(None),
     }
 }
@@ -470,9 +482,13 @@ mod tests {
     use claudear_analysis::deploy_qa::VERDICT_FAIL;
     use claudear_analysis::deploy_qa::VERDICT_PREFIX;
     use claudear_analysis::deploy_qa::VERDICT_UNVERIFIED;
+    use claudear_config::config::UserConfig;
     use claudear_core::error::Error;
+    use claudear_core::identity::ConsoleIdentity;
+    use claudear_core::identity::Identities;
     use serde_json::json;
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -483,6 +499,8 @@ mod tests {
     const TAG: &str = "1.2.3";
     const RELEASER: &str = "abnegate";
     const RELEASER_DISCORD_ID: &str = "452316113016193024";
+    const DIRECTORY_DISCORD_ID: &str = "123456789012345678";
+    const OTHER_DISCORD_ID: &str = "876543210987654321";
     const KNOWN_SECRET: &str = "configured-bot-token-0001";
     const BEARER_TOKEN: &str = "abc123def456ghi789";
     const GITHUB_TOKEN: &str = "ghp_0123456789abcdefXYZ";
@@ -579,9 +597,32 @@ mod tests {
         }
     }
 
+    fn releaser_map() -> GitHubDiscordMap {
+        GitHubDiscordMap::from_json_bytes(
+            json!({ "byGithubLogin": { RELEASER: { "discordUserId": RELEASER_DISCORD_ID } } })
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap()
+    }
+
     fn reporter(
         channel_messages: Vec<Value>,
         thread_creation_fails: bool,
+    ) -> (DeployQaDiscord<FakeDiscord>, Requests) {
+        reporter_with(
+            channel_messages,
+            thread_creation_fails,
+            UserRegistry::default(),
+            releaser_map(),
+        )
+    }
+
+    fn reporter_with(
+        channel_messages: Vec<Value>,
+        thread_creation_fails: bool,
+        registry: UserRegistry,
+        map: GitHubDiscordMap,
     ) -> (DeployQaDiscord<FakeDiscord>, Requests) {
         let requests = Requests::default();
         let http = FakeDiscord {
@@ -590,17 +631,47 @@ mod tests {
             requests: requests.clone(),
         };
         let client = DiscordClient::with_http_client("test-token", http).unwrap();
-        let map = GitHubDiscordMap::from_json_bytes(
-            json!({ "byGithubLogin": { RELEASER: { "discordUserId": RELEASER_DISCORD_ID } } })
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
         let redactor = Redactor::new([KNOWN_SECRET]);
         (
-            DeployQaDiscord::with_client(client, CHANNEL, map, redactor),
+            DeployQaDiscord::with_client(client, CHANNEL, registry, map, redactor),
             requests,
         )
+    }
+
+    fn configured_registry(github_login: &str, discord_id: &str) -> UserRegistry {
+        UserRegistry::new(HashMap::from([(
+            "releaser".to_string(),
+            UserConfig {
+                github_usernames: vec![github_login.to_string()],
+                discord_id: Some(discord_id.to_string()),
+                ..UserConfig::default()
+            },
+        )]))
+    }
+
+    /// The content of the FAIL post for a release by `author_login`.
+    async fn fail_content(
+        registry: UserRegistry,
+        map: GitHubDiscordMap,
+        author_login: &str,
+    ) -> String {
+        let mut tip = tip();
+        tip.author_login = Some(author_login.to_string());
+        let store = MemoryStore::new(tip);
+        let (discord, requests) = reporter_with(
+            vec![announcement(RELEASE_MESSAGE, REPO, TAG)],
+            false,
+            registry,
+            map,
+        );
+        report(&store, &discord, &verdict_report("LIVE FAIL", VERDICT_FAIL)).await;
+        posts(&requests)
+            .last()
+            .expect("the FAIL report should be posted")
+            .body["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn posts(requests: &Requests) -> Vec<Request> {
@@ -914,6 +985,95 @@ mod tests {
                 .to_string();
             assert!(!content.contains("<@"), "{author:?}: {content}");
         }
+    }
+
+    #[tokio::test]
+    async fn fail_mentions_directory_releaser_over_the_map() {
+        let content = fail_content(
+            configured_registry(RELEASER, DIRECTORY_DISCORD_ID),
+            releaser_map(),
+            RELEASER,
+        )
+        .await;
+
+        assert!(
+            content.contains(&format!("<@{DIRECTORY_DISCORD_ID}>")),
+            "the user directory should win: {content}"
+        );
+        assert!(
+            !content.contains(&format!("<@{RELEASER_DISCORD_ID}>")),
+            "the map must not be consulted once the directory answers: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_falls_back_to_the_map_when_the_directory_lacks_the_releaser() {
+        let content = fail_content(
+            configured_registry("someone-else", OTHER_DISCORD_ID),
+            releaser_map(),
+            RELEASER,
+        )
+        .await;
+
+        assert!(
+            content.contains(&format!("<@{RELEASER_DISCORD_ID}>")),
+            "the map should answer for a login the directory lacks: {content}"
+        );
+        assert!(
+            !content.contains(&format!("<@{OTHER_DISCORD_ID}>")),
+            "{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_matches_the_directory_login_ignoring_case() {
+        let content = fail_content(
+            configured_registry("AbNeGaTe", DIRECTORY_DISCORD_ID),
+            GitHubDiscordMap::default(),
+            "ABNEGATE",
+        )
+        .await;
+
+        assert!(
+            content.contains(&format!("<@{DIRECTORY_DISCORD_ID}>")),
+            "GitHub logins are case-insensitive: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_honours_directory_edits_made_after_the_reporter_is_built() {
+        let registry = UserRegistry::default();
+        let store = MemoryStore::new(tip());
+        let (discord, requests) = reporter_with(
+            vec![announcement(RELEASE_MESSAGE, REPO, TAG)],
+            false,
+            registry.clone(),
+            GitHubDiscordMap::default(),
+        );
+
+        registry.replace_console(vec![ConsoleIdentity {
+            user_id: 1,
+            login_email: "releaser@example.com".to_string(),
+            name: "Releaser".to_string(),
+            slug: None,
+            identities: Identities {
+                github_usernames: vec![RELEASER.to_string()],
+                discord_id: Some(DIRECTORY_DISCORD_ID.to_string()),
+                ..Identities::default()
+            },
+            updated_at: "2026-11-04 10:00:00".to_string(),
+        }]);
+        report(&store, &discord, &verdict_report("LIVE FAIL", VERDICT_FAIL)).await;
+
+        let posts = posts(&requests);
+        let content = posts.last().expect("the FAIL report should be posted").body["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content.contains(&format!("<@{DIRECTORY_DISCORD_ID}>")),
+            "a directory edit must apply without rebuilding the reporter: {content}"
+        );
     }
 
     #[tokio::test]

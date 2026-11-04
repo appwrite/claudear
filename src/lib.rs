@@ -235,7 +235,7 @@ pub async fn build_app(
     let notifier = build_notifier(&config, user_registry.clone());
 
     let mut sources = build_sources(&config);
-    if let Some(source) = build_deploy_qa_source(&config, tracker.clone()) {
+    if let Some(source) = build_deploy_qa_source(&config, tracker.clone(), user_registry.clone()) {
         sources.push(telemetry::InstrumentedSource::wrap(source));
     }
 
@@ -349,9 +349,13 @@ fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notif
 /// reporter that fails to build only degrades reporting, so the source is still
 /// returned. Every failure is logged. The source is returned unwrapped; callers
 /// add telemetry instrumentation.
+///
+/// FAIL `@releaser` looks the releaser up in `registry` first, live, and only
+/// then in the GitHub↔Discord map.
 pub fn build_deploy_qa_source(
     config: &Config,
     tracker: Arc<dyn storage::FixAttemptTracker>,
+    registry: UserRegistry,
 ) -> Option<Arc<dyn source::IssueSource>> {
     if !config.deploy_qa.enabled {
         return None;
@@ -362,7 +366,7 @@ pub fn build_deploy_qa_source(
             tracing::warn!(
                 error = %e,
                 path,
-                "Failed to load deploy_qa GitHub↔Discord map; FAIL @releaser disabled"
+                "Failed to load deploy_qa GitHub↔Discord map; FAIL @releaser uses the user directory only"
             );
             deploy_qa::GitHubDiscordMap::default()
         }),
@@ -378,6 +382,7 @@ pub fn build_deploy_qa_source(
     let discord = claudear_integrations::deploy_qa::try_build_discord(
         bot_token.as_deref(),
         config.deploy_qa.discord_channel_id.as_deref(),
+        registry,
         map,
         deploy_qa_redactor(config, environment),
     )
@@ -910,14 +915,22 @@ mod tests {
 
     #[test]
     fn build_deploy_qa_source_none_when_disabled() {
-        let source = build_deploy_qa_source(&Config::default(), in_memory_tracker());
+        let source = build_deploy_qa_source(
+            &Config::default(),
+            in_memory_tracker(),
+            UserRegistry::default(),
+        );
         assert!(source.is_none());
     }
 
     #[test]
     fn build_deploy_qa_source_without_discord() {
-        let source = build_deploy_qa_source(&deploy_qa_config(), in_memory_tracker())
-            .expect("enabled deploy_qa should build without Discord");
+        let source = build_deploy_qa_source(
+            &deploy_qa_config(),
+            in_memory_tracker(),
+            UserRegistry::default(),
+        )
+        .expect("enabled deploy_qa should build without Discord");
         assert_eq!(source.name(), deploy_qa::DEPLOY_QA_SOURCE);
     }
 
@@ -925,7 +938,7 @@ mod tests {
     fn build_deploy_qa_source_none_when_playbook_missing() {
         let mut config = deploy_qa_config();
         config.deploy_qa.instructions_path = Some("/nonexistent/deploy_qa_playbook.md".to_string());
-        let source = build_deploy_qa_source(&config, in_memory_tracker());
+        let source = build_deploy_qa_source(&config, in_memory_tracker(), UserRegistry::default());
         assert!(
             source.is_none(),
             "an unreadable playbook must disable the source"
@@ -937,10 +950,10 @@ mod tests {
         let mut config = deploy_qa_config();
         config.deploy_qa.github_discord_map_path =
             Some("/nonexistent/github-discord-map.json".to_string());
-        let source = build_deploy_qa_source(&config, in_memory_tracker());
+        let source = build_deploy_qa_source(&config, in_memory_tracker(), UserRegistry::default());
         assert!(
             source.is_some(),
-            "a missing GitHub↔Discord map only disables FAIL @releaser mentions"
+            "a missing GitHub↔Discord map only narrows FAIL @releaser to the user directory"
         );
     }
 
