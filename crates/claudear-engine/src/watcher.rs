@@ -19,7 +19,7 @@ use claudear_analysis::inference::{
 };
 use claudear_analysis::qa::build_correlation_id;
 use claudear_analysis::repo::{worktree_path, GitOps, RepoRelationships};
-use claudear_config::config::Config;
+use claudear_config::config::{Config, HELPSCOUT_SOURCE, MAILBOX_ID_METADATA_KEY};
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::security::{parse_security_fix_short_id, SECURITY_FIX_SOURCE};
@@ -91,9 +91,6 @@ pub const MANUAL_TRIGGER: &str = "Manual trigger";
 
 /// Prefix of the error recorded on an attempt whose retry could not run.
 pub(crate) const RETRY_TRIGGER_FAILED: &str = "Retry trigger failed";
-
-/// The source whose security mailboxes feed the security inbox.
-const HELPSCOUT_SOURCE: &str = "helpscout";
 
 /// Why a security fix is processed.
 const SECURITY_FIX_REASON: &str = "Security fix";
@@ -3490,7 +3487,7 @@ Create a PR with your changes.{custom_instructions}"#,
         };
 
         let inbox_key = issue
-            .get_metadata::<String>("mailbox_id")
+            .get_metadata::<String>(MAILBOX_ID_METADATA_KEY)
             .unwrap_or_else(|| attempt.source.clone());
         let guideline = self.config.reply().template_for(Some(&inbox_key));
         let context = match attempt.pr_url.as_deref() {

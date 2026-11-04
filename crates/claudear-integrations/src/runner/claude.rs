@@ -6,6 +6,7 @@ use super::{
 };
 use async_trait::async_trait;
 use claudear_analysis::deploy_qa::{DEPLOY_QA_SOURCE, VERDICT_PREFIX};
+use claudear_config::config::HELPSCOUT_SOURCE;
 use claudear_config::{AgentConfig, McpServerConfig};
 use claudear_core::error::{Error, Result};
 use claudear_core::security::SECURITY_FIX_SOURCE;
@@ -118,9 +119,6 @@ Your task:
 6. Create a PR with your changes
 7. Ensure all checks pass on the PR
 "#;
-
-/// Issue source whose ticket system renders reply bodies as HTML, not Markdown.
-const HELPSCOUT_SOURCE: &str = "helpscout";
 
 /// Error for a failed reply run that reported no error message.
 const REPLY_FAILURE_MESSAGE: &str = "Failed to generate reply";

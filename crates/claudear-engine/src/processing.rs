@@ -14,7 +14,7 @@ use claudear_analysis::qa::{
 };
 use claudear_analysis::repo::code_index::CodeSearchService;
 use claudear_analysis::repo::{worktree_path, GitOps};
-use claudear_config::config::Config;
+use claudear_config::config::{Config, HELPSCOUT_SOURCE, MAILBOX_ID_METADATA_KEY};
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::security::SECURITY_FIX_SOURCE;
@@ -167,8 +167,6 @@ pub(crate) const SECURITY_REFUSAL: &str = "security reports are handled by the s
 /// the fix.
 const SECURITY_FIX_PROMPT_NOT_NEUTRAL: &str =
     "The fix prompt names the security fix, so the fix agent was not run";
-
-const HELPSCOUT_SOURCE: &str = "helpscout";
 
 /// Why a security fix stops when its agent asks for human input.
 const SECURITY_FIX_NEEDS_HUMAN: &str =
@@ -3601,7 +3599,7 @@ impl IssueProcessor {
 
         // The inbox key is the HelpScout mailbox id when present, else the source.
         let inbox_key = issue
-            .get_metadata::<String>("mailbox_id")
+            .get_metadata::<String>(MAILBOX_ID_METADATA_KEY)
             .unwrap_or_else(|| source_name.to_string());
         let guideline = self.config.reply().template_for(Some(&inbox_key));
 

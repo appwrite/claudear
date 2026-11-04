@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 use claudear::{
     api::ApiServer,
-    config::{Config, SecurityDeploymentConfig},
+    config::{Config, SecurityDeploymentConfig, HELPSCOUT_SOURCE},
     deploy_qa::{DeployQaPollAction, DeployQaTracker},
     feedback::{EmbeddingClient, IssueEmbeddingService},
     github::GitHubClient,
@@ -1180,9 +1180,6 @@ fn create_sources(
 
     sources.into_iter().map(InstrumentedSource::wrap).collect()
 }
-
-/// The name of the source whose security mailboxes feed the security inbox.
-const HELPSCOUT_SOURCE: &str = "helpscout";
 
 /// The security inbox, when `[issues.helpscout.security]` is enabled and
 /// everything it needs runs: the HelpScout source among `sources` (wrapped,

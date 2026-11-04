@@ -7,11 +7,12 @@ use super::notify::{OwnerAction, PingSubject, ReviewReason};
 use super::replies::truncated_error;
 use super::screening::Screening;
 use super::scrub::public_reason;
-use super::{SecurityInbox, SecurityPollDecision, SecurityRoute, MAILBOX_ID_METADATA_KEY};
+use super::{SecurityInbox, SecurityPollDecision, SecurityRoute};
 use chrono::Utc;
 use claudear_analysis::inference::RepoResolution;
 use claudear_config::config::{
     SpamAction, ATTACHMENTS_METADATA_KEY, CUSTOMER_THREAD_COUNT_METADATA_KEY,
+    MAILBOX_ID_METADATA_KEY,
 };
 use claudear_core::error::Result;
 use claudear_core::security::{

@@ -27,7 +27,9 @@ use async_trait::async_trait;
 use claudear_analysis::feedback::EmbeddingClient;
 use claudear_analysis::inference::RepoInferrer;
 use claudear_analysis::release::DeploymentStatus;
-use claudear_config::config::{Config, SecurityInboxConfig};
+use claudear_config::config::{
+    Config, SecurityInboxConfig, HELPSCOUT_SOURCE, MAILBOX_ID_METADATA_KEY,
+};
 use claudear_core::error::Result;
 use claudear_core::security::SECURITY_FIX_SOURCE;
 use claudear_core::types::{Issue, VerifyResult};
@@ -40,8 +42,6 @@ use std::time::Duration;
 
 use dedup::TextEmbedder;
 
-const HELPSCOUT_SOURCE: &str = "helpscout";
-const MAILBOX_ID_METADATA_KEY: &str = "mailbox_id";
 const SENDING_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 const REPLY_RETRY_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
