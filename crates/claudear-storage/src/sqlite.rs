@@ -4444,6 +4444,14 @@ impl DeployQaStore for SqliteTracker {
         SqliteTracker::get_last_seen_deploy_qa_tip(self, track)
     }
 
+    fn list_deploy_qa_tips(
+        &self,
+        track: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::list_deploy_qa_tips(self, track, limit)
+    }
+
     fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
         SqliteTracker::list_pending_deploy_qa_tips(self)
     }
@@ -7939,6 +7947,32 @@ impl SqliteTracker {
         Ok(stmt
             .query_row(params![track], Self::row_to_deploy_qa_tip)
             .optional()?)
+    }
+
+    /// Most recent tips first, across every track or only `track`, at most
+    /// `limit` of them.
+    pub fn list_deploy_qa_tips(
+        &self,
+        track: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE (?1 IS NULL OR track = ?1)
+            ORDER BY COALESCE(published_at, created_at) DESC, id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let tips = stmt
+            .query_map(params![track, limit], Self::row_to_deploy_qa_tip)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tips)
     }
 
     /// Tips waiting to be picked up by the `deploy_qa` source.
@@ -11457,6 +11491,50 @@ mod tests {
         assert_eq!(stored.attempt_id, Some(9));
         assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
         assert_eq!(tracker.list_pending_deploy_qa_tips().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_list_deploy_qa_tips_newest_first_with_track_filter_and_limit() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for (track, tag, published_at) in [
+            ("cloud", "1.0.0", "2026-01-01T00:00:00Z"),
+            ("edge", "2.0.0", "2026-02-01T00:00:00Z"),
+            ("cloud", "1.1.0", "2026-03-01T00:00:00Z"),
+        ] {
+            let mut tip = DeployQaTip::new(track, format!("acme/{track}"), tag);
+            tip.published_at = Some(published_at.into());
+            tracker.upsert_deploy_qa_tip(&tip).unwrap();
+        }
+
+        let tags = |tips: Vec<DeployQaTip>| -> Vec<String> {
+            tips.into_iter().map(|tip| tip.tag).collect()
+        };
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(None, 10).unwrap()),
+            ["1.1.0", "2.0.0", "1.0.0"]
+        );
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(Some("cloud"), 10).unwrap()),
+            ["1.1.0", "1.0.0"]
+        );
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(None, 2).unwrap()),
+            ["1.1.0", "2.0.0"]
+        );
+        assert_eq!(
+            tags(
+                tracker
+                    .list_deploy_qa_tips(Some("edge"), usize::MAX)
+                    .unwrap()
+            ),
+            ["2.0.0"]
+        );
+        assert!(tracker
+            .list_deploy_qa_tips(Some("missing"), 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

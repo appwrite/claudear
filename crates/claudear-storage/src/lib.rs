@@ -1894,6 +1894,12 @@ pub trait DeployQaStore: Send + Sync {
         Ok(None)
     }
 
+    /// Most recent tips first, across every track or only `track`, at most
+    /// `limit` of them.
+    fn list_deploy_qa_tips(&self, _track: Option<&str>, _limit: usize) -> Result<Vec<DeployQaTip>> {
+        Ok(Vec::new())
+    }
+
     /// Pending tips waiting to be enqueued / picked up by the `deploy_qa` source.
     fn list_pending_deploy_qa_tips(&self) -> Result<Vec<DeployQaTip>> {
         Ok(Vec::new())
