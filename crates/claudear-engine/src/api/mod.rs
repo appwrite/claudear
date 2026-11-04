@@ -4,6 +4,7 @@
 
 pub mod auth;
 mod config_file;
+mod deploy_qa;
 pub(crate) mod embedded;
 mod features;
 mod routes;

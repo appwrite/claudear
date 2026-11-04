@@ -146,6 +146,12 @@ pub fn create_api_router_full(
         )
         .route("/api/feedback", get(feedback_handler))
         .route("/api/regressions", get(regressions_handler))
+        .route("/api/deploy-qa", get(super::deploy_qa::status_handler))
+        .route("/api/deploy-qa/tips", get(super::deploy_qa::tips_handler))
+        .route(
+            "/api/deploy-qa/config",
+            get(super::deploy_qa::get_config_handler).put(super::deploy_qa::put_config_handler),
+        )
         .route(
             "/api/regressions/{id}/checks",
             get(regression_checks_handler),
