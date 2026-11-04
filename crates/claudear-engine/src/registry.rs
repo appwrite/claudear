@@ -4,12 +4,10 @@ use claudear_config::users::UserRegistry;
 use claudear_storage::FixAttemptTracker;
 
 /// Load console identities into `registry`; on storage failure keep the previous directory and warn.
+/// Concurrent reloads apply in the order they read storage, so the newest snapshot wins.
 pub fn reload(registry: &UserRegistry, store: &dyn FixAttemptTracker) -> bool {
-    match store.list_user_identities() {
-        Ok(entries) => {
-            registry.replace_console(entries);
-            true
-        }
+    match registry.reload(|| store.list_user_identities()) {
+        Ok(()) => true,
         Err(error) => {
             tracing::warn!(
                 error = %error,
