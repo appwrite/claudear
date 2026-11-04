@@ -98,6 +98,7 @@
             <tr><td><code>CLAUDEAR_TELEGRAM_WEBHOOK_SECRET</code></td><td>Telegram webhook secret</td></tr>
             <tr><td><code>CLAUDEAR_WHATSAPP_WEBHOOK_VERIFY_TOKEN</code></td><td>WhatsApp webhook verify token</td></tr>
             <tr><td><code>CLAUDEAR_VECTORLITE_PATH</code></td><td>Path to vectorlite extension</td></tr>
+            <tr><td><code>CLAUDEAR_DASHBOARD_PUBLIC_URL</code></td><td>Dashboard address for absolute invite links (<code>dashboard.public_url</code>; empty means unset)</td></tr>
           </tbody>
         </table>
 
@@ -169,6 +170,15 @@
             <li>Notifications: <code>discord_id</code>, <code>slack_id</code>, <code>email</code>, <code>push_user_key</code>, <code>sms_number</code>, <code>whatsapp_number</code>, <code>telegram_chat_id</code></li>
             </ul>
             <p>When an issue is assigned to someone, Claudear routes notifications directly to that person on their preferred channels.</p>
+            <h3 id="dashboard-identities"><a class="anchor-link" href="#dashboard-identities" aria-label="Link to Dashboard identities">#</a>Dashboard identities</h3>
+            <p>People can also keep their identities in the dashboard. Every logged-in user sees <strong>Users</strong> in the sidebar: admins edit anyone there, and everyone else gets <strong>My identities</strong>, also under <strong>Settings &gt; My Identities</strong>. Admins can invite people who have no login yet and bulk-load the whole directory with <code>PUT /api/directory</code>; see the <a href="https://github.com/abnegate/claudear#identity-api">Identity API</a> in the README.</p>
+            <ol>
+            <li>Dashboard identities replace the <code>[users.&lt;key&gt;]</code> entry with the same person key, in full: a field set only in config does not survive the override.</li>
+            <li><code>[users]</code> entries without a dashboard override stay active, as seed and fallback.</li>
+            <li><code>github-discord-map.json</code> is consulted only when no person in the registry with that GitHub login has a <code>discord_id</code>.</li>
+            </ol>
+            <p>A dashboard user's person key is the slug an admin set on them, otherwise the <code>[users]</code> key whose <code>email</code> matches their <strong>login</strong> email, otherwise <code>console-&lt;user id&gt;</code>. The identity <code>email</code> field, which users edit themselves, never links. Notification targets (<code>email</code>, <code>sms_number</code>, <code>whatsapp_number</code>, <code>push_user_key</code>, <code>telegram_chat_id</code>) may be shared between people; any other handle that already belongs to someone else is rejected.</p>
+            <p>Edits apply without a restart: instantly in the process that served them, and within one housekeeping cycle in any other process sharing the database. Global references such as <code>[notifiers.discord] user_id = "jake"</code> are resolved each time a notification is sent, so they follow dashboard edits too.</p>
           </div>
         </details>
 
@@ -484,6 +494,7 @@
             <ul>
             <li><code>max_plan_monthly_cost</code>: monthly cost of your Claude Max plan, used to estimate per-fix cost when token pricing is unavailable. Set to <code>0</code> to disable.</li>
             <li><code>hourly_engineer_rate</code>: hourly engineer rate for cost-savings calculations (default: <code>75.0</code>).</li>
+            <li><code>public_url</code>: the address people use to reach the dashboard, such as <code>https://claudear.example.com</code>. When set, invite responses include an absolute <code>invite_url</code>; otherwise only the relative <code>/invite#cldi_...</code> link is returned and you prefix it with your dashboard's address. Env override: <code>CLAUDEAR_DASHBOARD_PUBLIC_URL</code>.</li>
             </ul>
           </div>
         </details>
@@ -627,7 +638,16 @@ skip_permissions = true
 # ============================================
 # Map team members to their identifiers across services.
 # When an issue is assigned to a user, notifications are routed to them specifically.
-# Global config fields (e.g. notifiers.discord.user_id) can reference user slugs instead of raw IDs.
+# Global config fields (e.g. notifiers.discord.user_id) can reference user slugs instead of raw IDs;
+# they are resolved each time a notification is sent, so dashboard edits apply without a restart.
+#
+# These entries are the seed and fallback for identities edited in the dashboard
+# (Users page, or Settings &gt; My Identities). A dashboard user&#39;s identities replace
+# this whole entry, config-only fields included, when their person key is &quot;jake&quot;:
+# an admin set their slug to &quot;jake&quot;, or their dashboard LOGIN email is
+# jake@example.com (the email below). The identity email they edit themselves
+# never links. Entries without a dashboard override stay active.
+# Reverting to config in the dashboard brings this entry back.
 
 [users.jake]
 # Source identifiers
@@ -1306,6 +1326,12 @@ max_plan_monthly_cost = 0.0
 
 # Hourly engineer rate for cost-savings calculation (default: 75.0)
 hourly_engineer_rate = 75.0
+
+# Address people use to reach the dashboard, used to build absolute invite
+# links (invite_url). Unset, the API returns only the relative
+# /invite#cldi_... link and invite_url is null. A trailing slash is fine.
+# Env override: CLAUDEAR_DASHBOARD_PUBLIC_URL (empty means unset).
+# public_url = &quot;https://claudear.example.com&quot;
 
 # ============================================
 # TLS Auto-Provisioning (Let's Encrypt)

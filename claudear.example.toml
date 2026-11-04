@@ -223,7 +223,16 @@ weight = 0.2
 # ============================================
 # Map team members to their identifiers across services.
 # When an issue is assigned to a user, notifications are routed to them specifically.
-# Global config fields (e.g. notifiers.discord.user_id) can reference user slugs instead of raw IDs.
+# Global config fields (e.g. notifiers.discord.user_id) can reference user slugs instead of raw IDs;
+# they are resolved each time a notification is sent, so dashboard edits apply without a restart.
+#
+# These entries are the seed and fallback for identities edited in the dashboard
+# (Users page, or Settings > My Identities). A dashboard user's identities replace
+# this whole entry, config-only fields included, when their person key is "jake":
+# an admin set their slug to "jake", or their dashboard LOGIN email is
+# jake@example.com (the email below). The identity email they edit themselves
+# never links. Entries without a dashboard override stay active.
+# Reverting to config in the dashboard brings this entry back.
 
 [users.jake]
 # Source identifiers (accepts a single string or a list of strings)
@@ -893,8 +902,10 @@ skip_if_previous_running = true
 # up to [retry] max_retries times.
 timeout_secs = 1800
 discord_channel_id = "990878183580651571"
-# GitHub login -> Discord user map for the FAIL @releaser mention. Use an
-# absolute path: a relative one breaks under systemd and drops the mention.
+# GitHub login -> Discord user map for the FAIL @releaser mention, used only
+# when no person in the user registry ([users] or dashboard identities) with
+# that GitHub login has a discord_id. Use an absolute path: a relative one
+# breaks under systemd and drops the mention.
 github_discord_map_path = "/etc/claudear/github-discord-map.json"
 # Optional; defaults to the bundled playbooks/deploy_qa.md. When set, use an
 # absolute path: a relative one breaks under systemd and disables deploy_qa.
@@ -1206,6 +1217,12 @@ max_plan_monthly_cost = 0.0
 # Hourly engineer rate for cost-savings calculation (default: 150.0)
 hourly_engineer_rate = 150.0
 
+# Address people use to reach the dashboard, used to build absolute invite
+# links (invite_url). Unset, the API returns only the relative
+# /invite#cldi_... link and invite_url is null. A trailing slash is fine.
+# Env override: CLAUDEAR_DASHBOARD_PUBLIC_URL (empty means unset).
+# public_url = "https://claudear.example.com"
+
 # ============================================
 # Local LLM
 # ============================================
@@ -1341,7 +1358,8 @@ reindex_interval_hours = 6.0
 # frequently and posts them once a week to your notifier(s), mentioning
 # notifiers.discord.user_id on Discord so a human can act. Report-only: it does
 # not change the fix pipeline. Requires a configured Sentry source + Discord
-# webhook.
+# webhook. The Discord post only goes out once PR #194's InstrumentedNotifier
+# forwarding fix lands.
 
 # Enable the weekly digest (default: false)
 enabled = false
