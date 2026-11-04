@@ -230,6 +230,7 @@ pub async fn build_app(
     tracker: Arc<dyn storage::FixAttemptTracker>,
 ) -> anyhow::Result<AppComponents> {
     let user_registry = UserRegistry::new(config.users.clone());
+    claudear_engine::registry::reload(&user_registry, tracker.as_ref());
 
     // Notifier
     let notifier = build_notifier(&config, user_registry.clone());

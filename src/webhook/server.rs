@@ -123,6 +123,7 @@ pub struct WebhookServer {
     port: u16,
     /// When set, the dashboard API routes are merged into the webhook server.
     dashboard_config_path: Option<std::path::PathBuf>,
+    user_registry: Option<UserRegistry>,
     runs: TaskTracker,
 }
 
@@ -182,6 +183,7 @@ impl WebhookServer {
             qa_agent: None,
             port,
             dashboard_config_path: None,
+            user_registry: None,
             runs: TaskTracker::new(),
         }
     }
@@ -242,6 +244,18 @@ impl WebhookServer {
         self.dashboard_config_path = Some(config_path);
     }
 
+    /// Share the daemon's person directory, so webhook processing and the merged
+    /// dashboard see the same identities as the notifiers and the watcher.
+    pub fn set_user_registry(&mut self, registry: UserRegistry) {
+        self.user_registry = Some(registry);
+    }
+
+    fn user_registry(&self) -> UserRegistry {
+        self.user_registry
+            .clone()
+            .unwrap_or_else(|| UserRegistry::new(self.config.users.clone()))
+    }
+
     /// Share the tracker that webhook-started runs are spawned on. Closing it makes the
     /// server answer new issue webhooks with 503; waiting on it drains the runs in flight.
     pub fn set_runs(&mut self, runs: TaskTracker) {
@@ -262,8 +276,8 @@ impl WebhookServer {
     /// Start the server.
     pub async fn start(self) -> Result<()> {
         let bind_address = self.config.bind_address.clone();
+        let user_registry = self.user_registry();
         let embedding_client = self.embedding_client;
-        let user_registry = UserRegistry::new(self.config.users.clone());
 
         // Initialize FeedbackAnalyzer and warm-start with DB outcomes
         let mut feedback_analyzer = FeedbackAnalyzer::new();
@@ -1453,6 +1467,70 @@ mod tests {
         );
 
         assert_eq!(server.port, 3000);
+    }
+
+    fn registry_test_server(config: Config) -> WebhookServer {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        WebhookServer::new(
+            config,
+            WebhookHandlerRegistry::new(),
+            Arc::new(MockNotifier::new()),
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        )
+    }
+
+    #[test]
+    fn webhook_server_serves_the_injected_registry_instance() {
+        use claudear_core::identity::{ConsoleIdentity, Identities};
+
+        let registry = UserRegistry::new(HashMap::new());
+        let mut server = registry_test_server(test_config());
+        server.set_user_registry(registry.clone());
+
+        server
+            .user_registry()
+            .replace_console(vec![ConsoleIdentity {
+                user_id: 7,
+                login_email: "amy@example.com".to_string(),
+                name: "Amy".to_string(),
+                slug: Some("amy".to_string()),
+                identities: Identities {
+                    github_usernames: vec!["amy-gh".to_string()],
+                    ..Identities::default()
+                },
+                updated_at: "2026-11-04 10:00:00".to_string(),
+            }]);
+
+        assert_eq!(
+            registry
+                .resolve("github", "amy-gh")
+                .map(|resolved| resolved.slug),
+            Some("amy".to_string())
+        );
+    }
+
+    #[test]
+    fn webhook_server_without_an_injected_registry_falls_back_to_config() {
+        let mut config = test_config();
+        config.users = HashMap::from([(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                github_usernames: vec!["jakebarnby".to_string()],
+                ..Default::default()
+            },
+        )]);
+        let server = registry_test_server(config);
+
+        assert_eq!(
+            server
+                .user_registry()
+                .resolve("github", "jakebarnby")
+                .map(|resolved| resolved.slug),
+            Some("jake".to_string())
+        );
     }
 
     #[test]

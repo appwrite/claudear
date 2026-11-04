@@ -3378,6 +3378,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                 match db_tracker.get_user_by_email(email)? {
                     Some(existing) => {
+                        db_tracker.activate_user(existing.id, &hash)?;
                         db_tracker.update_user(
                             existing.id,
                             None,
@@ -3680,6 +3681,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let notifier = create_notifier(&config, user_registry.clone());
     let database = create_tracker(&config);
     let tracker: Arc<dyn FixAttemptTracker> = database.clone();
+    claudear_engine::registry::reload(&user_registry, tracker.as_ref());
 
     if let Commands::Start {
         port,
@@ -3825,6 +3827,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         config.webhook_port = *port;
         let http = http_mode(enable_webhooks, enable_dashboard).map(|mode| {
             let notifier = notifier.clone();
+            let user_registry = user_registry.clone();
             let tracker = tracker.clone();
             let runs = runs.clone();
             let config_path = std::path::PathBuf::from(&config_path);
@@ -3860,6 +3863,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         server.set_discord_client(discord_client, discord_guild);
                         server.set_review_watcher(deps.review_watcher);
                         server.set_runs(runs);
+                        server.set_user_registry(user_registry);
                         if dashboard {
                             server.set_dashboard(config_path);
                         }
@@ -3867,6 +3871,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     }
                     HttpMode::Dashboard => {
                         ApiServer::with_port(config, tracker, *port, config_path)
+                            .with_registry(user_registry)
                             .start()
                             .await?;
                     }
@@ -4475,6 +4480,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             server.set_discord_client(discord_client, discord_guild);
             server.set_review_watcher(deps.review_watcher);
             server.set_runs(runs.clone());
+            server.set_user_registry(user_registry.clone());
 
             let regression_handle = start_regression_monitoring(
                 &config,
@@ -4757,7 +4763,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             tracker_for_api.clone(),
                             port,
                             std::path::PathBuf::from(&config_path),
-                        );
+                        )
+                        .with_registry(user_registry.clone());
                         Service::new(HTTP_SERVICE, async move {
                             server.start().await.map_err(anyhow::Error::from)
                         })

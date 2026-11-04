@@ -78,6 +78,7 @@ pub struct ApiServer {
     port: u16,
     dashboard_dir: Option<PathBuf>,
     config_path: PathBuf,
+    registry: UserRegistry,
 }
 
 impl ApiServer {
@@ -85,6 +86,7 @@ impl ApiServer {
     pub fn new(config: Config, tracker: Arc<dyn FixAttemptTracker>, config_path: PathBuf) -> Self {
         let port = config.webhook_port; // Reuse webhook port for now
         Self {
+            registry: UserRegistry::new(config.users.clone()),
             config,
             tracker,
             port,
@@ -101,6 +103,7 @@ impl ApiServer {
         config_path: PathBuf,
     ) -> Self {
         Self {
+            registry: UserRegistry::new(config.users.clone()),
             config,
             tracker,
             port,
@@ -118,6 +121,7 @@ impl ApiServer {
         config_path: PathBuf,
     ) -> Self {
         Self {
+            registry: UserRegistry::new(config.users.clone()),
             config,
             tracker,
             port,
@@ -126,26 +130,31 @@ impl ApiServer {
         }
     }
 
+    /// Serve the given registry instead of one built from config, so the dashboard
+    /// shares the daemon's person directory and identity edits reach every consumer.
+    pub fn with_registry(mut self, registry: UserRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    fn router(&self) -> axum::Router {
+        create_api_router_with_dashboard(
+            self.config.clone(),
+            self.tracker.clone(),
+            self.config_path.clone(),
+            self.tracker.subscribe_indexing_progress(),
+            self.dashboard_dir.clone(),
+            self.registry.clone(),
+        )
+    }
+
     /// Start the API server.
     pub async fn start(self) -> Result<()> {
-        // Subscribe to indexing progress from the tracker's watch channel
-        let indexing_rx = self.tracker.subscribe_indexing_progress();
-
         let tls_enabled = self.config.tls.enabled;
-        let app = apply_dashboard_middleware(
-            create_api_router_with_dashboard(
-                self.config.clone(),
-                self.tracker.clone(),
-                self.config_path,
-                indexing_rx,
-                self.dashboard_dir.clone(),
-                UserRegistry::new(self.config.users.clone()),
-            ),
-            tls_enabled,
-        )
-        // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
-        .layer(SentryHttpLayer::new().enable_transaction())
-        .layer(NewSentryLayer::new_from_top());
+        let app = apply_dashboard_middleware(self.router(), tls_enabled)
+            // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
+            .layer(SentryHttpLayer::new().enable_transaction())
+            .layer(NewSentryLayer::new_from_top());
 
         let tls_enabled = self.config.tls.enabled;
         let scheme = if tls_enabled { "https" } else { "http" };
@@ -218,5 +227,98 @@ impl ApiServer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use claudear_config::config::UserConfig;
+    use claudear_storage::SqliteTracker;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+
+    const FILLER_USERS: usize = 800;
+
+    fn server(users: HashMap<String, UserConfig>) -> ApiServer {
+        let tracker: Arc<dyn FixAttemptTracker> =
+            Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
+        let config = Config {
+            users,
+            storage_dir: std::env::temp_dir().join("claudear-api-server-tests"),
+            ..Config::default()
+        };
+        ApiServer::with_port(config, tracker, 0, PathBuf::from("claudear.toml"))
+    }
+
+    #[tokio::test]
+    async fn identity_edits_through_the_server_reach_the_injected_registry() {
+        let server = server(HashMap::new());
+        let tracker = server.tracker.clone();
+        for index in 0..FILLER_USERS {
+            tracker
+                .create_user(
+                    &format!("filler{index}@example.com"),
+                    "unused-hash",
+                    "Filler",
+                    "viewer",
+                )
+                .expect("create filler user");
+        }
+        let admin = tracker
+            .create_user("admin@example.com", "unused-hash", "Admin", "admin")
+            .expect("create admin");
+        let token = tracker
+            .create_session(admin, "2099-12-31 23:59:59")
+            .expect("create session");
+        let registry = UserRegistry::new(HashMap::new());
+        let notifier_view = registry.clone();
+        let router = server
+            .with_registry(registry.clone())
+            .router()
+            .layer(CookieManagerLayer::new());
+        assert!(notifier_view.resolve("github", "admin-gh").is_none());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/users/{admin}/identities"))
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={token}"))
+                    .body(Body::from(
+                        serde_json::json!({"github_usernames": ["admin-gh"]}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let resolved = notifier_view
+            .resolve("github", "admin-gh")
+            .expect("an HTTP identity edit must reach every holder of the registry");
+        assert_eq!(resolved.slug, format!("console-{admin}"));
+    }
+
+    #[test]
+    fn server_without_an_injected_registry_serves_config_people() {
+        let server = server(HashMap::from([(
+            "jake".to_string(),
+            UserConfig {
+                github_usernames: vec!["jakebarnby".to_string()],
+                ..UserConfig::default()
+            },
+        )]));
+
+        assert_eq!(
+            server
+                .registry
+                .resolve("github", "jakebarnby")
+                .map(|resolved| resolved.slug),
+            Some("jake".to_string())
+        );
     }
 }
