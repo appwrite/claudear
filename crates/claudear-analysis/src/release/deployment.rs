@@ -12,6 +12,7 @@ use claudear_core::error::Error;
 use claudear_core::error::Result;
 use futures::future::try_join_all;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 const DEFAULT_VALUES_FILE: &str = "default.yaml";
 const CHART_FILE: &str = "Chart.yaml";
@@ -19,6 +20,8 @@ const IMAGE_KEY: &str = "image";
 const REPOSITORY_KEY: &str = "repository";
 const TAG_KEY: &str = "tag";
 const LIST_ITEM_SEGMENT: &str = "[]";
+const MERGE_KEY: &str = "<<";
+const DOCKER_HUB_PREFIXES: [&str; 3] = ["docker.io/", "index.docker.io/", "registry-1.docker.io/"];
 
 /// The production deployment: which configuration repository pins the image
 /// tags, and which source repositories each deployed image is built from.
@@ -72,11 +75,20 @@ pub struct PullRequestState {
     pub merged_at: Option<DateTime<Utc>>,
 }
 
-/// An `image:` mapping in a values file. `path` is its key path, such as
+/// How an `image:` entry is written: a mapping with `repository` and `tag`
+/// keys, or a single `repository:tag` string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageForm {
+    Mapping,
+    Scalar,
+}
+
+/// An `image:` entry in a values file. `path` is its key path, such as
 /// `global.image` or `cloud.initContainers[].image`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageReference {
     pub path: String,
+    pub form: ImageForm,
     pub repository: Option<String>,
     pub tag: Option<String>,
 }
@@ -159,26 +171,34 @@ impl<C: HttpClient> DeploymentResolver<C> {
         }))
         .await?;
 
-        let references: Vec<Vec<ImageReference>> =
-            contents.iter().map(|yaml| image_references(yaml)).collect();
-        let default_paths: Vec<&str> = references[default_file]
+        let references: Vec<Vec<ImageReference>> = files
             .iter()
-            .filter(|reference| reference.repository.as_deref() == Some(application.image.as_str()))
-            .map(|reference| reference.path.as_str())
-            .collect();
+            .zip(&contents)
+            .map(|(path, yaml)| {
+                image_references(yaml).map_err(|error| {
+                    Error::Other(format!("{configuration}/{path}@{reference}: {error}"))
+                })
+            })
+            .collect::<Result<_>>()?;
+        let defaults = DefaultImages::new(&references[default_file], &application.image);
 
         let mut versions = Vec::new();
-        for reference in references.iter().flatten() {
-            let pins_image = match reference.repository.as_deref() {
-                Some(repository) => repository == application.image,
-                None => default_paths.contains(&reference.path.as_str()),
-            };
-            let Some(tag) = reference.tag.as_deref().filter(|_| pins_image) else {
-                continue;
-            };
-            let tag = validated_reference(tag)?;
-            if !versions.iter().any(|version| version == tag) {
-                versions.push(tag.to_string());
+        for (index, file_references) in references.iter().enumerate() {
+            let is_default = index == default_file;
+            for image in file_references {
+                let tag = defaults.pinned_tag(image, is_default).map_err(|error| {
+                    Error::Other(format!(
+                        "{configuration}/{}@{reference}: {error}",
+                        files[index]
+                    ))
+                })?;
+                let Some(tag) = tag else {
+                    continue;
+                };
+                let tag = validated_reference(tag)?;
+                if !versions.iter().any(|version| version == tag) {
+                    versions.push(tag.to_string());
+                }
             }
         }
         if versions.is_empty() {
@@ -316,11 +336,13 @@ impl<C: HttpClient + 'static> DeploymentStatus for DeploymentResolver<C> {
     }
 }
 
-/// Every `image:` mapping in a YAML values file, found by an indentation-aware
-/// line scan that tracks the key path. Values are trimmed and unquoted; an
-/// alias (`*name`) is unresolvable and left out.
-pub fn image_references(yaml: &str) -> Vec<ImageReference> {
-    ImageScanner::default().scan(yaml)
+/// Every `image:` entry in a YAML values file, found by an indentation-aware
+/// line scan that tracks the key path. Anything the scan cannot read with
+/// certainty is an error rather than a skipped entry: an alias, anchor or merge
+/// key in an image block, a block or flow value it cannot parse, a nested
+/// `repository`/`tag`, or a tag YAML would load as a number, boolean or null.
+pub fn image_references(yaml: &str) -> Result<Vec<ImageReference>> {
+    ImageScanner::default().scan(yaml).map_err(Error::Other)
 }
 
 /// The locked version of `package` in a `composer.lock`, from `packages` or
@@ -396,10 +418,131 @@ fn is_values_file(path: &str) -> bool {
     (name.ends_with(".yaml") || name.ends_with(".yml")) && name != CHART_FILE
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    Application,
+    Other,
+    Mixed,
+}
+
+/// Which image each `default.yaml` image path names, so that an override that
+/// sets only a tag can be attributed to the image it changes.
+struct DefaultImages<'a> {
+    image: &'a str,
+    owners: HashMap<&'a str, Ownership>,
+}
+
+impl<'a> DefaultImages<'a> {
+    fn new(references: &'a [ImageReference], image: &'a str) -> Self {
+        let mut owners: HashMap<&str, Ownership> = HashMap::new();
+        for reference in references {
+            let Some(repository) = reference.repository.as_deref() else {
+                continue;
+            };
+            let owner = if names_image(repository, image) {
+                Ownership::Application
+            } else {
+                Ownership::Other
+            };
+            owners
+                .entry(reference.path.as_str())
+                .and_modify(|existing| {
+                    if *existing != owner {
+                        *existing = Ownership::Mixed;
+                    }
+                })
+                .or_insert(owner);
+        }
+        Self { image, owners }
+    }
+
+    /// The tag `reference` pins for the application image, `None` when it pins
+    /// another image or inherits the default tag, and an error when it cannot
+    /// be attributed with certainty.
+    fn pinned_tag<'r>(
+        &self,
+        reference: &'r ImageReference,
+        is_default: bool,
+    ) -> std::result::Result<Option<&'r str>, String> {
+        let image = self.image;
+        let path = reference.path.as_str();
+        let owner = self.owners.get(path).copied();
+        let overrides_default_path = !is_default && !path.contains(LIST_ITEM_SEGMENT);
+        let tag = reference.tag.as_deref();
+        match reference.repository.as_deref() {
+            Some(repository) if names_image(repository, image) => match (reference.form, tag) {
+                (ImageForm::Scalar, _) => Err(format!(
+                    "{path} pins {image} as a single image string, which is not tracked"
+                )),
+                (ImageForm::Mapping, Some(tag)) => Ok(Some(tag)),
+                (ImageForm::Mapping, None)
+                    if overrides_default_path && owner == Some(Ownership::Application) =>
+                {
+                    Ok(None)
+                }
+                (ImageForm::Mapping, None) => Err(format!("{path} names {image} without a tag")),
+            },
+            Some(_)
+                if overrides_default_path
+                    && matches!(owner, Some(Ownership::Application | Ownership::Mixed)) =>
+            {
+                Err(format!("{path} replaces {image} with another image"))
+            }
+            Some(_) => Ok(None),
+            None => match tag {
+                None => Ok(None),
+                Some(_) if !overrides_default_path => {
+                    Err(format!("{path} sets a tag without a repository"))
+                }
+                Some(tag) => match owner {
+                    Some(Ownership::Application) => Ok(Some(tag)),
+                    Some(Ownership::Other) => Ok(None),
+                    Some(Ownership::Mixed) | None => Err(format!(
+                        "{path} sets a tag that cannot be attributed to an image in {DEFAULT_VALUES_FILE}"
+                    )),
+                },
+            },
+        }
+    }
+}
+
+fn names_image(repository: &str, image: &str) -> bool {
+    fn normalized(name: &str) -> String {
+        let lower = name.trim().to_ascii_lowercase();
+        DOCKER_HUB_PREFIXES
+            .iter()
+            .find_map(|prefix| lower.strip_prefix(prefix))
+            .map_or_else(|| lower.clone(), str::to_string)
+    }
+    normalized(repository) == normalized(image)
+}
+
+/// The repository and tag of a `repository[:tag][@digest]` image string.
+fn split_image(value: &str) -> (String, Option<String>) {
+    let undigested = value.split_once('@').map_or(value, |(name, _)| name);
+    let name_start = undigested.rfind('/').map_or(0, |slash| slash + 1);
+    match undigested[name_start..].rfind(':') {
+        Some(colon) => {
+            let split = name_start + colon;
+            (
+                undigested[..split].to_string(),
+                Some(undigested[split + 1..].to_string()),
+            )
+        }
+        None => (undigested.to_string(), None),
+    }
+}
+
 struct ScopeEntry {
     indent: usize,
     segment: String,
     image: Option<usize>,
+    within_image: bool,
+}
+
+struct PendingFlow {
+    text: String,
+    depth: i64,
 }
 
 #[derive(Default)]
@@ -407,35 +550,58 @@ struct ImageScanner {
     scopes: Vec<ScopeEntry>,
     references: Vec<ImageReference>,
     block_scalar_indent: Option<usize>,
+    flow: Option<PendingFlow>,
+    line_number: usize,
 }
 
+type ScanResult<T> = std::result::Result<T, String>;
+
 impl ImageScanner {
-    fn scan(mut self, yaml: &str) -> Vec<ImageReference> {
+    fn scan(mut self, yaml: &str) -> ScanResult<Vec<ImageReference>> {
         for raw in yaml.lines() {
-            self.line(raw);
+            self.line_number += 1;
+            self.line(raw)
+                .map_err(|error| format!("line {}: {error}", self.line_number))?;
         }
-        self.references
+        if self.flow.is_some() {
+            return Err("unterminated flow collection".to_string());
+        }
+        Ok(self
+            .references
             .into_iter()
             .filter(|reference| reference.repository.is_some() || reference.tag.is_some())
-            .collect()
+            .collect())
     }
 
-    fn line(&mut self, raw: &str) {
+    fn line(&mut self, raw: &str) -> ScanResult<()> {
         let content = strip_comment(raw).trim_end();
         let trimmed = content.trim_start();
+        if let Some(flow) = self.flow.as_mut() {
+            flow.text.push(' ');
+            flow.text.push_str(trimmed);
+            flow.depth += flow_balance(trimmed);
+            if flow.depth <= 0 {
+                let text = std::mem::take(&mut flow.text);
+                self.flow = None;
+                if mentions_image_key(&text) {
+                    return Err("an image inside a multi-line flow collection".to_string());
+                }
+            }
+            return Ok(());
+        }
         if trimmed.is_empty() {
-            return;
+            return Ok(());
         }
         let indent = content.len() - trimmed.len();
         if let Some(block) = self.block_scalar_indent {
             if indent > block {
-                return;
+                return Ok(());
             }
             self.block_scalar_indent = None;
         }
         if trimmed == "---" || trimmed == "..." {
             self.scopes.clear();
-            return;
+            return Ok(());
         }
 
         let mut indent = indent;
@@ -445,90 +611,204 @@ impl ImageScanner {
                 scope.indent < indent
                     || (scope.indent == indent && scope.segment != LIST_ITEM_SEGMENT)
             });
+            let parent = self.scopes.last();
+            if parent.is_some_and(|scope| scope.image.is_some()) {
+                return Err(format!("{} is a sequence", self.path()));
+            }
+            let within_image = parent.is_some_and(|scope| scope.within_image);
             self.scopes.push(ScopeEntry {
                 indent,
                 segment: LIST_ITEM_SEGMENT.to_string(),
                 image: None,
+                within_image,
             });
             let item = entry[1..].trim_start();
             indent += entry.len() - item.len();
             entry = item;
             if entry.is_empty() {
-                return;
+                return Ok(());
             }
         } else {
             self.scopes.retain(|scope| scope.indent < indent);
         }
 
+        let within_image = self.scopes.last().is_some_and(|scope| scope.within_image);
         let Some((key, value)) = split_key(entry) else {
-            return;
-        };
-        let value = strip_anchor(value);
-        if is_block_scalar(value) {
-            self.block_scalar_indent = Some(indent);
-            return;
-        }
-        if value.is_empty() {
-            self.open_mapping(indent, key);
-        } else if let Some(flow) = value
-            .strip_prefix('{')
-            .and_then(|rest| rest.strip_suffix('}'))
-        {
-            self.open_mapping(indent, key);
-            for (child, child_value) in flow.split(',').filter_map(split_key) {
-                self.assign(indent + 1, child, child_value);
+            if within_image {
+                return Err(format!("{} has an entry that is not a key", self.path()));
             }
-            self.scopes.pop();
+            return Ok(());
+        };
+        if within_image {
+            self.image_entry(indent, key, value)
+        } else if key == IMAGE_KEY {
+            self.image(indent, value)
         } else {
-            self.assign(indent, key, value);
+            self.entry(indent, key, value)
         }
     }
 
-    fn open_mapping(&mut self, indent: usize, key: &str) {
-        let image = (key == IMAGE_KEY).then(|| {
-            self.references.push(ImageReference {
-                path: self.path_with(key),
-                repository: None,
-                tag: None,
-            });
-            self.references.len() - 1
+    fn entry(&mut self, indent: usize, key: &str, value: &str) -> ScanResult<()> {
+        let value = strip_anchor(value);
+        if is_block_scalar(value) {
+            self.block_scalar_indent = Some(indent);
+        } else if value.is_empty() {
+            self.open(indent, key, None);
+        } else if value.starts_with(['{', '[']) {
+            let depth = flow_balance(value);
+            if depth > 0 {
+                self.flow = Some(PendingFlow {
+                    text: value.to_string(),
+                    depth,
+                });
+            } else if mentions_image_key(value) {
+                return Err(format!(
+                    "{} has an image inside a flow collection",
+                    self.path_with(key)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn image(&mut self, indent: usize, value: &str) -> ScanResult<()> {
+        let path = self.path_with(IMAGE_KEY);
+        if value.starts_with(['&', '*']) {
+            return Err(format!("{path} is anchored or aliased"));
+        }
+        if is_block_scalar(value) || value.starts_with('[') {
+            return Err(format!("{path} is not a mapping or an image string"));
+        }
+        if value.is_empty() {
+            let index = self.record(path, ImageForm::Mapping, None, None);
+            self.open(indent, IMAGE_KEY, Some(index));
+            return Ok(());
+        }
+        if let Some(flow) = value.strip_prefix('{') {
+            let inner = flow
+                .strip_suffix('}')
+                .filter(|inner| !inner.contains(['{', '[', '}', ']']))
+                .ok_or_else(|| format!("{path} is a flow mapping that cannot be read"))?;
+            let index = self.record(path.clone(), ImageForm::Mapping, None, None);
+            for piece in inner
+                .split(',')
+                .map(str::trim)
+                .filter(|piece| !piece.is_empty())
+            {
+                let (child, child_value) = split_key(piece)
+                    .ok_or_else(|| format!("{path} has an entry that cannot be read"))?;
+                self.assign(index, &path, child, child_value)?;
+            }
+            return Ok(());
+        }
+        let name = scalar(value).map_err(|error| format!("{path} {error}"))?;
+        if name.is_empty() {
+            return Err(format!("{path} is empty"));
+        }
+        let (repository, tag) = split_image(name);
+        self.record(path, ImageForm::Scalar, Some(repository), tag);
+        Ok(())
+    }
+
+    fn image_entry(&mut self, indent: usize, key: &str, value: &str) -> ScanResult<()> {
+        let path = self.path_with(key);
+        if key == MERGE_KEY || value.starts_with(['&', '*']) {
+            return Err(format!(
+                "{path} uses an alias, anchor or merge key in an image block"
+            ));
+        }
+        let direct = self.scopes.last().and_then(|scope| scope.image);
+        let tracked = matches!(key, REPOSITORY_KEY | TAG_KEY);
+        match direct {
+            Some(index) if tracked => {
+                let image_path = self.path();
+                self.assign(index, &image_path, key, value)
+            }
+            _ if tracked || key == IMAGE_KEY => {
+                Err(format!("{path} is nested too deeply in an image block"))
+            }
+            _ if is_block_scalar(value) => {
+                self.block_scalar_indent = Some(indent);
+                Ok(())
+            }
+            _ if value.is_empty() => {
+                self.open(indent, key, None);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn assign(&mut self, index: usize, path: &str, key: &str, value: &str) -> ScanResult<()> {
+        if key == MERGE_KEY || value.starts_with(['&', '*']) {
+            return Err(format!(
+                "{path} uses an alias, anchor or merge key in an image block"
+            ));
+        }
+        if key != REPOSITORY_KEY && key != TAG_KEY {
+            return Ok(());
+        }
+        if value.is_empty() || is_block_scalar(value) || value.starts_with(['{', '[']) {
+            return Err(format!("{path}.{key} is not a single value"));
+        }
+        let value = scalar(value)
+            .map_err(|error| format!("{path}.{key} {error}"))?
+            .to_string();
+        if value.is_empty() {
+            return Err(format!("{path}.{key} is empty"));
+        }
+        let reference = &mut self.references[index];
+        if key == REPOSITORY_KEY {
+            reference.repository = Some(value);
+        } else {
+            reference.tag = Some(value);
+        }
+        Ok(())
+    }
+
+    fn record(
+        &mut self,
+        path: String,
+        form: ImageForm,
+        repository: Option<String>,
+        tag: Option<String>,
+    ) -> usize {
+        self.references.push(ImageReference {
+            path,
+            form,
+            repository,
+            tag,
         });
+        self.references.len() - 1
+    }
+
+    fn open(&mut self, indent: usize, key: &str, image: Option<usize>) {
+        let within_image =
+            image.is_some() || self.scopes.last().is_some_and(|scope| scope.within_image);
         self.scopes.push(ScopeEntry {
             indent,
             segment: key.to_string(),
             image,
+            within_image,
         });
     }
 
-    fn assign(&mut self, indent: usize, key: &str, value: &str) {
-        let Some(index) = self
-            .scopes
-            .last()
-            .filter(|scope| scope.indent < indent)
-            .and_then(|scope| scope.image)
-        else {
-            return;
-        };
-        let value = unquote(value.trim());
-        if value.is_empty() || value.starts_with('*') {
-            return;
-        }
-        let reference = &mut self.references[index];
-        match key {
-            REPOSITORY_KEY => reference.repository = Some(value.to_string()),
-            TAG_KEY => reference.tag = Some(value.to_string()),
-            _ => {}
-        }
+    fn path(&self) -> String {
+        self.joined(self.scopes.iter().map(|scope| scope.segment.as_str()))
     }
 
     fn path_with(&self, key: &str) -> String {
+        self.joined(
+            self.scopes
+                .iter()
+                .map(|scope| scope.segment.as_str())
+                .chain([key]),
+        )
+    }
+
+    fn joined<'s>(&self, segments: impl Iterator<Item = &'s str>) -> String {
         let mut path = String::new();
-        for segment in self
-            .scopes
-            .iter()
-            .map(|scope| scope.segment.as_str())
-            .chain([key])
-        {
+        for segment in segments {
             if segment == LIST_ITEM_SEGMENT {
                 path.push_str(LIST_ITEM_SEGMENT);
             } else {
@@ -540,6 +820,69 @@ impl ImageScanner {
         }
         path
     }
+}
+
+/// The string a scalar value loads as, or an error when YAML would load it as
+/// something other than a string.
+fn scalar(value: &str) -> ScanResult<&str> {
+    let unquoted = unquote(value);
+    if unquoted.len() != value.len() {
+        return Ok(unquoted);
+    }
+    if value.starts_with(['"', '\'']) {
+        return Err("has an unterminated quote".to_string());
+    }
+    if loads_as_non_string(value) {
+        return Err(format!(
+            "{value:?} loads as a number, boolean or null; quote it"
+        ));
+    }
+    Ok(value)
+}
+
+fn loads_as_non_string(value: &str) -> bool {
+    const KEYWORDS: [&str; 11] = [
+        "~", "null", "true", "false", "yes", "no", "on", "off", "y", "n", "nan",
+    ];
+    let lower = value.to_ascii_lowercase();
+    KEYWORDS.contains(&lower.trim_start_matches('.'))
+        || lower.trim_start_matches(['+', '-', '.']) == "inf"
+        || value.parse::<f64>().is_ok()
+        || lower
+            .strip_prefix("0x")
+            .or_else(|| lower.strip_prefix("0o"))
+            .is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+}
+
+/// Opened minus closed flow brackets outside quotes.
+fn flow_balance(text: &str) -> i64 {
+    let mut quote = None;
+    let mut depth = 0;
+    for character in text.chars() {
+        match (quote, character) {
+            (None, '"' | '\'') => quote = Some(character),
+            (Some(open), _) if character == open => quote = None,
+            (None, '{' | '[') => depth += 1,
+            (None, '}' | ']') => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// Whether flow-collection text contains an `image` key.
+fn mentions_image_key(text: &str) -> bool {
+    text.match_indices(IMAGE_KEY).any(|(index, _)| {
+        let before = text[..index].trim_end_matches(['"', '\'']);
+        let after = text[index + IMAGE_KEY.len()..].trim_start_matches(['"', '\'']);
+        before
+            .chars()
+            .last()
+            .is_none_or(|character| character.is_whitespace() || matches!(character, '{' | ','))
+            && after.trim_start().starts_with(':')
+    })
 }
 
 fn is_list_item(entry: &str) -> bool {
@@ -820,6 +1163,11 @@ worker-audits:
     /// The production configuration: cloud pins 1.53.30 by default and fra1
     /// overrides it to 1.53.31; cloud-background pins 1.53.30 everywhere.
     fn production() -> RoutedHttpClient {
+        production_with(&region_override("1.53.31"))
+    }
+
+    /// The production configuration with `fra1.yaml` of cloud replaced.
+    fn production_with(fra1: &str) -> RoutedHttpClient {
         RoutedHttpClient::default()
             .directory(
                 CONFIGURATION_REPOSITORY,
@@ -836,7 +1184,7 @@ worker-audits:
                 CONFIGURATION_REPOSITORY,
                 &format!("{CLOUD_DIRECTORY}/fra1.yaml"),
                 "main",
-                &region_override("1.53.31"),
+                fra1,
             )
             .directory(
                 CONFIGURATION_REPOSITORY,
@@ -868,21 +1216,38 @@ worker-audits:
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    fn mapping(path: &str, repository: Option<&str>, tag: Option<&str>) -> ImageReference {
+        ImageReference {
+            path: path.to_string(),
+            form: ImageForm::Mapping,
+            repository: repository.map(str::to_string),
+            tag: tag.map(str::to_string),
+        }
+    }
+
+    fn scan_error(yaml: &str) -> String {
+        image_references(yaml)
+            .expect_err("the scan must fail closed")
+            .to_string()
+    }
+
     #[test]
     fn test_image_references_reads_the_cloud_default_values() {
         assert_eq!(
-            image_references(CLOUD_DEFAULT),
+            image_references(CLOUD_DEFAULT).unwrap(),
             vec![
+                mapping("global.image", Some(CLOUD_IMAGE), Some("1.53.30")),
                 ImageReference {
-                    path: "global.image".to_string(),
-                    repository: Some(CLOUD_IMAGE.to_string()),
-                    tag: Some("1.53.30".to_string()),
+                    path: "cloud.initContainers[].image".to_string(),
+                    form: ImageForm::Scalar,
+                    repository: Some("ghcr.io/loks0n/php-fast-profile".to_string()),
+                    tag: Some("0.3.0".to_string()),
                 },
-                ImageReference {
-                    path: "cloud-geo-premium.image".to_string(),
-                    repository: Some("appwrite/geo-premium".to_string()),
-                    tag: Some("0.2.3".to_string()),
-                },
+                mapping(
+                    "cloud-geo-premium.image",
+                    Some("appwrite/geo-premium"),
+                    Some("0.2.3")
+                ),
             ]
         );
     }
@@ -890,77 +1255,103 @@ worker-audits:
     #[test]
     fn test_image_references_reads_the_cloud_background_default_values() {
         assert_eq!(
-            image_references(BACKGROUND_DEFAULT),
-            vec![ImageReference {
-                path: "global.image".to_string(),
-                repository: Some(CLOUD_IMAGE.to_string()),
-                tag: Some("1.53.30".to_string()),
-            }]
+            image_references(BACKGROUND_DEFAULT).unwrap(),
+            vec![mapping("global.image", Some(CLOUD_IMAGE), Some("1.53.30"))]
         );
     }
 
     #[test]
     fn test_image_references_reads_a_region_override_without_a_repository() {
         assert_eq!(
-            image_references(&region_override("1.53.31")),
+            image_references(&region_override("1.53.31")).unwrap(),
             vec![
-                ImageReference {
-                    path: "global.image".to_string(),
-                    repository: None,
-                    tag: Some("1.53.31".to_string()),
-                },
-                ImageReference {
-                    path: "cloud-geo-premium.image".to_string(),
-                    repository: None,
-                    tag: Some("0.2.4".to_string()),
-                },
+                mapping("global.image", None, Some("1.53.31")),
+                mapping("cloud-geo-premium.image", None, Some("0.2.4")),
             ]
         );
     }
 
     #[test]
     fn test_image_references_tracks_list_items_in_the_path() {
-        let yaml = "cloud:\n  sidecars:\n  - name: agent\n    image:\n      repository: 'appwrite/agent' # pinned\n      tag: \"1.0\"\n  - name: other\n    image: {repository: appwrite/other, tag: 2.0}\n";
+        let yaml = "cloud:\n  sidecars:\n  - name: agent\n    image:\n      repository: 'appwrite/agent' # pinned\n      tag: \"1.0\"\n  - name: other\n    image: {repository: appwrite/other, tag: 2.0.0}\n";
         assert_eq!(
-            image_references(yaml),
+            image_references(yaml).unwrap(),
             vec![
-                ImageReference {
-                    path: "cloud.sidecars[].image".to_string(),
-                    repository: Some("appwrite/agent".to_string()),
-                    tag: Some("1.0".to_string()),
-                },
-                ImageReference {
-                    path: "cloud.sidecars[].image".to_string(),
-                    repository: Some("appwrite/other".to_string()),
-                    tag: Some("2.0".to_string()),
-                },
+                mapping(
+                    "cloud.sidecars[].image",
+                    Some("appwrite/agent"),
+                    Some("1.0")
+                ),
+                mapping(
+                    "cloud.sidecars[].image",
+                    Some("appwrite/other"),
+                    Some("2.0.0")
+                ),
             ]
         );
     }
 
     #[test]
-    fn test_image_references_ignores_block_scalars_aliases_and_deeper_keys() {
-        let yaml = "global:\n  notes: |\n    image:\n      tag: 9.9.9\n  image: &cloud-image\n    repository: appwrite/cloud\n    tag: *pinned\n    extra:\n      tag: 8.8.8\n";
+    fn test_image_references_ignores_block_scalars_and_anchors_outside_images() {
+        let yaml = "x-base: &base\n  tag: 7.7.7\nglobal:\n  <<: *base\n  notes: |\n    image:\n      tag: 9.9.9\n  securityContext: *hardened\n  image:\n    repository: appwrite/cloud\n    tag: 1.53.30\n";
         assert_eq!(
-            image_references(yaml),
-            vec![ImageReference {
-                path: "global.image".to_string(),
-                repository: Some(CLOUD_IMAGE.to_string()),
-                tag: None,
-            }]
+            image_references(yaml).unwrap(),
+            vec![mapping("global.image", Some(CLOUD_IMAGE), Some("1.53.30"))]
+        );
+    }
+
+    #[test]
+    fn test_image_references_rejects_aliases_anchors_and_merge_keys_in_image_blocks() {
+        for yaml in [
+            "global:\n  image:\n    repository: appwrite/cloud\n    tag: *old\n",
+            "global:\n  image:\n    repository: *repository\n    tag: 1.53.30\n",
+            "global:\n  image: &cloud-image\n    repository: appwrite/cloud\n    tag: 1.53.30\n",
+            "global:\n  image: *cloud-image\n",
+            "global:\n  image:\n    <<: *cloud-image\n    tag: 1.53.31\n",
+            "global:\n  image:\n    tag: &pinned 1.53.31\n",
+            "global:\n  image: {repository: appwrite/cloud, <<: *pinned}\n",
+            "global:\n  image: {repository: appwrite/cloud, tag: *pinned}\n",
+        ] {
+            let error = scan_error(yaml);
+            assert!(error.contains("global.image"), "{yaml:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_image_references_rejects_values_it_cannot_read() {
+        for yaml in [
+            "global:\n  image:\n    repository: appwrite/cloud\n    extra:\n      tag: 8.8.8\n",
+            "global:\n  image:\n    tag: |\n      1.53.31\n",
+            "global:\n  image: |\n    appwrite/cloud:1.53.31\n",
+            "global:\n  image:\n    - appwrite/cloud:1.53.31\n",
+            "global:\n  image: [appwrite/cloud]\n",
+            "global:\n  image: {repository: appwrite/cloud, tag: 1.53.31\n",
+            "global:\n  image:\n    tag:\n      name: 1.53.31\n",
+            "global:\n  image:\n    tag: 1.50\n",
+            "global:\n  image:\n    tag: null\n",
+            "global:\n  image:\n    tag: \"\"\n",
+            "global: {image: {repository: appwrite/cloud, tag: 1.53.31}}\n",
+            "cloud:\n  containers: [\n    {name: api, image: appwrite/cloud:1.53.31}\n  ]\n",
+        ] {
+            scan_error(yaml);
+        }
+        assert_eq!(
+            image_references("global:\n  image:\n    tag: \"1.50\"\n").unwrap(),
+            vec![mapping("global.image", None, Some("1.50"))]
+        );
+        assert!(
+            image_references("global:\n  args: [\"--image-pull\", \"x\"]\n")
+                .unwrap()
+                .is_empty()
         );
     }
 
     #[test]
     fn test_image_references_strips_comments_after_plain_apostrophes() {
-        let yaml = "global:\n  image:\n    repository: appwrite/cloud\n    tag: 1.0\n  note: don't # it's 'quoted'\n";
+        let yaml = "global:\n  image:\n    repository: appwrite/cloud\n    tag: 1.0.0\n  note: don't # it's 'quoted'\n";
         assert_eq!(
-            image_references(yaml),
-            vec![ImageReference {
-                path: "global.image".to_string(),
-                repository: Some(CLOUD_IMAGE.to_string()),
-                tag: Some("1.0".to_string()),
-            }]
+            image_references(yaml).unwrap(),
+            vec![mapping("global.image", Some(CLOUD_IMAGE), Some("1.0.0"))]
         );
         assert_eq!(strip_comment("  note: don't # it's"), "  note: don't ");
     }
@@ -968,15 +1359,34 @@ worker-audits:
     #[test]
     fn test_image_references_keeps_hashes_inside_quotes() {
         let yaml =
-            "global:\n  image:\n    repository: \"appwrite/cloud#edge\"\n    tag: 1.0 # comment\n";
+            "global:\n  image:\n    repository: \"appwrite/cloud#edge\"\n    tag: 1.0.0 # comment\n";
         assert_eq!(
-            image_references(yaml),
-            vec![ImageReference {
-                path: "global.image".to_string(),
-                repository: Some("appwrite/cloud#edge".to_string()),
-                tag: Some("1.0".to_string()),
-            }]
+            image_references(yaml).unwrap(),
+            vec![mapping(
+                "global.image",
+                Some("appwrite/cloud#edge"),
+                Some("1.0.0")
+            )]
         );
+    }
+
+    #[test]
+    fn test_split_image_separates_registry_ports_tags_and_digests() {
+        assert_eq!(
+            split_image("appwrite/cloud:1.53.30"),
+            ("appwrite/cloud".to_string(), Some("1.53.30".to_string()))
+        );
+        assert_eq!(
+            split_image("registry.local:5000/appwrite/cloud"),
+            ("registry.local:5000/appwrite/cloud".to_string(), None)
+        );
+        assert_eq!(
+            split_image("ghcr.io/a/b:0.3.0@sha256:04a7"),
+            ("ghcr.io/a/b".to_string(), Some("0.3.0".to_string()))
+        );
+        assert!(names_image("docker.io/appwrite/cloud", CLOUD_IMAGE));
+        assert!(names_image("Appwrite/Cloud", CLOUD_IMAGE));
+        assert!(!names_image("appwrite/cloud-dev", CLOUD_IMAGE));
     }
 
     #[test]
@@ -1012,6 +1422,77 @@ worker-audits:
             .unwrap();
 
         assert_eq!(versions_pinned, versions(&["1.53.30", "1.53.31"]));
+    }
+
+    async fn pinned_error(fra1: &str) -> String {
+        resolver(production_with(fra1))
+            .pinned_versions(&cloud_application())
+            .await
+            .expect_err("an override the scan cannot attribute must fail closed")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_pinned_versions_rejects_a_tag_only_override_outside_the_default_paths() {
+        let error = pinned_error("cloud:\n  image:\n    tag: 1.52.0\n").await;
+        assert!(error.contains("cloud.image"), "{error}");
+        assert!(error.contains("fra1.yaml"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_pinned_versions_rejects_a_scalar_application_image() {
+        let error = pinned_error("cloud:\n  image: appwrite/cloud:1.52.0\n").await;
+        assert!(error.contains("single image string"), "{error}");
+        let error = pinned_error("cloud:\n  image: \"docker.io/appwrite/cloud:1.52.0\"\n").await;
+        assert!(error.contains("single image string"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_pinned_versions_rejects_aliased_and_merged_override_tags() {
+        let error = pinned_error("x-old: &old 1.52.0\nglobal:\n  image:\n    tag: *old\n").await;
+        assert!(error.contains("alias, anchor or merge key"), "{error}");
+        let error =
+            pinned_error("x-old: &old\n  tag: 1.52.0\nglobal:\n  image:\n    <<: *old\n").await;
+        assert!(error.contains("alias, anchor or merge key"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_pinned_versions_rejects_an_override_that_swaps_the_application_image() {
+        let error = pinned_error(
+            "global:\n  image:\n    repository: appwrite/cloud-canary\n    tag: 1.52.0\n",
+        )
+        .await;
+        assert!(error.contains("replaces appwrite/cloud"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_pinned_versions_rejects_a_tag_only_list_item_override() {
+        let error = pinned_error("cloud:\n  initContainers:\n    - name: php-fast-profile\n      image:\n        tag: 0.4.0\n").await;
+        assert!(error.contains("without a repository"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_pinned_versions_counts_a_registry_qualified_application_image() {
+        let versions_pinned = resolver(production_with(
+            "worker:\n  image:\n    repository: docker.io/appwrite/cloud\n    tag: 1.53.32\n",
+        ))
+        .pinned_versions(&cloud_application())
+        .await
+        .unwrap();
+
+        assert_eq!(versions_pinned, versions(&["1.53.30", "1.53.32"]));
+    }
+
+    #[tokio::test]
+    async fn test_pinned_versions_inherits_the_default_tag_for_a_repository_only_override() {
+        let versions_pinned = resolver(production_with(
+            "global:\n  image:\n    repository: appwrite/cloud\n",
+        ))
+        .pinned_versions(&cloud_application())
+        .await
+        .unwrap();
+
+        assert_eq!(versions_pinned, versions(&["1.53.30"]));
     }
 
     #[tokio::test]
