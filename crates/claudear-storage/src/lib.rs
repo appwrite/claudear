@@ -3,6 +3,7 @@
 pub mod analytics;
 #[cfg(feature = "sqlite")]
 pub(crate) mod migrator;
+pub mod scope;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod tenant;
@@ -15,6 +16,7 @@ pub mod vectorlite;
 pub use analytics::{
     classify_error, compute_error_hash, AnalyticsService, TimePeriod, TrendAnalysis, TrendDirection,
 };
+pub use scope::AttemptScope;
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteTracker, VectorIndexRebuilder};
 pub use types::{
@@ -199,6 +201,13 @@ pub trait AttemptTracker: Send + Sync {
 
     /// Get statistics about fix attempts.
     fn get_stats(&self) -> Result<FixAttemptStats>;
+
+    /// Statistics about the fix attempts within `scope`.
+    fn get_scoped_stats(&self, scope: AttemptScope) -> Result<FixAttemptStats> {
+        let mut stats = self.get_stats()?;
+        scope.scrub(&mut stats);
+        Ok(stats)
+    }
 
     /// Increment retry count and set last retry timestamp.
     fn increment_retry(&self, source: &str, issue_id: &str) -> Result<()>;
@@ -399,8 +408,8 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Get analytics summary.
-    fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
+    /// Analytics summary over the attempts within `_scope`.
+    fn get_analytics_summary(&self, _scope: AttemptScope) -> Result<AnalyticsSummary> {
         Ok(AnalyticsSummary::default())
     }
 
@@ -409,13 +418,14 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Get PR analytics.
-    fn get_pr_analytics(&self) -> Result<PrAnalytics> {
+    /// Analytics over the PRs within `_scope`.
+    fn get_pr_analytics(&self, _scope: AttemptScope) -> Result<PrAnalytics> {
         Ok(PrAnalytics::default())
     }
 
-    /// Average time from issue attempt to PR creation in minutes.
-    fn get_avg_time_to_pr(&self) -> Result<Option<f64>> {
+    /// Average time from issue attempt to PR creation in minutes, over the
+    /// attempts within `_scope`.
+    fn get_avg_time_to_pr(&self, _scope: AttemptScope) -> Result<Option<f64>> {
         Ok(None)
     }
 
@@ -427,35 +437,47 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Count Claude agent spawns since a given ISO timestamp.
-    fn get_agent_spawn_count(&self, _since_iso: &str) -> Result<i64> {
+    /// Count Claude agent spawns for attempts within `_scope` since a given ISO
+    /// timestamp.
+    fn get_agent_spawn_count(&self, _since_iso: &str, _scope: AttemptScope) -> Result<i64> {
         Ok(0)
     }
 
-    /// Compute cost estimate from Claude execution data.
+    /// Compute cost estimate from the Claude executions of attempts within
+    /// `_scope`.
     fn get_cost_estimate(
         &self,
         _since_iso: &str,
         _max_plan_monthly_cost: f64,
         _period_label: &str,
+        _scope: AttemptScope,
     ) -> Result<claudear_core::types::CostEstimate> {
         Ok(claudear_core::types::CostEstimate::default())
     }
 
-    /// MTTR trend grouped by week.
-    fn get_mttr_trend(&self, _weeks: usize) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
+    /// MTTR trend of the attempts within `_scope`, grouped by week.
+    fn get_mttr_trend(
+        &self,
+        _weeks: usize,
+        _scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
         Ok(Vec::new())
     }
 
-    /// Per-repository leaderboard.
-    fn get_repo_leaderboard(&self) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
+    /// Per-repository leaderboard of the attempts within `_scope`.
+    fn get_repo_leaderboard(
+        &self,
+        _scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
         Ok(Vec::new())
     }
 
-    /// Daily commit-production trend over the last `_days` days.
+    /// Daily commit-production trend of the attempts within `_scope` over the
+    /// last `_days` days.
     fn get_commit_trend(
         &self,
         _days: usize,
+        _scope: AttemptScope,
     ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
         Ok(Vec::new())
     }
@@ -484,12 +506,14 @@ pub trait ActivityStore: Send + Sync {
         Ok(claudear_core::types::SupportRatingSummary::default())
     }
 
-    /// Complexity-based engineering time savings estimate.
+    /// Complexity-based engineering time savings estimate over the attempts
+    /// within `_scope`.
     fn get_complexity_time_savings(
         &self,
         _since_iso: &str,
         _hourly_rate: f64,
         _period_label: &str,
+        _scope: AttemptScope,
     ) -> Result<claudear_core::types::TimeSavings> {
         Ok(claudear_core::types::TimeSavings::default())
     }
@@ -554,17 +578,22 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Count fix attempts with optional filters.
-    fn count_attempts(&self, _status: Option<&str>, _source: Option<&str>) -> Result<usize> {
+    /// Count the fix attempts within `_scope` with optional filters.
+    fn count_attempts(
+        &self,
+        _status: Option<&str>,
+        _source: Option<&str>,
+        _scope: AttemptScope,
+    ) -> Result<usize> {
         Ok(0)
     }
 
-    /// Like [`Self::list_attempts`] across every source except `excluded_source`
-    /// (compared case-insensitively), so a page skips it without scanning.
-    fn list_attempts_excluding_source(
+    /// Like [`Self::list_attempts`] across every source within `_scope`, so a
+    /// page skips excluded attempts without scanning.
+    fn list_scoped_attempts(
         &self,
         _status: Option<&str>,
-        _excluded_source: &str,
+        _scope: AttemptScope,
         _limit: usize,
         _offset: usize,
     ) -> Result<Vec<FixAttempt>> {
@@ -576,8 +605,12 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// List fix attempts created since a timestamp.
-    fn list_attempts_since(&self, _since: DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+    /// List the fix attempts within `_scope` created since a timestamp.
+    fn list_attempts_since(
+        &self,
+        _since: DateTime<Utc>,
+        _scope: AttemptScope,
+    ) -> Result<Vec<FixAttempt>> {
         Ok(Vec::new())
     }
 
@@ -647,37 +680,42 @@ pub trait ActivityStore: Send + Sync {
         Ok(0)
     }
 
-    /// Get activity type counts since a timestamp.
+    /// Get counts by type of the activity within `_scope` since a timestamp.
     fn get_activity_type_counts_since(
         &self,
         _since: DateTime<Utc>,
+        _scope: AttemptScope,
     ) -> Result<HashMap<String, i64>> {
         Ok(HashMap::new())
     }
 
-    /// Get metric counts for named metrics since a timestamp.
+    /// Get counts of the named metrics within `_scope` since a timestamp.
     fn get_metric_counts_since(
         &self,
         _metric_names: &[&str],
         _since: DateTime<Utc>,
+        _scope: AttemptScope,
     ) -> Result<HashMap<String, i64>> {
         Ok(HashMap::new())
     }
 
-    /// Get metric sums for named metrics since a timestamp.
+    /// Get sums of the named metrics within `_scope` since a timestamp.
     fn get_metric_sums_since(
         &self,
         _metric_names: &[&str],
         _since: DateTime<Utc>,
+        _scope: AttemptScope,
     ) -> Result<HashMap<String, f64>> {
         Ok(HashMap::new())
     }
 
-    /// Get metric sums grouped by source for named metrics since a timestamp.
+    /// Get sums grouped by source of the named metrics within `_scope` since a
+    /// timestamp.
     fn get_metric_sums_by_source_since(
         &self,
         _metric_names: &[&str],
         _since: DateTime<Utc>,
+        _scope: AttemptScope,
     ) -> Result<HashMap<(String, String), f64>> {
         Ok(HashMap::new())
     }
@@ -1244,16 +1282,16 @@ pub trait EmbeddingStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Count issues with optional source filter.
-    fn count_issues(&self, _source: Option<&str>) -> Result<usize> {
+    /// Count the issues within `_scope` with optional source filter.
+    fn count_issues(&self, _source: Option<&str>, _scope: AttemptScope) -> Result<usize> {
         Ok(0)
     }
 
-    /// Like [`Self::list_issues`] across every source except `excluded_source`
-    /// (compared case-insensitively), so a page skips it without scanning.
-    fn list_issues_excluding_source(
+    /// Like [`Self::list_issues`] across every source within `_scope`, so a page
+    /// skips excluded issues without scanning.
+    fn list_scoped_issues(
         &self,
-        _excluded_source: &str,
+        _scope: AttemptScope,
         _limit: usize,
         _offset: usize,
     ) -> Result<Vec<IssueEmbedding>> {
@@ -2691,7 +2729,7 @@ mod tests {
         #[test]
         fn test_default_get_analytics_summary_returns_default() {
             let t = MockActivity;
-            let summary = t.get_analytics_summary().unwrap();
+            let summary = t.get_analytics_summary(AttemptScope::All).unwrap();
             assert_eq!(summary.success_rate, 0.0);
         }
 
@@ -2704,7 +2742,7 @@ mod tests {
         #[test]
         fn test_default_get_pr_analytics_returns_default() {
             let t = MockActivity;
-            let analytics = t.get_pr_analytics().unwrap();
+            let analytics = t.get_pr_analytics(AttemptScope::All).unwrap();
             assert_eq!(analytics.total, 0);
         }
 
@@ -2786,7 +2824,7 @@ mod tests {
         #[test]
         fn test_default_get_avg_time_to_pr_returns_none() {
             let t = MockActivity;
-            assert!(t.get_avg_time_to_pr().unwrap().is_none());
+            assert!(t.get_avg_time_to_pr(AttemptScope::All).unwrap().is_none());
         }
 
         #[test]
@@ -2798,14 +2836,18 @@ mod tests {
         #[test]
         fn test_default_get_agent_spawn_count_returns_zero() {
             let t = MockActivity;
-            assert_eq!(t.get_agent_spawn_count("2024-01-01T00:00:00Z").unwrap(), 0);
+            assert_eq!(
+                t.get_agent_spawn_count("2024-01-01T00:00:00Z", AttemptScope::All)
+                    .unwrap(),
+                0
+            );
         }
 
         #[test]
         fn test_default_get_cost_estimate_returns_default() {
             let t = MockActivity;
             let est = t
-                .get_cost_estimate("2024-01-01T00:00:00Z", 100.0, "month")
+                .get_cost_estimate("2024-01-01T00:00:00Z", 100.0, "month", AttemptScope::All)
                 .unwrap();
             assert_eq!(est.total_cost, 0.0);
             assert_eq!(est.avg_cost_per_fix, 0.0);
@@ -2815,20 +2857,28 @@ mod tests {
         #[test]
         fn test_default_get_mttr_trend_returns_empty() {
             let t = MockActivity;
-            assert!(t.get_mttr_trend(4).unwrap().is_empty());
+            assert!(t.get_mttr_trend(4, AttemptScope::All).unwrap().is_empty());
         }
 
         #[test]
         fn test_default_get_repo_leaderboard_returns_empty() {
             let t = MockActivity;
-            assert!(t.get_repo_leaderboard().unwrap().is_empty());
+            assert!(t
+                .get_repo_leaderboard(AttemptScope::All)
+                .unwrap()
+                .is_empty());
         }
 
         #[test]
         fn test_default_get_complexity_time_savings_returns_default() {
             let t = MockActivity;
             let savings = t
-                .get_complexity_time_savings("2024-01-01T00:00:00Z", 150.0, "month")
+                .get_complexity_time_savings(
+                    "2024-01-01T00:00:00Z",
+                    150.0,
+                    "month",
+                    AttemptScope::All,
+                )
                 .unwrap();
             assert_eq!(savings.merged_count, 0);
             assert_eq!(savings.hours_saved, 0.0);
@@ -3890,8 +3940,11 @@ mod tests {
         #[test]
         fn test_default_count_issues_returns_zero() {
             let t = MockEmbeddingExt;
-            assert_eq!(t.count_issues(None).unwrap(), 0);
-            assert_eq!(t.count_issues(Some("source")).unwrap(), 0);
+            assert_eq!(t.count_issues(None, AttemptScope::All).unwrap(), 0);
+            assert_eq!(
+                t.count_issues(Some("source"), AttemptScope::All).unwrap(),
+                0
+            );
         }
 
         #[test]
@@ -3981,8 +4034,12 @@ mod tests {
         #[test]
         fn test_default_count_attempts_returns_zero() {
             let t = MockActivityExt;
-            assert_eq!(t.count_attempts(None, None).unwrap(), 0);
-            assert_eq!(t.count_attempts(Some("failed"), Some("sentry")).unwrap(), 0);
+            assert_eq!(t.count_attempts(None, None, AttemptScope::All).unwrap(), 0);
+            assert_eq!(
+                t.count_attempts(Some("failed"), Some("sentry"), AttemptScope::All)
+                    .unwrap(),
+                0
+            );
         }
 
         #[test]
@@ -3994,7 +4051,10 @@ mod tests {
         #[test]
         fn test_default_list_attempts_since_returns_empty() {
             let t = MockActivityExt;
-            assert!(t.list_attempts_since(Utc::now()).unwrap().is_empty());
+            assert!(t
+                .list_attempts_since(Utc::now(), AttemptScope::All)
+                .unwrap()
+                .is_empty());
         }
 
         #[test]
@@ -4034,7 +4094,7 @@ mod tests {
         fn test_default_get_activity_type_counts_since_returns_empty() {
             let t = MockActivityExt;
             assert!(t
-                .get_activity_type_counts_since(Utc::now())
+                .get_activity_type_counts_since(Utc::now(), AttemptScope::All)
                 .unwrap()
                 .is_empty());
         }
@@ -4043,7 +4103,7 @@ mod tests {
         fn test_default_get_metric_counts_since_returns_empty() {
             let t = MockActivityExt;
             assert!(t
-                .get_metric_counts_since(&["queue_depth"], Utc::now())
+                .get_metric_counts_since(&["queue_depth"], Utc::now(), AttemptScope::All)
                 .unwrap()
                 .is_empty());
         }
@@ -4052,7 +4112,7 @@ mod tests {
         fn test_default_get_metric_sums_since_returns_empty() {
             let t = MockActivityExt;
             assert!(t
-                .get_metric_sums_since(&["processing_time"], Utc::now())
+                .get_metric_sums_since(&["processing_time"], Utc::now(), AttemptScope::All)
                 .unwrap()
                 .is_empty());
         }
@@ -4061,7 +4121,7 @@ mod tests {
         fn test_default_get_metric_sums_by_source_since_returns_empty() {
             let t = MockActivityExt;
             assert!(t
-                .get_metric_sums_by_source_since(&["queue_depth"], Utc::now())
+                .get_metric_sums_by_source_since(&["queue_depth"], Utc::now(), AttemptScope::All)
                 .unwrap()
                 .is_empty());
         }

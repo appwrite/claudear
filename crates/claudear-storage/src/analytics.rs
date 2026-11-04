@@ -109,7 +109,7 @@ impl<'a> AnalyticsService<'a> {
 
     /// Get the overall analytics summary.
     pub fn get_summary(&self) -> Result<AnalyticsSummary> {
-        self.tracker.get_analytics_summary()
+        self.tracker.get_analytics_summary(crate::AttemptScope::All)
     }
 
     /// Get the success rate over a time period.
