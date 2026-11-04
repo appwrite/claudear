@@ -8,14 +8,20 @@ use super::types::{
 };
 use super::{
     ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
-    EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore, SimilarityStore,
-    UserStore, WebhookStore,
+    EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
+    SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
 };
 use crate::vector_index::catalog::Catalog;
 use crate::vector_index::progress::Progress;
 use crate::vector_index::{embedding_blob, embedding_from_blob, REBUILD_BATCH_SIZE};
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
+use claudear_core::security::{
+    AwardStatus, DeliveryStatus, NewSecurityAward, NewSecurityEvent, NewSecurityReport,
+    NewSecurityVulnerability, SecurityAward, SecurityEvent, SecurityEventKind, SecurityReply,
+    SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportFilter,
+    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityChanges, VulnerabilityState,
+};
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
     ExperimentProviderStats, FixAttempt, FixAttemptStats, FixAttemptStatus, FixOutcome,
@@ -30,6 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod security_reports;
 mod vector_index_rebuilder;
 
 pub use vector_index_rebuilder::VectorIndexRebuilder;
@@ -4482,6 +4489,189 @@ impl DeployQaStore for SqliteTracker {
         thread_id: Option<&str>,
     ) -> Result<()> {
         SqliteTracker::update_deploy_qa_discord_ids(self, id, message_id, thread_id)
+    }
+}
+
+impl SecurityReportStore for SqliteTracker {
+    fn upsert_security_report(&self, report: &NewSecurityReport) -> Result<SecurityReport> {
+        SqliteTracker::upsert_security_report(self, report)
+    }
+
+    fn get_security_report(&self, id: i64) -> Result<Option<SecurityReport>> {
+        SqliteTracker::get_security_report(self, id)
+    }
+
+    fn get_security_report_by_conversation(
+        &self,
+        source: &str,
+        conversation_id: &str,
+    ) -> Result<Option<SecurityReport>> {
+        SqliteTracker::get_security_report_by_conversation(self, source, conversation_id)
+    }
+
+    fn list_security_reports(&self, filter: &SecurityReportFilter) -> Result<Vec<SecurityReport>> {
+        SqliteTracker::list_security_reports(self, filter)
+    }
+
+    fn list_reports_for_vulnerability(&self, vulnerability_id: i64) -> Result<Vec<SecurityReport>> {
+        SqliteTracker::list_reports_for_vulnerability(self, vulnerability_id)
+    }
+
+    fn transition_security_report(
+        &self,
+        id: i64,
+        expected: SecurityReportState,
+        next: SecurityReportState,
+        changes: &SecurityReportChanges,
+        event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        SqliteTracker::transition_security_report(self, id, expected, next, changes, event)
+    }
+
+    fn release_stale_security_assessments(&self, stale_after: Duration) -> Result<usize> {
+        SqliteTracker::release_stale_security_assessments(self, stale_after)
+    }
+
+    fn record_security_follow_up(
+        &self,
+        id: i64,
+        expected_count: u32,
+        new_count: u32,
+    ) -> Result<bool> {
+        SqliteTracker::record_security_follow_up(self, id, expected_count, new_count)
+    }
+
+    fn record_security_event(
+        &self,
+        report_id: Option<i64>,
+        vulnerability_id: Option<i64>,
+        event: &NewSecurityEvent,
+    ) -> Result<()> {
+        SqliteTracker::record_security_event(self, report_id, vulnerability_id, event)
+    }
+
+    fn list_security_timeline(&self, report_id: i64) -> Result<Vec<SecurityEvent>> {
+        SqliteTracker::list_security_timeline(self, report_id)
+    }
+
+    fn last_security_event(
+        &self,
+        vulnerability_id: i64,
+        kind: SecurityEventKind,
+    ) -> Result<Option<SecurityEvent>> {
+        SqliteTracker::last_security_event(self, vulnerability_id, kind)
+    }
+
+    fn list_admin_confirmed_reports(&self) -> Result<Vec<(SecurityReport, SecurityEvent)>> {
+        SqliteTracker::list_admin_confirmed_reports(self)
+    }
+
+    fn create_security_vulnerability(
+        &self,
+        vulnerability: &NewSecurityVulnerability,
+    ) -> Result<SecurityVulnerability> {
+        SqliteTracker::create_security_vulnerability(self, vulnerability)
+    }
+
+    fn get_security_vulnerability(&self, id: i64) -> Result<Option<SecurityVulnerability>> {
+        SqliteTracker::get_security_vulnerability(self, id)
+    }
+
+    fn list_security_vulnerabilities(
+        &self,
+        state: Option<VulnerabilityState>,
+    ) -> Result<Vec<SecurityVulnerability>> {
+        SqliteTracker::list_security_vulnerabilities(self, state)
+    }
+
+    fn transition_security_vulnerability(
+        &self,
+        id: i64,
+        expected: VulnerabilityState,
+        next: VulnerabilityState,
+        changes: &SecurityVulnerabilityChanges,
+        event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        SqliteTracker::transition_security_vulnerability(self, id, expected, next, changes, event)
+    }
+
+    fn replace_first_reporter(
+        &self,
+        vulnerability_id: i64,
+        expected_first_report_id: i64,
+        report_id: i64,
+        reported_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        SqliteTracker::replace_first_reporter(
+            self,
+            vulnerability_id,
+            expected_first_report_id,
+            report_id,
+            reported_at,
+        )
+    }
+
+    fn claim_security_reply(&self, report_id: i64, kind: SecurityReplyKind) -> Result<bool> {
+        SqliteTracker::claim_security_reply(self, report_id, kind)
+    }
+
+    fn complete_security_reply(
+        &self,
+        report_id: i64,
+        kind: SecurityReplyKind,
+        status: DeliveryStatus,
+        error: Option<&str>,
+    ) -> Result<()> {
+        SqliteTracker::complete_security_reply(self, report_id, kind, status, error)
+    }
+
+    fn confirm_security_reply(
+        &self,
+        report_id: i64,
+        kind: SecurityReplyKind,
+        delivered: bool,
+        actor: &str,
+    ) -> Result<bool> {
+        SqliteTracker::confirm_security_reply(self, report_id, kind, delivered, actor)
+    }
+
+    fn list_security_replies(&self, report_id: i64) -> Result<Vec<SecurityReply>> {
+        SqliteTracker::list_security_replies(self, report_id)
+    }
+
+    fn prepare_security_award(
+        &self,
+        vulnerability_id: i64,
+        report_id: i64,
+        award: &NewSecurityAward,
+    ) -> Result<bool> {
+        SqliteTracker::prepare_security_award(self, vulnerability_id, report_id, award)
+    }
+
+    fn update_security_award_status(
+        &self,
+        vulnerability_id: i64,
+        expected: &[AwardStatus],
+        next: AwardStatus,
+        actor: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        SqliteTracker::update_security_award_status(
+            self,
+            vulnerability_id,
+            expected,
+            next,
+            actor,
+            note,
+        )
+    }
+
+    fn get_security_award(&self, vulnerability_id: i64) -> Result<Option<SecurityAward>> {
+        SqliteTracker::get_security_award(self, vulnerability_id)
+    }
+
+    fn list_security_awards(&self, status: Option<AwardStatus>) -> Result<Vec<SecurityAward>> {
+        SqliteTracker::list_security_awards(self, status)
     }
 }
 

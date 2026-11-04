@@ -6,6 +6,7 @@
 pub mod error;
 pub mod platform;
 pub mod secret;
+pub mod security;
 pub mod templates;
 pub mod tls;
 pub mod types;
