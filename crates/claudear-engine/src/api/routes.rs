@@ -1,6 +1,7 @@
 //! API route handlers for the dashboard.
 
 use super::auth::*;
+use super::visibility::Visibility;
 use crate::retry::RetryManager;
 use axum::{
     extract::{
@@ -171,6 +172,34 @@ pub fn create_api_router_full(
         )
         .route("/api/telemetry/pipeline", get(telemetry_pipeline_handler))
         .route("/api/telemetry/latency", get(telemetry_latency_handler))
+        .route(
+            "/api/security/summary",
+            get(super::security_reports::summary_handler),
+        )
+        .route(
+            "/api/security/reports",
+            get(super::security_reports::reports_handler),
+        )
+        .route(
+            "/api/security/reports/{id}",
+            get(super::security_reports::report_handler),
+        )
+        .route(
+            "/api/security/reports/{id}/override",
+            axum::routing::post(super::security_reports::override_handler),
+        )
+        .route(
+            "/api/security/vulnerabilities/{id}/award",
+            axum::routing::post(super::security_reports::award_handler),
+        )
+        .route(
+            "/api/security/vulnerabilities/{id}/pull-request",
+            axum::routing::post(super::security_reports::pull_request_handler),
+        )
+        .route(
+            "/api/security/vulnerabilities/{id}/live",
+            axum::routing::post(super::security_reports::live_handler),
+        )
         // Auth routes
         .route("/api/auth/login", axum::routing::post(login_handler))
         .route("/api/auth/logout", axum::routing::post(logout_handler))
@@ -378,25 +407,29 @@ async fn health_handler(_user: AuthUser, State(state): State<ApiState>) -> Json<
 }
 
 async fn stats_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<FixAttemptStats>, StatusCode> {
-    state.tracker.get_stats().map(Json).map_err(|e| {
-        tracing::error!(error = %e, "Internal server error");
-        sentry::capture_error(&e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
-}
-
-async fn overview_handler(
-    _user: AuthUser,
-    State(state): State<ApiState>,
-) -> Result<Json<OverviewResponse>, StatusCode> {
-    let stats = state.tracker.get_stats().map_err(|e| {
+    let mut stats = state.tracker.get_stats().map_err(|e| {
         tracing::error!(error = %e, "Internal server error");
         sentry::capture_error(&e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    Visibility::for_user(&user).scrub_stats(&mut stats);
+    Ok(Json(stats))
+}
+
+async fn overview_handler(
+    user: AuthUser,
+    State(state): State<ApiState>,
+) -> Result<Json<OverviewResponse>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
+    let mut stats = state.tracker.get_stats().map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    visibility.scrub_stats(&mut stats);
 
     // Calculate rates
     let completed = stats.merged + stats.closed + stats.failed + stats.cannot_fix;
@@ -412,9 +445,12 @@ async fn overview_handler(
     };
 
     // Get recent attempts (last 10).
-    let recent = state
-        .tracker
-        .list_recent_attempts(10)
+    let recent = visibility
+        .prefix(
+            |limit| state.tracker.list_recent_attempts(limit),
+            |attempt| visibility.shows(&attempt.source),
+            10,
+        )
         .map(|records| {
             records
                 .into_iter()
@@ -482,10 +518,11 @@ async fn overview_handler(
 }
 
 async fn attempts_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<AttemptsQuery>,
 ) -> Result<Json<AttemptsResponse>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let status_filter = query.status.as_ref().map(|s| s.to_lowercase());
@@ -493,23 +530,44 @@ async fn attempts_handler(
     let status_filter = status_filter.as_deref();
     let source_filter = source_filter.as_deref();
 
+    if visibility.hides_filter(source_filter) {
+        return Ok(Json(AttemptsResponse {
+            attempts: Vec::new(),
+            total: 0,
+            page,
+            per_page,
+        }));
+    }
+
+    let internal_error = |e: claudear_core::error::Error| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
     let offset = (page - 1) * per_page;
-    let rows = state
-        .tracker
-        .list_attempts(status_filter, source_filter, per_page, offset)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    let total = state
+    let rows = visibility
+        .page(
+            |limit, offset| {
+                state
+                    .tracker
+                    .list_attempts(status_filter, source_filter, limit, offset)
+            },
+            |attempt| visibility.shows(&attempt.source),
+            offset,
+            per_page,
+        )
+        .map_err(internal_error)?;
+    let mut total = state
         .tracker
         .count_attempts(status_filter, source_filter)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .map_err(internal_error)?;
+    if visibility.subtracts_hidden(source_filter) {
+        let hidden = state
+            .tracker
+            .count_attempts(status_filter, Some(visibility.hidden_source()))
+            .map_err(internal_error)?;
+        total = total.saturating_sub(hidden);
+    }
     let attempts: Vec<AttemptSummary> = rows
         .into_iter()
         .map(|attempt| attempt_to_summary(&attempt))
@@ -524,10 +582,15 @@ async fn attempts_handler(
 }
 
 async fn attempt_detail_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<FixAttempt>, StatusCode> {
+    visible_attempt(&state, &user, id).map(Json)
+}
+
+/// The attempt with `id`, or 404 when it is missing or hidden from `user`.
+fn visible_attempt(state: &ApiState, user: &AuthUser, id: i64) -> Result<FixAttempt, StatusCode> {
     state
         .tracker
         .get_attempt_by_id(id)
@@ -536,7 +599,7 @@ async fn attempt_detail_handler(
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
-        .map(Json)
+        .filter(|attempt| Visibility::for_user(user).shows(&attempt.source))
         .ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -594,14 +657,15 @@ async fn sources_handler(_user: AuthUser, State(state): State<ApiState>) -> Json
 }
 
 async fn retries_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<RetriesResponse>, StatusCode> {
     use crate::retry::RetryManager;
 
+    let visibility = Visibility::for_user(&user);
     let max_retries = state.config.retry.max_retries;
 
-    let retryable = state
+    let mut retryable = state
         .tracker
         .get_retryable_issues(max_retries)
         .map_err(|e| {
@@ -609,6 +673,7 @@ async fn retries_handler(
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    retryable.retain(|attempt| visibility.shows(&attempt.source));
 
     // Create RetryManager to compute which attempts are ready for retry
     let retry_manager = RetryManager::new(state.config.retry.clone(), state.tracker.clone());
@@ -1166,19 +1231,11 @@ struct TelemetryLatencyResponse {
 }
 
 async fn attempt_full_detail_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<AttemptDetailResponse>, StatusCode> {
-    let attempt = state
-        .tracker
-        .get_attempt_by_id(id)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let attempt = visible_attempt(&state, &user, id)?;
 
     let executions = state
         .tracker
@@ -1206,10 +1263,13 @@ async fn attempt_full_detail_handler(
 /// Retrieval-quality assessment for an attempt: every chunk pulled from each RAG
 /// source, with score/rank/injected/used/quality_score.
 async fn attempt_retrieval_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<AttemptRetrievalResponse>, StatusCode> {
+    if super::visibility::hides_security(&user) {
+        visible_attempt(&state, &user, id)?;
+    }
     let rows = state.tracker.get_retrieval_usage(id).map_err(|e| {
         tracing::error!(error = %e, "Internal server error");
         sentry::capture_error(&e);
@@ -1222,7 +1282,7 @@ async fn attempt_retrieval_handler(
 }
 
 async fn attempt_execution_log_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Path((attempt_id, execution_id, stream)): Path<(i64, i64, String)>,
 ) -> Result<Json<AttemptExecutionLogResponse>, StatusCode> {
@@ -1230,18 +1290,7 @@ async fn attempt_execution_log_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let attempt_exists = state
-        .tracker
-        .get_attempt_by_id(attempt_id)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .is_some();
-    if !attempt_exists {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    visible_attempt(&state, &user, attempt_id)?;
 
     let execution = state
         .tracker
@@ -1341,16 +1390,27 @@ fn tail_utf8(value: &str, max_bytes: usize) -> (String, bool) {
 }
 
 async fn activity_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<ActivityQuery>,
 ) -> Result<Json<Vec<claudear_core::types::ActivityLogEntry>>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let limit = query.limit.unwrap_or(50).min(500);
     let source_filter = query.source.as_deref();
+    if visibility.hides_filter(source_filter) {
+        return Ok(Json(Vec::new()));
+    }
 
-    state
-        .tracker
-        .get_recent_activities_filtered(limit, source_filter)
+    visibility
+        .prefix(
+            |limit| {
+                state
+                    .tracker
+                    .get_recent_activities_filtered(limit, source_filter)
+            },
+            |entry| visibility.shows_optional(entry.source.as_deref()),
+            limit,
+        )
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -1361,10 +1421,13 @@ async fn activity_handler(
 
 /// Return the timeline for a single issue.
 async fn issue_timeline_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Path((source, issue_id)): Path<(String, String)>,
 ) -> Result<Json<claudear_core::types::IssueTimeline>, StatusCode> {
+    if !Visibility::for_user(&user).shows(&source) {
+        return Err(StatusCode::NOT_FOUND);
+    }
     state
         .tracker
         .get_issue_timeline(&source, &issue_id)
@@ -1483,15 +1546,19 @@ async fn metrics_handler(
 }
 
 async fn errors_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<ErrorsQuery>,
 ) -> Result<Json<Vec<claudear_core::types::ErrorPattern>>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let limit = query.limit.unwrap_or(50).min(200);
 
-    state
-        .tracker
-        .get_error_patterns(limit)
+    visibility
+        .prefix(
+            |limit| state.tracker.get_error_patterns(limit),
+            |pattern| visibility.shows_all(pattern.sources.iter().flatten().map(String::as_str)),
+            limit,
+        )
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -1501,31 +1568,50 @@ async fn errors_handler(
 }
 
 async fn issues_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<IssuesQuery>,
 ) -> Result<Json<IssuesResponse>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(100).min(500);
     let offset = (page - 1) * per_page;
+    let source_filter = query.source.as_deref();
 
-    let total = state
-        .tracker
-        .count_issues(query.source.as_deref())
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    if visibility.hides_filter(source_filter) {
+        return Ok(Json(IssuesResponse {
+            issues: Vec::new(),
+            total: 0,
+            page,
+            per_page,
+        }));
+    }
 
-    let rows = state
+    let internal_error = |e: claudear_core::error::Error| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let mut total = state
         .tracker
-        .list_issues(query.source.as_deref(), per_page, offset)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .count_issues(source_filter)
+        .map_err(internal_error)?;
+    if visibility.subtracts_hidden(source_filter) {
+        let hidden = state
+            .tracker
+            .count_issues(Some(visibility.hidden_source()))
+            .map_err(internal_error)?;
+        total = total.saturating_sub(hidden);
+    }
+
+    let rows = visibility
+        .page(
+            |limit, offset| state.tracker.list_issues(source_filter, limit, offset),
+            |issue| visibility.shows(&issue.source),
+            offset,
+            per_page,
+        )
+        .map_err(internal_error)?;
 
     let issues: Vec<IssueSummary> = rows
         .into_iter()
@@ -1563,15 +1649,19 @@ async fn issues_handler(
 }
 
 async fn prs_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<PrsQuery>,
 ) -> Result<Json<Vec<claudear_core::types::PrRecord>>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let limit = query.limit.unwrap_or(100).min(500);
 
-    state
-        .tracker
-        .list_prs(query.status.as_deref(), limit)
+    visibility
+        .prefix(
+            |limit| state.tracker.list_prs(query.status.as_deref(), limit),
+            |pull_request| visibility.shows_optional(pull_request.issue_source.as_deref()),
+            limit,
+        )
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -1597,15 +1687,23 @@ async fn pr_analytics_handler(
 }
 
 async fn feedback_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<FeedbackQuery>,
 ) -> Result<Json<Vec<claudear_analysis::feedback::FixOutcome>>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let limit = query.limit.unwrap_or(50).min(200);
+    let source_filter = query.source.as_deref();
+    if visibility.hides_filter(source_filter) {
+        return Ok(Json(Vec::new()));
+    }
 
-    state
-        .tracker
-        .get_feedback_outcomes(query.source.as_deref(), limit)
+    visibility
+        .prefix(
+            |limit| state.tracker.get_feedback_outcomes(source_filter, limit),
+            |outcome| visibility.shows(&outcome.source),
+            limit,
+        )
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
