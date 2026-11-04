@@ -208,9 +208,12 @@ fn restore(incoming: &mut Value, current: &Value) -> Result<(), ConfigFileError>
 }
 
 /// `incoming` with its sentinels restored from `current`, refusing any it
-/// cannot restore.
+/// cannot restore. `incoming` comes from [`redact`], which writes every default
+/// out, so it is compared with `current` in that same form; `current` is used
+/// as written only when it does not deserialize into a [`Config`].
 pub(super) fn restore_all(mut incoming: Value, current: &Value) -> Result<Value, ConfigFileError> {
-    restore(&mut incoming, current)?;
+    let normalized = normalize_document(current);
+    restore(&mut incoming, normalized.as_ref().unwrap_or(current))?;
     let placeholders = unrestored(&incoming);
     if !placeholders.is_empty() {
         return Err(ConfigFileError::invalid(format!(
@@ -250,6 +253,11 @@ fn deserialize<T: DeserializeOwned>(content: &str) -> Result<T, ConfigFileError>
 /// The config as the daemon would deserialize it, without env overrides.
 pub(super) fn normalize(content: &str) -> Result<Value, ConfigFileError> {
     to_value(&parse(content)?)
+}
+
+fn normalize_document(document: &Value) -> Option<Value> {
+    let config: Config = document.clone().try_into().ok()?;
+    to_value(&config).ok()
 }
 
 pub(super) fn revision(bytes: &[u8]) -> String {
@@ -1866,6 +1874,97 @@ mod tests {
             "Re-enter issues.linear.api_key when changing issues.linear.api_url"
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), base);
+    }
+
+    const GITLAB_WITHOUT_BASE_URL: &str = "workspace = \"/tmp/repos\"\n\n\
+         [issues.linear]\napi_key = \"fake-linear-key\"\n\n\
+         [scm.gitlab]\ntoken = \"fake-gitlab-token\"\n";
+
+    const JIRA_WITHOUT_BASE_URL: &str = "workspace = \"/tmp/repos\"\n\n\
+         [issues.linear]\napi_key = \"fake-linear-key\"\n\n\
+         [issues.jira]\napi_token = \"fake-jira-token\"\n";
+
+    async fn save_redacted(
+        disk: &str,
+        edit: impl FnOnce(&mut Value),
+    ) -> (Result<WriteOutcome, ConfigFileError>, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        fs::write(&path, disk).unwrap();
+        let mut incoming = parse_document(&redact(&parse(disk).unwrap()).unwrap().content).unwrap();
+        edit(&mut incoming);
+
+        let outcome =
+            write_validated(&path, None, move |current| restore_all(incoming, &current)).await;
+
+        (outcome, fs::read_to_string(&path).unwrap())
+    }
+
+    #[tokio::test]
+    async fn restore_all_keeps_a_secret_whose_omitted_endpoint_renders_as_its_default() {
+        let (outcome, written) = save_redacted(GITLAB_WITHOUT_BASE_URL, |_| {}).await;
+
+        outcome.expect("an unchanged redacted config saves");
+        let saved = parse(&written).unwrap();
+        let gitlab = saved.scm.gitlab.expect("gitlab section kept");
+        assert_eq!(
+            gitlab.token.as_ref().map(SecretValue::expose),
+            Some("fake-gitlab-token")
+        );
+        assert_eq!(gitlab.base_url, "https://gitlab.com");
+    }
+
+    #[tokio::test]
+    async fn restore_all_keeps_a_secret_whose_omitted_endpoint_defaults_to_empty() {
+        let (outcome, written) = save_redacted(JIRA_WITHOUT_BASE_URL, |_| {}).await;
+
+        outcome.expect("an unchanged redacted config saves");
+        let saved = parse(&written).unwrap();
+        let jira = saved.issues.jira.expect("jira section kept");
+        assert_eq!(jira.api_token.expose(), "fake-jira-token");
+        assert_eq!(jira.base_url, "");
+    }
+
+    #[tokio::test]
+    async fn restore_all_refuses_a_secret_when_an_omitted_endpoint_is_changed() {
+        let (outcome, written) = save_redacted(GITLAB_WITHOUT_BASE_URL, |incoming| {
+            *lookup_mut(incoming, "scm.gitlab.base_url").unwrap() =
+                Value::String("https://evil.invalid".to_string());
+        })
+        .await;
+
+        let error = outcome.expect_err("a redirected secret is refused");
+        assert_eq!(error.code, ConfigErrorCode::Invalid);
+        assert_eq!(
+            error.message,
+            "Re-enter scm.gitlab.token when changing scm.gitlab.base_url"
+        );
+        assert_eq!(written, GITLAB_WITHOUT_BASE_URL);
+    }
+
+    #[tokio::test]
+    async fn restore_all_restores_from_a_disk_file_that_does_not_deserialize() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        fs::write(
+            &path,
+            "workspace = \"/tmp/repos\"\n\n\
+             [issues.linear]\napi_key = \"fake-linear-key\"\nmax_concurrent = \"many\"\n",
+        )
+        .unwrap();
+        let mut incoming = valid_document();
+        *lookup_mut(&mut incoming, "issues.linear.api_key").unwrap() =
+            Value::String(REDACTED.to_string());
+
+        write_validated(&path, None, move |current| restore_all(incoming, &current))
+            .await
+            .expect("a corrected config replaces one that does not deserialize");
+
+        let saved = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.issues.linear.unwrap().api_key.expose(),
+            "fake-linear-key"
+        );
     }
 
     #[cfg(unix)]
