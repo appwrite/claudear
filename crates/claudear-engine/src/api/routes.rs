@@ -9300,7 +9300,7 @@ mod tests {
         /// Users created before each app's acting users. The API, login and invite rate
         /// limiters are process-wide, so every app gets its own slot of user ids, emails
         /// and client IP, clear of the low ids the rest of the suite writes as.
-        const FILLER_USERS: usize = 5000;
+        const FILLER_USERS: usize = 5500;
         const SLOT_WIDTH: usize = 4;
         static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 
