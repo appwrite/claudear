@@ -677,6 +677,20 @@ Console config edits are written to `claudear.toml` in normalised form and apply
 | `GET /api/telemetry/overview` | Telemetry overview |
 | `GET /api/telemetry/cost-analysis` | Cost analysis |
 
+#### Reverse proxy
+
+The chat websocket (`/api/chat/ws`) only accepts an upgrade whose `Origin` matches the host the browser connected to. Behind a reverse proxy, either preserve the original `Host` header or send it in `X-Forwarded-Host` or `Forwarded: host=`, otherwise every upgrade is rejected with 403. For nginx:
+
+```nginx
+location /api/chat/ws {
+    proxy_pass http://127.0.0.1:3100;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+}
+```
+
 ### Scheduled Reports
 
 ```bash

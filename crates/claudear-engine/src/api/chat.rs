@@ -17,7 +17,8 @@ use claudear_storage::FixAttemptTracker;
 use std::sync::Arc;
 
 const WEBSOCKET_PATH: &str = "/api/chat/ws";
-const FORWARDED_HOST: &str = "x-forwarded-host";
+const X_FORWARDED_HOST: &str = "x-forwarded-host";
+const FORWARDED_HOST_PARAMETER: &str = "host";
 
 /// Build the chat state when `[chat]` and `[llm]` are enabled and an
 /// embedding client is available for code search.
@@ -51,9 +52,13 @@ pub fn chat_state(
     })
 }
 
-/// Require a dashboard session on every route of `router`.
-pub(super) fn authenticated(router: Router, state: ApiState) -> Router {
-    router.route_layer(from_fn_with_state(state, require_session))
+/// Merge `chat` into `routes` with a dashboard session required on every
+/// chat route; without `chat`, `routes` is returned unchanged.
+pub(super) fn mount(routes: Router, chat: Option<Router>, state: ApiState) -> Router {
+    match chat {
+        Some(chat) => routes.merge(chat.route_layer(from_fn_with_state(state, require_session))),
+        None => routes,
+    }
 }
 
 /// Reject requests without a session, and cross-origin websocket upgrades.
@@ -85,15 +90,34 @@ fn is_same_origin(request: &Request) -> bool {
     };
 
     let header_value = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
-    let forwarded_host = header_value(FORWARDED_HOST)
+    let x_forwarded_host = header_value(X_FORWARDED_HOST)
         .and_then(|value| value.split(',').next())
         .map(str::trim);
+    let forwarded = header_value(header::FORWARDED.as_str()).and_then(forwarded_host);
     let target = request.uri().authority().map(Authority::as_str);
 
-    [header_value(header::HOST.as_str()), forwarded_host, target]
-        .into_iter()
-        .flatten()
-        .any(|host| host.eq_ignore_ascii_case(origin.as_str()))
+    [
+        header_value(header::HOST.as_str()),
+        x_forwarded_host,
+        forwarded,
+        target,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|host| host.eq_ignore_ascii_case(origin.as_str()))
+}
+
+/// The `host` parameter of the first, client-side element of an RFC 7239
+/// `Forwarded` header.
+fn forwarded_host(value: &str) -> Option<&str> {
+    value
+        .split(',')
+        .next()?
+        .split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case(FORWARDED_HOST_PARAMETER))
+        .map(|(_, host)| host.trim().trim_matches('"'))
+        .filter(|host| !host.is_empty())
 }
 
 #[cfg(test)]
@@ -136,9 +160,9 @@ mod tests {
         config
     }
 
-    fn stub_router(tracker: &Arc<dyn FixAttemptTracker>) -> Router {
+    fn api_state(tracker: &Arc<dyn FixAttemptTracker>) -> ApiState {
         let config = Config::default();
-        let state = ApiState {
+        ApiState {
             storage_dir: config.storage_dir.clone(),
             config,
             tracker: tracker.clone(),
@@ -147,7 +171,10 @@ mod tests {
             indexing_rx: tracker.subscribe_indexing_progress(),
             chat_service: None,
             startup_config: None,
-        };
+        }
+    }
+
+    fn stub_router(tracker: &Arc<dyn FixAttemptTracker>) -> Router {
         let chat = Router::new()
             .route("/api/chat/ws", get(|| async { StatusCode::OK }))
             .route("/api/chat/models", get(|| async { StatusCode::OK }))
@@ -156,7 +183,7 @@ mod tests {
                 "/api/chat/sessions/{id}",
                 get(|| async { StatusCode::OK }).delete(|| async { StatusCode::OK }),
             );
-        apply_dashboard_middleware(Router::new().merge(authenticated(chat, state)), false)
+        apply_dashboard_middleware(mount(Router::new(), Some(chat), api_state(tracker)), false)
     }
 
     async fn get_status(router: &Router, uri: &str, headers: &[(&str, &str)]) -> StatusCode {
@@ -170,15 +197,6 @@ mod tests {
             .await
             .unwrap()
             .status()
-    }
-
-    fn try_embedding_client() -> Option<Arc<EmbeddingClient>> {
-        EmbeddingClient::new(EmbeddingConfig {
-            pool_size: 1,
-            ..EmbeddingConfig::from_env()
-        })
-        .ok()
-        .map(Arc::new)
     }
 
     #[tokio::test]
@@ -259,6 +277,127 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn mount_without_chat_adds_no_chat_routes() {
+        let tracker = tracker();
+        let token = session(&tracker);
+        let router =
+            apply_dashboard_middleware(mount(Router::new(), None, api_state(&tracker)), false);
+        let cookie = format!("claudear_session={token}");
+
+        for route in ROUTES {
+            assert_eq!(
+                get_status(&router, route, &[("cookie", &cookie)]).await,
+                StatusCode::NOT_FOUND,
+                "{route} without chat"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_behind_a_host_rewriting_proxy_needs_a_forwarded_host() {
+        let tracker = tracker();
+        let token = session(&tracker);
+        let router = stub_router(&tracker);
+        let cookie = format!("claudear_session={token}");
+        let proxied = |forwarding: &'static [(&'static str, &'static str)]| {
+            let mut headers = vec![
+                ("cookie", cookie.as_str()),
+                ("host", "127.0.0.1:3100"),
+                ("origin", "https://claudear.example.com"),
+            ];
+            headers.extend_from_slice(forwarding);
+            headers
+        };
+
+        assert_eq!(
+            get_status(&router, WEBSOCKET_PATH, &proxied(&[])).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_status(
+                &router,
+                WEBSOCKET_PATH,
+                &proxied(&[(
+                    "forwarded",
+                    "for=192.0.2.60;proto=https;host=claudear.example.com"
+                )])
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_status(
+                &router,
+                WEBSOCKET_PATH,
+                &proxied(&[("x-forwarded-host", "claudear.example.com")])
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn forwarded_host_reads_the_first_element_host_parameter() {
+        for (value, expected) in [
+            ("host=claudear.example.com", Some("claudear.example.com")),
+            (
+                "for=192.0.2.60;proto=https;host=claudear.example.com",
+                Some("claudear.example.com"),
+            ),
+            (
+                "for=\"[2001:db8::1]\"; Host=\"Claudear.example.com:8443\"",
+                Some("Claudear.example.com:8443"),
+            ),
+            (
+                "host=claudear.example.com, host=proxy.internal",
+                Some("claudear.example.com"),
+            ),
+            ("for=192.0.2.60, host=proxy.internal", None),
+            ("for=192.0.2.60;proto=https", None),
+            ("host=", None),
+            ("host=\"\"", None),
+            ("", None),
+        ] {
+            assert_eq!(forwarded_host(value), expected, "Forwarded: {value}");
+        }
+    }
+
+    #[test]
+    fn same_origin_accepts_the_forwarded_host() {
+        let same_origin = |forwarded: &str, origin: &str| {
+            let request = axum::http::Request::builder()
+                .uri(WEBSOCKET_PATH)
+                .header("host", "127.0.0.1:3100")
+                .header("forwarded", forwarded)
+                .header("origin", origin)
+                .body(Body::empty())
+                .unwrap();
+            is_same_origin(&request)
+        };
+
+        assert!(same_origin(
+            "proto=https;host=claudear.example.com",
+            "https://claudear.example.com"
+        ));
+        assert!(same_origin(
+            "host=\"claudear.example.com:8443\"",
+            "https://claudear.example.com:8443"
+        ));
+        assert!(!same_origin(
+            "host=claudear.example.com, host=evil.example",
+            "https://evil.example"
+        ));
+        assert!(!same_origin(
+            "host=claudear.example.com",
+            "https://evil.example"
+        ));
+        assert!(!same_origin(
+            "for=192.0.2.60;proto=https",
+            "https://claudear.example.com"
+        ));
+    }
+
     #[test]
     fn same_origin_compares_origin_authority_to_host() {
         let same_origin = |uri: &str, headers: &[(&str, &str)]| {
@@ -326,11 +465,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "loads the ONNX embedding model"]
     async fn chat_enabled_router_requires_a_session() {
-        let Some(embedding_client) = try_embedding_client() else {
-            eprintln!("Skipping: embedding model unavailable");
-            return;
-        };
+        let embedding_client = EmbeddingClient::new(EmbeddingConfig {
+            pool_size: 1,
+            ..EmbeddingConfig::from_env()
+        })
+        .map(Arc::new)
+        .expect("embedding model loads");
         let storage = tempfile::tempdir().unwrap();
         let tracker = tracker();
         let token = session(&tracker);
