@@ -119,11 +119,7 @@ pub async fn revoke_token_handler(
     Path(id): Path<String>,
 ) -> StatusCode {
     // Admins can revoke any token; everyone else is scoped to their own.
-    let scope = if user.role == "admin" {
-        None
-    } else {
-        Some(user.id)
-    };
+    let scope = if user.is_admin() { None } else { Some(user.id) };
     match state.tracker.delete_api_token(&id, scope) {
         Ok(true) => StatusCode::NO_CONTENT,
         Ok(false) => StatusCode::NOT_FOUND,

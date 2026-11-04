@@ -209,6 +209,8 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
     "unknown".to_string()
 }
 
+pub const ADMIN_ROLE: &str = "admin";
+
 /// Authenticated user extracted from session cookie.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthUser {
@@ -217,6 +219,12 @@ pub struct AuthUser {
     pub name: String,
     pub role: String,
     pub avatar_url: Option<String>,
+}
+
+impl AuthUser {
+    pub fn is_admin(&self) -> bool {
+        self.role == ADMIN_ROLE
+    }
 }
 
 impl FromRequestParts<ApiState> for AuthUser {
@@ -267,7 +275,7 @@ impl FromRequestParts<ApiState> for AuthUser {
     }
 }
 
-/// Admin user extractor — wraps AuthUser and checks role == "admin".
+/// Admin user extractor — wraps AuthUser and checks the admin role.
 #[derive(Debug, Clone)]
 pub struct AdminUser(pub AuthUser);
 
@@ -279,7 +287,7 @@ impl FromRequestParts<ApiState> for AdminUser {
         state: &ApiState,
     ) -> Result<Self, Self::Rejection> {
         let user = AuthUser::from_request_parts(parts, state).await?;
-        if user.role != "admin" {
+        if !user.is_admin() {
             return Err(StatusCode::FORBIDDEN);
         }
         Ok(AdminUser(user))
