@@ -3,7 +3,7 @@
 //! The registry merges people configured in `[users.<key>]` (the seed) with console users
 //! whose identities live in the database. A console person replaces the config entry with
 //! the same person key in full. Every clone shares one directory, so [`UserRegistry::replace_console`]
-//! is seen everywhere at once.
+//! is seen everywhere at once, and [`UserRegistry::reload`] applies reloads in the order they read.
 
 mod channel;
 
@@ -13,7 +13,7 @@ use crate::config::UserConfig;
 use claudear_core::identity::{ConsoleIdentity, Identities, IdentityField, IdentityOrigin};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 const CONSOLE_KEY_PREFIX: &str = "console-";
 
@@ -59,6 +59,7 @@ pub struct ResolvedUser {
 pub struct UserRegistry {
     seed: Arc<Seed>,
     directory: Arc<RwLock<Arc<Directory>>>,
+    reloading: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for UserRegistry {
@@ -78,7 +79,24 @@ impl UserRegistry {
         Self {
             seed: Arc::new(seed),
             directory: Arc::new(RwLock::new(Arc::new(directory))),
+            reloading: Arc::default(),
         }
+    }
+
+    /// Load the console identities with `load` and apply them. Reloads through any clone
+    /// run one at a time, so a reload that read an older snapshot can never replace the
+    /// directory after one that read a newer snapshot. On error the directory is kept.
+    pub fn reload<E>(
+        &self,
+        load: impl FnOnce() -> Result<Vec<ConsoleIdentity>, E>,
+    ) -> Result<(), E> {
+        let _reloading = self
+            .reloading
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entries = load()?;
+        self.replace_console(entries);
+        Ok(())
     }
 
     /// Rebuild the merged directory from the console users' identities. An empty list
@@ -133,6 +151,9 @@ impl UserRegistry {
             return slug.to_string();
         }
         let directory = self.snapshot();
+        if let Some(key) = directory.stored_key(entry) {
+            return key.to_string();
+        }
         let mut entries: Vec<ConsoleIdentity> = directory
             .entries
             .iter()
@@ -173,12 +194,12 @@ impl UserRegistry {
         person.map(|person| person.key.clone())
     }
 
-    /// The Discord id of the first person with this GitHub login and a Discord id.
+    /// The Discord id of the person who owns this GitHub login (the person
+    /// [`Self::resolve`] finds), if they have one.
     pub fn discord_id_for_github(&self, login: &str) -> Option<String> {
         self.snapshot()
-            .github_discord
-            .get(&login.to_lowercase())
-            .cloned()
+            .handle_owner(IdentityField::GithubUsernames, login)
+            .and_then(|person| person.user.discord_id.clone())
     }
 
     /// Resolve a notifier reference: a person key becomes that person's address on
@@ -317,15 +338,15 @@ impl Handle {
     }
 }
 
-/// An immutable merged view. Persons are ordered console first (ascending user id), then
-/// config (ascending key); the first person to claim a handle owns it.
+/// An immutable merged view. Persons are ordered console first (ascending user id, aligned
+/// with `entries`), then config (ascending key); the first person to claim a handle owns it.
 #[derive(Default)]
 struct Directory {
     entries: Vec<ConsoleIdentity>,
+    consoles: HashMap<i64, usize>,
     persons: Vec<Person>,
     keys: HashMap<String, usize>,
     handles: HashMap<Handle, usize>,
-    github_discord: HashMap<String, String>,
 }
 
 impl Directory {
@@ -359,7 +380,6 @@ impl Directory {
 
         let mut keys: HashMap<String, usize> = HashMap::with_capacity(persons.len());
         let mut handles: HashMap<Handle, usize> = HashMap::new();
-        let mut github_discord: HashMap<String, String> = HashMap::new();
         for (index, person) in persons.iter().enumerate() {
             keys.entry(person.key.clone()).or_insert(index);
             for field in EXCLUSIVE_FIELDS {
@@ -367,25 +387,30 @@ impl Directory {
                     handles.entry(Handle::new(field, value)).or_insert(index);
                 }
             }
-            if let Some(discord_id) = &person.user.discord_id {
-                for login in &person.user.github_usernames {
-                    github_discord
-                        .entry(login.to_lowercase())
-                        .or_insert_with(|| discord_id.clone());
-                }
-            }
         }
+        let mut consoles: HashMap<i64, usize> = HashMap::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             keys.entry(console_key(entry.user_id)).or_insert(index);
+            consoles.insert(entry.user_id, index);
         }
 
         Self {
             entries,
+            consoles,
             persons,
             keys,
             handles,
-            github_discord,
         }
+    }
+
+    /// The key the stored console person for `entry.user_id` holds, when `entry` has the
+    /// same slug and login email, since nothing else about the entry affects its key.
+    fn stored_key(&self, entry: &ConsoleIdentity) -> Option<&str> {
+        let &index = self.consoles.get(&entry.user_id)?;
+        let stored = &self.entries[index];
+        let unchanged = explicit_slug(stored) == explicit_slug(entry)
+            && email_key(&stored.login_email) == email_key(&entry.login_email);
+        unchanged.then(|| self.persons[index].key.as_str())
     }
 
     fn person(&self, key: &str) -> Option<&Person> {
@@ -981,10 +1006,7 @@ mod tests {
             registry.discord_id_for_github("JAKEBARNBY").as_deref(),
             Some("123456789")
         );
-        assert_eq!(
-            registry.discord_id_for_github("shared").as_deref(),
-            Some("452316113016193024")
-        );
+        assert_eq!(registry.discord_id_for_github("Shared"), None);
         assert_eq!(registry.discord_id_for_github("nobody"), None);
 
         registry.replace_console(vec![console(
@@ -1215,5 +1237,122 @@ mod tests {
             Identities::default(),
         )]);
         assert!(!registry.is_empty());
+    }
+
+    #[test]
+    fn discord_id_for_github_follows_the_handle_owner() {
+        let users = HashMap::from([
+            ("amy".to_string(), config_user(&["shared"], None, None)),
+            (
+                "bob".to_string(),
+                config_user(&["shared"], Some("452316113016193024"), None),
+            ),
+        ]);
+        let registry = UserRegistry::new(users);
+
+        assert_eq!(registry.resolve("github", "shared").unwrap().slug, "amy");
+        assert_eq!(registry.discord_id_for_github("shared"), None);
+
+        registry.replace_console(vec![console(
+            4,
+            "carl@appwrite.io",
+            None,
+            handles(&["SHARED"], Some("111111111111111111")),
+        )]);
+        assert_eq!(
+            registry.resolve("github", "shared").unwrap().slug,
+            "console-4"
+        );
+        assert_eq!(
+            registry.discord_id_for_github("Shared").as_deref(),
+            Some("111111111111111111")
+        );
+    }
+
+    #[test]
+    fn person_key_recomputes_when_a_stored_entry_changes() {
+        let registry = UserRegistry::new(test_users());
+        let boss = console(2, "boss@appwrite.io", Some("jake"), Identities::default());
+        let amy = console(3, "alice@example.com", None, Identities::default());
+        registry.replace_console(vec![boss.clone(), amy.clone()]);
+
+        assert_eq!(registry.person_key(&boss), "jake");
+        assert_eq!(registry.person_key(&amy), "alice");
+        let renamed = ConsoleIdentity {
+            name: "Amy Renamed".to_string(),
+            identities: handles(&["amy-gh"], None),
+            ..amy.clone()
+        };
+        assert_eq!(registry.person_key(&renamed), "alice");
+
+        let unlinked = ConsoleIdentity {
+            slug: None,
+            ..boss.clone()
+        };
+        assert_eq!(registry.person_key(&unlinked), "console-2");
+        let moved = ConsoleIdentity {
+            slug: None,
+            login_email: "Jake@Example.com".to_string(),
+            ..boss
+        };
+        assert_eq!(registry.person_key(&moved), "jake");
+        let claims_jake = ConsoleIdentity {
+            login_email: "jake@example.com".to_string(),
+            ..amy
+        };
+        assert_eq!(registry.person_key(&claims_jake), "console-3");
+    }
+
+    #[test]
+    fn reload_never_applies_an_older_snapshot_after_a_newer_one() {
+        let registry = UserRegistry::new(HashMap::new());
+        let stale = vec![console(1, "a@appwrite.io", None, handles(&["old"], None))];
+        let fresh = vec![console(1, "a@appwrite.io", None, handles(&["new"], None))];
+        let (listed, started) = std::sync::mpsc::channel::<()>();
+        let (finished, newer_done) = std::sync::mpsc::channel::<()>();
+
+        let older = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                registry.reload(|| {
+                    listed.send(()).unwrap();
+                    let _ = newer_done.recv_timeout(std::time::Duration::from_millis(300));
+                    Ok::<_, ()>(stale)
+                })
+            })
+        };
+        started.recv().unwrap();
+        let newer = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                let outcome = registry.reload(|| Ok::<_, ()>(fresh));
+                let _ = finished.send(());
+                outcome
+            })
+        };
+        older.join().unwrap().unwrap();
+        newer.join().unwrap().unwrap();
+
+        assert!(registry.resolve("github", "old").is_none());
+        assert_eq!(registry.resolve("github", "new").unwrap().slug, "console-1");
+    }
+
+    #[test]
+    fn failed_reload_keeps_the_directory() {
+        let registry = UserRegistry::new(HashMap::new());
+        registry
+            .reload(|| {
+                Ok::<_, ()>(vec![console(
+                    1,
+                    "a@appwrite.io",
+                    None,
+                    handles(&["a"], None),
+                )])
+            })
+            .unwrap();
+
+        assert_eq!(registry.reload(|| Err("storage down")), Err("storage down"));
+
+        assert_eq!(registry.resolve("github", "a").unwrap().slug, "console-1");
     }
 }

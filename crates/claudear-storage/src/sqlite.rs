@@ -16,7 +16,7 @@ use crate::vector_index::progress::Progress;
 use crate::vector_index::{embedding_blob, embedding_from_blob, REBUILD_BATCH_SIZE};
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
-use claudear_core::identity::{ConsoleIdentity, Identities, UserStatus};
+use claudear_core::identity::{normalize_login_email, ConsoleIdentity, Identities, UserStatus};
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
     ExperimentProviderStats, FixAttempt, FixAttemptStats, FixAttemptStatus, FixOutcome,
@@ -135,6 +135,50 @@ fn read_user(connection: &Connection, user_id: i64) -> rusqlite::Result<UserRow>
     )
 }
 
+/// The error a write gets when another user already has the login email, worded like
+/// SQLite's own `UNIQUE` violation so callers detect both the same way.
+const DUPLICATE_LOGIN_EMAIL: &str = "UNIQUE constraint failed: users.email";
+
+/// Fail with [`DUPLICATE_LOGIN_EMAIL`] when a user other than `except` has `email`,
+/// compared case-insensitively so rows stored before normalization still collide.
+fn ensure_login_email_available(
+    connection: &Connection,
+    email: &str,
+    except: Option<i64>,
+) -> Result<()> {
+    let taken: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM users WHERE lower(email) = lower(?1) AND (?2 IS NULL OR id != ?2)
+         )",
+        params![email, except],
+        |row| row.get(0),
+    )?;
+    if taken {
+        return Err(claudear_core::error::Error::Database(
+            DUPLICATE_LOGIN_EMAIL.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+const CONSOLE_IDENTITY_SELECT: &str = "SELECT ui.user_id, u.email, u.name, ui.slug,
+            ui.linear_names, ui.github_usernames, ui.sentry_usernames, ui.jira_usernames,
+            ui.gitlab_usernames, ui.discord_id, ui.slack_id, ui.email, ui.push_user_key,
+            ui.sms_number, ui.whatsapp_number, ui.telegram_chat_id, ui.updated_at
+     FROM user_identities ui
+     JOIN users u ON u.id = ui.user_id";
+
+fn read_console_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConsoleIdentity> {
+    Ok(ConsoleIdentity {
+        user_id: row.get(0)?,
+        login_email: row.get(1)?,
+        name: row.get(2)?,
+        slug: row.get(3)?,
+        identities: read_identities(row, 4)?,
+        updated_at: row.get(16)?,
+    })
+}
+
 fn read_invite(connection: &Connection, id: &str) -> rusqlite::Result<InviteRow> {
     connection.query_row(
         &format!("SELECT {QUALIFIED_INVITE_COLUMNS} FROM user_invites i WHERE i.id = ?1"),
@@ -171,6 +215,8 @@ fn write_directory_user(connection: &Connection, user: &DirectoryUser) -> Result
             password_hash,
             status,
         } => {
+            let email = normalize_login_email(email);
+            ensure_login_email_available(connection, &email, None)?;
             connection.execute(
                 "INSERT INTO users (email, password_hash, name, role, status) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![email, password_hash, name, role, status.as_str()],
@@ -4321,18 +4367,26 @@ impl UserStore for SqliteTracker {
     }
 
     fn create_user(&self, email: &str, password_hash: &str, name: &str, role: &str) -> Result<i64> {
-        let connection = self.acquire_lock()?;
-        connection.execute(
+        let email = normalize_login_email(email);
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_login_email_available(&transaction, &email, None)?;
+        transaction.execute(
             "INSERT INTO users (email, password_hash, name, role) VALUES (?1, ?2, ?3, ?4)",
             params![email, password_hash, name, role],
         )?;
-        Ok(connection.last_insert_rowid())
+        let user_id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(user_id)
     }
 
     fn get_user_by_email(&self, email: &str) -> Result<Option<UserRow>> {
+        let email = normalize_login_email(email);
         let connection = self.acquire_lock()?;
         let mut statement = connection.prepare(&format!(
-            "SELECT {USER_COLUMNS} FROM users WHERE email = ?1"
+            "SELECT {USER_COLUMNS} FROM users WHERE lower(email) = lower(?1)
+             ORDER BY email = ?1 DESC, id
+             LIMIT 1"
         ))?;
         let user = statement
             .query_row(params![email], UserRow::from_row)
@@ -4369,13 +4423,16 @@ impl UserStore for SqliteTracker {
         role: Option<&str>,
         avatar_url: Option<&str>,
     ) -> Result<bool> {
-        let connection = self.acquire_lock()?;
+        let email = email.map(normalize_login_email);
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut sets = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
         if let Some(email) = email {
+            ensure_login_email_available(&transaction, &email, Some(id))?;
             sets.push("email = ?");
-            values.push(Box::new(email.to_string()));
+            values.push(Box::new(email));
         }
         if let Some(password_hash) = password_hash {
             sets.push("password_hash = ?");
@@ -4404,7 +4461,8 @@ impl UserStore for SqliteTracker {
         let sql = format!("UPDATE users SET {} WHERE id = ?", sets.join(", "));
         let params: Vec<&dyn rusqlite::types::ToSql> =
             values.iter().map(|value| value.as_ref()).collect();
-        let rows = connection.execute(&sql, params.as_slice())?;
+        let rows = transaction.execute(&sql, params.as_slice())?;
+        transaction.commit()?;
         Ok(rows > 0)
     }
 
@@ -4573,28 +4631,24 @@ impl UserStore for SqliteTracker {
 
     fn list_user_identities(&self) -> Result<Vec<ConsoleIdentity>> {
         let connection = self.acquire_lock()?;
-        let mut statement = connection.prepare(
-            "SELECT ui.user_id, u.email, u.name, ui.slug,
-                    ui.linear_names, ui.github_usernames, ui.sentry_usernames, ui.jira_usernames,
-                    ui.gitlab_usernames, ui.discord_id, ui.slack_id, ui.email, ui.push_user_key,
-                    ui.sms_number, ui.whatsapp_number, ui.telegram_chat_id, ui.updated_at
-             FROM user_identities ui
-             JOIN users u ON u.id = ui.user_id
-             ORDER BY ui.user_id",
-        )?;
+        let mut statement =
+            connection.prepare(&format!("{CONSOLE_IDENTITY_SELECT} ORDER BY ui.user_id"))?;
         let identities = statement
-            .query_map([], |row| {
-                Ok(ConsoleIdentity {
-                    user_id: row.get(0)?,
-                    login_email: row.get(1)?,
-                    name: row.get(2)?,
-                    slug: row.get(3)?,
-                    identities: read_identities(row, 4)?,
-                    updated_at: row.get(16)?,
-                })
-            })?
+            .query_map([], read_console_identity)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(identities)
+    }
+
+    fn get_user_identities(&self, user_id: i64) -> Result<Option<ConsoleIdentity>> {
+        let connection = self.acquire_lock()?;
+        let identity = connection
+            .query_row(
+                &format!("{CONSOLE_IDENTITY_SELECT} WHERE ui.user_id = ?1"),
+                params![user_id],
+                read_console_identity,
+            )
+            .optional()?;
+        Ok(identity)
     }
 
     fn delete_user_identities(&self, user_id: i64) -> Result<bool> {
@@ -23705,6 +23759,205 @@ mod tests {
                 assert!(!output.contains(secret), "Debug leaked {secret}");
             }
             assert!(output.contains("Invited"));
+        }
+
+        fn insert_raw_user(tracker: &SqliteTracker, email: &str) -> i64 {
+            let connection = tracker.acquire_lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO users (email, password_hash, name, role) VALUES (?1, 'hash', 'Legacy', 'viewer')",
+                    params![email],
+                )
+                .unwrap();
+            connection.last_insert_rowid()
+        }
+
+        fn assert_duplicate_email(result: Result<impl std::fmt::Debug>) {
+            let error = result.expect_err("a case-insensitive duplicate login email must fail");
+            assert!(
+                error.to_string().contains(DUPLICATE_LOGIN_EMAIL),
+                "unexpected error: {error}"
+            );
+        }
+
+        #[test]
+        fn test_create_user_stores_the_normalized_login_email() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("  Amy@Example.COM ", "hash", "Amy", "viewer")
+                .unwrap();
+
+            let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
+            assert_eq!(user.email, "amy@example.com");
+        }
+
+        #[test]
+        fn test_get_user_by_email_is_case_insensitive() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("amy@example.com", "hash", "Amy", "viewer")
+                .unwrap();
+            let legacy = insert_raw_user(&tracker, "Bob@Example.com");
+
+            for lookup in ["amy@example.com", "AMY@example.com", " Amy@Example.Com "] {
+                assert_eq!(
+                    tracker
+                        .get_user_by_email(lookup)
+                        .unwrap()
+                        .map(|user| user.id),
+                    Some(user_id),
+                    "{lookup:?}"
+                );
+            }
+            assert_eq!(
+                tracker
+                    .get_user_by_email("bob@example.com")
+                    .unwrap()
+                    .map(|user| user.id),
+                Some(legacy)
+            );
+        }
+
+        #[test]
+        fn test_get_user_by_email_prefers_the_exact_row_among_legacy_case_variants() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let mixed = insert_raw_user(&tracker, "Amy@Example.com");
+            let lower = insert_raw_user(&tracker, "amy@example.com");
+
+            assert_eq!(
+                tracker
+                    .get_user_by_email("AMY@EXAMPLE.COM")
+                    .unwrap()
+                    .map(|user| user.id),
+                Some(lower)
+            );
+            assert_ne!(mixed, lower);
+        }
+
+        #[test]
+        fn test_create_user_rejects_a_case_variant_of_an_existing_email() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            tracker
+                .create_user("amy@example.com", "hash", "Amy", "viewer")
+                .unwrap();
+            insert_raw_user(&tracker, "Bob@Example.com");
+
+            assert_duplicate_email(tracker.create_user("Amy@Example.com", "hash", "Amy", "admin"));
+            assert_duplicate_email(tracker.create_user("bob@example.com", "hash", "Bob", "admin"));
+            assert_eq!(count(&tracker, "users"), 2);
+        }
+
+        #[test]
+        fn test_save_directory_rejects_case_variant_emails_and_rolls_back() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            tracker
+                .create_user("amy@example.com", "hash", "Amy", "viewer")
+                .unwrap();
+
+            assert_duplicate_email(tracker.save_directory(&[DirectoryWrite {
+                user: new_user("AMY@example.com", UserStatus::Active),
+                identities: None,
+                invite: None,
+            }]));
+            assert_duplicate_email(tracker.save_directory(&[
+                DirectoryWrite {
+                    user: new_user("carl@example.com", UserStatus::Active),
+                    identities: None,
+                    invite: None,
+                },
+                DirectoryWrite {
+                    user: new_user("Carl@Example.com", UserStatus::Active),
+                    identities: None,
+                    invite: None,
+                },
+            ]));
+            assert_eq!(count(&tracker, "users"), 1);
+
+            let ids = tracker
+                .save_directory(&[DirectoryWrite {
+                    user: new_user(" Dana@Example.com", UserStatus::Active),
+                    identities: None,
+                    invite: None,
+                }])
+                .unwrap();
+            assert_eq!(
+                tracker.get_user_by_id(ids[0]).unwrap().unwrap().email,
+                "dana@example.com"
+            );
+        }
+
+        #[test]
+        fn test_update_user_normalizes_and_rejects_another_users_email() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = tracker
+                .create_user("amy@example.com", "hash", "Amy", "viewer")
+                .unwrap();
+            let bob = tracker
+                .create_user("bob@example.com", "hash", "Bob", "viewer")
+                .unwrap();
+
+            assert_duplicate_email(tracker.update_user(
+                bob,
+                Some("Amy@Example.com"),
+                None,
+                Some("Renamed"),
+                None,
+                None,
+            ));
+            let unchanged = tracker.get_user_by_id(bob).unwrap().unwrap();
+            assert_eq!(unchanged.email, "bob@example.com");
+            assert_eq!(unchanged.name, "Bob");
+
+            assert!(tracker
+                .update_user(amy, Some(" AMY@example.com "), None, None, None, None)
+                .unwrap());
+            assert!(tracker
+                .update_user(bob, Some("Robert@Example.com"), None, None, None, None)
+                .unwrap());
+            assert_eq!(
+                tracker.get_user_by_id(amy).unwrap().unwrap().email,
+                "amy@example.com"
+            );
+            assert_eq!(
+                tracker.get_user_by_id(bob).unwrap().unwrap().email,
+                "robert@example.com"
+            );
+        }
+
+        #[test]
+        fn test_get_user_identities_returns_one_users_row() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = tracker
+                .create_user("amy@example.com", "hash", "Amy", "viewer")
+                .unwrap();
+            let bob = tracker
+                .create_user("bob@example.com", "hash", "Bob", "viewer")
+                .unwrap();
+            tracker
+                .save_directory(&[
+                    identities_write(amy, Some("amy"), complete_identities()),
+                    identities_write(bob, None, github("bob-gh")),
+                ])
+                .unwrap();
+
+            let found = tracker.get_user_identities(amy).unwrap().unwrap();
+            assert_eq!(found.user_id, amy);
+            assert_eq!(found.login_email, "amy@example.com");
+            assert_eq!(found.name, "Amy");
+            assert_eq!(found.slug.as_deref(), Some("amy"));
+            assert_eq!(found.identities, complete_identities());
+            assert_eq!(
+                tracker
+                    .list_user_identities()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.user_id == amy),
+                Some(found)
+            );
+
+            assert!(tracker.delete_user_identities(bob).unwrap());
+            assert_eq!(tracker.get_user_identities(bob).unwrap(), None);
+            assert_eq!(tracker.get_user_identities(9999).unwrap(), None);
         }
     }
 }

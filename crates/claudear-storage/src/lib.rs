@@ -1747,7 +1747,9 @@ pub trait UserStore: Send + Sync {
         Ok(())
     }
 
-    /// Create a new user.
+    /// Create a new user. The login email is stored normalized (see
+    /// [`claudear_core::identity::normalize_login_email`]); one that matches another
+    /// user's case-insensitively is a `UNIQUE` violation.
     fn create_user(
         &self,
         _email: &str,
@@ -1758,7 +1760,7 @@ pub trait UserStore: Send + Sync {
         Ok(0)
     }
 
-    /// Get a user by email.
+    /// Get a user by login email, compared case-insensitively.
     fn get_user_by_email(&self, _email: &str) -> Result<Option<UserRow>> {
         Ok(None)
     }
@@ -1773,7 +1775,8 @@ pub trait UserStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Update user fields. Returns true if a row was modified.
+    /// Update user fields. Returns true if a row was modified. A new email is stored
+    /// normalized and must not match another user's case-insensitively.
     fn update_user(
         &self,
         _id: i64,
@@ -1871,6 +1874,12 @@ pub trait UserStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// One console user's saved identities joined with their login email and name;
+    /// `None` when the user has no identities row.
+    fn get_user_identities(&self, _user_id: i64) -> Result<Option<ConsoleIdentity>> {
+        Ok(None)
+    }
+
     /// Remove a user's identities so the person falls back to config. Returns
     /// whether a row was deleted.
     fn delete_user_identities(&self, _user_id: i64) -> Result<bool> {
@@ -1880,7 +1889,8 @@ pub trait UserStore: Send + Sync {
     /// Apply every write in one transaction (all or nothing): create or update
     /// each user, replace their identities and issue their invite. Returns the
     /// user id of each entry, in order. An `Active` new user with an invite is
-    /// rejected.
+    /// rejected, and a new user's login email is normalized and must not match an
+    /// existing (or earlier in the batch) user's case-insensitively.
     fn save_directory(&self, _writes: &[DirectoryWrite]) -> Result<Vec<i64>> {
         Err(claudear_core::error::Error::Other(
             "save_directory not supported".to_string(),
