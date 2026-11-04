@@ -1,14 +1,20 @@
 use super::*;
+use chrono::Utc;
 use claudear_config::config::{HelpScoutConfig, HelpScoutMailboxConfig, MailboxProfile};
+use claudear_core::security::NewSecurityReport;
 use claudear_core::types::{AgentResult, BlockingQuestion, FixAttemptStatus, MatchResult};
-use claudear_integrations::runner::ProviderCapabilities;
-use claudear_storage::{AttemptTracker, SqliteTracker};
+use claudear_integrations::runner::{ClaudeAgentRunner, ClaudeRunnerConfig, ProviderCapabilities};
+use claudear_storage::{AttemptTracker, NoopTracker, SqliteTracker};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const SECURITY_MAILBOX: &str = "249891";
 const SUPPORT_MAILBOX: &str = "249877";
-const BRIEF: &str = "# Security fix SEC-7\nHarden the session revocation on logout.";
+const BRIEF: &str = "Harden the session revocation on logout.";
+const NAMED_BRIEF: &str = "# Security fix SEC-7\nHarden the session revocation on logout.";
+const PULL_REQUEST: &str = "https://github.com/appwrite/appwrite/pull/12";
+const CHANGELOG: &str = "Revoke the session token on logout";
+const REASONING: &str = "The stolen token from the report no longer works";
 const DIAGNOSIS_MARKER: &str = "DIAGNOSIS-FREE-TEXT";
 const TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 const HOST: &str = "billing.svc.cluster.local";
@@ -19,10 +25,11 @@ struct ExecutedRun {
     issue: Option<Issue>,
 }
 
-/// An agent that records every fix run and answers each with `result`.
+/// An agent that builds its fix prompts with the real Claude prompt builder,
+/// records every fix run and answers each with `result`.
 struct RecordingAgent {
     result: AgentResult,
-    contexts: Mutex<Vec<String>>,
+    prompts: ClaudeAgentRunner,
     runs: Mutex<Vec<ExecutedRun>>,
 }
 
@@ -30,9 +37,18 @@ impl RecordingAgent {
     fn answering(result: AgentResult) -> Arc<Self> {
         Arc::new(Self {
             result,
-            contexts: Mutex::new(Vec::new()),
+            prompts: ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), Arc::new(NoopTracker)),
             runs: Mutex::new(Vec::new()),
         })
+    }
+
+    fn succeeding() -> Arc<Self> {
+        let mut result = agent_result(true, None, None);
+        result.pr_url = Some(PULL_REQUEST.to_string());
+        result.changelog = Some(CHANGELOG.to_string());
+        result.confidence = 80;
+        result.confidence_reasoning = Some(REASONING.to_string());
+        Self::answering(result)
     }
 
     fn failing(error: &str) -> Arc<Self> {
@@ -73,9 +89,9 @@ impl AgentRunner for RecordingAgent {
         ProviderCapabilities::default()
     }
 
-    fn build_prompt_for_issue(&self, issue: &Issue, context: &str, _: &Path) -> String {
-        self.contexts.lock().unwrap().push(context.to_string());
-        format!("{} {}\n{context}", issue.short_id, issue.title)
+    fn build_prompt_for_issue(&self, issue: &Issue, context: &str, project_dir: &Path) -> String {
+        self.prompts
+            .build_prompt_for_issue(issue, context, project_dir)
     }
 
     async fn execute_with_attempt(
@@ -93,10 +109,12 @@ impl AgentRunner for RecordingAgent {
     }
 }
 
-/// A notifier that records the error of every failure it is told about.
+/// A notifier that records the error of every failure and the issue of
+/// every success it is told about.
 #[derive(Default)]
 struct FailureNotifier {
     failures: Mutex<Vec<String>>,
+    successes: Mutex<Vec<Issue>>,
 }
 
 #[async_trait]
@@ -113,7 +131,8 @@ impl Notifier for FailureNotifier {
         Ok(())
     }
 
-    async fn notify_success(&self, _: &Issue, _: &str) -> Result<()> {
+    async fn notify_success(&self, issue: &Issue, _: &str) -> Result<()> {
+        self.successes.lock().unwrap().push(issue.clone());
         Ok(())
     }
 
@@ -278,6 +297,49 @@ impl Fixture {
     fn failures(&self) -> Vec<String> {
         self.notifier.failures.lock().unwrap().clone()
     }
+
+    fn successes(&self) -> Vec<Issue> {
+        self.notifier.successes.lock().unwrap().clone()
+    }
+
+    /// A security report held for the conversation of `helpscout_issue`.
+    fn hold_report(&self) {
+        self.tracker
+            .upsert_security_report(&NewSecurityReport {
+                source: "helpscout".to_string(),
+                conversation_id: "8812".to_string(),
+                short_id: "HS-8812".to_string(),
+                mailbox_id: SECURITY_MAILBOX.to_string(),
+                url: String::new(),
+                subject: "Session token survives logout".to_string(),
+                reporter_email: None,
+                reporter_customer_id: None,
+                reported_at: Utc::now(),
+                customer_thread_count: 1,
+            })
+            .unwrap();
+    }
+
+    /// Run the security fix `issue` with `brief` against `repository`.
+    async fn run_security_fix(
+        &mut self,
+        repository: &LocalRepository,
+        issue: Issue,
+        brief: &str,
+    ) -> ProcessingOutcome {
+        self.processor.config.workspace = repository.workspace();
+        self.tracker
+            .record_attempt(SECURITY_FIX_SOURCE, &issue.id, &issue.short_id)
+            .unwrap();
+        self.processor
+            .run_security_fix(
+                input(issue, repository.resolution()),
+                &crate::security::SecurityFixContext {
+                    context: brief.to_string(),
+                },
+            )
+            .await
+    }
 }
 
 fn helpscout_issue(mailbox_id: Option<&str>) -> Issue {
@@ -296,14 +358,9 @@ fn helpscout_issue(mailbox_id: Option<&str>) -> Issue {
     issue
 }
 
+/// A security fix issue shaped like the security inbox's fix request.
 fn security_fix_issue() -> Issue {
-    Issue::new(
-        "SEC-7",
-        "SEC-7",
-        "Security fix SEC-7",
-        "",
-        SECURITY_FIX_SOURCE,
-    )
+    Issue::new("SEC-7", "SEC-7", "Hardening", "", SECURITY_FIX_SOURCE)
 }
 
 fn diagnosis() -> VerifyResult {
@@ -337,6 +394,12 @@ fn unresolved() -> RepoResolution {
     RepoResolution::Skip {
         reason: "no repository".to_string(),
     }
+}
+
+fn moved_conversation() -> ProcessingInput {
+    let mut moved = input(helpscout_issue(Some(SUPPORT_MAILBOX)), unresolved());
+    moved.intent = Some(Intent::Fix);
+    moved
 }
 
 fn assert_refused(outcome: ProcessingOutcome) {
@@ -721,4 +784,161 @@ fn a_security_fix_red_phase_prompt_does_not_name_its_source() {
     assert!(prompt.contains("Harden the session revocation"), "{prompt}");
     let support = build_failing_test_prompt(&helpscout_issue(None), "context");
     assert!(support.contains("from helpscout"), "{support}");
+}
+
+#[test]
+fn a_security_fix_red_phase_prompt_names_neither_its_id_nor_its_title() {
+    let prompt = build_failing_test_prompt(&security_fix_issue(), BRIEF);
+
+    assert!(!prompt.contains("SEC-"), "{prompt}");
+    assert!(!prompt.contains("Hardening"), "{prompt}");
+    assert!(!prompt.contains("Issue:"), "{prompt}");
+    let support = build_failing_test_prompt(&helpscout_issue(None), "context");
+    assert!(
+        support.contains("Issue: HS-8812 - Session token survives logout\n\nInstructions:"),
+        "{support}"
+    );
+}
+
+#[tokio::test]
+async fn a_security_fix_prompt_from_the_real_prompt_builder_names_no_fix() {
+    let repository = LocalRepository::new();
+    let agent = RecordingAgent::failing("the fix did not build");
+    let mut fixture = Fixture::new(agent.clone());
+
+    fixture
+        .run_security_fix(&repository, security_fix_issue(), BRIEF)
+        .await;
+
+    let runs = agent.runs();
+    assert_eq!(runs.len(), 1, "the fix agent must run once");
+    let prompt = &runs[0].prompt;
+    assert!(prompt.contains("Harden the session revocation"), "{prompt}");
+    for named in ["SEC-", "Hardening", "from security", "issue ID"] {
+        assert!(
+            !prompt.contains(named),
+            "the prompt names {named}: {prompt}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_security_fix_whose_prompt_names_it_never_reaches_the_agent() {
+    let repository = LocalRepository::new();
+    let agent = RecordingAgent::failing("unused");
+    let mut fixture = Fixture::new(agent.clone());
+    let issue = security_fix_issue();
+
+    let error = failed(
+        fixture
+            .run_security_fix(&repository, issue.clone(), NAMED_BRIEF)
+            .await,
+    );
+
+    assert_eq!(error, SECURITY_FIX_PROMPT_NOT_NEUTRAL);
+    assert!(
+        agent.runs().is_empty(),
+        "the named prompt reached the agent"
+    );
+    let attempt = fixture
+        .tracker
+        .get_attempt(SECURITY_FIX_SOURCE, &issue.id)
+        .unwrap()
+        .expect("the attempt is recorded");
+    assert_eq!(attempt.status, FixAttemptStatus::Failed);
+}
+
+#[tokio::test]
+async fn a_successful_security_fix_notifies_no_changelog_or_confidence_reasoning() {
+    let repository = LocalRepository::new();
+    let mut fixture = Fixture::new(RecordingAgent::succeeding());
+
+    let outcome = fixture
+        .run_security_fix(&repository, security_fix_issue(), BRIEF)
+        .await;
+
+    match outcome {
+        ProcessingOutcome::Success { pr_url } => assert_eq!(pr_url, PULL_REQUEST),
+        ProcessingOutcome::Failed { error } => panic!("expected Success, got Failed: {error}"),
+        ProcessingOutcome::CompletedNoPr { reason } => {
+            panic!("expected Success, got CompletedNoPr: {reason}")
+        }
+        ProcessingOutcome::WrongRepo { .. } => panic!("expected Success, got WrongRepo"),
+    }
+    let successes = fixture.successes();
+    assert_eq!(successes.len(), 1, "the success must be notified once");
+    let notified = &successes[0];
+    assert_eq!(notified.get_metadata::<String>("changelog"), None);
+    assert_eq!(
+        notified.get_metadata::<String>("confidence_reasoning"),
+        None
+    );
+    assert_eq!(notified.get_metadata::<u8>("confidence"), Some(80));
+}
+
+#[test]
+fn a_support_fix_notifies_its_changelog_and_confidence_reasoning() {
+    let mut issue = helpscout_issue(Some(SUPPORT_MAILBOX));
+    let mut result = agent_result(true, None, None);
+    result.changelog = Some(CHANGELOG.to_string());
+    result.confidence = 80;
+    result.confidence_reasoning = Some(REASONING.to_string());
+
+    record_notification_details(&mut issue, &result);
+
+    assert_eq!(
+        issue.get_metadata::<String>("changelog").as_deref(),
+        Some(CHANGELOG)
+    );
+    assert_eq!(
+        issue
+            .get_metadata::<String>("confidence_reasoning")
+            .as_deref(),
+        Some(REASONING)
+    );
+}
+
+#[test]
+fn a_security_fix_pull_request_gets_no_evaluation_or_confidence_comment() {
+    let mut fixture = Fixture::new(RecordingAgent::failing("unused"));
+    fixture.processor.config.evaluation.post_pr_comment = true;
+
+    assert!(!fixture
+        .processor
+        .posts_pull_request_comments(&security_fix_issue()));
+    assert!(fixture
+        .processor
+        .posts_pull_request_comments(&helpscout_issue(Some(SUPPORT_MAILBOX))));
+}
+
+#[tokio::test]
+async fn run_refuses_a_conversation_the_security_inbox_holds_after_it_moved() {
+    let agent = RecordingAgent::failing("unused");
+    let fixture = Fixture::new(agent.clone());
+    fixture.hold_report();
+
+    assert_refused(
+        fixture
+            .processor
+            .run(moved_conversation(), &StaticContext(""))
+            .await,
+    );
+    assert!(agent.runs().is_empty());
+}
+
+#[tokio::test]
+async fn run_single_action_refuses_a_conversation_the_security_inbox_holds_after_it_moved() {
+    for action in [ActionKind::Verify, ActionKind::Reply, ActionKind::Resolve] {
+        let agent = RecordingAgent::failing("unused");
+        let fixture = Fixture::new(agent.clone());
+        fixture.hold_report();
+
+        assert_refused(
+            fixture
+                .processor
+                .run_single_action(action, moved_conversation(), &StaticContext(""))
+                .await,
+        );
+        assert!(agent.runs().is_empty(), "{action} reached the agent");
+    }
 }
