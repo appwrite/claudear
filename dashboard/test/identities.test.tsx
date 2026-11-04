@@ -31,8 +31,9 @@ function userIdentities(overrides: Partial<UserIdentities> = {}, identities: Par
   return {
     user_id: 3,
     name: "Jake",
-    email: "jake@appwrite.io",
-    slug: "jake",
+    login_email: "jake@appwrite.io",
+    person_key: "jake",
+    slug: null,
     origin: "config",
     status: "active",
     redacted: false,
@@ -120,8 +121,53 @@ describe("IdentityForm", () => {
     await waitFor(() => expect(screen.getByText("From config (jake)")).toBeTruthy());
     expect(input("GitHub").value).toBe("jakebarnby, jake-alt");
     expect(input("Discord ID").value).toBe("452316113016193024");
-    expect(input("Person key").value).toBe("jake");
+    expect(input("Person key").value).toBe("");
+    expect(input("Person key").placeholder).toBe("jake");
     expect(screen.queryByRole("button", { name: /Revert to config/ })).toBeNull();
+  });
+
+  test("binds the editable input to the admin-set slug, never the derived person key", async () => {
+    const calls = installFetch([
+      route("GET", "/api/users/3/identities", {
+        status: 200,
+        body: userIdentities({ origin: "console", person_key: "console-3", slug: null, updated_at: "2026-11-04 10:00:00" }),
+      }),
+      route("PUT", "/api/users/3/identities", (call) => ({
+        status: 200,
+        body: userIdentities(
+          { origin: "console", person_key: "console-3", slug: null, updated_at: "2026-11-04 11:00:00" },
+          call.body as Partial<Identities>,
+        ),
+      })),
+    ]);
+
+    render(<IdentityForm userId={3} canEditSlug />, { wrapper: Wrapper });
+    await waitFor(() => expect(input("Person key")).toBeTruthy());
+
+    expect(input("Person key").value).toBe("");
+    expect(input("Person key").readOnly).toBe(false);
+    expect(screen.getByText("console-3")).toBeTruthy();
+
+    fireEvent.change(input("GitHub"), { target: { value: "jakebarnby" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save identities" }));
+
+    await waitFor(() => expect(screen.getByText("Identities saved")).toBeTruthy());
+    expect(calls.find((call) => call.method === "PUT")?.body).toEqual({ github_usernames: ["jakebarnby"] });
+  });
+
+  test("shows a non-admin their derived person key read-only", async () => {
+    installFetch([
+      route("GET", "/api/users/3/identities", {
+        status: 200,
+        body: userIdentities({ origin: "console", person_key: "console-3", slug: null, updated_at: "2026-11-04 10:00:00" }),
+      }),
+    ]);
+
+    render(<IdentityForm userId={3} canEditSlug={false} />, { wrapper: Wrapper });
+    await waitFor(() => expect(input("Person key")).toBeTruthy());
+
+    expect(input("Person key").value).toBe("console-3");
+    expect(input("Person key").readOnly).toBe(true);
   });
 
   test("sends only the fields that changed", async () => {
@@ -194,7 +240,7 @@ describe("IdentityForm", () => {
     const calls = installFetch([
       route("GET", "/api/users/3/identities", {
         status: 200,
-        body: userIdentities({ redacted: true, email: null }, { github_usernames: ["jakebarnby"] }),
+        body: userIdentities({ redacted: true, login_email: null }, { github_usernames: ["jakebarnby"] }),
       }),
       route("PUT", "/api/users/3/identities", { status: 200, body: userIdentities({ redacted: true }) }),
     ]);
@@ -223,6 +269,7 @@ describe("IdentityForm", () => {
     render(<IdentityForm userId={3} canEditSlug={false} />, { wrapper: Wrapper });
     await waitFor(() => expect(input("Person key")).toBeTruthy());
 
+    expect(input("Person key").value).toBe("jake");
     expect(input("Person key").readOnly).toBe(true);
     expect(screen.getByText("Only admins can change the person key.")).toBeTruthy();
   });
@@ -269,6 +316,61 @@ describe("IdentityForm", () => {
     expect(input("GitHub").value).toBe("jakebarnby");
     expect(input("Discord ID").value).toBe("");
     expect(screen.queryByRole("button", { name: /Revert to config/ })).toBeNull();
+  });
+
+  test("explains to a non-admin that reverting keeps the admin-set person key", async () => {
+    const prompts: string[] = [];
+    globalThis.confirm = (message?: string) => {
+      prompts.push(message ?? "");
+      return true;
+    };
+    installFetch([
+      route("GET", "/api/users/3/identities", {
+        status: 200,
+        body: userIdentities(
+          { origin: "console", slug: "jake", updated_at: "2026-11-04 10:00:00" },
+          { github_usernames: ["jakebarnby"] },
+        ),
+      }),
+      route("DELETE", "/api/users/3/identities", {
+        status: 200,
+        body: userIdentities({ origin: "console", slug: "jake", updated_at: "2026-11-04 11:00:00" }),
+      }),
+    ]);
+
+    render(<IdentityForm userId={3} canEditSlug={false} />, { wrapper: Wrapper });
+    await waitFor(() => expect(screen.getByText("Console")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /Revert to config/ }));
+
+    await waitFor(() => expect(screen.getByText("Reverted to config; person key kept")).toBeTruthy());
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('The person key "jake" was set by an admin and is kept.');
+    expect(input("Person key").value).toBe("jake");
+    expect(input("GitHub").value).toBe("");
+  });
+
+  test("does not promise an admin that reverting keeps the slug", async () => {
+    const prompts: string[] = [];
+    globalThis.confirm = (message?: string) => {
+      prompts.push(message ?? "");
+      return false;
+    };
+    const calls = installFetch([
+      route("GET", "/api/users/3/identities", {
+        status: 200,
+        body: userIdentities({ origin: "console", slug: "jake", updated_at: "2026-11-04 10:00:00" }),
+      }),
+    ]);
+
+    render(<IdentityForm userId={3} canEditSlug />, { wrapper: Wrapper });
+    await waitFor(() => expect(screen.getByText("Console")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /Revert to config/ }));
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).not.toContain("is kept");
+    expect(calls.some((call) => call.method === "DELETE")).toBe(false);
   });
 
   test("shows the server error when a handle belongs to someone else", async () => {
@@ -320,6 +422,7 @@ describe("Users page identities", () => {
     await waitFor(() => expect(screen.getByText("@jakebarnby")).toBeTruthy());
     expect(screen.getByRole("columnheader", { name: "Identities" })).toBeTruthy();
     expect(screen.getByText("Discord")).toBeTruthy();
+    expect(screen.getByTitle("Person key").textContent).toBe("jake");
     expect(calls.some((call) => call.url.endsWith("/api/identities"))).toBe(true);
 
     fireEvent.click(screen.getByTitle("Edit"));

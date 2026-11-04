@@ -22,6 +22,7 @@ import {
 } from '../lib/api'
 import { formatDate, parseUTCDate } from '../lib/formatters'
 import { useAuth } from '../lib/auth'
+import { passwordLengthProblem } from '../lib/password'
 import { UsersTableSkeleton } from '../components/shared/page-skeletons'
 import { TimeAgo } from '../components/shared/time-ago'
 import { Badge } from '../components/ui/badge'
@@ -54,6 +55,10 @@ export function describeInviteExpiry(expiresAt: string | null, now: number = Dat
   if (remaining >= DAY_MS) return `expires ${relative.format(Math.round(remaining / DAY_MS), 'day')}`
   if (remaining >= HOUR_MS) return `expires ${relative.format(Math.round(remaining / HOUR_MS), 'hour')}`
   return `expires ${relative.format(Math.max(1, Math.round(remaining / MINUTE_MS)), 'minute')}`
+}
+
+export function hasOpenInvite(user: UserRecord, now: number = Date.now()): boolean {
+  return user.invite_expires_at !== null && parseUTCDate(user.invite_expires_at).getTime() > now
 }
 
 function failureMessage(error: unknown, fallback: string): string {
@@ -114,12 +119,17 @@ function UserDirectory({ currentUserId }: { currentUserId: number }) {
     try {
       await deleteUser(id)
       await mutate()
-    } catch {
-      setActionError('Failed to delete user')
+    } catch (error: unknown) {
+      setActionError(failureMessage(error, 'Failed to delete user'))
     }
   }
 
   const handleCopyInvite = async (user: UserRecord) => {
+    const replacesPrevious = hasOpenInvite(user)
+    if (
+      replacesPrevious
+      && !confirm(`Create a new invite link for ${user.name}? The link sent earlier stops working.`)
+    ) return
     setActionError('')
     let issued: UserInvite
     try {
@@ -129,7 +139,7 @@ function UserDirectory({ currentUserId }: { currentUserId: number }) {
       return
     }
     const copied = await copyToClipboard(inviteAbsoluteUrl(issued))
-    setInvite(issuedInvite(user, issued, copied, true))
+    setInvite(issuedInvite(user, issued, copied, replacesPrevious))
     void mutate().catch(() => setActionError('Failed to refresh users'))
   }
 
@@ -323,6 +333,11 @@ function UserForm({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    const lengthProblem = password ? passwordLengthProblem(password) : null
+    if (lengthProblem) {
+      setError(lengthProblem)
+      return
+    }
     setError('')
     setSaving(true)
     try {

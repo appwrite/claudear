@@ -5,7 +5,8 @@ import type { ReactNode } from "react";
 import App from "../src/App";
 import { AuthProvider } from "../src/lib/auth";
 import InvitePage, { passwordProblem } from "../src/pages/invite";
-import UsersPage, { describeInviteExpiry } from "../src/pages/users";
+import UsersPage, { describeInviteExpiry, hasOpenInvite } from "../src/pages/users";
+import { isInvitePath } from "../src/lib/invite-token";
 import type { Identities, UserIdentities, UserRecord } from "../src/lib/api";
 
 type Call = { url: string; method: string; body?: unknown };
@@ -15,6 +16,7 @@ type Route = (call: Call) => Reply | undefined;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const TOKEN = "cldi_0123456789abcdef";
 const INVALID = "This invite link is invalid or has expired";
+const LENGTH_MESSAGE = "Password must be 8-72 bytes";
 
 const admin = { id: 1, email: "admin@test.com", name: "Admin", role: "admin" };
 
@@ -56,7 +58,8 @@ function userIdentities(userId: number, name: string): UserIdentities {
   return {
     user_id: userId,
     name,
-    email: null,
+    login_email: null,
+    person_key: null,
     slug: null,
     origin: "unset",
     status: "invited",
@@ -181,6 +184,29 @@ describe("InvitePage", () => {
     expect(accept?.method).toBe("POST");
     expect(accept?.body).toEqual({ token: TOKEN, password: "correct horse" });
     expect(screen.getByRole("link", { name: "Sign in" }).getAttribute("href")).toBe("/");
+    expect(window.history.state).toBeNull();
+    expect(window.location.pathname).toBe("/invite");
+  });
+
+  test("a reload after accepting no longer carries the used token", async () => {
+    installFetch([
+      inspectRoute(validInvite),
+      route("POST", "/api/auth/invite/accept", { status: 200, body: { message: "Invite accepted" } }),
+    ]);
+    visit(`/invite#${TOKEN}`);
+    render(<InvitePage />);
+    await waitFor(() => expect(screen.getByLabelText("Password")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "correct horse" } });
+    fireEvent.change(screen.getByLabelText("Confirm password"), { target: { value: "correct horse" } });
+    fireEvent.click(screen.getByRole("button", { name: "Set password" }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "You're all set" })).toBeTruthy());
+    cleanup();
+
+    const calls = installFetch([inspectRoute(validInvite)]);
+    render(<InvitePage />);
+
+    expect(screen.getByRole("alert").textContent).toContain(INVALID);
+    expect(calls).toHaveLength(0);
   });
 
   test("rejects mismatched or short passwords without calling the server", async () => {
@@ -195,9 +221,30 @@ describe("InvitePage", () => {
 
     expect(screen.getByRole("alert").textContent).toBe("Passwords do not match");
     expect(paths(calls)).not.toContain("/api/auth/invite/accept");
-    expect(passwordProblem("short", "short")).toBe("Password must be 8 to 72 characters");
-    expect(passwordProblem("x".repeat(73), "x".repeat(73))).toBe("Password must be 8 to 72 characters");
+    expect(passwordProblem("short", "short")).toBe(LENGTH_MESSAGE);
+    expect(passwordProblem("x".repeat(73), "x".repeat(73))).toBe(LENGTH_MESSAGE);
     expect(passwordProblem("x".repeat(72), "x".repeat(72))).toBeNull();
+  });
+
+  test("counts password length in UTF-8 bytes like the server", async () => {
+    const emoji = "\u{1F600}";
+    expect(passwordProblem(emoji.repeat(18), emoji.repeat(18))).toBeNull();
+    expect(passwordProblem(emoji.repeat(19), emoji.repeat(19))).toBe(LENGTH_MESSAGE);
+    expect(passwordProblem("\u00e9".repeat(4), "\u00e9".repeat(4))).toBeNull();
+
+    const calls = installFetch([inspectRoute(validInvite)]);
+    visit(`/invite#${TOKEN}`);
+    render(<InvitePage />);
+    await waitFor(() => expect(screen.getByLabelText("Password")).toBeTruthy());
+
+    const tooLong = emoji.repeat(30);
+    expect(tooLong.length).toBeLessThanOrEqual(72);
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: tooLong } });
+    fireEvent.change(screen.getByLabelText("Confirm password"), { target: { value: tooLong } });
+    fireEvent.submit(screen.getByRole("button", { name: "Set password" }));
+
+    expect(screen.getByRole("alert").textContent).toBe(LENGTH_MESSAGE);
+    expect(paths(calls)).not.toContain("/api/auth/invite/accept");
   });
 
   test("shows the error card for an invalid or expired token", async () => {
@@ -266,6 +313,37 @@ describe("InvitePage", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "Welcome, Amy" })).toBeTruthy());
     expect(paths(calls)).not.toContain("/api/auth/me");
     expect(screen.queryByRole("heading", { name: "Sign in" })).toBeNull();
+  });
+
+  test("App also routes /invite/ with a trailing slash to the invite page", async () => {
+    const calls = installFetch([inspectRoute(validInvite)]);
+    visit(`/invite/#${TOKEN}`);
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Welcome, Amy" })).toBeTruthy());
+    expect(calls[0]?.body).toEqual({ token: TOKEN });
+    expect(window.location.hash).toBe("");
+  });
+
+  test("isInvitePath matches only the invite route", () => {
+    for (const path of ["/invite", "/invite/"]) {
+      visit(path);
+      expect(isInvitePath()).toBe(true);
+    }
+    for (const path of ["/", "/invites", "/invite/extra", "/users"]) {
+      visit(path);
+      expect(isInvitePath()).toBe(false);
+    }
+  });
+});
+
+describe("hasOpenInvite", () => {
+  const now = Date.UTC(2026, 10, 4, 10, 0, 0);
+
+  test("is true only for an unexpired invite", () => {
+    expect(hasOpenInvite(userRecord({ status: "invited", invite_expires_at: "2026-11-05 10:00:00" }), now)).toBe(true);
+    expect(hasOpenInvite(userRecord({ status: "invited", invite_expires_at: "2026-11-04 09:59:59" }), now)).toBe(false);
+    expect(hasOpenInvite(userRecord({ status: "invited", invite_expires_at: null }), now)).toBe(false);
   });
 });
 
@@ -346,6 +424,50 @@ describe("Users page invites", () => {
     expect(notice.textContent).toContain("http://localhost/invite#cldi_fresh");
   });
 
+  test("Copy invite link asks before replacing an open invite and does nothing when declined", async () => {
+    const prompts: string[] = [];
+    globalThis.confirm = (message?: string) => {
+      prompts.push(message ?? "");
+      return false;
+    };
+    const writeText = stubClipboard(() => Promise.resolve());
+    const calls = installFetch(directoryRoutes([invited]));
+    render(<UsersPage />, { wrapper: Wrapper });
+    await waitFor(() => expect(screen.getByTitle("Copy invite link")).toBeTruthy());
+
+    fireEvent.click(screen.getByTitle("Copy invite link"));
+
+    expect(prompts).toEqual(["Create a new invite link for Amy? The link sent earlier stops working."]);
+    await Promise.resolve();
+    expect(calls.some((call) => call.method === "POST")).toBe(false);
+    expect(writeText).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  test("Copy invite link reissues a lapsed invite without asking", async () => {
+    const prompts: string[] = [];
+    globalThis.confirm = (message?: string) => {
+      prompts.push(message ?? "");
+      return true;
+    };
+    const writeText = stubClipboard(() => Promise.resolve());
+    installFetch([
+      route("POST", "/api/users/8/invite", {
+        status: 201,
+        body: { invite_link: "/invite#cldi_bob", invite_url: null, expires_at: sqliteTimestamp(7 * DAY_MS) },
+      }),
+      ...directoryRoutes([lapsed]),
+    ]);
+    render(<UsersPage />, { wrapper: Wrapper });
+    await waitFor(() => expect(screen.getByTitle("Copy invite link")).toBeTruthy());
+
+    fireEvent.click(screen.getByTitle("Copy invite link"));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("http://localhost/invite#cldi_bob"));
+    expect(prompts).toEqual([]);
+    expect(screen.getByRole("status").textContent).not.toContain("Any previous invite link");
+  });
+
   test("Copy invite link falls back to showing the link when the clipboard is denied", async () => {
     stubClipboard(() => Promise.reject(new Error("denied")));
     installFetch([
@@ -408,5 +530,77 @@ describe("Users page invites", () => {
     expect(screen.getByRole("heading", { name: "Edit User" })).toBeTruthy();
     await waitFor(() => expect(screen.getByLabelText("Person key")).toBeTruthy());
     expect(paths(calls)).toContain("/api/users/12/identities");
+  });
+});
+
+describe("Users page errors", () => {
+  const originalFetch = globalThis.fetch;
+  const originalConfirm = globalThis.confirm;
+
+  beforeEach(() => {
+    globalThis.confirm = () => true;
+  });
+
+  afterEach(() => {
+    cleanup();
+    globalThis.fetch = originalFetch;
+    globalThis.confirm = originalConfirm;
+  });
+
+  const amy = userRecord();
+
+  function directoryRoutes(): Route[] {
+    return [
+      route("GET", "/api/auth/me", { status: 200, body: admin }),
+      route("GET", "/api/users", { status: 200, body: [amy] }),
+      route("GET", "/api/identities", { status: 200, body: [userIdentities(amy.id, amy.name)] }),
+      route("GET", `/api/users/${amy.id}/identities`, { status: 200, body: userIdentities(amy.id, amy.name) }),
+      route("GET", `/api/users/${amy.id}/tokens`, { status: 200, body: [] }),
+    ];
+  }
+
+  async function openEditForm() {
+    render(<UsersPage />, { wrapper: Wrapper });
+    await waitFor(() => expect(screen.getByTitle("Edit")).toBeTruthy());
+    fireEvent.click(screen.getByTitle("Edit"));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Edit User" })).toBeTruthy());
+  }
+
+  test("shows the server message when an update is rejected", async () => {
+    installFetch([
+      route("PUT", `/api/users/${amy.id}`, { status: 409, body: { error: "A user with this email already exists" } }),
+      ...directoryRoutes(),
+    ]);
+    await openEditForm();
+
+    const [loginEmail] = screen.getAllByLabelText("Email");
+    fireEvent.change(loginEmail, { target: { value: "bob@example.com" } });
+    fireEvent.submit(screen.getByRole("button", { name: "Update" }));
+
+    expect(await screen.findByText("A user with this email already exists")).toBeTruthy();
+  });
+
+  test("rejects a password over 72 UTF-8 bytes before calling the server", async () => {
+    const calls = installFetch(directoryRoutes());
+    await openEditForm();
+
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "\u{1F600}".repeat(19) } });
+    fireEvent.submit(screen.getByRole("button", { name: "Update" }));
+
+    expect(await screen.findByText("Password must be 8-72 bytes")).toBeTruthy();
+    expect(calls.some((call) => call.method === "PUT")).toBe(false);
+  });
+
+  test("shows the server message when a delete is rejected", async () => {
+    installFetch([
+      route("DELETE", `/api/users/${amy.id}`, { status: 403, body: { error: "Admin access required" } }),
+      ...directoryRoutes(),
+    ]);
+    render(<UsersPage />, { wrapper: Wrapper });
+    await waitFor(() => expect(screen.getByTitle("Delete")).toBeTruthy());
+
+    fireEvent.click(screen.getByTitle("Delete"));
+
+    expect(await screen.findByText("Admin access required")).toBeTruthy();
   });
 });

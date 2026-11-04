@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { ApiError, acceptInvite, inspectInvite, type InviteDetails } from '../lib/api'
 import { formatDate } from '../lib/formatters'
-import { readInviteToken } from '../lib/invite-token'
+import { clearInviteToken, readInviteToken } from '../lib/invite-token'
+import { PASSWORD_MIN_BYTES, passwordLengthProblem } from '../lib/password'
 import { hideSentryFeedbackWidget } from '../lib/sentry'
 import {
   AUTH_ALERT_CLASS,
@@ -11,9 +12,6 @@ import {
   AuthButtonLabel,
   AuthShell,
 } from '../components/layout/auth-shell'
-
-export const PASSWORD_MIN_LENGTH = 8
-export const PASSWORD_MAX_LENGTH = 72
 
 const NOT_FOUND = 404
 
@@ -29,9 +27,8 @@ function viewForFailure(error: unknown): InviteView {
 }
 
 export function passwordProblem(password: string, confirmation: string): string | null {
-  if (password.length < PASSWORD_MIN_LENGTH || password.length > PASSWORD_MAX_LENGTH) {
-    return `Password must be ${PASSWORD_MIN_LENGTH} to ${PASSWORD_MAX_LENGTH} characters`
-  }
+  const lengthProblem = passwordLengthProblem(password)
+  if (lengthProblem) return lengthProblem
   if (password !== confirmation) return 'Passwords do not match'
   return null
 }
@@ -135,6 +132,7 @@ function SetPasswordForm({
     setSaving(true)
     try {
       await acceptInvite(token, password)
+      clearInviteToken()
       onAccepted()
     } catch (failure: unknown) {
       if (!(failure instanceof ApiError) || failure.status >= 500) {
@@ -170,7 +168,7 @@ function SetPasswordForm({
             autoFocus
             autoComplete="new-password"
             className={AUTH_INPUT_CLASS}
-            placeholder={`At least ${PASSWORD_MIN_LENGTH} characters`}
+            placeholder={`At least ${PASSWORD_MIN_BYTES} bytes`}
           />
         </div>
 

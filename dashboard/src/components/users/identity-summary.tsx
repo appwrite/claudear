@@ -6,12 +6,14 @@ export function IdentitySummary({ identities }: { identities: UserIdentities | u
   if (!identities) {
     return <span className="text-xs text-muted-foreground">—</span>
   }
+  const { person_key: personKey } = identities
   const { github_usernames: githubUsernames, discord_id: discordId, slack_id: slackId } = identities.identities
-  if (githubUsernames.length === 0 && !discordId && !slackId) {
+  if (!personKey && githubUsernames.length === 0 && !discordId && !slackId) {
     return <span className="text-xs text-muted-foreground">Not set</span>
   }
   return (
-    <div className="flex flex-wrap gap-1">
+    <div className="flex flex-wrap items-center gap-1">
+      {personKey && <span className="font-mono text-xs text-muted-foreground mr-1" title="Person key">{personKey}</span>}
       {githubUsernames.map((login) => (
         <span key={login} className={CHIP_CLASS} title="GitHub">@{login}</span>
       ))}

@@ -4,6 +4,7 @@ import {
   SENSITIVE_IDENTITY_FIELDS,
   acceptInvite,
   createUser,
+  deleteUser,
   fetchIdentities,
   fetchUserIdentities,
   inspectInvite,
@@ -12,6 +13,7 @@ import {
   resetUserIdentities,
   revokeInvite,
   setOnUnauthorized,
+  updateUser,
   updateUserIdentities,
   type Identities,
   type IdentityViolation,
@@ -39,7 +41,8 @@ const emptyIdentities: Identities = {
 const jake: UserIdentities = {
   user_id: 3,
   name: 'Jake',
-  email: 'jake@example.com',
+  login_email: 'jake@example.com',
+  person_key: 'jake',
   slug: 'jake',
   origin: 'console',
   status: 'active',
@@ -115,6 +118,8 @@ describe('identities api', () => {
     expect(url).toBe('/api/users/3/identities')
     expect(init.method).toBe('GET')
     expect(result.slug).toBe('jake')
+    expect(result.person_key).toBe('jake')
+    expect(result.login_email).toBe('jake@example.com')
   })
 
   test('updateUserIdentities puts the sparse update with the CSRF header', async () => {
@@ -227,10 +232,38 @@ describe('identities api', () => {
   })
 
   test('createUser rejects with ApiError on a validation failure', async () => {
-    mockFetch({ error: 'Password must be between 8 and 72 characters' }, 400)
+    mockFetch({ error: 'Password must be 8-72 bytes' }, 400)
     const error = await captureError(createUser({ email: 'a@example.com', name: 'A', role: 'viewer', password: 'short' }))
     expect(error.status).toBe(400)
-    expect(error.message).toBe('Password must be between 8 and 72 characters')
+    expect(error.message).toBe('Password must be 8-72 bytes')
+  })
+
+  test('updateUser puts the sparse update with the CSRF header', async () => {
+    const fetchMock = mockFetch({ id: 7, email: 'amy@example.com', name: 'Amy', role: 'admin' })
+    await updateUser(7, { role: 'admin' })
+    const { url, init } = lastCall(fetchMock)
+    expect(url).toBe('/api/users/7')
+    expect(init.method).toBe('PUT')
+    expect(header(init, 'x-csrf-token')).toBe(CSRF_TOKEN)
+    expect(JSON.parse(init.body as string)).toEqual({ role: 'admin' })
+  })
+
+  test('updateUser surfaces the server error message', async () => {
+    mockFetch({ error: 'A user with this email already exists' }, 409)
+    const error = await captureError(updateUser(7, { email: 'taken@example.com' }))
+    expect(error.status).toBe(409)
+    expect(error.message).toBe('A user with this email already exists')
+  })
+
+  test('deleteUser deletes with the CSRF header and surfaces the server error message', async () => {
+    const fetchMock = mockFetch({ error: 'Admin access required' }, 403)
+    const error = await captureError(deleteUser(7))
+    const { url, init } = lastCall(fetchMock)
+    expect(url).toBe('/api/users/7')
+    expect(init.method).toBe('DELETE')
+    expect(header(init, 'x-csrf-token')).toBe(CSRF_TOKEN)
+    expect(error.status).toBe(403)
+    expect(error.message).toBe('Admin access required')
   })
 
   test('issueInvite posts to the user invite route', async () => {
