@@ -83,7 +83,7 @@ impl Roster {
             }
             let developer = Developer {
                 login: login.clone(),
-                discord_id: registry.discord_id_for_github(login),
+                discord_id: non_empty(registry.discord_id_for_github(login).as_deref()),
                 slack_id: non_empty(user.slack_id.as_deref()),
             };
             for alias in &aliases {
@@ -325,6 +325,20 @@ mod tests {
         assert_eq!(roster.by_slug("amy"), Some(amy));
         assert_eq!(roster.by_discord_id("2").unwrap().login, "bob");
         assert_eq!(roster.by_slack_id("U_ZED").unwrap().login, "zed");
+    }
+
+    #[test]
+    fn a_blank_registry_discord_id_falls_back_to_the_map() {
+        let roster = Roster::new(
+            &registry(vec![("amy", user(&["amy"], Some("  "), None))]),
+            &map(&[("amy", "99")]),
+            &[],
+        );
+
+        assert_eq!(
+            roster.find("amy").unwrap().discord_id.as_deref(),
+            Some("99")
+        );
     }
 
     #[test]
