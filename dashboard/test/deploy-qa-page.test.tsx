@@ -61,6 +61,9 @@ const status: DeployQaStatus = {
   ],
 }
 
+const RESTART_BANNER =
+  /Restart the claudear process serving this console \(and the daemon, if it runs separately\) to apply them/
+
 function configResponse(overrides: Partial<DeployQaConfigResponse> = {}): DeployQaConfigResponse {
   return {
     settings: {
@@ -219,7 +222,7 @@ describe('DeployQaPage', () => {
     await renderPage()
 
     await waitFor(() => {
-      expect(screen.getByText(/Restart claudear to apply them/)).toBeTruthy()
+      expect(screen.getByText(RESTART_BANNER)).toBeTruthy()
     })
   })
 
@@ -247,7 +250,7 @@ describe('DeployQaPage', () => {
 
     await waitFor(() => {
       expect(screen.getByText('Saved to claudear.toml.')).toBeTruthy()
-      expect(screen.getByText(/Restart claudear to apply them/)).toBeTruthy()
+      expect(screen.getByText(RESTART_BANNER)).toBeTruthy()
     })
   })
 
@@ -296,6 +299,52 @@ describe('DeployQaPage', () => {
     fireEvent.submit(save.closest('form') as HTMLFormElement)
     await new Promise(resolve => setTimeout(resolve, 20))
     expect(harness.puts()).toHaveLength(0)
+  })
+
+  test('a whitespace-padded track name blocks the save instead of renaming the track', async () => {
+    const harness = createHarness({
+      role: 'admin',
+      config: configResponse({
+        settings: {
+          ...configResponse().settings,
+          tracks: [
+            { name: ' cloud', repo: 'appwrite/cloud', tag_filter: 'any' },
+            { name: 'edge', repo: 'appwrite/edge', tag_filter: 'any' },
+          ],
+        },
+      }),
+    })
+    await renderAdminSettings()
+
+    expect((screen.getByLabelText('Track 1 name') as HTMLInputElement).value).toBe(' cloud')
+    expect(screen.getByText('Track name must not start or end with whitespace.')).toBeTruthy()
+    const save = screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement
+    expect(save.disabled).toBe(true)
+    fireEvent.submit(save.closest('form') as HTMLFormElement)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(harness.puts()).toHaveLength(0)
+  })
+
+  test('save sends track names unchanged while trimming repos and blank paths', async () => {
+    const harness = createHarness({ role: 'admin' })
+    await renderAdminSettings()
+
+    fireEvent.change(screen.getByLabelText('Track 2 name'), { target: { value: 'edge-db' } })
+    fireEvent.change(screen.getByLabelText('Track 2 repository'), { target: { value: '  appwrite/edge  ' } })
+    fireEvent.change(screen.getByLabelText('GitHub to Discord map path'), { target: { value: '   ' } })
+    fireEvent.change(screen.getByLabelText('Instructions path'), { target: { value: ' /etc/qa.md ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => {
+      expect(harness.puts()).toHaveLength(1)
+    })
+    const body = harness.puts()[0].body as { settings: DeployQaSettings }
+    expect(body.settings.tracks).toEqual([
+      { name: 'cloud', repo: 'appwrite/cloud', tag_filter: 'any' },
+      { name: 'edge-db', repo: 'appwrite/edge', tag_filter: 'any' },
+    ])
+    expect(body.settings.github_discord_map_path).toBeNull()
+    expect(body.settings.instructions_path).toBe('/etc/qa.md')
   })
 
   test('adding and removing tracks edits the list sent to the server', async () => {

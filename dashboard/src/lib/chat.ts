@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { ApiError, getCsrfToken, getWsBase } from './api'
+import { ApiError, deleteRequest, fetchJson, getWsBase } from './api'
 
 export interface ChatMessage {
   id?: number
@@ -200,32 +200,18 @@ export function isChatDisabled(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404
 }
 
-function ensureOk(res: Response, failure: string): void {
-  if (!res.ok) throw new ApiError(res.status, `${failure}: ${res.statusText}`)
-}
-
 export async function fetchChatSessions(): Promise<ChatSession[]> {
-  const res = await fetch(`${API_BASE}/chat/sessions`)
-  ensureOk(res, 'Failed to fetch sessions')
-  return res.json()
+  return fetchJson(`${API_BASE}/chat/sessions`)
 }
 
 export async function fetchChatSession(id: string): Promise<ChatSession> {
-  const res = await fetch(`${API_BASE}/chat/sessions/${id}`)
-  ensureOk(res, 'Failed to fetch session')
-  return res.json()
+  return fetchJson(`${API_BASE}/chat/sessions/${encodeURIComponent(id)}`)
 }
 
 export async function deleteChatSession(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/chat/sessions/${id}`, {
-    method: 'DELETE',
-    headers: { 'x-csrf-token': getCsrfToken() },
-  })
-  ensureOk(res, 'Failed to delete session')
+  return deleteRequest(`${API_BASE}/chat/sessions/${encodeURIComponent(id)}`)
 }
 
 export async function fetchChatModels(): Promise<ChatModelsResponse> {
-  const res = await fetch(`${API_BASE}/chat/models`)
-  ensureOk(res, 'Failed to fetch models')
-  return res.json()
+  return fetchJson(`${API_BASE}/chat/models`)
 }

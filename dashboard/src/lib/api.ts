@@ -754,7 +754,7 @@ async function ensureOk(res: Response, url: string, method: ApiMethod): Promise<
   }
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
+export async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url)
   await ensureOk(res, url, 'GET')
   return res.json()
@@ -789,7 +789,7 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
   return res.json()
 }
 
-async function deleteRequest(url: string): Promise<void> {
+export async function deleteRequest(url: string): Promise<void> {
   Sentry.addBreadcrumb({ category: 'api', message: `DELETE ${url}`, level: 'info' })
   const res = await fetch(url, {
     method: 'DELETE',
@@ -1252,8 +1252,6 @@ export async function updateUser(id: number, data: {
 export async function deleteUser(id: number): Promise<void> {
   return deleteRequest(`${API_BASE}/users/${id}`)
 }
-
-// --- Personal access tokens -------------------------------------------------
 
 /** A personal access token (never includes the secret after creation). */
 export interface ApiToken {

@@ -20,7 +20,8 @@ export default function ChatPage() {
     refreshInterval: 10000,
   })
   const disabled = isChatDisabled(sessionsError)
-  const available = sessions !== undefined || (sessionsError !== undefined && !disabled)
+  const available = sessions !== undefined && !disabled
+  const failed = !available && !disabled && sessionsError !== undefined
 
   const { messages, sendMessage, stopStreaming, isStreaming, isConnected, error, sessionId, clearMessages } =
     useChat(undefined, available)
@@ -72,6 +73,10 @@ export default function ChatPage() {
       {disabled ? (
         <div className="flex-1 flex items-center justify-center">
           <ChatDisabledNotice />
+        </div>
+      ) : failed ? (
+        <div className="flex-1 flex items-center justify-center">
+          <div className="text-destructive text-sm">Failed to load chat sessions.</div>
         </div>
       ) : (
         <div className="flex-1 flex min-h-0">

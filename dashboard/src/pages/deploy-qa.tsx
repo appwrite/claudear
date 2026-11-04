@@ -113,7 +113,7 @@ function toSettings(draft: SettingsDraft, kinds: DeployQaTagFilterKind[]): Deplo
     tracks: draft.tracks.map(track => {
       const kind = findTagFilterKind(track.kind, kinds)
       return {
-        name: track.name.trim(),
+        name: track.name,
         repo: track.repo.trim(),
         tag_filter: kind ? composeTagFilter(kind, track.value) : track.kind,
       }
@@ -730,7 +730,8 @@ export default function DeployQaPage() {
         >
           <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
           <span>
-            claudear.toml has deploy QA changes that are not running yet. Restart claudear to apply them.
+            claudear.toml has deploy QA changes that are not running yet. Restart the claudear process serving this
+            console (and the daemon, if it runs separately) to apply them.
           </span>
         </div>
       )}

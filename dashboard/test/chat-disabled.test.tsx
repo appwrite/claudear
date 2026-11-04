@@ -40,7 +40,7 @@ function json(status: number, body: unknown) {
   return Promise.resolve({
     ok: status >= 200 && status < 300,
     status,
-    statusText: status === 404 ? "Not Found" : "OK",
+    statusText: status === 404 ? "Not Found" : status >= 400 ? "Error" : "OK",
     json: () => Promise.resolve(body),
   });
 }
@@ -54,7 +54,7 @@ function mockServer(role: Role, chatStatus: number): string[] {
       return json(200, { id: 1, email: `${role}@test.com`, name: role, role });
     }
     if (url.endsWith("/api/chat/sessions")) {
-      return json(chatStatus, chatStatus === 200 ? [] : { error: "not found" });
+      return json(chatStatus, chatStatus === 200 ? [] : { error: chatStatus === 404 ? "not found" : "chat failed" });
     }
     if (url.endsWith("/api/chat/models")) {
       return json(
@@ -127,6 +127,22 @@ describe("chat disabled state", () => {
     });
     expect(screen.queryByText(CHAT_DISABLED_MESSAGE)).toBeNull();
   });
+
+  for (const status of [401, 500]) {
+    test(`chat page shows an error and never opens a websocket on ${status}`, async () => {
+      mockServer("admin", status);
+      render(<ChatPage />, { wrapper: Wrapper });
+
+      await waitFor(() => {
+        expect(screen.getByText("Failed to load chat sessions.")).toBeTruthy();
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(screen.queryByText(CHAT_DISABLED_MESSAGE)).toBeNull();
+      expect(screen.queryByText("Disconnected")).toBeNull();
+      expect(screen.queryByPlaceholderText("Connecting...")).toBeNull();
+      expect(constructedSockets).toBe(0);
+    });
+  }
 
   test("models page shows the notice and keeps HuggingFace browsing", async () => {
     mockServer("admin", 404);

@@ -63,9 +63,11 @@ export function validateDeployQaSettings(
 
   const seenNames = new Set<string>()
   settings.tracks.forEach((track, index) => {
-    const name = track.name.trim()
-    if (name === '') {
+    const name = track.name
+    if (name.trim() === '') {
       issues.push({ path: `tracks[${index}].name`, message: 'Track name is required.' })
+    } else if (name !== name.trim()) {
+      issues.push({ path: `tracks[${index}].name`, message: 'Track name must not start or end with whitespace.' })
     } else if (separator !== '' && name.includes(separator)) {
       issues.push({ path: `tracks[${index}].name`, message: `Track name must not contain '${separator}'.` })
     } else if (seenNames.has(name)) {
