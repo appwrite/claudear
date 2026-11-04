@@ -3846,6 +3846,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             build_mcp_list_backends(&config);
                         let mut server = WebhookServer::new_with_github(
                             config,
+                            user_registry,
                             handlers,
                             notifier,
                             tracker.clone(),
@@ -3863,7 +3864,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         server.set_discord_client(discord_client, discord_guild);
                         server.set_review_watcher(deps.review_watcher);
                         server.set_runs(runs);
-                        server.set_user_registry(user_registry);
                         if dashboard {
                             server.set_dashboard(config_path);
                         }
@@ -4461,6 +4461,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             let mut server = WebhookServer::new_with_github(
                 config.clone(),
+                user_registry.clone(),
                 handlers,
                 notifier.clone(),
                 tracker.clone(),
@@ -4480,7 +4481,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             server.set_discord_client(discord_client, discord_guild);
             server.set_review_watcher(deps.review_watcher);
             server.set_runs(runs.clone());
-            server.set_user_registry(user_registry.clone());
 
             let regression_handle = start_regression_monitoring(
                 &config,
