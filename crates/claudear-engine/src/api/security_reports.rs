@@ -12,7 +12,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use claudear_core::error::Error;
 use claudear_core::security::{
-    AwardStatus, DeliveryStatus, NewSecurityEvent, SecurityAward, SecurityEvent, SecurityEventKind,
+    AwardStatus, NewSecurityEvent, SecurityAward, SecurityEvent, SecurityEventKind,
     SecurityOutcome, SecurityOverride, SecurityReply, SecurityReport, SecurityReportChanges,
     SecurityReportFilter, SecurityReportState, SecuritySeverity, SecurityVulnerability,
     SecurityVulnerabilityChanges, VulnerabilityState,
@@ -20,7 +20,7 @@ use claudear_core::security::{
 use claudear_storage::FixAttemptTracker;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 const DEFAULT_REPORT_LIMIT: usize = 100;
@@ -119,12 +119,6 @@ fn count_by<T, K: Eq + Hash>(
     counts
 }
 
-fn has_unconfirmed_reply(replies: &[SecurityReply]) -> bool {
-    replies
-        .iter()
-        .any(|reply| reply.status == DeliveryStatus::Unconfirmed)
-}
-
 fn report_row(
     report: SecurityReport,
     vulnerability: Option<&SecurityVulnerability>,
@@ -166,18 +160,21 @@ fn report_rows(
     vulnerabilities: &HashMap<i64, SecurityVulnerability>,
     awards: &HashMap<i64, SecurityAward>,
 ) -> Result<Vec<SecurityReportRow>, Error> {
-    reports
+    let unconfirmed: HashSet<i64> = tracker
+        .list_reports_with_unconfirmed_replies()?
+        .into_iter()
+        .collect();
+    Ok(reports
         .into_iter()
         .map(|report| {
-            let unconfirmed_reply =
-                has_unconfirmed_reply(&tracker.list_security_replies(report.id)?);
+            let unconfirmed_reply = unconfirmed.contains(&report.id);
             let vulnerability = report
                 .vulnerability_id
                 .and_then(|id| vulnerabilities.get(&id));
             let award = report.vulnerability_id.and_then(|id| awards.get(&id));
-            Ok(report_row(report, vulnerability, award, unconfirmed_reply))
+            report_row(report, vulnerability, award, unconfirmed_reply)
         })
-        .collect()
+        .collect())
 }
 
 fn vulnerabilities_by_id(
@@ -219,15 +216,10 @@ pub async fn summary_handler(
         .map_err(internal_error)?;
     let awards = tracker.list_security_awards(None).map_err(internal_error)?;
 
-    let mut unconfirmed_replies = 0;
-    for report in &reports {
-        unconfirmed_replies += tracker
-            .list_security_replies(report.id)
-            .map_err(internal_error)?
-            .iter()
-            .filter(|reply| reply.status == DeliveryStatus::Unconfirmed)
-            .count();
-    }
+    let unconfirmed_replies = tracker
+        .list_reports_with_unconfirmed_replies()
+        .map_err(internal_error)?
+        .len();
 
     Ok(Json(SecuritySummary {
         reports_by_state: count_by(&reports, |report| Some(report.state)),
@@ -576,7 +568,8 @@ mod tests {
     use super::*;
     use chrono::TimeDelta;
     use claudear_core::security::{
-        NewSecurityAward, NewSecurityReport, NewSecurityVulnerability, SecurityReplyKind,
+        DeliveryStatus, NewSecurityAward, NewSecurityReport, NewSecurityVulnerability,
+        SecurityReplyKind,
     };
     use serde_json::Value;
 
