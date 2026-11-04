@@ -2052,6 +2052,15 @@ pub trait SecurityReportStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Reports in `state` that have no event of `kind`, oldest first.
+    fn list_security_reports_without_event(
+        &self,
+        _state: SecurityReportState,
+        _kind: SecurityEventKind,
+    ) -> Result<Vec<SecurityReport>> {
+        Ok(Vec::new())
+    }
+
     /// Create a vulnerability in an initial state (with its
     /// `VulnerabilityCreated` event).
     fn create_security_vulnerability(

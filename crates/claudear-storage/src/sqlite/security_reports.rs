@@ -764,6 +764,33 @@ impl SqliteTracker {
         Ok(confirmed)
     }
 
+    pub fn list_security_reports_without_event(
+        &self,
+        state: SecurityReportState,
+        kind: SecurityEventKind,
+    ) -> Result<Vec<SecurityReport>> {
+        let connection = self.acquire_lock()?;
+        let sql = format!(
+            r#"
+            SELECT {} FROM security_reports
+            WHERE security_reports.state = ?1
+              AND NOT EXISTS (
+                  SELECT 1 FROM security_events
+                  WHERE security_events.report_id = security_reports.id AND security_events.kind = ?2
+              )
+            ORDER BY security_reports.reported_at ASC, security_reports.id ASC
+            "#,
+            select_list(REPORT_COLUMNS, "security_reports")
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let reports = statement
+            .query_map(params![state.as_str(), kind.as_str()], |row| {
+                row_to_report(row, 0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(reports)
+    }
+
     pub fn create_security_vulnerability(
         &self,
         vulnerability: &NewSecurityVulnerability,
@@ -2042,6 +2069,47 @@ mod tests {
         assert_eq!(tracker.list_admin_confirmed_reports().unwrap().len(), 1);
         track(&tracker, confirmed.id, vulnerability.id);
         assert!(tracker.list_admin_confirmed_reports().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reports_without_an_event_are_listed_per_state_oldest_first() {
+        let tracker = tracker();
+        let later = tracker
+            .upsert_security_report(&new_report("1", reported_at(5)))
+            .unwrap();
+        let earlier = tracker
+            .upsert_security_report(&new_report("2", reported_at(1)))
+            .unwrap();
+        let closed = tracker
+            .upsert_security_report(&new_report("3", reported_at(0)))
+            .unwrap();
+        let unrelated = tracker
+            .upsert_security_report(&new_report("4", reported_at(2)))
+            .unwrap();
+        tracker
+            .record_security_event(
+                Some(closed.id),
+                None,
+                &event(SecurityEventKind::ConversationClosed),
+            )
+            .unwrap();
+        assess(&tracker, unrelated.id);
+
+        let listed = tracker
+            .list_security_reports_without_event(
+                SecurityReportState::Received,
+                SecurityEventKind::ConversationClosed,
+            )
+            .unwrap();
+        let ids: Vec<i64> = listed.iter().map(|report| report.id).collect();
+        assert_eq!(ids, vec![earlier.id, later.id]);
+        assert!(tracker
+            .list_security_reports_without_event(
+                SecurityReportState::Received,
+                SecurityEventKind::Received,
+            )
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

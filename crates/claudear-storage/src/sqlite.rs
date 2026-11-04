@@ -4566,6 +4566,14 @@ impl SecurityReportStore for SqliteTracker {
         SqliteTracker::list_admin_confirmed_reports(self)
     }
 
+    fn list_security_reports_without_event(
+        &self,
+        state: SecurityReportState,
+        kind: SecurityEventKind,
+    ) -> Result<Vec<SecurityReport>> {
+        SqliteTracker::list_security_reports_without_event(self, state, kind)
+    }
+
     fn create_security_vulnerability(
         &self,
         vulnerability: &NewSecurityVulnerability,
