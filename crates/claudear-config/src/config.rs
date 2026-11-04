@@ -3,6 +3,13 @@
 //! Configuration is loaded from a TOML file (`claudear.toml` by default).
 //! Environment variables can override any TOML values.
 
+pub use crate::security_inbox::{
+    render_security_template, DeploymentApplicationConfig, DeploymentPackageConfig,
+    HelpScoutMailboxConfig, MailboxProfile, SecurityDeploymentConfig, SecurityInboxConfig,
+    SecurityReplyVariables, SecurityRewardConfig, SecurityTemplates, SpamAction,
+    ATTACHMENTS_METADATA_KEY, CUSTOMER_THREAD_COUNT_METADATA_KEY, DEFAULT_SECURITY_SCOPE,
+    MAILBOX_PROFILE_METADATA_KEY,
+};
 use claudear_core::error::{Error, Result};
 use claudear_core::secret::SecretValue;
 use claudear_core::types::DeployQaTip;
@@ -1930,6 +1937,10 @@ pub struct HelpScoutConfig {
     pub max_concurrent: Option<usize>,
     /// Polling interval in milliseconds for this source (overrides global).
     pub poll_interval_ms: Option<u64>,
+    /// Per-mailbox profile and overrides (`[[issues.helpscout.mailboxes]]`).
+    pub mailboxes: Vec<HelpScoutMailboxConfig>,
+    /// Security inbox handling for mailboxes with `profile = "security"`.
+    pub security: SecurityInboxConfig,
 }
 
 impl Default for HelpScoutConfig {
@@ -1946,7 +1957,123 @@ impl Default for HelpScoutConfig {
             max_issues_per_cycle: None,
             max_concurrent: None,
             poll_interval_ms: None,
+            mailboxes: Vec::new(),
+            security: SecurityInboxConfig::default(),
         }
+    }
+}
+
+impl HelpScoutConfig {
+    pub fn all_mailbox_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for id in self
+            .mailbox_ids
+            .iter()
+            .chain(self.mailboxes.iter().map(|mailbox| &mailbox.id))
+        {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    fn mailbox(&self, mailbox_id: &str) -> Option<&HelpScoutMailboxConfig> {
+        self.mailboxes
+            .iter()
+            .find(|mailbox| mailbox.id == mailbox_id)
+    }
+
+    pub fn profile_for(&self, mailbox_id: &str) -> MailboxProfile {
+        if self.is_security_mailbox(mailbox_id) {
+            MailboxProfile::Security
+        } else {
+            MailboxProfile::Support
+        }
+    }
+
+    pub fn is_security_mailbox(&self, mailbox_id: &str) -> bool {
+        self.mailboxes
+            .iter()
+            .any(|mailbox| mailbox.id == mailbox_id && mailbox.profile == MailboxProfile::Security)
+    }
+
+    pub fn has_security_mailbox(&self) -> bool {
+        self.mailboxes
+            .iter()
+            .any(|mailbox| mailbox.profile == MailboxProfile::Security)
+    }
+
+    pub fn has_mailbox_overrides(&self) -> bool {
+        !self.mailboxes.is_empty()
+    }
+
+    /// Whether a conversation must be handled as a security report. An unknown
+    /// mailbox fails closed while any security mailbox is configured.
+    pub fn treats_as_security(&self, mailbox_id: Option<&str>) -> bool {
+        match mailbox_id {
+            Some(id) => self.is_security_mailbox(id),
+            None => self.has_security_mailbox(),
+        }
+    }
+
+    pub fn reply_as_for(&self, mailbox_id: &str) -> ReplyAs {
+        if self.is_security_mailbox(mailbox_id) {
+            return ReplyAs::Reply;
+        }
+        self.mailbox(mailbox_id)
+            .and_then(|mailbox| mailbox.reply_as)
+            .unwrap_or(self.reply_as)
+    }
+
+    pub fn trigger_tags_for(&self, mailbox_id: &str) -> &[String] {
+        self.mailbox(mailbox_id)
+            .and_then(|mailbox| mailbox.trigger_tags.as_deref())
+            .unwrap_or(&self.trigger_tags)
+    }
+
+    pub fn trigger_status_for(&self, mailbox_id: &str) -> &str {
+        let status = self
+            .mailbox(mailbox_id)
+            .and_then(|mailbox| mailbox.trigger_status.as_deref())
+            .unwrap_or(&self.trigger_status)
+            .trim();
+        if status.is_empty() {
+            "active"
+        } else {
+            status
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut seen: Vec<&str> = Vec::new();
+        for mailbox in &self.mailboxes {
+            let id = mailbox.id.trim();
+            if id.is_empty() {
+                return Err(Error::config(
+                    "issues.helpscout.mailboxes[].id must not be empty",
+                ));
+            }
+            if seen.contains(&id) {
+                return Err(Error::config(format!(
+                    "issues.helpscout.mailboxes lists mailbox '{id}' more than once"
+                )));
+            }
+            seen.push(id);
+            if mailbox.profile == MailboxProfile::Security
+                && mailbox.reply_as == Some(ReplyAs::Note)
+            {
+                return Err(Error::config(format!(
+                    "issues.helpscout.mailboxes '{id}' has profile = \"security\", which always sends customer replies; remove reply_as = \"note\""
+                )));
+            }
+        }
+        if self.security.enabled && !self.has_security_mailbox() {
+            return Err(Error::config(
+                "issues.helpscout.security.enabled requires a [[issues.helpscout.mailboxes]] entry with profile = \"security\"",
+            ));
+        }
+        self.security.validate().map_err(Error::config)
     }
 }
 
@@ -3663,6 +3790,10 @@ impl Config {
             }
         }
 
+        if let Some(helpscout) = self.helpscout() {
+            helpscout.validate()?;
+        }
+
         // Validate prioritisation config only when engine is enabled
         if self.prioritisation.enabled {
             self.prioritisation.validate()?;
@@ -3788,6 +3919,16 @@ impl Config {
     /// Accessor: get reference to HelpScoutConfig.
     pub fn helpscout(&self) -> Option<&HelpScoutConfig> {
         self.issues.helpscout.as_ref()
+    }
+
+    /// The Security inbox configuration, only when HelpScout and the inbox are
+    /// both enabled and a security mailbox exists.
+    pub fn security_inbox(&self) -> Option<&SecurityInboxConfig> {
+        self.helpscout()
+            .filter(|helpscout| {
+                helpscout.enabled && helpscout.security.enabled && helpscout.has_security_mailbox()
+            })
+            .map(|helpscout| &helpscout.security)
     }
 
     /// Accessor: get reference to GitHubCodeScanningConfig.
@@ -4208,6 +4349,280 @@ mod tests {
         assert!(hs.enabled);
         assert_eq!(hs.mailbox_ids, vec!["100".to_string(), "200".to_string()]);
         assert_eq!(hs.reply_as, ReplyAs::Reply);
+    }
+
+    const SUPPORT_HELPSCOUT_TOML: &str = r#"
+        [issues.linear]
+        enabled = true
+        api_key = "key"
+
+        [issues.helpscout]
+        enabled = true
+        mailbox_ids = ["249877"]
+        trigger_tags = ["auto-implement", "claude"]
+        trigger_status = "active"
+        reply_as = "note"
+    "#;
+
+    const SECURITY_MAILBOX_TOML: &str = r#"
+        [[issues.helpscout.mailboxes]]
+        id = "249891"
+        profile = "security"
+        trigger_tags = []
+        trigger_status = "active"
+
+        [issues.helpscout.security]
+        enabled = true
+        process_after = "2026-11-05T00:00:00Z"
+        spam_action = "close"
+        default_repository = "appwrite-labs/cloud"
+
+        [issues.helpscout.security.reward]
+        campaign = "SecurityResearchers"
+        credits = 100
+
+        [issues.helpscout.security.deployment]
+        configuration_repository = "appwrite-labs/application-configuration"
+        configuration_reference = "main"
+
+        [[issues.helpscout.security.deployment.applications]]
+        repository = "appwrite-labs/cloud"
+        image = "appwrite/cloud"
+        directories = ["cloud/production/cloud", "cloud/production/cloud-background"]
+
+        [[issues.helpscout.security.deployment.applications.packages]]
+        repository = "appwrite/appwrite"
+        package = "appwrite/server-ce"
+        lock_file = "composer.lock"
+    "#;
+
+    fn parse_helpscout(toml: &str) -> Config {
+        toml::from_str(toml).expect("parse")
+    }
+
+    #[test]
+    fn test_helpscout_support_only_toml_is_unchanged() {
+        let config = parse_helpscout(SUPPORT_HELPSCOUT_TOML);
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert!(helpscout.mailboxes.is_empty());
+        assert!(!helpscout.has_mailbox_overrides());
+        assert!(!helpscout.has_security_mailbox());
+        assert_eq!(helpscout.all_mailbox_ids(), vec!["249877".to_string()]);
+        assert_eq!(helpscout.profile_for("249877"), MailboxProfile::Support);
+        assert_eq!(helpscout.reply_as_for("249877"), ReplyAs::Note);
+        assert_eq!(
+            helpscout.trigger_tags_for("249877"),
+            ["auto-implement".to_string(), "claude".to_string()]
+        );
+        assert_eq!(helpscout.trigger_status_for("249877"), "active");
+        assert!(!helpscout.treats_as_security(Some("249877")));
+        assert!(!helpscout.treats_as_security(None));
+        assert_eq!(helpscout.security, SecurityInboxConfig::default());
+        assert!(config.security_inbox().is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_helpscout_security_mailbox_toml_parses() {
+        let config = parse_helpscout(&format!("{SUPPORT_HELPSCOUT_TOML}{SECURITY_MAILBOX_TOML}"));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert_eq!(
+            helpscout.all_mailbox_ids(),
+            vec!["249877".to_string(), "249891".to_string()]
+        );
+        assert_eq!(helpscout.profile_for("249891"), MailboxProfile::Security);
+        assert_eq!(helpscout.profile_for("249877"), MailboxProfile::Support);
+        assert!(helpscout.is_security_mailbox("249891"));
+        assert!(!helpscout.is_security_mailbox("249877"));
+        assert_eq!(helpscout.reply_as_for("249891"), ReplyAs::Reply);
+        assert_eq!(helpscout.reply_as_for("249877"), ReplyAs::Note);
+        assert!(helpscout.trigger_tags_for("249891").is_empty());
+        assert_eq!(
+            helpscout.trigger_tags_for("249877"),
+            ["auto-implement".to_string(), "claude".to_string()]
+        );
+        let security = config.security_inbox().expect("security inbox enabled");
+        assert_eq!(
+            security.process_after,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-11-05T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
+        );
+        assert_eq!(security.spam_action, SpamAction::Close);
+        assert_eq!(
+            security.default_repository.as_deref(),
+            Some("appwrite-labs/cloud")
+        );
+        assert_eq!(security.deployment.applications.len(), 1);
+        assert_eq!(
+            security.deployment.applications[0].packages[0].package,
+            "appwrite/server-ce"
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_helpscout_mailbox_overrides_inherit_and_override() {
+        let config = parse_helpscout(
+            r#"
+            [issues.helpscout]
+            enabled = true
+            mailbox_ids = ["1", "2"]
+            trigger_tags = ["bug"]
+            trigger_status = ""
+            reply_as = "note"
+
+            [[issues.helpscout.mailboxes]]
+            id = "2"
+            reply_as = "reply"
+            trigger_tags = []
+            trigger_status = "pending"
+
+            [[issues.helpscout.mailboxes]]
+            id = "3"
+            trigger_tags = ["vip"]
+            "#,
+        );
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert_eq!(
+            helpscout.all_mailbox_ids(),
+            vec!["1".to_string(), "2".to_string(), "3".to_string()]
+        );
+        assert!(helpscout.has_mailbox_overrides());
+        assert!(!helpscout.has_security_mailbox());
+        assert_eq!(helpscout.reply_as_for("1"), ReplyAs::Note);
+        assert_eq!(helpscout.reply_as_for("2"), ReplyAs::Reply);
+        assert_eq!(helpscout.reply_as_for("3"), ReplyAs::Note);
+        assert_eq!(helpscout.trigger_tags_for("1"), ["bug".to_string()]);
+        assert!(helpscout.trigger_tags_for("2").is_empty());
+        assert_eq!(helpscout.trigger_tags_for("3"), ["vip".to_string()]);
+        assert_eq!(helpscout.trigger_status_for("1"), "active");
+        assert_eq!(helpscout.trigger_status_for("2"), "pending");
+        assert_eq!(helpscout.profile_for("3"), MailboxProfile::Support);
+    }
+
+    #[test]
+    fn test_helpscout_treats_missing_mailbox_as_security_when_one_exists() {
+        let config = parse_helpscout(&format!("{SUPPORT_HELPSCOUT_TOML}{SECURITY_MAILBOX_TOML}"));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert!(helpscout.treats_as_security(None));
+        assert!(helpscout.treats_as_security(Some("249891")));
+        assert!(!helpscout.treats_as_security(Some("249877")));
+    }
+
+    #[test]
+    fn test_helpscout_security_mailbox_rejects_note_replies() {
+        let config = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}{}",
+            SECURITY_MAILBOX_TOML.replace(
+                "profile = \"security\"",
+                "profile = \"security\"\nreply_as = \"note\""
+            )
+        ));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert_eq!(helpscout.mailboxes[0].reply_as, Some(ReplyAs::Note));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("249891"), "{error}");
+        assert!(error.contains("reply_as"), "{error}");
+    }
+
+    #[test]
+    fn test_helpscout_security_mailbox_ignores_top_level_note() {
+        let config = parse_helpscout(&format!("{SUPPORT_HELPSCOUT_TOML}{SECURITY_MAILBOX_TOML}"));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert_eq!(helpscout.reply_as, ReplyAs::Note);
+        assert_eq!(helpscout.reply_as_for("249891"), ReplyAs::Reply);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_helpscout_security_enabled_requires_security_mailbox() {
+        let config = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}\n[issues.helpscout.security]\nenabled = true\n"
+        ));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("profile = \"security\""), "{error}");
+        assert!(config.security_inbox().is_none());
+    }
+
+    #[test]
+    fn test_helpscout_security_thresholds_are_validated() {
+        let mut config =
+            parse_helpscout(&format!("{SUPPORT_HELPSCOUT_TOML}{SECURITY_MAILBOX_TOML}"));
+        let helpscout = config.issues.helpscout.as_mut().unwrap();
+        helpscout.security.spam_confidence = 1.01;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("spam_confidence"));
+        let helpscout = config.issues.helpscout.as_mut().unwrap();
+        helpscout.security.spam_confidence = 0.9;
+        helpscout.security.duplicate_similarity = 2.0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate_similarity"));
+    }
+
+    #[test]
+    fn test_helpscout_duplicate_mailbox_entries_are_rejected() {
+        let config = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}{SECURITY_MAILBOX_TOML}\n[[issues.helpscout.mailboxes]]\nid = \"249891\"\nprofile = \"support\"\n"
+        ));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert!(helpscout.is_security_mailbox("249891"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("more than once"));
+    }
+
+    #[test]
+    fn test_example_toml_security_block_parses() {
+        let example = include_str!("../../../claudear.example.toml");
+        let start = example
+            .find("# [[issues.helpscout.mailboxes]]")
+            .expect("documented mailboxes block");
+        let end = example[start..]
+            .find("# lock_file = \"composer.lock\"")
+            .map(|offset| start + offset + "# lock_file = \"composer.lock\"".len())
+            .expect("documented deployment block");
+        let snippet: String = example[start..end]
+            .lines()
+            .filter_map(|line| line.strip_prefix('#'))
+            .map(str::trim)
+            .filter(|line| line.starts_with('[') || line.contains(" = "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let config: Config = toml::from_str(&format!(
+            "[issues.helpscout]\nenabled = true\nmailbox_ids = [\"249877\"]\n{snippet}"
+        ))
+        .expect("example parses");
+        let helpscout = config.helpscout().expect("helpscout config");
+        helpscout.validate().expect("example validates");
+        assert!(helpscout.is_security_mailbox("249891"));
+        assert_eq!(helpscout.reply_as_for("249877"), ReplyAs::Note);
+        let security = config.security_inbox().expect("security inbox");
+        assert!(security.templates.not_vulnerability.contains("{reason}"));
+        assert_eq!(security.deployment, SecurityDeploymentConfig::default());
+    }
+
+    #[test]
+    fn test_security_inbox_requires_helpscout_enabled() {
+        let config = parse_helpscout(&format!(
+            "{}{SECURITY_MAILBOX_TOML}",
+            SUPPORT_HELPSCOUT_TOML.replace(
+                "[issues.helpscout]\n        enabled = true",
+                "[issues.helpscout]\n        enabled = false"
+            )
+        ));
+        assert!(!config.helpscout().unwrap().enabled);
+        assert!(config.security_inbox().is_none());
     }
 
     #[test]
