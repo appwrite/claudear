@@ -15,6 +15,8 @@ use crate::scm::{
 use crate::source::IssueSource;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use claudear_analysis::distribution::AssignmentNotice;
+use claudear_analysis::distribution::Digest;
 use claudear_core::error::Result;
 use claudear_core::types::{
     AgentResult, AskDelivery, AskReply, AskRequest, Issue, MatchResult, ReplyKind, VerifyResult,
@@ -293,6 +295,41 @@ impl Notifier for InstrumentedNotifier {
             }
             Err(e) => {
                 tracing::warn!(component = self.inner.name(), error = %e, "Failed to notify repetitive digest");
+                Err(e)
+            }
+        }
+    }
+
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
+        match self.inner.notify_pr_assignment(notice).await {
+            Ok(v) => {
+                tracing::info!(
+                    component = self.inner.name(),
+                    pr_url = %notice.pull_request.url,
+                    assignee = %notice.developer.login,
+                    "Notified PR assignment"
+                );
+                Ok(v)
+            }
+            Err(e) => {
+                tracing::warn!(component = self.inner.name(), pr_url = %notice.pull_request.url, error = %e, "Failed to notify PR assignment");
+                Err(e)
+            }
+        }
+    }
+
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
+        match self.inner.notify_pr_digest(digest).await {
+            Ok(v) => {
+                tracing::info!(
+                    component = self.inner.name(),
+                    count = digest.count(),
+                    "Notified PR digest"
+                );
+                Ok(v)
+            }
+            Err(e) => {
+                tracing::warn!(component = self.inner.name(), error = %e, "Failed to notify PR digest");
                 Err(e)
             }
         }
@@ -583,6 +620,10 @@ impl AgentRunner for InstrumentedRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claudear_analysis::distribution::Developer;
+    use claudear_analysis::distribution::DigestGroup;
+    use claudear_analysis::distribution::PullRequestSummary;
+    use claudear_core::types::AssignmentReason;
     use std::sync::Mutex;
 
     /// Records which trait method was called, so a wrapper falling back to a
@@ -628,12 +669,25 @@ mod tests {
         async fn notify_repetitive_digest(&self, _digest: &RepetitiveDigest) -> Result<()> {
             self.record("repetitive_digest")
         }
+        async fn notify_pr_assignment(&self, _notice: &AssignmentNotice) -> Result<()> {
+            self.record("pr_assignment")
+        }
+        async fn notify_pr_digest(&self, _digest: &Digest) -> Result<()> {
+            self.record("pr_digest")
+        }
     }
 
     #[tokio::test]
     async fn instrumented_notifier_forwards_mention_capable_digests() {
         let recorder = Arc::new(Recorder::default());
         let notifier = InstrumentedNotifier::wrap(Arc::clone(&recorder) as Arc<dyn Notifier>);
+        let summary = PullRequestSummary {
+            url: "https://github.com/org/repo/pull/1".to_string(),
+            repo: "org/repo".to_string(),
+            number: 1,
+            title: "Fix".to_string(),
+            opened_at: None,
+        };
 
         notifier
             .notify_repetitive_digest(&RepetitiveDigest {
@@ -644,7 +698,29 @@ mod tests {
             })
             .await
             .unwrap();
+        notifier
+            .notify_pr_assignment(&AssignmentNotice {
+                developer: Developer::new("amy"),
+                pull_request: summary.clone(),
+                reason: AssignmentReason::Load,
+                previous: None,
+            })
+            .await
+            .unwrap();
+        notifier
+            .notify_pr_digest(&Digest {
+                groups: vec![DigestGroup {
+                    developer: Developer::new("amy"),
+                    pull_requests: vec![summary],
+                }],
+                generated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
 
-        assert_eq!(*recorder.calls.lock().unwrap(), vec!["repetitive_digest"]);
+        assert_eq!(
+            *recorder.calls.lock().unwrap(),
+            vec!["repetitive_digest", "pr_assignment", "pr_digest"]
+        );
     }
 }

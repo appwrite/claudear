@@ -11,6 +11,10 @@ use abnegate_http::HttpResponse;
 use async_trait::async_trait;
 use chrono::DateTime;
 use chrono::Utc;
+use claudear_analysis::distribution::AssignmentNotice;
+use claudear_analysis::distribution::Developer;
+use claudear_analysis::distribution::Digest;
+use claudear_analysis::distribution::Markup;
 use claudear_config::config::DiscordConfig;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Error;
@@ -1213,6 +1217,56 @@ pub(crate) fn build_repetitive_digest_message(
     })
 }
 
+/// Longest Discord message content, in characters.
+const MESSAGE_CHARACTER_LIMIT: usize = 2000;
+
+/// Discord markup: `<@id>` mentions, falling back to the GitHub handle for a
+/// developer without a Discord id, and masked links that do not unfurl.
+pub(crate) struct DiscordMarkup;
+
+impl Markup for DiscordMarkup {
+    fn mention(&self, developer: &Developer) -> String {
+        developer
+            .discord_id
+            .as_ref()
+            .map_or_else(|| developer.handle(), |id| format!("<@{id}>"))
+    }
+
+    fn link(&self, text: &str, url: &str) -> String {
+        format!("[{text}](<{url}>)")
+    }
+}
+
+/// Build the Discord message telling a developer they own a PR. The text is
+/// the message content, not an embed, so the mention pings.
+pub(crate) fn build_pr_assignment_message(notice: &AssignmentNotice) -> DiscordMessage {
+    DiscordMessage {
+        content: Some(truncate_string(
+            &notice.render(&DiscordMarkup),
+            MESSAGE_CHARACTER_LIMIT,
+        )),
+        embeds: None,
+    }
+}
+
+/// Build the Discord messages for the PR digest: the title, then each
+/// assignee's PRs, split to fit Discord's content limit with the mention on
+/// the first page. Empty when no PR needs anyone.
+pub(crate) fn build_pr_digest_messages(digest: &Digest) -> Vec<DiscordMessage> {
+    if digest.is_empty() {
+        return Vec::new();
+    }
+    std::iter::once(Digest::TITLE.to_string())
+        .chain(digest.groups.iter().flat_map(|group| {
+            group.pages(&DiscordMarkup, digest.generated_at, MESSAGE_CHARACTER_LIMIT)
+        }))
+        .map(|content| DiscordMessage {
+            content: Some(content),
+            embeds: None,
+        })
+        .collect()
+}
+
 /// Build the Discord message for a human-in-the-loop question.
 pub(crate) fn build_ask_question_message(
     issue: &Issue,
@@ -1405,6 +1459,18 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
         let mention = self.get_user_mention();
         if let Some(message) = build_repetitive_digest_message(digest, mention) {
+            let _ = self.send(message).await?;
+        }
+        Ok(())
+    }
+
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
+        let _ = self.send(build_pr_assignment_message(notice)).await?;
+        Ok(())
+    }
+
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
+        for message in build_pr_digest_messages(digest) {
             let _ = self.send(message).await?;
         }
         Ok(())
@@ -4052,6 +4118,144 @@ mod tests {
             to: Utc::now(),
             entries,
         }
+    }
+
+    fn pr_summary(number: i64) -> claudear_analysis::distribution::PullRequestSummary {
+        claudear_analysis::distribution::PullRequestSummary {
+            url: format!("https://github.com/org/repo/pull/{number}"),
+            repo: "org/repo".to_string(),
+            number,
+            title: format!("Fix {number}"),
+            opened_at: None,
+        }
+    }
+
+    fn pr_developer(login: &str, discord_id: Option<&str>) -> Developer {
+        Developer {
+            login: login.to_string(),
+            discord_id: discord_id.map(str::to_string),
+            slack_id: Some("U_IGNORED".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_pr_assignment_message_pings_the_discord_user_in_content() {
+        let message = build_pr_assignment_message(&AssignmentNotice {
+            developer: pr_developer("amy", Some("42")),
+            pull_request: pr_summary(7),
+            reason: claudear_core::types::AssignmentReason::CodeOwner,
+            previous: None,
+        });
+
+        assert!(message.embeds.is_none());
+        assert_eq!(
+            message.content.as_deref(),
+            Some(
+                "<@42> you're responsible for getting \
+                 [org/repo#7](<https://github.com/org/repo/pull/7>) over the line: Fix 7\n\
+                 You own the changed code."
+            )
+        );
+    }
+
+    #[test]
+    fn test_pr_assignment_message_falls_back_to_the_github_handle() {
+        let message = build_pr_assignment_message(&AssignmentNotice {
+            developer: pr_developer("amy", None),
+            pull_request: pr_summary(7),
+            reason: claudear_core::types::AssignmentReason::Load,
+            previous: None,
+        });
+
+        assert!(message
+            .content
+            .unwrap()
+            .starts_with("@amy you're responsible"));
+    }
+
+    #[test]
+    fn test_pr_digest_messages_mention_each_assignee() {
+        let digest = Digest {
+            groups: vec![
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("amy", Some("1")),
+                    pull_requests: vec![pr_summary(1), pr_summary(2)],
+                },
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("bob", Some("2")),
+                    pull_requests: vec![pr_summary(3)],
+                },
+            ],
+            generated_at: Utc::now(),
+        };
+
+        let contents: Vec<String> = build_pr_digest_messages(&digest)
+            .into_iter()
+            .map(|message| message.content.unwrap())
+            .collect();
+
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0], Digest::TITLE);
+        assert!(contents[1].starts_with("<@1> 2 Claudear PRs waiting on you:\n"));
+        assert!(contents[1].contains("[org/repo#2](<https://github.com/org/repo/pull/2>) Fix 2"));
+        assert!(contents[2].starts_with("<@2> 1 Claudear PR waiting on you:\n"));
+    }
+
+    #[test]
+    fn test_pr_digest_messages_fit_discords_limit() {
+        let digest = Digest {
+            groups: vec![claudear_analysis::distribution::DigestGroup {
+                developer: pr_developer("amy", Some("1")),
+                pull_requests: (1..=100).map(pr_summary).collect(),
+            }],
+            generated_at: Utc::now(),
+        };
+
+        let messages = build_pr_digest_messages(&digest);
+
+        assert!(messages.len() > 2);
+        assert!(messages
+            .iter()
+            .all(|message| message.content.as_ref().unwrap().chars().count()
+                <= MESSAGE_CHARACTER_LIMIT));
+        assert!(messages[1]
+            .content
+            .as_ref()
+            .unwrap()
+            .starts_with("<@1> 100 Claudear PRs"));
+    }
+
+    #[test]
+    fn test_pr_digest_messages_empty_digest_sends_nothing() {
+        let digest = Digest {
+            groups: Vec::new(),
+            generated_at: Utc::now(),
+        };
+        assert!(build_pr_digest_messages(&digest).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_notify_pr_digest_posts_every_message_to_the_webhook() {
+        let notifier = DiscordNotifier::with_http_client(
+            enabled_config(),
+            MockDiscordWebhookClient::success(),
+        );
+        let digest = Digest {
+            groups: vec![claudear_analysis::distribution::DigestGroup {
+                developer: pr_developer("amy", Some("1")),
+                pull_requests: vec![pr_summary(1)],
+            }],
+            generated_at: Utc::now(),
+        };
+
+        notifier.notify_pr_digest(&digest).await.unwrap();
+
+        assert_eq!(notifier.http.get_call_count(), 2);
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        assert!(body["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("<@1> 1 Claudear PR"));
     }
 
     #[test]

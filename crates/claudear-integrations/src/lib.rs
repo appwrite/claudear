@@ -7,6 +7,7 @@ pub mod ask_reply_inbox;
 pub mod chat;
 pub mod deploy_qa;
 pub mod discord;
+pub mod distribution;
 pub mod github;
 pub mod github_app;
 pub mod gitlab;

@@ -27,10 +27,11 @@ pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActivityLogEntry, AgentExecution, AnalyticsSummary, DeployQaTip, DeployQaTipStatus,
-    ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, IssueTimeline,
-    PrAnalytics, PrRecord, PrReviewRecord, ProcessingMetric, PromptExperiment, QaKnowledgeEntry,
-    QaMatch, RegressionCheck, RegressionWatch, RegressionWatchStatus, SimilarIssue,
+    ActivityLogEntry, AgentExecution, AnalyticsSummary, AssignmentStatus, DeployQaTip,
+    DeployQaTipStatus, ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding,
+    IssueTimeline, PrAnalytics, PrAssignment, PrRecord, PrReviewRecord, ProcessingMetric,
+    PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck, RegressionWatch,
+    RegressionWatchStatus, SimilarIssue,
 };
 use claudear_core::types::{CrossRepoCorrelation, FixOutcome};
 use std::collections::{HashMap, HashSet};
@@ -1949,6 +1950,33 @@ pub trait DeployQaStore: Send + Sync {
     }
 }
 
+/// The developer responsible for each open Claudear PR (all defaulted).
+pub trait PrAssignmentStore: Send + Sync {
+    /// Every active assignment, oldest first.
+    fn active_pr_assignments(&self) -> Result<Vec<PrAssignment>> {
+        Ok(Vec::new())
+    }
+
+    /// The active assignment of `pr_url`, if it has one.
+    fn active_pr_assignment(&self, _pr_url: &str) -> Result<Option<PrAssignment>> {
+        Ok(None)
+    }
+
+    /// Record `assignment` as its PR's active assignment.
+    ///
+    /// Returns the stored row, or `None` when the PR already has an active
+    /// assignment, so of two processes assigning the same PR only one wins.
+    fn record_pr_assignment(&self, _assignment: &PrAssignment) -> Result<Option<PrAssignment>> {
+        Ok(None)
+    }
+
+    /// End the active assignment `id` with `status`, returning whether it was
+    /// still active.
+    fn end_pr_assignment(&self, _id: i64, _status: AssignmentStatus) -> Result<bool> {
+        Ok(false)
+    }
+}
+
 /// Regression watches and checks (all defaulted).
 pub trait RegressionStore: Send + Sync {
     /// Get regression watches by status.
@@ -2042,7 +2070,7 @@ pub trait ChatStore: Send + Sync {
     }
 }
 
-/// Supertrait combining all 12 sub-traits. Auto-implemented for any type
+/// Supertrait combining all sub-traits. Auto-implemented for any type
 /// that implements all sub-traits via the blanket impl below.
 pub trait FixAttemptTracker:
     AttemptTracker
@@ -2057,6 +2085,7 @@ pub trait FixAttemptTracker:
     + UserStore
     + RegressionStore
     + DeployQaStore
+    + PrAssignmentStore
     + ChatStore
     + DiscordStore
 {
@@ -2075,6 +2104,7 @@ impl<T> FixAttemptTracker for T where
         + UserStore
         + RegressionStore
         + DeployQaStore
+        + PrAssignmentStore
         + ChatStore
         + DiscordStore
 {
@@ -2166,6 +2196,7 @@ impl RepoStore for NoopTracker {}
 impl UserStore for NoopTracker {}
 impl RegressionStore for NoopTracker {}
 impl DeployQaStore for NoopTracker {}
+impl PrAssignmentStore for NoopTracker {}
 impl ChatStore for NoopTracker {}
 impl DiscordStore for NoopTracker {}
 
@@ -2351,6 +2382,7 @@ mod tests {
         impl UserStore for FullTracker {}
         impl RegressionStore for FullTracker {}
         impl DeployQaStore for FullTracker {}
+        impl PrAssignmentStore for FullTracker {}
         impl ChatStore for FullTracker {}
         impl DiscordStore for FullTracker {}
 

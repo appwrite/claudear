@@ -2037,6 +2037,141 @@ impl DeployQaTip {
     }
 }
 
+/// Why a developer was made responsible for an open Claudear PR.
+///
+/// Variants are ordered from the strongest ownership signal to the weakest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentReason {
+    /// They asked for the work: the originating issue's assignee or reporter.
+    Requester,
+    /// CODEOWNERS names them for the changed files.
+    CodeOwner,
+    /// They recently committed to the changed files.
+    Author,
+    /// They recently committed to the repository.
+    Activity,
+    /// Everyone with ownership already held their fair share, so the
+    /// least-loaded developer took it.
+    Load,
+}
+
+impl std::fmt::Display for AssignmentReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Requester => write!(f, "requester"),
+            Self::CodeOwner => write!(f, "code_owner"),
+            Self::Author => write!(f, "author"),
+            Self::Activity => write!(f, "activity"),
+            Self::Load => write!(f, "load"),
+        }
+    }
+}
+
+impl std::str::FromStr for AssignmentReason {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "requester" => Ok(Self::Requester),
+            "code_owner" => Ok(Self::CodeOwner),
+            "author" => Ok(Self::Author),
+            "activity" => Ok(Self::Activity),
+            "load" => Ok(Self::Load),
+            other => Err(format!("unknown assignment reason: {other}")),
+        }
+    }
+}
+
+/// Lifecycle of a PR assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentStatus {
+    /// The assignee is responsible for getting the PR over the line.
+    #[default]
+    Active,
+    /// The assignee left the roster, so the PR was handed to someone else.
+    Released,
+    /// The PR was merged or closed.
+    Closed,
+}
+
+impl std::fmt::Display for AssignmentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Released => write!(f, "released"),
+            Self::Closed => write!(f, "closed"),
+        }
+    }
+}
+
+impl std::str::FromStr for AssignmentStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "active" => Ok(Self::Active),
+            "released" => Ok(Self::Released),
+            "closed" => Ok(Self::Closed),
+            other => Err(format!("unknown assignment status: {other}")),
+        }
+    }
+}
+
+/// A developer made responsible for one open Claudear PR.
+///
+/// A PR has at most one active assignment; ended ones are kept as history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrAssignment {
+    /// Database ID.
+    pub id: i64,
+    /// Full PR URL.
+    pub pr_url: String,
+    /// GitHub `owner/repo`.
+    pub repo: String,
+    /// PR number.
+    pub pr_number: i64,
+    /// GitHub login of the responsible developer.
+    pub assignee: String,
+    /// Strongest signal that won the assignee the PR.
+    pub reason: AssignmentReason,
+    /// Ownership score the assignee had for the PR.
+    pub score: f64,
+    /// Lifecycle status.
+    pub status: AssignmentStatus,
+    /// When the assignment was made.
+    pub assigned_at: DateTime<Utc>,
+    /// When the assignment was released or closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+}
+
+impl PrAssignment {
+    /// Build an active assignment of `pr_url` to `assignee`.
+    pub fn new(
+        pr_url: impl Into<String>,
+        repo: impl Into<String>,
+        pr_number: i64,
+        assignee: impl Into<String>,
+        reason: AssignmentReason,
+        score: f64,
+    ) -> Self {
+        Self {
+            id: 0,
+            pr_url: pr_url.into(),
+            repo: repo.into(),
+            pr_number,
+            assignee: assignee.into(),
+            reason,
+            score,
+            status: AssignmentStatus::Active,
+            assigned_at: Utc::now(),
+            ended_at: None,
+        }
+    }
+}
+
 /// A single regression check result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegressionCheck {

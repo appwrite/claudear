@@ -69,6 +69,8 @@ pub use whatsapp::WhatsAppNotifier;
 use crate::reports::{RepetitiveDigest, Report};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use claudear_analysis::distribution::AssignmentNotice;
+use claudear_analysis::distribution::Digest;
 use claudear_core::error::Result;
 use claudear_core::types::{AskDelivery, AskReply, AskRequest, Issue};
 use std::sync::Arc;
@@ -145,6 +147,22 @@ pub trait Notifier: Send + Sync {
     /// that can mention a user (e.g. Discord) should override this to tag the
     /// configured on-call user.
     async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
+        self.notify_status(&digest.format_text()).await
+    }
+
+    /// Tell a developer they are now responsible for an open Claudear PR.
+    ///
+    /// The default sends plain text naming the developer's GitHub login;
+    /// channels with native mentions override it to ping the developer.
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
+        self.notify_status(&notice.format_text()).await
+    }
+
+    /// Send every assignee the open Claudear PRs still waiting on them.
+    ///
+    /// The default sends plain text naming each assignee's GitHub login;
+    /// channels with native mentions override it to ping each assignee.
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
         self.notify_status(&digest.format_text()).await
     }
 
@@ -379,6 +397,26 @@ impl Notifier for CompositeNotifier {
         self.broadcast(|n| {
             let digest = digest.clone();
             async move { n.notify_repetitive_digest(&digest).await }
+        })
+        .await;
+        Ok(())
+    }
+
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
+        let notice = notice.clone();
+        self.broadcast(|n| {
+            let notice = notice.clone();
+            async move { n.notify_pr_assignment(&notice).await }
+        })
+        .await;
+        Ok(())
+    }
+
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
+        let digest = digest.clone();
+        self.broadcast(|n| {
+            let digest = digest.clone();
+            async move { n.notify_pr_digest(&digest).await }
         })
         .await;
         Ok(())
@@ -1758,5 +1796,105 @@ mod tests {
             .unwrap();
         assert_eq!(mock1_clone.get_call_count(), 1);
         assert_eq!(mock2_clone.get_call_count(), 1);
+    }
+
+    fn assignment_notice() -> AssignmentNotice {
+        AssignmentNotice {
+            developer: claudear_analysis::distribution::Developer {
+                login: "amy".to_string(),
+                discord_id: Some("42".to_string()),
+                slack_id: None,
+            },
+            pull_request: claudear_analysis::distribution::PullRequestSummary {
+                url: "https://github.com/org/repo/pull/7".to_string(),
+                repo: "org/repo".to_string(),
+                number: 7,
+                title: "Fix the thing".to_string(),
+                opened_at: None,
+            },
+            reason: claudear_core::types::AssignmentReason::Requester,
+            previous: None,
+        }
+    }
+
+    fn pr_digest() -> Digest {
+        let notice = assignment_notice();
+        Digest {
+            groups: vec![claudear_analysis::distribution::DigestGroup {
+                developer: notice.developer,
+                pull_requests: vec![notice.pull_request],
+            }],
+            generated_at: Utc::now(),
+        }
+    }
+
+    struct StatusCapture {
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Notifier for StatusCapture {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        async fn notify_start(&self, _issue: &Issue) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_success(&self, _issue: &Issue, _pr_url: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_completed(&self, _issue: &Issue) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_failed(&self, _issue: &Issue, _error: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_status(&self, message: &str) -> Result<()> {
+            self.messages.lock().unwrap().push(message.to_string());
+            Ok(())
+        }
+        async fn notify_urgent_issues(&self, _issues: &[Issue]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_default_pr_notifications_send_plain_text_with_the_login() {
+        let notifier = StatusCapture {
+            messages: std::sync::Mutex::new(Vec::new()),
+        };
+
+        notifier
+            .notify_pr_assignment(&assignment_notice())
+            .await
+            .unwrap();
+        notifier.notify_pr_digest(&pr_digest()).await.unwrap();
+
+        let messages = notifier.messages.lock().unwrap();
+        assert_eq!(messages[0], assignment_notice().format_text());
+        assert!(messages[0].starts_with("@amy "));
+        assert_eq!(messages[1], pr_digest().format_text());
+        assert!(messages[1].contains("@amy 1 Claudear PR waiting on you:"));
+    }
+
+    #[tokio::test]
+    async fn test_composite_broadcasts_pr_notifications_to_all() {
+        let mut composite = CompositeNotifier::new();
+        let first = Arc::new(MockNotifier::new("first", true));
+        let second = Arc::new(MockNotifier::new("second", true));
+        composite.add(Arc::clone(&first) as Arc<dyn Notifier>);
+        composite.add(Arc::clone(&second) as Arc<dyn Notifier>);
+
+        composite
+            .notify_pr_assignment(&assignment_notice())
+            .await
+            .unwrap();
+        composite.notify_pr_digest(&pr_digest()).await.unwrap();
+
+        assert_eq!(first.get_call_count(), 2);
+        assert_eq!(second.get_call_count(), 2);
     }
 }

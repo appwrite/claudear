@@ -86,6 +86,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "fix_attempt_heartbeat",
         sql: include_str!("../../../migrations/V14__fix_attempt_heartbeat.sql"),
     },
+    Migration {
+        version: 15,
+        name: "pr_assignments",
+        sql: include_str!("../../../migrations/V15__pr_assignments.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -244,6 +249,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_deploy_qa, 1);
+
+        let has_pr_assignments: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pr_assignments'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_pr_assignments, 1);
     }
 
     #[test]
@@ -313,6 +327,7 @@ mod tests {
             "support_reply_ratings",
             "issue_recurrence",
             "retrieval_usage",
+            "pr_assignments",
         ];
 
         for table in expected_tables {

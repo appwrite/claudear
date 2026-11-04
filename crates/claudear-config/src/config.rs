@@ -486,6 +486,9 @@ pub struct Config {
     /// Live deploy QA for GitHub release tips (separate from `[regression]`).
     #[serde(default)]
     pub deploy_qa: DeployQaConfig,
+    /// Distribution of Claudear's open PRs across developers.
+    #[serde(default)]
+    pub pr_distribution: PrDistributionConfig,
     /// Cascade configuration for multi-repo chaining.
     #[serde(default)]
     pub cascade: CascadeConfig,
@@ -807,6 +810,7 @@ impl Default for Config {
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
             deploy_qa: DeployQaConfig::default(),
+            pr_distribution: PrDistributionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
@@ -863,6 +867,70 @@ impl Default for RepetitiveDigestConfig {
             day: "monday".to_string(),
             hour: 9,
             min_event_count: 50,
+        }
+    }
+}
+
+/// Distribution of Claudear's open PRs across developers.
+///
+/// Makes one developer from the roster responsible for each open Claudear PR,
+/// pings them when the PR opens, and sends each assignee a digest of the PRs
+/// still waiting on them. The roster is every `[users]` entry with a GitHub
+/// username plus every login in the GitHub↔Discord map, minus `excluded`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrDistributionConfig {
+    /// Whether PR distribution is enabled (default: false).
+    pub enabled: bool,
+    /// Assign and ping a developer as soon as Claudear opens a PR
+    /// (default: true).
+    pub notify_on_open: bool,
+    /// Send the scheduled per-assignee digest (default: true). When false the
+    /// scheduled run still assigns unowned PRs, pinging each new assignee.
+    pub digest: bool,
+    /// How often the scheduled run fires: "daily", "weekly-monday" …
+    /// "weekly-sunday", or "monthly" (default: "daily").
+    pub digest_frequency: String,
+    /// Hour the scheduled run fires, 0-23 UTC (default: 9).
+    pub digest_hour: u32,
+    /// GitHub logins never assigned, e.g. people on leave (default: empty).
+    pub excluded: Vec<String>,
+    /// How many PRs a developer may hold above the fair share before an owner
+    /// loses a PR to someone less loaded (default: 0).
+    pub tolerance: usize,
+    /// GitHub login → Discord user map. Falls back to
+    /// `[deploy_qa] github_discord_map_path` when unset.
+    pub github_discord_map_path: Option<String>,
+}
+
+impl PrDistributionConfig {
+    /// Latest hour of the day [`Self::digest_hour`] accepts.
+    pub const LATEST_HOUR: u32 = 23;
+
+    /// Validate `[pr_distribution]`.
+    pub fn validate(&self) -> Result<()> {
+        if self.digest_hour > Self::LATEST_HOUR {
+            return Err(Error::config(format!(
+                "pr_distribution.digest_hour must be 0-{}, got {}",
+                Self::LATEST_HOUR,
+                self.digest_hour
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for PrDistributionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            notify_on_open: true,
+            digest: true,
+            digest_frequency: "daily".to_string(),
+            digest_hour: 9,
+            excluded: Vec::new(),
+            tolerance: 0,
+            github_discord_map_path: None,
         }
     }
 }
@@ -3672,6 +3740,10 @@ impl Config {
             self.deploy_qa.validate()?;
         }
 
+        if self.pr_distribution.enabled {
+            self.pr_distribution.validate()?;
+        }
+
         let has_github_token = self
             .github()
             .token
@@ -3681,6 +3753,12 @@ impl Config {
             return Err(Error::config(
                 "deploy_qa requires a GitHub token to poll release tips. \
                  Set scm.github.token or CLAUDEAR_GITHUB_TOKEN, or disable deploy_qa.",
+            ));
+        }
+        if self.pr_distribution.enabled && !has_github_token {
+            return Err(Error::config(
+                "pr_distribution reads PRs, reviews and CODEOWNERS from GitHub. \
+                 Set scm.github.token or CLAUDEAR_GITHUB_TOKEN, or disable pr_distribution.",
             ));
         }
         if has_github_code_scanning && !has_github_token {
@@ -5684,6 +5762,57 @@ monitoring_duration_hours = 12
         let unbounded = deploy_qa_with_timeout(u64::MAX);
         assert!(unbounded.backstop_timeout() >= Duration::from_secs(u64::MAX));
         assert!(unbounded.stale_run_after() >= Duration::from_secs(u64::MAX));
+    }
+
+    #[test]
+    fn test_pr_distribution_is_off_by_default() {
+        let config = Config::default();
+        assert!(!config.pr_distribution.enabled);
+        assert!(config.pr_distribution.notify_on_open);
+        assert!(config.pr_distribution.digest);
+        assert_eq!(config.pr_distribution.digest_frequency, "daily");
+        assert_eq!(config.pr_distribution.digest_hour, 9);
+        assert!(config.pr_distribution.excluded.is_empty());
+        assert_eq!(config.pr_distribution.tolerance, 0);
+        assert!(config.pr_distribution.github_discord_map_path.is_none());
+    }
+
+    #[test]
+    fn test_pr_distribution_from_toml() {
+        let config: Config = toml::from_str(
+            "[pr_distribution]\n\
+             enabled = true\n\
+             notify_on_open = false\n\
+             digest_frequency = \"weekly-monday\"\n\
+             digest_hour = 14\n\
+             excluded = [\"alice\"]\n\
+             tolerance = 2\n\
+             github_discord_map_path = \"/etc/claudear/map.json\"\n",
+        )
+        .expect("parse");
+        let distribution = config.pr_distribution;
+        assert!(distribution.enabled);
+        assert!(!distribution.notify_on_open);
+        assert!(distribution.digest);
+        assert_eq!(distribution.digest_frequency, "weekly-monday");
+        assert_eq!(distribution.digest_hour, 14);
+        assert_eq!(distribution.excluded, vec!["alice".to_string()]);
+        assert_eq!(distribution.tolerance, 2);
+        assert_eq!(
+            distribution.github_discord_map_path.as_deref(),
+            Some("/etc/claudear/map.json")
+        );
+    }
+
+    #[test]
+    fn test_pr_distribution_rejects_an_hour_past_the_day() {
+        let mut distribution = PrDistributionConfig {
+            digest_hour: PrDistributionConfig::LATEST_HOUR,
+            ..PrDistributionConfig::default()
+        };
+        assert!(distribution.validate().is_ok());
+        distribution.digest_hour = PrDistributionConfig::LATEST_HOUR + 1;
+        assert!(distribution.validate().is_err());
     }
 
     #[test]
@@ -8689,6 +8818,49 @@ sms_number = "+1111111111"
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("github_code_scanning"), "{error}");
         assert!(error.contains("GitHub token"), "{error}");
+    }
+
+    fn pr_distribution_enabled() -> PrDistributionConfig {
+        PrDistributionConfig {
+            enabled: true,
+            ..PrDistributionConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_validation_pr_distribution_requires_github_token() {
+        let config = Config {
+            scm: scm_with_github_token(None),
+            pr_distribution: pr_distribution_enabled(),
+            ..config_with_linear()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("pr_distribution"), "{error}");
+        assert!(error.contains("scm.github.token"), "{error}");
+
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            pr_distribution: pr_distribution_enabled(),
+            ..config_with_linear()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_pr_distribution_checks_the_hour_only_when_enabled() {
+        let mut config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            pr_distribution: PrDistributionConfig {
+                digest_hour: 24,
+                ..PrDistributionConfig::default()
+            },
+            ..config_with_linear()
+        };
+        assert!(config.validate().is_ok());
+
+        config.pr_distribution.enabled = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("digest_hour"), "{error}");
     }
 
     #[test]

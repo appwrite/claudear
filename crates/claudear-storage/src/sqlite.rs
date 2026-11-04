@@ -9,7 +9,7 @@ use super::types::{
 use super::{
     is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
     DeployQaStore, DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
-    RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
+    PrAssignmentStore, RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
 };
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
@@ -4729,6 +4729,34 @@ impl DeployQaStore for SqliteTracker {
     }
 }
 
+impl PrAssignmentStore for SqliteTracker {
+    fn active_pr_assignments(&self) -> Result<Vec<claudear_core::types::PrAssignment>> {
+        SqliteTracker::active_pr_assignments(self)
+    }
+
+    fn active_pr_assignment(
+        &self,
+        pr_url: &str,
+    ) -> Result<Option<claudear_core::types::PrAssignment>> {
+        SqliteTracker::active_pr_assignment(self, pr_url)
+    }
+
+    fn record_pr_assignment(
+        &self,
+        assignment: &claudear_core::types::PrAssignment,
+    ) -> Result<Option<claudear_core::types::PrAssignment>> {
+        SqliteTracker::record_pr_assignment(self, assignment)
+    }
+
+    fn end_pr_assignment(
+        &self,
+        id: i64,
+        status: claudear_core::types::AssignmentStatus,
+    ) -> Result<bool> {
+        SqliteTracker::end_pr_assignment(self, id, status)
+    }
+}
+
 impl ChatStore for SqliteTracker {
     fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
         SqliteTracker::create_chat_session(self, id, repo_id)
@@ -8341,7 +8369,120 @@ impl SqliteTracker {
     }
 }
 
+const PR_ASSIGNMENT_COLUMNS: &str =
+    "id, pr_url, repo, pr_number, assignee, reason, score, status, assigned_at, ended_at";
+
 impl SqliteTracker {
+    fn row_to_pr_assignment(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<claudear_core::types::PrAssignment> {
+        fn parse<T: std::str::FromStr<Err = String>>(
+            row: &rusqlite::Row<'_>,
+            column: usize,
+        ) -> rusqlite::Result<T> {
+            row.get::<_, String>(column)?.parse::<T>().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })
+        }
+        let ended_at = row
+            .get::<_, Option<String>>(9)?
+            .map(|value| Self::parse_datetime(&value))
+            .transpose()?;
+        Ok(claudear_core::types::PrAssignment {
+            id: row.get(0)?,
+            pr_url: row.get(1)?,
+            repo: row.get(2)?,
+            pr_number: row.get(3)?,
+            assignee: row.get(4)?,
+            reason: parse(row, 5)?,
+            score: row.get(6)?,
+            status: parse(row, 7)?,
+            assigned_at: Self::parse_datetime(&row.get::<_, String>(8)?)?,
+            ended_at,
+        })
+    }
+
+    /// Every active PR assignment, oldest first.
+    pub fn active_pr_assignments(&self) -> Result<Vec<claudear_core::types::PrAssignment>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PR_ASSIGNMENT_COLUMNS} FROM pr_assignments \
+             WHERE status = 'active' ORDER BY assigned_at, id"
+        ))?;
+        let rows = stmt.query_map([], Self::row_to_pr_assignment)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The active assignment of `pr_url`, if it has one.
+    pub fn active_pr_assignment(
+        &self,
+        pr_url: &str,
+    ) -> Result<Option<claudear_core::types::PrAssignment>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PR_ASSIGNMENT_COLUMNS} FROM pr_assignments \
+             WHERE pr_url = ?1 AND status = 'active'"
+        ))?;
+        Ok(stmt
+            .query_row(params![pr_url], Self::row_to_pr_assignment)
+            .optional()?)
+    }
+
+    /// Record `assignment` as its PR's active assignment, or return `None`
+    /// when the PR already has one.
+    pub fn record_pr_assignment(
+        &self,
+        assignment: &claudear_core::types::PrAssignment,
+    ) -> Result<Option<claudear_core::types::PrAssignment>> {
+        let conn = self.acquire_lock()?;
+        let inserted = conn.execute(
+            r#"
+            INSERT OR IGNORE INTO pr_assignments
+                (pr_url, repo, pr_number, assignee, reason, score, status, assigned_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)
+            "#,
+            params![
+                assignment.pr_url,
+                assignment.repo,
+                assignment.pr_number,
+                assignment.assignee,
+                assignment.reason.to_string(),
+                assignment.score,
+                assignment.assigned_at.to_rfc3339(),
+            ],
+        )?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PR_ASSIGNMENT_COLUMNS} FROM pr_assignments WHERE id = ?1"
+        ))?;
+        Ok(Some(stmt.query_row(
+            params![conn.last_insert_rowid()],
+            Self::row_to_pr_assignment,
+        )?))
+    }
+
+    /// End the active assignment `id` with `status`, returning whether it was
+    /// still active.
+    pub fn end_pr_assignment(
+        &self,
+        id: i64,
+        status: claudear_core::types::AssignmentStatus,
+    ) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let ended = conn.execute(
+            "UPDATE pr_assignments SET status = ?1, ended_at = ?2 \
+             WHERE id = ?3 AND status = 'active'",
+            params![status.to_string(), Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(ended > 0)
+    }
+
     /// System 1: Update learnings text on a feedback outcome.
     pub fn update_feedback_learnings(&self, outcome_id: i64, learnings: &str) -> Result<()> {
         let conn = self.acquire_lock()?;
@@ -11782,6 +11923,137 @@ mod tests {
 
         let watch_id = tracker.create_regression_watch(&watch).unwrap();
         assert!(watch_id > 0);
+    }
+
+    #[test]
+    fn test_pr_assignment_round_trips() {
+        use claudear_core::types::{AssignmentReason, AssignmentStatus, PrAssignment};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let assignment = PrAssignment::new(
+            "https://github.com/org/repo/pull/7",
+            "org/repo",
+            7,
+            "alice",
+            AssignmentReason::CodeOwner,
+            32.5,
+        );
+
+        let stored = tracker.record_pr_assignment(&assignment).unwrap().unwrap();
+
+        assert!(stored.id > 0);
+        assert_eq!(stored.assignee, "alice");
+        assert_eq!(stored.reason, AssignmentReason::CodeOwner);
+        assert_eq!(stored.score, 32.5);
+        assert_eq!(stored.status, AssignmentStatus::Active);
+        assert_eq!(
+            stored.assigned_at.timestamp(),
+            assignment.assigned_at.timestamp()
+        );
+        assert_eq!(
+            tracker
+                .active_pr_assignment(&assignment.pr_url)
+                .unwrap()
+                .unwrap(),
+            stored
+        );
+        assert_eq!(tracker.active_pr_assignments().unwrap(), vec![stored]);
+    }
+
+    #[test]
+    fn test_pr_assignment_allows_one_active_per_pr() {
+        use claudear_core::types::{AssignmentReason, PrAssignment};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let url = "https://github.com/org/repo/pull/7";
+        let first = PrAssignment::new(url, "org/repo", 7, "alice", AssignmentReason::Load, 0.0);
+        let second = PrAssignment::new(url, "org/repo", 7, "bob", AssignmentReason::Load, 0.0);
+
+        assert!(tracker.record_pr_assignment(&first).unwrap().is_some());
+        assert!(tracker.record_pr_assignment(&second).unwrap().is_none());
+        assert_eq!(
+            tracker.active_pr_assignment(url).unwrap().unwrap().assignee,
+            "alice"
+        );
+    }
+
+    #[test]
+    fn test_ended_pr_assignment_frees_the_pr_and_keeps_history() {
+        use claudear_core::types::{AssignmentReason, AssignmentStatus, PrAssignment};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let url = "https://github.com/org/repo/pull/7";
+        let first = tracker
+            .record_pr_assignment(&PrAssignment::new(
+                url,
+                "org/repo",
+                7,
+                "alice",
+                AssignmentReason::Requester,
+                100.0,
+            ))
+            .unwrap()
+            .unwrap();
+
+        assert!(tracker
+            .end_pr_assignment(first.id, AssignmentStatus::Released)
+            .unwrap());
+        assert!(!tracker
+            .end_pr_assignment(first.id, AssignmentStatus::Closed)
+            .unwrap());
+        assert!(tracker.active_pr_assignment(url).unwrap().is_none());
+        assert!(tracker.active_pr_assignments().unwrap().is_empty());
+
+        let second = tracker
+            .record_pr_assignment(&PrAssignment::new(
+                url,
+                "org/repo",
+                7,
+                "bob",
+                AssignmentReason::Load,
+                0.0,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.assignee, "bob");
+
+        let (status, ended): (String, Option<String>) = tracker
+            .acquire_lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, ended_at FROM pr_assignments WHERE id = ?1",
+                params![first.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "released");
+        assert!(ended.is_some());
+    }
+
+    #[test]
+    fn test_pr_assignment_unknown_reason_is_an_error() {
+        use claudear_core::types::{AssignmentReason, PrAssignment};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let url = "https://github.com/org/repo/pull/7";
+        tracker
+            .record_pr_assignment(&PrAssignment::new(
+                url,
+                "org/repo",
+                7,
+                "alice",
+                AssignmentReason::Load,
+                0.0,
+            ))
+            .unwrap();
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute("UPDATE pr_assignments SET reason = 'unrecognised'", [])
+            .unwrap();
+
+        assert!(tracker.active_pr_assignment(url).is_err());
+        assert!(tracker.active_pr_assignments().is_err());
     }
 
     #[test]

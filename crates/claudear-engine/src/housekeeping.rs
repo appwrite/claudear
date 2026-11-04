@@ -1,7 +1,7 @@
 //! Standalone housekeeping worker for periodic background tasks.
 //!
 //! Runs retries, PR merge cascades, release cascades, auto-close, reviews,
-//! learning, and regression monitoring on a timer — independently of the
+//! learning, regression monitoring, and PR distribution on a timer — independently of the
 //! polling loop in [`Watcher::start`].  Used by `Commands::Webhook` and
 //! `Commands::Start` (when polling is disabled) so that housekeeping runs
 //! regardless of how issues are ingested.
@@ -68,6 +68,7 @@ impl HousekeepingWorker {
         // exact hour + a 6-day window, so a duplicate is only possible if the
         // daemon restarts during the target hour on the target weekday.
         let mut digest_schedule = self.watcher.repetitive_digest_schedule();
+        let mut distribution_schedule = self.watcher.pr_distribution_schedule();
 
         while self.watcher.is_running() {
             timer.tick().await;
@@ -153,12 +154,27 @@ impl HousekeepingWorker {
                 }
             };
 
-            let (_, _, housekeeping_ok, _, _) = tokio::join!(
+            let distribution_fut = async {
+                if !self.watcher.is_dry_run() {
+                    if let Some(schedule) = distribution_schedule.as_mut() {
+                        let now = Utc::now();
+                        if schedule.is_due(now) {
+                            if let Err(e) = self.watcher.distribute_pull_requests().await {
+                                tracing::error!(component = "pr_distribution", error = %e, "Error distributing open PRs");
+                            }
+                            schedule.last_sent_at = Some(now);
+                        }
+                    }
+                }
+            };
+
+            let (_, _, housekeeping_ok, _, _, _) = tokio::join!(
                 auto_close_fut,
                 reviews_fut,
                 housekeeping_fut,
                 learning_fut,
-                digest_fut
+                digest_fut,
+                distribution_fut
             );
 
             let duration_secs = cron_start.elapsed().as_secs_f64();
