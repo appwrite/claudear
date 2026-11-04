@@ -4,6 +4,10 @@
 //! with and their recent release tips. Admins can read and rewrite the
 //! `[deploy_qa]` section of `claudear.toml`; nothing reloads at runtime, so a
 //! change only applies after a restart and the API reports when one is due.
+//!
+//! `GET /api/deploy-qa/tips` returns at most [`MAX_TIPS_PAGE`] tips however
+//! large a `limit` it is asked for, and [`DEFAULT_TIPS_LIMIT`] without one;
+//! `limit=0` returns none.
 
 use super::auth::{check_api_rate_limit, AdminUser, AuthUser};
 use super::config_file::{self, ConfigFileError};
@@ -22,6 +26,8 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 const DEFAULT_TIPS_LIMIT: usize = 50;
+
+const MAX_TIPS_PAGE: usize = 100;
 
 const DISCORD_CHANNELS_URL: &str = "https://discord.com/channels";
 
@@ -426,16 +432,19 @@ pub(super) async fn tips_handler(
     Query(query): Query<DeployQaTipsQuery>,
 ) -> Result<Json<DeployQaTipsResponse>, StatusCode> {
     let track = query.track.as_deref().filter(|track| !track.is_empty());
-    let limit = query.limit.unwrap_or(DEFAULT_TIPS_LIMIT);
     let links = DiscordLinks::new(&state);
     let tips = state
         .tracker
-        .list_deploy_qa_tips(track, limit)
+        .list_deploy_qa_tips(track, tips_page_size(query.limit))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .into_iter()
         .map(|tip| links.view(tip))
         .collect();
     Ok(Json(DeployQaTipsResponse { tips }))
+}
+
+fn tips_page_size(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_TIPS_LIMIT).min(MAX_TIPS_PAGE)
 }
 
 /// `GET /api/deploy-qa/config` — the `[deploy_qa]` section as written in
@@ -857,6 +866,39 @@ mod tests {
         assert_eq!(tags(&body), ["1.1.0", "2.0.0"]);
         let (_, body) = app.get("/api/deploy-qa/tips?track=cloud&limit=1").await;
         assert_eq!(tags(&body), ["1.1.0"]);
+    }
+
+    #[tokio::test]
+    async fn tips_pages_are_bounded_however_large_a_limit_is_asked_for() {
+        let app = app("viewer");
+        for index in 0..MAX_TIPS_PAGE + 20 {
+            let tip = DeployQaTip::new("cloud", "acme/cloud", format!("1.0.{index}"));
+            app.tracker.upsert_deploy_qa_tip(&tip).unwrap();
+        }
+        let page_length = |body: &Value| body["tips"].as_array().unwrap().len();
+
+        for uri in [
+            "/api/deploy-qa/tips?limit=1000000",
+            "/api/deploy-qa/tips?limit=18446744073709551615",
+        ] {
+            let (status, body) = app.get(uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(page_length(&body), MAX_TIPS_PAGE, "{uri}");
+        }
+        let (_, body) = app.get("/api/deploy-qa/tips").await;
+        assert_eq!(page_length(&body), DEFAULT_TIPS_LIMIT);
+        let (_, body) = app.get("/api/deploy-qa/tips?limit=0").await;
+        assert_eq!(page_length(&body), 0);
+    }
+
+    #[test]
+    fn tips_page_size_never_asks_storage_for_more_than_a_page() {
+        assert_eq!(tips_page_size(Some(1_000_000)), MAX_TIPS_PAGE);
+        assert_eq!(tips_page_size(Some(usize::MAX)), MAX_TIPS_PAGE);
+        assert_eq!(tips_page_size(Some(MAX_TIPS_PAGE)), MAX_TIPS_PAGE);
+        assert_eq!(tips_page_size(Some(7)), 7);
+        assert_eq!(tips_page_size(Some(0)), 0);
+        assert_eq!(tips_page_size(None), DEFAULT_TIPS_LIMIT);
     }
 
     #[test]
