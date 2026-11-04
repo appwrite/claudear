@@ -86,6 +86,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "fix_attempt_heartbeat",
         sql: include_str!("../../../migrations/V14__fix_attempt_heartbeat.sql"),
     },
+    Migration {
+        version: 15,
+        name: "security_inbox",
+        sql: include_str!("../../../migrations/V15__security_inbox.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -254,6 +259,79 @@ mod tests {
 
         assert_eq!(applied_version(&conn), latest_version());
         assert_eq!(applied_count(&conn), MIGRATIONS.len());
+    }
+
+    fn unique_constraint_columns(connection: &Connection, table: &str) -> Vec<Vec<String>> {
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM pragma_index_list(?1) WHERE \"unique\" = 1 AND origin = 'u' ORDER BY name",
+            )
+            .unwrap();
+        let indexes: Vec<String> = statement
+            .query_map([table], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        indexes
+            .iter()
+            .map(|index| {
+                let mut statement = connection
+                    .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                    .unwrap();
+                statement
+                    .query_map([index], |row| row.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_security_inbox_schema() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+
+        for table in [
+            "security_vulnerabilities",
+            "security_reports",
+            "security_events",
+            "security_replies",
+            "security_awards",
+        ] {
+            let count: u32 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Table '{table}' should exist");
+        }
+
+        assert_eq!(
+            unique_constraint_columns(&connection, "security_reports"),
+            vec![vec!["source".to_string(), "conversation_id".to_string()]]
+        );
+        assert_eq!(
+            unique_constraint_columns(&connection, "security_replies"),
+            vec![vec!["report_id".to_string(), "kind".to_string()]]
+        );
+        assert_eq!(
+            unique_constraint_columns(&connection, "security_awards"),
+            vec![vec!["vulnerability_id".to_string()]]
+        );
+
+        let defaulted_timestamps: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master AS tables, pragma_table_info(tables.name) AS columns
+                 WHERE tables.type = 'table' AND tables.name LIKE 'security_%'
+                   AND columns.name LIKE '%_at' AND columns.dflt_value IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(defaulted_timestamps, 0);
     }
 
     #[test]

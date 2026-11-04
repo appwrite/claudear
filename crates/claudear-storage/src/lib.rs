@@ -27,7 +27,13 @@ pub use types::{
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 
 use chrono::{DateTime, Utc};
-use claudear_core::error::Result;
+use claudear_core::error::{Error, Result};
+use claudear_core::security::{
+    AwardStatus, DeliveryStatus, NewSecurityAward, NewSecurityEvent, NewSecurityReport,
+    NewSecurityVulnerability, SecurityAward, SecurityEvent, SecurityEventKind, SecurityReply,
+    SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportFilter,
+    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityChanges, VulnerabilityState,
+};
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, DeployQaTip, DeployQaTipStatus,
     ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, IssueTimeline,
@@ -1951,6 +1957,212 @@ pub trait DeployQaStore: Send + Sync {
     }
 }
 
+/// Security inbox reports, canonical vulnerabilities, reply ledger and awards.
+///
+/// Every state change writes its event row in the same transaction, and every
+/// transition is a compare-and-set on the expected state, so concurrent
+/// pollers and admins never apply the same step twice.
+pub trait SecurityReportStore: Send + Sync {
+    /// Insert a `Received` report (with its `Received` event), or return the
+    /// existing row for `(source, conversation_id)` unchanged.
+    fn upsert_security_report(&self, _report: &NewSecurityReport) -> Result<SecurityReport> {
+        Err(Error::Other("unsupported".to_string()))
+    }
+
+    fn get_security_report(&self, _id: i64) -> Result<Option<SecurityReport>> {
+        Ok(None)
+    }
+
+    fn get_security_report_by_conversation(
+        &self,
+        _source: &str,
+        _conversation_id: &str,
+    ) -> Result<Option<SecurityReport>> {
+        Ok(None)
+    }
+
+    /// Newest first; at most `filter.limit` rows (default 100).
+    fn list_security_reports(&self, _filter: &SecurityReportFilter) -> Result<Vec<SecurityReport>> {
+        Ok(Vec::new())
+    }
+
+    /// Oldest first.
+    fn list_reports_for_vulnerability(
+        &self,
+        _vulnerability_id: i64,
+    ) -> Result<Vec<SecurityReport>> {
+        Ok(Vec::new())
+    }
+
+    /// Move a report from `expected` to `next`, applying `changes`, returning
+    /// whether it moved. Nothing is written when the edge is not allowed or
+    /// the report is no longer in `expected`.
+    fn transition_security_report(
+        &self,
+        _id: i64,
+        _expected: SecurityReportState,
+        _next: SecurityReportState,
+        _changes: &SecurityReportChanges,
+        _event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Return every report left `Assessing` for longer than `stale_after` to
+    /// `Received`, counting the abandoned attempt.
+    fn release_stale_security_assessments(&self, _stale_after: Duration) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Record a reporter follow-up when the stored thread count is still
+    /// `expected_count` and `new_count` is higher.
+    fn record_security_follow_up(
+        &self,
+        _id: i64,
+        _expected_count: u32,
+        _new_count: u32,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn record_security_event(
+        &self,
+        _report_id: Option<i64>,
+        _vulnerability_id: Option<i64>,
+        _event: &NewSecurityEvent,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// The report's events plus its vulnerability's, oldest first.
+    fn list_security_timeline(&self, _report_id: i64) -> Result<Vec<SecurityEvent>> {
+        Ok(Vec::new())
+    }
+
+    fn last_security_event(
+        &self,
+        _vulnerability_id: i64,
+        _kind: SecurityEventKind,
+    ) -> Result<Option<SecurityEvent>> {
+        Ok(None)
+    }
+
+    /// Reports in `Assessing` whose latest event is `AdminConfirmed`, with that event.
+    fn list_admin_confirmed_reports(&self) -> Result<Vec<(SecurityReport, SecurityEvent)>> {
+        Ok(Vec::new())
+    }
+
+    /// Create a vulnerability in an initial state (with its
+    /// `VulnerabilityCreated` event).
+    fn create_security_vulnerability(
+        &self,
+        _vulnerability: &NewSecurityVulnerability,
+    ) -> Result<SecurityVulnerability> {
+        Err(Error::Other("unsupported".to_string()))
+    }
+
+    fn get_security_vulnerability(&self, _id: i64) -> Result<Option<SecurityVulnerability>> {
+        Ok(None)
+    }
+
+    /// Oldest first, optionally only those in `state`.
+    fn list_security_vulnerabilities(
+        &self,
+        _state: Option<VulnerabilityState>,
+    ) -> Result<Vec<SecurityVulnerability>> {
+        Ok(Vec::new())
+    }
+
+    /// Move a vulnerability from `expected` to `next`, applying `changes`,
+    /// returning whether it moved.
+    fn transition_security_vulnerability(
+        &self,
+        _id: i64,
+        _expected: VulnerabilityState,
+        _next: VulnerabilityState,
+        _changes: &SecurityVulnerabilityChanges,
+        _event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Make `report_id` the first reporter while `expected_first_report_id`
+    /// still is, `reported_at` is strictly earlier, and no award exists.
+    fn replace_first_reporter(
+        &self,
+        _vulnerability_id: i64,
+        _expected_first_report_id: i64,
+        _report_id: i64,
+        _reported_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Claim a reply for sending: true for a new claim or a re-claim of a
+    /// `Failed` reply; false while one is sending, sent or unconfirmed.
+    fn claim_security_reply(&self, _report_id: i64, _kind: SecurityReplyKind) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Finish a claimed reply as `Sent`, `Failed` or `Unconfirmed`.
+    fn complete_security_reply(
+        &self,
+        _report_id: i64,
+        _kind: SecurityReplyKind,
+        _status: DeliveryStatus,
+        _error: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Resolve an `Unconfirmed` reply after an admin checked the mailbox.
+    fn confirm_security_reply(
+        &self,
+        _report_id: i64,
+        _kind: SecurityReplyKind,
+        _delivered: bool,
+        _actor: &str,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn list_security_replies(&self, _report_id: i64) -> Result<Vec<SecurityReply>> {
+        Ok(Vec::new())
+    }
+
+    /// Prepare the vulnerability's only award, and only for its current
+    /// first reporter.
+    fn prepare_security_award(
+        &self,
+        _vulnerability_id: i64,
+        _report_id: i64,
+        _award: &NewSecurityAward,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Move the award to `next` when its status is one of `expected` and the
+    /// edge is allowed, recording `next`'s event.
+    fn update_security_award_status(
+        &self,
+        _vulnerability_id: i64,
+        _expected: &[AwardStatus],
+        _next: AwardStatus,
+        _actor: Option<&str>,
+        _note: Option<&str>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn get_security_award(&self, _vulnerability_id: i64) -> Result<Option<SecurityAward>> {
+        Ok(None)
+    }
+
+    fn list_security_awards(&self, _status: Option<AwardStatus>) -> Result<Vec<SecurityAward>> {
+        Ok(Vec::new())
+    }
+}
+
 /// Regression watches and checks (all defaulted).
 pub trait RegressionStore: Send + Sync {
     /// Get regression watches by status.
@@ -2044,7 +2256,7 @@ pub trait ChatStore: Send + Sync {
     }
 }
 
-/// Supertrait combining all 12 sub-traits. Auto-implemented for any type
+/// Supertrait combining all sub-traits. Auto-implemented for any type
 /// that implements all sub-traits via the blanket impl below.
 pub trait FixAttemptTracker:
     AttemptTracker
@@ -2059,6 +2271,7 @@ pub trait FixAttemptTracker:
     + UserStore
     + RegressionStore
     + DeployQaStore
+    + SecurityReportStore
     + ChatStore
     + DiscordStore
 {
@@ -2077,6 +2290,7 @@ impl<T> FixAttemptTracker for T where
         + UserStore
         + RegressionStore
         + DeployQaStore
+        + SecurityReportStore
         + ChatStore
         + DiscordStore
 {
@@ -2168,6 +2382,7 @@ impl RepoStore for NoopTracker {}
 impl UserStore for NoopTracker {}
 impl RegressionStore for NoopTracker {}
 impl DeployQaStore for NoopTracker {}
+impl SecurityReportStore for NoopTracker {}
 impl ChatStore for NoopTracker {}
 impl DiscordStore for NoopTracker {}
 
@@ -2353,6 +2568,7 @@ mod tests {
         impl UserStore for FullTracker {}
         impl RegressionStore for FullTracker {}
         impl DeployQaStore for FullTracker {}
+        impl SecurityReportStore for FullTracker {}
         impl ChatStore for FullTracker {}
         impl DiscordStore for FullTracker {}
 
@@ -3057,6 +3273,137 @@ mod tests {
                 created_at: Utc::now(),
             };
             assert_eq!(t.record_regression_check(&check).unwrap(), 0);
+        }
+    }
+
+    mod security_report_store_defaults {
+        use super::*;
+
+        mock_for_subtrait!(MockSecurity, SecurityReportStore);
+
+        fn new_report() -> NewSecurityReport {
+            NewSecurityReport {
+                source: "helpscout".to_string(),
+                conversation_id: "1".to_string(),
+                short_id: "HS-1".to_string(),
+                mailbox_id: "249891".to_string(),
+                url: String::new(),
+                subject: String::new(),
+                reporter_email: None,
+                reporter_customer_id: None,
+                reported_at: Utc::now(),
+                customer_thread_count: 1,
+            }
+        }
+
+        #[test]
+        fn test_default_creators_are_unsupported() {
+            let store = MockSecurity;
+            assert!(store.upsert_security_report(&new_report()).is_err());
+            let vulnerability = NewSecurityVulnerability {
+                title: String::new(),
+                summary: String::new(),
+                embedding: Vec::new(),
+                repository: None,
+                severity: None,
+                state: VulnerabilityState::AwaitingFix,
+                first_report_id: 1,
+                first_reported_at: Utc::now(),
+                merge_commit: None,
+                merged_at: None,
+            };
+            assert!(store.create_security_vulnerability(&vulnerability).is_err());
+        }
+
+        #[test]
+        fn test_default_reads_are_empty() {
+            let store = MockSecurity;
+            assert!(store.get_security_report(1).unwrap().is_none());
+            assert!(store
+                .get_security_report_by_conversation("helpscout", "1")
+                .unwrap()
+                .is_none());
+            assert!(store
+                .list_security_reports(&SecurityReportFilter::default())
+                .unwrap()
+                .is_empty());
+            assert!(store.list_reports_for_vulnerability(1).unwrap().is_empty());
+            assert!(store.list_security_timeline(1).unwrap().is_empty());
+            assert!(store
+                .last_security_event(1, SecurityEventKind::Live)
+                .unwrap()
+                .is_none());
+            assert!(store.list_admin_confirmed_reports().unwrap().is_empty());
+            assert!(store.get_security_vulnerability(1).unwrap().is_none());
+            assert!(store
+                .list_security_vulnerabilities(None)
+                .unwrap()
+                .is_empty());
+            assert!(store.list_security_replies(1).unwrap().is_empty());
+            assert!(store.get_security_award(1).unwrap().is_none());
+            assert!(store.list_security_awards(None).unwrap().is_empty());
+        }
+
+        #[test]
+        fn test_default_writes_change_nothing() {
+            let store = MockSecurity;
+            let event = NewSecurityEvent::new(SecurityEventKind::AssessmentStarted);
+            assert!(!store
+                .transition_security_report(
+                    1,
+                    SecurityReportState::Received,
+                    SecurityReportState::Assessing,
+                    &SecurityReportChanges::default(),
+                    &event,
+                )
+                .unwrap());
+            assert!(!store
+                .transition_security_vulnerability(
+                    1,
+                    VulnerabilityState::AwaitingFix,
+                    VulnerabilityState::Fixing,
+                    &SecurityVulnerabilityChanges::default(),
+                    &event,
+                )
+                .unwrap());
+            assert_eq!(
+                store
+                    .release_stale_security_assessments(Duration::from_secs(1))
+                    .unwrap(),
+                0
+            );
+            assert!(!store.record_security_follow_up(1, 1, 2).unwrap());
+            assert!(store.record_security_event(Some(1), None, &event).is_ok());
+            assert!(!store.replace_first_reporter(1, 1, 2, Utc::now()).unwrap());
+            assert!(!store
+                .claim_security_reply(1, SecurityReplyKind::Confirmed)
+                .unwrap());
+            assert!(store
+                .complete_security_reply(
+                    1,
+                    SecurityReplyKind::Confirmed,
+                    DeliveryStatus::Sent,
+                    None
+                )
+                .is_ok());
+            assert!(!store
+                .confirm_security_reply(1, SecurityReplyKind::Confirmed, true, "admin")
+                .unwrap());
+            let award = NewSecurityAward {
+                recipient_email: None,
+                campaign: "SecurityResearchers".to_string(),
+                credits: 100,
+            };
+            assert!(!store.prepare_security_award(1, 1, &award).unwrap());
+            assert!(!store
+                .update_security_award_status(
+                    1,
+                    &[AwardStatus::Prepared],
+                    AwardStatus::Awarded,
+                    None,
+                    None,
+                )
+                .unwrap());
         }
     }
 
@@ -3911,10 +4258,6 @@ mod tests {
             assert!(t.add_dependency("upstream", "downstream", "npm").is_ok());
         }
     }
-
-    // -------------------------------------------------------------------
-    // parse_pr_url tests
-    // -------------------------------------------------------------------
 
     #[test]
     fn test_parse_pr_url_github() {
