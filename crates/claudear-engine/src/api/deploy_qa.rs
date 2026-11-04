@@ -19,12 +19,15 @@ use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 
 const DEFAULT_TIPS_LIMIT: usize = 50;
 
 const DISCORD_CHANNELS_URL: &str = "https://discord.com/channels";
 
 const SECTION: &str = "deploy_qa";
+
+static STATUS_FAILURES: FailureLog = FailureLog::new();
 
 const SAVED_MESSAGE: &str =
     "Saved to claudear.toml (rewritten in normalised form). Restart claudear to apply.";
@@ -278,8 +281,35 @@ struct DiskSection {
     revision: String,
 }
 
+/// The last failure reported, so a poll repeating it is not logged as new.
+struct FailureLog {
+    last: Mutex<Option<String>>,
+}
+
+impl FailureLog {
+    const fn new() -> Self {
+        Self {
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Record `message`, returning whether it differs from the last one.
+    fn record(&self, message: &str) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.as_deref() == Some(message) {
+            return false;
+        }
+        *last = Some(message.to_string());
+        true
+    }
+
+    fn clear(&self) {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
 async fn read_disk_section(path: &Path) -> Result<DiskSection, ConfigFileError> {
-    let bytes = match tokio::fs::read(path).await {
+    let bytes = match config_file::read_locked(path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
@@ -290,8 +320,12 @@ async fn read_disk_section(path: &Path) -> Result<DiskSection, ConfigFileError> 
     };
     let content = std::str::from_utf8(&bytes)
         .map_err(|error| ConfigFileError::unreadable(format!("Failed to read config: {error}")))?;
-    let document: toml::Value = toml::from_str(content)
-        .map_err(|error| ConfigFileError::unreadable(format!("Invalid on-disk config: {error}")))?;
+    let document: toml::Value = toml::from_str(content).map_err(|error| {
+        ConfigFileError::unreadable(format!(
+            "Invalid on-disk config: {}",
+            config_file::describe_toml_error(&error, content)
+        ))
+    })?;
     Ok(DiskSection {
         config: section_config(&document)?,
         revision: config_file::revision(&bytes),
@@ -301,7 +335,10 @@ async fn read_disk_section(path: &Path) -> Result<DiskSection, ConfigFileError> 
 fn section_config(document: &toml::Value) -> Result<DeployQaConfig, ConfigFileError> {
     match document.get(SECTION) {
         Some(section) => section.clone().try_into().map_err(|error| {
-            ConfigFileError::unreadable(format!("Invalid on-disk [{SECTION}]: {error}"))
+            ConfigFileError::unreadable(format!(
+                "Invalid on-disk [{SECTION}]: {}",
+                config_file::describe_toml_error(&error, "")
+            ))
         }),
         None => Ok(DeployQaConfig::default()),
     }
@@ -323,16 +360,29 @@ pub(super) async fn status_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<DeployQaStatus>, StatusCode> {
-    let restart_required = read_disk_section(&state.config_path)
+    let restart_required = match read_disk_section(&state.config_path)
         .await
         .and_then(|disk| restart_required(&state, &disk.config))
-        .unwrap_or_else(|error| {
-            tracing::warn!(
-                error = %error.message,
-                "Failed to compare deploy_qa with claudear.toml"
-            );
+    {
+        Ok(restart_required) => {
+            STATUS_FAILURES.clear();
+            restart_required
+        }
+        Err(error) => {
+            if STATUS_FAILURES.record(&error.message) {
+                tracing::warn!(
+                    error = %error.message,
+                    "Failed to compare deploy_qa with claudear.toml"
+                );
+            } else {
+                tracing::debug!(
+                    error = %error.message,
+                    "Failed to compare deploy_qa with claudear.toml"
+                );
+            }
             false
-        });
+        }
+    };
 
     let links = DiscordLinks::new(&state);
     let running = &state.config.deploy_qa;
@@ -429,7 +479,7 @@ pub(super) async fn put_config_handler(
     }
     let result = match body {
         Ok(Json(update)) => save(&state, update).await,
-        Err(rejection) => Err(ConfigFileError::invalid(rejection.body_text())),
+        Err(rejection) => Err(ConfigFileError::rejected(&rejection)),
     };
     match result {
         Ok(saved) => Json(saved).into_response(),
@@ -442,15 +492,19 @@ async fn save(
     update: DeployQaConfigUpdate,
 ) -> Result<DeployQaSaveResponse, ConfigFileError> {
     let config = DeployQaConfig::try_from(update.settings)?;
-    let mut document = config_file::read_document(&state.config_path).await?;
-    let table = document.as_table_mut().ok_or_else(|| {
-        ConfigFileError::unreadable("Invalid on-disk config: the document is not a table")
-    })?;
-    table.insert(SECTION.to_string(), section_value(&config)?);
-
-    let outcome =
-        config_file::write_validated(&state.config_path, document, update.revision.as_deref())
-            .await?;
+    let section = section_value(&config)?;
+    let outcome = config_file::write_validated(
+        &state.config_path,
+        update.revision.as_deref(),
+        move |mut document| {
+            let table = document.as_table_mut().ok_or_else(|| {
+                ConfigFileError::unreadable("Invalid on-disk config: the document is not a table")
+            })?;
+            table.insert(SECTION.to_string(), section);
+            Ok(document)
+        },
+    )
+    .await?;
     let written = section_config(&outcome.normalized)?;
 
     Ok(DeployQaSaveResponse {
@@ -1019,5 +1073,124 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "invalid");
         assert!(body["error"].is_string());
+    }
+
+    const UNQUOTED_SECRET_FILE: &str =
+        "workspace = \"/tmp/repos\"\n[scm.github]\ntoken = fake-secret-unquoted\n";
+
+    #[tokio::test]
+    async fn an_unparseable_disk_file_is_reported_without_its_lines() {
+        let app = app("admin");
+        std::fs::write(&app.path, UNQUOTED_SECRET_FILE).unwrap();
+
+        let (status, body) = app.get("/api/deploy-qa/config").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["code"], "unreadable");
+        assert!(!body.to_string().contains("fake-secret-unquoted"), "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("(line 3)"),
+            "{body}"
+        );
+
+        let (status, body) = app.put_settings(settings_with_tracks(json!([]))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.to_string().contains("fake-secret-unquoted"), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(&app.path).unwrap(),
+            UNQUOTED_SECRET_FILE
+        );
+
+        let (status, body) = app.get("/api/deploy-qa").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["restart_required"], false);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_disk_section_is_reported_without_its_values() {
+        let app = app("admin");
+        let content = disk_content().replace(
+            "repo = \"acme/cloud\"\n",
+            "repo = \"acme/cloud\"\ntag_filter = \"fake-secret-filter\"\n",
+        );
+        std::fs::write(&app.path, &content).unwrap();
+
+        let (status, body) = app.get("/api/deploy-qa/config").await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.to_string().contains("fake-secret-filter"), "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("tag_filter"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn failure_log_reports_each_new_failure_once() {
+        let log = FailureLog::new();
+        assert!(log.record("unreadable"));
+        assert!(!log.record("unreadable"));
+        assert!(log.record("invalid"));
+        assert!(log.record("unreadable"));
+        log.clear();
+        assert!(log.record("unreadable"));
+    }
+
+    #[tokio::test]
+    async fn config_read_waits_for_an_in_progress_write() {
+        let app = app("admin");
+        let held = config_file::HeldWriteLock::acquire();
+
+        let request = tokio::spawn(
+            app.router.clone().oneshot(
+                Request::builder()
+                    .uri("/api/deploy-qa/config")
+                    .header("cookie", format!("claudear_session={}", app.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !request.is_finished(),
+            "GET /api/deploy-qa/config read the file during a write"
+        );
+
+        held.release();
+        assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_save_keeps_a_change_written_while_it_waited() {
+        let app = app("admin");
+        let held = config_file::HeldWriteLock::acquire();
+
+        let request = tokio::spawn(
+            app.router.clone().oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/deploy-qa/config")
+                    .header("cookie", format!("claudear_session={}", app.token))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "settings": settings_with_tracks(json!([
+                            { "name": "edge", "repo": "acme/edge", "tag_filter": "any" },
+                        ])) })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::fs::write(
+            &app.path,
+            disk_content().replace("/tmp/repos", "/tmp/changed-meanwhile"),
+        )
+        .unwrap();
+        held.release();
+
+        assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);
+        let written: Config = toml::from_str(&std::fs::read_to_string(&app.path).unwrap()).unwrap();
+        assert_eq!(written.workspace, PathBuf::from("/tmp/changed-meanwhile"));
+        assert_eq!(written.deploy_qa.tracks[0].name, "edge");
     }
 }

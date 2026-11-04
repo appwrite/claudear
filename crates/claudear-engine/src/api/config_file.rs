@@ -4,9 +4,16 @@
 //! Secrets are found by type: every [`SecretValue`](claudear_core::secret::SecretValue)
 //! serializes as [`REDACTED`] inside [`with_redaction`], plain-string secrets
 //! are listed in [`PLAIN_SECRET_PATHS`], and every string under a table named
-//! in [`SECRET_TABLE_NAMES`] is treated as a secret.
+//! in [`SECRET_TABLE_NAMES`] is treated as a secret. A kept secret is only
+//! restored while the endpoint it is sent to (a sibling `*url` or `*host`)
+//! is unchanged, so a masked credential cannot be redirected to a new host.
+//!
+//! TOML errors never reach a response or a log through their `Display`, which
+//! quotes the offending source line: [`describe_toml_error`] reports the
+//! message with any echoed value removed, and the line number.
 
 use axum::{
+    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -16,17 +23,45 @@ use claudear_config::config::{
     GitLabConfig, HelpScoutConfig, JiraConfig, LinearConfig, SentryConfig, SlackSourceConfig,
 };
 use claudear_core::secret::{with_redaction, REDACTED};
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use toml::{Table, Value};
 
-const PLAIN_SECRET_PATHS: &[&str] = &["regression.github_token"];
+const PLAIN_SECRET_PATHS: &[&str] = &[
+    "regression.github_token",
+    "notifiers.sms.account_sid",
+    "notifiers.push.user_key",
+    "users.*.push_user_key",
+];
 
 const SECRET_TABLE_NAMES: &[&str] = &["env", "headers", "extra"];
+
+const MAP_PATHS: &[&str] = &[
+    "agent.providers",
+    "agent.providers.*.env",
+    "agent.providers.*.extra",
+    "agent.providers.*.mcp",
+    "agent.providers.*.mcp.*.env",
+    "agent.providers.*.mcp.*.headers",
+    "notifiers.helpscout.templates",
+    "regression.package_names",
+    "users",
+];
+
+const WILDCARD: &str = "*";
+
+const ENDPOINT_SUFFIXES: &[&str] = &["url", "host"];
+
+const QUOTES: &[char] = &['"', '\'', '`'];
+
+const EXPECTED_CLAUSE: &str = "expected";
+
+const OMITTED_VALUE: &str = "...";
 
 const SIBLING_PREFIX: &str = ".claudear-config-";
 
@@ -83,6 +118,10 @@ impl ConfigFileError {
         Self::new(ConfigErrorCode::Unreadable, message)
     }
 
+    pub(super) fn rejected(rejection: &JsonRejection) -> Self {
+        Self::invalid(scrub_values(&rejection.body_text()))
+    }
+
     fn read_only() -> Self {
         Self::new(ConfigErrorCode::ReadOnly, READ_ONLY_MESSAGE)
     }
@@ -122,15 +161,24 @@ pub(super) struct WriteOutcome {
     pub normalized: Value,
 }
 
+/// `error`'s message with every value it echoes removed, and the line of
+/// `source` it points at. Use this instead of `error`'s `Display`, which
+/// quotes the source line and so any secret on it.
+pub(super) fn describe_toml_error(error: &toml::de::Error, source: &str) -> String {
+    let message = scrub_values(error.message());
+    match error.span() {
+        Some(span) => format!("{message} (line {})", line_of(source, span.start)),
+        None => message,
+    }
+}
+
 /// Render `config` as TOML in struct order with every secret replaced by
 /// [`REDACTED`], except unset secrets, which stay empty.
 pub(super) fn redact(config: &Config) -> Result<RedactedDocument, ConfigFileError> {
     let plain = to_value(config)?;
     let mut masked = with_redaction(|| to_value(config))?;
     for path in PLAIN_SECRET_PATHS {
-        if let Some(leaf) = lookup_mut(&mut masked, path) {
-            mask_strings(leaf);
-        }
+        visit_path(&mut masked, &segments(path), &mut mask_strings);
     }
     mask_secret_tables(&mut masked);
 
@@ -138,52 +186,65 @@ pub(super) fn redact(config: &Config) -> Result<RedactedDocument, ConfigFileErro
     mark_secrets(&plain, &mut masked, "", &mut secret_paths);
 
     let masked: Config = masked.try_into().map_err(|error| {
-        ConfigFileError::unreadable(format!("Failed to redact config: {error}"))
-    })?;
-    let content = toml::to_string_pretty(&masked).map_err(|error| {
-        ConfigFileError::unreadable(format!("Failed to serialize config: {error}"))
+        ConfigFileError::unreadable(format!(
+            "Failed to redact config: {}",
+            describe_toml_error(&error, "")
+        ))
     })?;
 
     Ok(RedactedDocument {
-        content,
+        content: render(&masked)?,
         secret_paths,
     })
 }
 
 /// Replace every [`REDACTED`] sentinel in `incoming` with the value at the same
 /// path in `current`. Arrays are restored element by element when both sides
-/// have the same length.
-pub(super) fn restore(incoming: &mut Value, current: &Value) {
-    match (incoming, current) {
-        (Value::Table(incoming), Value::Table(current)) => {
-            for (key, value) in incoming.iter_mut() {
-                if let Some(current) = current.get(key) {
-                    restore(value, current);
-                }
-            }
-        }
-        (Value::Array(incoming), Value::Array(current)) if incoming.len() == current.len() => {
-            for (value, current) in incoming.iter_mut().zip(current) {
-                restore(value, current);
-            }
-        }
-        (incoming @ Value::String(_), current) if incoming.as_str() == Some(REDACTED) => {
-            *incoming = current.clone();
-        }
-        _ => {}
+/// have the same length. A sentinel is refused when an endpoint in its scope
+/// changed: a `*url` or `*host` key of its own table, or of the parent of the
+/// `env`/`headers`/`extra` table it sits in.
+fn restore(incoming: &mut Value, current: &Value) -> Result<(), ConfigFileError> {
+    restore_value(incoming, current, "", None)
+}
+
+/// `incoming` with its sentinels restored from `current`, refusing any it
+/// cannot restore.
+pub(super) fn restore_all(mut incoming: Value, current: &Value) -> Result<Value, ConfigFileError> {
+    restore(&mut incoming, current)?;
+    let placeholders = unrestored(&incoming);
+    if !placeholders.is_empty() {
+        return Err(ConfigFileError::invalid(format!(
+            "Config still contains redacted placeholders for: {}. \
+             Provide the actual value(s) for these fields.",
+            placeholders.join(", ")
+        )));
     }
+    Ok(incoming)
 }
 
 /// Paths that still hold the [`REDACTED`] sentinel, as `a.b` or `a.list[0].c`.
-pub(super) fn unrestored(document: &Value) -> Vec<String> {
+fn unrestored(document: &Value) -> Vec<String> {
     let mut paths = Vec::new();
     collect_sentinels(document, "", &mut paths);
     paths
 }
 
 pub(super) fn parse(content: &str) -> Result<Config, ConfigFileError> {
-    toml::from_str(content)
-        .map_err(|error| ConfigFileError::invalid(format!("Invalid TOML config: {error}")))
+    deserialize(content)
+}
+
+/// A TOML document from client input, for merging into the on-disk one.
+pub(super) fn parse_document(content: &str) -> Result<Value, ConfigFileError> {
+    deserialize(content)
+}
+
+fn deserialize<T: DeserializeOwned>(content: &str) -> Result<T, ConfigFileError> {
+    toml::from_str(content).map_err(|error| {
+        ConfigFileError::invalid(format!(
+            "Invalid TOML config: {}",
+            describe_toml_error(&error, content)
+        ))
+    })
 }
 
 /// The config as the daemon would deserialize it, without env overrides.
@@ -195,28 +256,60 @@ pub(super) fn revision(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// The raw on-disk document; a missing file is an empty table.
-pub(super) async fn read_document(path: &Path) -> Result<Value, ConfigFileError> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(content) => toml::from_str(&content).map_err(|error| {
-            ConfigFileError::unreadable(format!("Invalid on-disk config: {error}"))
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Value::Table(Table::new())),
-        Err(error) => Err(ConfigFileError::unreadable(format!(
-            "Failed to read on-disk config: {error}"
-        ))),
+/// The file's bytes, read while no write is in progress.
+pub(super) async fn read_locked(path: &Path) -> io::Result<Vec<u8>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _lock = lock_writes();
+        fs::read(path)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Whether the config could be saved, checked without opening the file for
+/// writing (a write-mode open fires change watchers on close).
+pub(super) fn writable(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(_) => can_write(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            can_create_in(parent_directory(path))
+        }
+        Err(_) => false,
     }
 }
 
-pub(super) fn writable(path: &Path) -> bool {
-    match fs::OpenOptions::new().write(true).open(path) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => tempfile::Builder::new()
-            .prefix(SIBLING_PREFIX)
-            .tempfile_in(parent_directory(path))
-            .is_ok(),
-        Err(_) => false,
-    }
+#[cfg(unix)]
+fn can_write(path: &Path) -> bool {
+    has_access(path, libc::W_OK)
+}
+
+#[cfg(unix)]
+fn can_create_in(directory: &Path) -> bool {
+    has_access(directory, libc::W_OK | libc::X_OK)
+}
+
+#[cfg(unix)]
+fn has_access(path: &Path, mode: libc::c_int) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    unsafe { libc::access(path.as_ptr(), mode) == 0 }
+}
+
+#[cfg(not(unix))]
+fn can_write(path: &Path) -> bool {
+    fs::OpenOptions::new().write(true).open(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn can_create_in(directory: &Path) -> bool {
+    tempfile::Builder::new()
+        .prefix(SIBLING_PREFIX)
+        .tempfile_in(directory)
+        .is_ok()
 }
 
 /// Paths whose values the daemon would see differently from the file:
@@ -245,17 +338,22 @@ pub(super) fn optional_sections(document: &Value) -> Vec<OptionalSection> {
         .collect()
 }
 
-/// Validate `document` exactly as daemon startup would (env overrides,
-/// instructions files, user slugs), then write it without any of them.
-pub(super) async fn write_validated(
+/// Under the write lock, check `expected_revision` against the file, build the
+/// new document with `merge` from exactly the checked on-disk document,
+/// validate it as daemon startup would (env overrides, instructions files,
+/// user slugs), then write it without any of them.
+pub(super) async fn write_validated<Merge>(
     path: &Path,
-    document: Value,
     expected_revision: Option<&str>,
-) -> Result<WriteOutcome, ConfigFileError> {
+    merge: Merge,
+) -> Result<WriteOutcome, ConfigFileError>
+where
+    Merge: FnOnce(Value) -> Result<Value, ConfigFileError> + Send + 'static,
+{
     let path = path.to_path_buf();
     let expected_revision = expected_revision.map(str::to_owned);
     tokio::task::spawn_blocking(move || {
-        write_validated_blocking(&path, document, expected_revision.as_deref())
+        write_validated_blocking(&path, expected_revision.as_deref(), merge)
     })
     .await
     .map_err(|error| ConfigFileError::unreadable(format!("Config write failed: {error}")))?
@@ -263,45 +361,36 @@ pub(super) async fn write_validated(
 
 fn write_validated_blocking(
     path: &Path,
-    document: Value,
     expected_revision: Option<&str>,
+    merge: impl FnOnce(Value) -> Result<Value, ConfigFileError>,
 ) -> Result<WriteOutcome, ConfigFileError> {
-    let _lock = WRITE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _lock = lock_writes();
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
-    if let Some(expected) = expected_revision {
-        let current = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => {
-                return Err(ConfigFileError::unreadable(format!(
-                    "Failed to read on-disk config: {error}"
-                )))
-            }
-        };
-        if revision(&current) != expected {
-            return Err(ConfigFileError::new(
-                ConfigErrorCode::RevisionMismatch,
-                REVISION_MISMATCH_MESSAGE,
-            ));
+    let current = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(ConfigFileError::unreadable(format!(
+                "Failed to read on-disk config: {error}"
+            )))
         }
+    };
+    if expected_revision.is_some_and(|expected| revision(&current) != expected) {
+        return Err(ConfigFileError::new(
+            ConfigErrorCode::RevisionMismatch,
+            REVISION_MISMATCH_MESSAGE,
+        ));
     }
 
-    let placeholders = unrestored(&document);
-    if !placeholders.is_empty() {
-        return Err(ConfigFileError::invalid(format!(
-            "Config still contains redacted placeholders for: {}. \
-             Provide the actual value(s) for these fields.",
-            placeholders.join(", ")
-        )));
-    }
-
-    let parsed: Config = document
-        .try_into()
-        .map_err(|error| ConfigFileError::invalid(format!("Invalid TOML config: {error}")))?;
-    let content = toml::to_string_pretty(&parsed).map_err(|error| {
-        ConfigFileError::unreadable(format!("Failed to serialize config: {error}"))
+    let document = merge(disk_document(&current)?)?;
+    let parsed: Config = document.try_into().map_err(|error| {
+        ConfigFileError::invalid(format!(
+            "Invalid TOML config: {}",
+            describe_toml_error(&error, "")
+        ))
     })?;
+    let content = render(&parsed)?;
 
     validate_as_startup(&path, &parsed)?;
 
@@ -316,6 +405,22 @@ fn write_validated_blocking(
     })
 }
 
+fn lock_writes() -> MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn disk_document(bytes: &[u8]) -> Result<Value, ConfigFileError> {
+    let content = std::str::from_utf8(bytes).map_err(|error| {
+        ConfigFileError::unreadable(format!("Failed to read on-disk config: {error}"))
+    })?;
+    toml::from_str(content).map_err(|error| {
+        ConfigFileError::unreadable(format!(
+            "Invalid on-disk config: {}",
+            describe_toml_error(&error, content)
+        ))
+    })
+}
+
 fn validate_as_startup(path: &Path, parsed: &Config) -> Result<(), ConfigFileError> {
     let directory = parent_directory(path);
     let directory = std::path::absolute(directory).unwrap_or_else(|_| directory.to_path_buf());
@@ -327,9 +432,8 @@ fn validate_as_startup(path: &Path, parsed: &Config) -> Result<(), ConfigFileErr
             }
         }
     }
-    let content = toml::to_string_pretty(&candidate).map_err(|error| {
-        ConfigFileError::unreadable(format!("Failed to serialize config: {error}"))
-    })?;
+    let content = render(&candidate)?;
+    parse(&content)?;
 
     let mut temporary = tempfile::Builder::new()
         .prefix(VALIDATION_PREFIX)
@@ -367,13 +471,28 @@ fn replace_through_sibling(path: &Path, content: &str) -> io::Result<()> {
     temporary.write_all(content.as_bytes())?;
     temporary.as_file().sync_all()?;
     match fs::metadata(path) {
-        Ok(metadata) => fs::set_permissions(temporary.path(), metadata.permissions())?,
+        Ok(metadata) => {
+            keep_owner(temporary.as_file(), &metadata);
+            fs::set_permissions(temporary.path(), metadata.permissions())?;
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
+
+#[cfg(unix)]
+fn keep_owner(file: &fs::File, original: &fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+    if let Err(error) = std::os::unix::fs::fchown(file, Some(original.uid()), Some(original.gid()))
+    {
+        tracing::debug!(%error, "Could not keep the owner of claudear.toml");
+    }
+}
+
+#[cfg(not(unix))]
+fn keep_owner(_file: &fs::File, _original: &fs::Metadata) {}
 
 fn overwrite_in_place(path: &Path, content: &str) -> Result<(), ConfigFileError> {
     let mut file = fs::OpenOptions::new()
@@ -434,9 +553,102 @@ fn parent_directory(path: &Path) -> &Path {
 }
 
 fn to_value(config: &Config) -> Result<Value, ConfigFileError> {
-    Value::try_from(config).map_err(|error| {
-        ConfigFileError::unreadable(format!("Failed to serialize config: {error}"))
-    })
+    Value::try_from(config).map_err(serialize_error)
+}
+
+/// `config` as TOML in struct order, with the keys of every map-typed table
+/// sorted so the same config always renders to the same bytes.
+fn render(config: &Config) -> Result<String, ConfigFileError> {
+    let text = toml::to_string_pretty(config).map_err(serialize_error)?;
+    let mut document: Value = toml::from_str(&text).map_err(|error| {
+        ConfigFileError::unreadable(format!(
+            "Failed to serialize config: {}",
+            describe_toml_error(&error, &text)
+        ))
+    })?;
+    for path in MAP_PATHS {
+        visit_path(&mut document, &segments(path), &mut sort_keys);
+    }
+    toml::to_string_pretty(&document).map_err(serialize_error)
+}
+
+fn serialize_error(error: toml::ser::Error) -> ConfigFileError {
+    ConfigFileError::unreadable(format!(
+        "Failed to serialize config: {}",
+        scrub_values(&error.to_string())
+    ))
+}
+
+fn sort_keys(value: &mut Value) {
+    if let Value::Table(table) = value {
+        let mut entries: Vec<(String, Value)> = std::mem::take(table).into_iter().collect();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        table.extend(entries);
+    }
+}
+
+fn segments(path: &str) -> Vec<&str> {
+    path.split('.').collect()
+}
+
+fn visit_path(value: &mut Value, segments: &[&str], action: &mut impl FnMut(&mut Value)) {
+    let Some((first, rest)) = segments.split_first() else {
+        action(value);
+        return;
+    };
+    let Some(table) = value.as_table_mut() else {
+        return;
+    };
+    if *first == WILDCARD {
+        for (_, child) in table.iter_mut() {
+            visit_path(child, rest, action);
+        }
+    } else if let Some(child) = table.get_mut(*first) {
+        visit_path(child, rest, action);
+    }
+}
+
+/// `message` with the content of every quoted literal before its `expected`
+/// clause replaced: serde puts the offending value there (`string "..."`,
+/// ``integer `...` ``, ``unknown variant `...` ``), and the expected clause
+/// only lists what the type accepts.
+fn scrub_values(message: &str) -> String {
+    let mut scrubbed = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some((start, quote)) = rest.char_indices().find(|(_, c)| QUOTES.contains(c)) {
+        if rest[..start].contains(EXPECTED_CLAUSE) {
+            break;
+        }
+        let opened = start + quote.len_utf8();
+        scrubbed.push_str(&rest[..opened]);
+        scrubbed.push_str(OMITTED_VALUE);
+        match closing_quote(&rest[opened..], quote) {
+            Some(length) => {
+                scrubbed.push(quote);
+                rest = &rest[opened + length + quote.len_utf8()..];
+            }
+            None => return scrubbed,
+        }
+    }
+    scrubbed.push_str(rest);
+    scrubbed
+}
+
+fn closing_quote(text: &str, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (index, character) in text.char_indices() {
+        match character {
+            '\\' if quote == '"' && !escaped => escaped = true,
+            character if character == quote && !escaped => return Some(index),
+            _ => escaped = false,
+        }
+    }
+    None
+}
+
+fn line_of(source: &str, offset: usize) -> usize {
+    let preceding = &source.as_bytes()[..offset.min(source.len())];
+    preceding.iter().filter(|byte| **byte == b'\n').count() + 1
 }
 
 fn child_path(parent: &str, key: &str) -> String {
@@ -452,12 +664,6 @@ fn lookup<'a>(document: &'a Value, path: &str) -> Option<&'a Value> {
         .try_fold(document, |value, segment| value.as_table()?.get(segment))
 }
 
-fn lookup_mut<'a>(document: &'a mut Value, path: &str) -> Option<&'a mut Value> {
-    path.split('.').try_fold(document, |value, segment| {
-        value.as_table_mut()?.get_mut(segment)
-    })
-}
-
 fn mask_strings(value: &mut Value) {
     match value {
         Value::String(text) => *text = REDACTED.to_string(),
@@ -471,7 +677,7 @@ fn mask_secret_tables(value: &mut Value) {
     match value {
         Value::Table(table) => {
             for (key, child) in table.iter_mut() {
-                if SECRET_TABLE_NAMES.contains(&key.as_str()) {
+                if is_secret_table(key) {
                     mask_strings(child);
                 } else {
                     mask_secret_tables(child);
@@ -483,8 +689,84 @@ fn mask_secret_tables(value: &mut Value) {
     }
 }
 
+fn is_secret_table(key: &str) -> bool {
+    SECRET_TABLE_NAMES.contains(&key)
+}
+
 fn is_sentinel(value: &Value) -> bool {
     value.as_str() == Some(REDACTED)
+}
+
+fn is_endpoint(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ENDPOINT_SUFFIXES.iter().any(|suffix| key.ends_with(suffix))
+}
+
+fn restore_value(
+    incoming: &mut Value,
+    current: &Value,
+    path: &str,
+    changed_endpoint: Option<&str>,
+) -> Result<(), ConfigFileError> {
+    match (incoming, current) {
+        (Value::Table(incoming), Value::Table(current)) => {
+            restore_table(incoming, current, path, changed_endpoint)
+        }
+        (Value::Array(incoming), Value::Array(current)) if incoming.len() == current.len() => {
+            for (index, (value, current)) in incoming.iter_mut().zip(current).enumerate() {
+                let scope = if value.is_table() {
+                    None
+                } else {
+                    changed_endpoint
+                };
+                restore_value(value, current, &format!("{path}[{index}]"), scope)?;
+            }
+            Ok(())
+        }
+        (incoming, current) if is_sentinel(incoming) => match changed_endpoint {
+            Some(endpoint) => Err(ConfigFileError::invalid(format!(
+                "Re-enter {path} when changing {endpoint}"
+            ))),
+            None => {
+                *incoming = current.clone();
+                Ok(())
+            }
+        },
+        _ => Ok(()),
+    }
+}
+
+fn restore_table(
+    incoming: &mut Table,
+    current: &Table,
+    path: &str,
+    inherited_endpoint: Option<&str>,
+) -> Result<(), ConfigFileError> {
+    let changed = changed_endpoint(incoming, current, path);
+    let endpoint = changed.as_deref().or(inherited_endpoint);
+    for (key, value) in incoming.iter_mut() {
+        let Some(current) = current.get(key) else {
+            continue;
+        };
+        let scope = match value {
+            Value::Table(_) if !is_secret_table(key) && inherited_endpoint.is_none() => None,
+            _ => endpoint,
+        };
+        restore_value(value, current, &child_path(path, key), scope)?;
+    }
+    Ok(())
+}
+
+fn changed_endpoint(incoming: &Table, current: &Table, path: &str) -> Option<String> {
+    incoming
+        .keys()
+        .chain(current.keys().filter(|key| !incoming.contains_key(*key)))
+        .filter(|key| is_endpoint(key))
+        .find(|key| {
+            let edited = incoming.get(*key);
+            !edited.is_some_and(is_sentinel) && edited != current.get(*key)
+        })
+        .map(|key| child_path(path, key))
 }
 
 fn mark_secrets(plain: &Value, masked: &mut Value, path: &str, secret_paths: &mut Vec<String>) {
@@ -604,9 +886,35 @@ fn render_section(key: &str, value: Value) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(super) struct HeldWriteLock {
+    release: std::sync::mpsc::Sender<()>,
+    holder: std::thread::JoinHandle<()>,
+}
+
+#[cfg(test)]
+impl HeldWriteLock {
+    pub(super) fn acquire() -> Self {
+        let (locked, acquired) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _lock = lock_writes();
+            let _ = locked.send(());
+            let _ = released.recv();
+        });
+        acquired.recv().expect("the write lock holder started");
+        Self { release, holder }
+    }
+
+    pub(super) fn release(self) {
+        let _ = self.release.send(());
+        self.holder.join().expect("the write lock holder finished");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use claudear_config::config::McpServerConfig;
+    use claudear_config::config::{McpServerConfig, UserConfig};
     use claudear_core::secret::SecretValue;
     use std::path::PathBuf;
 
@@ -616,19 +924,14 @@ mod tests {
             "private_key_path",
             "a filesystem path to the key, not the key itself",
         ),
-        (
-            "user_key",
-            "a Pushover user identifier or a [users] slug that resolves to one",
-        ),
-        (
-            "push_user_key",
-            "a Pushover user identifier from the [users] registry",
-        ),
         ("project_keys", "Jira project keys such as PROJ"),
     ];
 
-    const PLAIN_SECRET_FIELD_NAMES: &[(&str, &str)] =
-        &[("github_token", "regression.github_token")];
+    const PLAIN_SECRET_FIELD_NAMES: &[(&str, &str)] = &[
+        ("github_token", "regression.github_token"),
+        ("user_key", "notifiers.push.user_key"),
+        ("push_user_key", "users.*.push_user_key"),
+    ];
 
     const FAKE_SECRETS: &[(&str, &str)] = &[
         ("scm.github.token", "fake-github-token-0001"),
@@ -652,7 +955,16 @@ mod tests {
             "agent.providers.claude.extra.nested.list[0]",
             "fake-extra-list-0009",
         ),
+        ("notifiers.sms.account_sid", "fake-twilio-sid-0010"),
+        ("notifiers.push.user_key", "fake-pushover-user-0011"),
+        ("users.jake.push_user_key", "fake-pushover-user-0012"),
     ];
+
+    fn lookup_mut<'a>(document: &'a mut Value, path: &str) -> Option<&'a mut Value> {
+        path.split('.').try_fold(document, |value, segment| {
+            value.as_table_mut()?.get_mut(segment)
+        })
+    }
 
     fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
         for entry in fs::read_dir(directory).expect("readable config source directory") {
@@ -737,6 +1049,15 @@ mod tests {
             ..HelpScoutConfig::default()
         });
         config.regression.github_token = Some("fake-regression-token-0005".to_string());
+        config.notifiers.sms.account_sid = Some("fake-twilio-sid-0010".to_string());
+        config.notifiers.push.user_key = Some("fake-pushover-user-0011".to_string());
+        config.users.insert(
+            "jake".to_string(),
+            UserConfig {
+                push_user_key: Some("fake-pushover-user-0012".to_string()),
+                ..UserConfig::default()
+            },
+        );
         config.chat.max_tokens = 4321;
         config.mcp_server.require_auth = true;
         config.issues.jira = Some(JiraConfig {
@@ -851,7 +1172,7 @@ mod tests {
         let on_disk: Value = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
         let mut incoming: Value = toml::from_str(&redact(&config).unwrap().content).unwrap();
 
-        restore(&mut incoming, &on_disk);
+        restore(&mut incoming, &on_disk).unwrap();
 
         assert!(
             unrestored(&incoming).is_empty(),
@@ -872,7 +1193,7 @@ mod tests {
     fn merged(incoming: &str, current: &str) -> Value {
         let mut incoming: Value = toml::from_str(incoming).expect("valid incoming toml");
         let current: Value = toml::from_str(current).expect("valid current toml");
-        restore(&mut incoming, &current);
+        restore(&mut incoming, &current).expect("restorable");
         incoming
     }
 
@@ -1028,7 +1349,7 @@ mod tests {
         fs::write(&path, "# comment\n").unwrap();
         let expected = revision(&fs::read(&path).unwrap());
 
-        let outcome = write_validated(&path, valid_document(), Some(&expected))
+        let outcome = write_validated(&path, Some(&expected), |_| Ok(valid_document()))
             .await
             .unwrap();
 
@@ -1055,7 +1376,7 @@ mod tests {
         let path = directory.path().join("claudear.toml");
         fs::write(&path, "workspace = \"/tmp/repos\"\n").unwrap();
 
-        let error = write_validated(&path, valid_document(), Some("stale"))
+        let error = write_validated(&path, Some("stale"), |_| Ok(valid_document()))
             .await
             .unwrap_err();
 
@@ -1075,7 +1396,9 @@ mod tests {
         *lookup_mut(&mut document, "issues.linear.api_key").unwrap() =
             Value::String(REDACTED.to_string());
 
-        let error = write_validated(&path, document, None).await.unwrap_err();
+        let error = write_validated(&path, None, move |current| restore_all(document, &current))
+            .await
+            .unwrap_err();
 
         assert_eq!(error.code, ConfigErrorCode::Invalid);
         assert!(error.message.contains("issues.linear.api_key"));
@@ -1088,7 +1411,9 @@ mod tests {
         let path = directory.path().join("claudear.toml");
         let document: Value = toml::from_str("workspace = \"/tmp/repos\"\n").unwrap();
 
-        let error = write_validated(&path, document, None).await.unwrap_err();
+        let error = write_validated(&path, None, move |_| Ok(document))
+            .await
+            .unwrap_err();
 
         assert_eq!(error.code, ConfigErrorCode::Invalid);
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -1105,7 +1430,7 @@ mod tests {
         fs::write(&path, "").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
-        write_validated(&path, valid_document(), None)
+        write_validated(&path, None, |_| Ok(valid_document()))
             .await
             .unwrap();
 
@@ -1122,7 +1447,7 @@ mod tests {
         fs::write(&target, "").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        write_validated(&link, valid_document(), None)
+        write_validated(&link, None, |_| Ok(valid_document()))
             .await
             .unwrap();
 
@@ -1148,7 +1473,7 @@ mod tests {
         }
 
         assert!(!writable(&path));
-        let error = write_validated(&path, valid_document(), None)
+        let error = write_validated(&path, None, |_| Ok(valid_document()))
             .await
             .unwrap_err();
 
@@ -1232,5 +1557,517 @@ mod tests {
         .unwrap();
         assert_eq!(body["error"], "nope");
         assert_eq!(body["code"], "revision_mismatch");
+    }
+
+    const UNQUOTED_SECRET_FILE: &str = "[scm.github]\ntoken = fake-secret-unquoted\n";
+
+    fn assert_omits(message: &str, secret: &str) {
+        assert!(!message.contains(secret), "{secret} leaked: {message}");
+    }
+
+    #[test]
+    fn describe_toml_error_omits_the_source_line() {
+        let error = toml::from_str::<Value>(UNQUOTED_SECRET_FILE).unwrap_err();
+        assert!(error.to_string().contains("fake-secret-unquoted"));
+
+        let described = describe_toml_error(&error, UNQUOTED_SECRET_FILE);
+
+        assert_omits(&described, "fake-secret-unquoted");
+        assert!(described.ends_with("(line 2)"), "{described}");
+        assert!(described.starts_with(error.message()), "{described}");
+    }
+
+    #[test]
+    fn parse_errors_omit_the_source_line() {
+        let error = parse(UNQUOTED_SECRET_FILE).unwrap_err();
+        assert_eq!(error.code, ConfigErrorCode::Invalid);
+        assert_omits(&error.message, "fake-secret-unquoted");
+
+        let error = disk_document(UNQUOTED_SECRET_FILE.as_bytes()).unwrap_err();
+        assert_omits(&error.message, "fake-secret-unquoted");
+        assert!(error.message.contains("(line 2)"), "{}", error.message);
+    }
+
+    #[test]
+    fn type_errors_omit_the_offending_value() {
+        let content = "poll_interval_ms = \"fake-secret-in-number\"\n";
+
+        let error = parse(content).unwrap_err();
+        assert_omits(&error.message, "fake-secret-in-number");
+        assert!(error.message.contains("expected u64"), "{}", error.message);
+        assert!(error.message.contains("(line 1)"), "{}", error.message);
+
+        let document: Value = toml::from_str(content).unwrap();
+        let error = document.try_into::<Config>().unwrap_err();
+        assert!(error.message().contains("fake-secret-in-number"));
+        assert_omits(
+            &describe_toml_error(&error, content),
+            "fake-secret-in-number",
+        );
+    }
+
+    #[test]
+    fn scrub_values_removes_quoted_values_before_the_expected_clause() {
+        let cases = [
+            (
+                "invalid type: string \"fake \\\"quoted\\\" secret\", expected u64",
+                "invalid type: string \"...\", expected u64",
+            ),
+            (
+                "invalid type: integer `424242`, expected a string",
+                "invalid type: integer `...`, expected a string",
+            ),
+            (
+                "unknown variant `fake-variant`, expected one of `stdio`, `http`",
+                "unknown variant `...`, expected one of `stdio`, `http`",
+            ),
+            (
+                "unknown tag_filter 'fake-filter' (expected any | suffix:<text>)",
+                "unknown tag_filter '...' (expected any | suffix:<text>)",
+            ),
+            (
+                "invalid string, expected `\"`, `'`",
+                "invalid string, expected `\"`, `'`",
+            ),
+            (
+                "custom failure for 'fake-unterminated",
+                "custom failure for '...",
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(scrub_values(message), expected, "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_validated_reports_type_errors_without_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        let mut document = valid_document();
+        document.as_table_mut().unwrap().insert(
+            "poll_interval_ms".to_string(),
+            Value::String("fake-typed-secret-0001".to_string()),
+        );
+
+        let error = write_validated(&path, None, move |_| Ok(document))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ConfigErrorCode::Invalid);
+        assert_omits(&error.message, "fake-typed-secret-0001");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn write_validated_reports_an_unparseable_disk_file_without_its_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        fs::write(&path, UNQUOTED_SECRET_FILE).unwrap();
+
+        let error = write_validated(&path, None, |_| Ok(valid_document()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ConfigErrorCode::Unreadable);
+        assert_omits(&error.message, "fake-secret-unquoted");
+        assert_eq!(fs::read_to_string(&path).unwrap(), UNQUOTED_SECRET_FILE);
+    }
+
+    #[tokio::test]
+    async fn write_validated_merges_against_the_checked_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        let base = render(&valid_document().try_into::<Config>().unwrap()).unwrap();
+        fs::write(&path, &base).unwrap();
+        let expected = revision(base.as_bytes());
+
+        write_validated(&path, Some(&expected), move |current| {
+            assert_eq!(current, toml::from_str::<Value>(&base).unwrap());
+            Ok(current)
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_merges_keep_every_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        let base = render(&valid_document().try_into::<Config>().unwrap()).unwrap();
+        fs::write(&path, &base).unwrap();
+
+        let writers: Vec<_> = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                tokio::spawn(async move {
+                    write_validated(&path, None, move |mut current| {
+                        let templates = ["notifiers", "helpscout", "templates"].into_iter().fold(
+                            &mut current,
+                            |value, segment| {
+                                value
+                                    .as_table_mut()
+                                    .unwrap()
+                                    .entry(segment)
+                                    .or_insert_with(|| Value::Table(Table::new()))
+                            },
+                        );
+                        templates.as_table_mut().unwrap().insert(
+                            format!("inbox-{index}"),
+                            Value::String(format!("template {index}")),
+                        );
+                        Ok(current)
+                    })
+                    .await
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.await.unwrap().unwrap();
+        }
+
+        let written = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        let mut inboxes: Vec<String> = written.notifiers.helpscout.templates.into_keys().collect();
+        inboxes.sort();
+        let expected: Vec<String> = (0..8).map(|index| format!("inbox-{index}")).collect();
+        assert_eq!(inboxes, expected);
+    }
+
+    fn restore_error(incoming: &str, current: &str) -> String {
+        let mut incoming: Value = toml::from_str(incoming).expect("valid incoming toml");
+        let current: Value = toml::from_str(current).expect("valid current toml");
+        restore(&mut incoming, &current)
+            .expect_err("restore should refuse")
+            .message
+    }
+
+    #[test]
+    fn restore_refuses_a_secret_when_its_endpoint_changes() {
+        let cases = [
+            (
+                "[scm.gitlab]\nbase_url = \"https://evil.invalid\"\ntoken = \"[REDACTED]\"",
+                "[scm.gitlab]\nbase_url = \"https://gitlab.com\"\ntoken = \"fake-gitlab\"",
+                "Re-enter scm.gitlab.token when changing scm.gitlab.base_url",
+            ),
+            (
+                "[agent.providers.x]\napi_url = \"https://evil.invalid\"\napi_key = \"[REDACTED]\"",
+                "[agent.providers.x]\napi_url = \"https://api.invalid\"\napi_key = \"fake-key\"",
+                "Re-enter agent.providers.x.api_key when changing agent.providers.x.api_url",
+            ),
+            (
+                "[notifiers.email]\nsmtp_host = \"evil.invalid\"\nsmtp_password = \"[REDACTED]\"",
+                "[notifiers.email]\nsmtp_host = \"smtp.invalid\"\nsmtp_password = \"fake-pw\"",
+                "Re-enter notifiers.email.smtp_password when changing notifiers.email.smtp_host",
+            ),
+            (
+                "[issues.jira]\napi_token = \"[REDACTED]\"",
+                "[issues.jira]\nbase_url = \"https://jira.invalid\"\napi_token = \"fake-jira\"",
+                "Re-enter issues.jira.api_token when changing issues.jira.base_url",
+            ),
+            (
+                "[mcp.x]\nurl = \"https://evil.invalid\"\n[mcp.x.headers]\nAuthorization = \"[REDACTED]\"",
+                "[mcp.x]\nurl = \"https://mcp.invalid\"\n[mcp.x.headers]\nAuthorization = \"fake-bearer\"",
+                "Re-enter mcp.x.headers.Authorization when changing mcp.x.url",
+            ),
+            (
+                "[mcp.x]\nurl = \"https://evil.invalid\"\n[mcp.x.env]\nTOKEN = \"[REDACTED]\"",
+                "[mcp.x]\nurl = \"https://mcp.invalid\"\n[mcp.x.env]\nTOKEN = \"fake-env\"",
+                "Re-enter mcp.x.env.TOKEN when changing mcp.x.url",
+            ),
+            (
+                "[servers]\nimap_host = \"evil.invalid\"\ntokens = [\"[REDACTED]\"]",
+                "[servers]\nimap_host = \"imap.invalid\"\ntokens = [\"fake-0\"]",
+                "Re-enter servers.tokens[0] when changing servers.imap_host",
+            ),
+        ];
+        for (incoming, current, expected) in cases {
+            assert_eq!(restore_error(incoming, current), expected);
+        }
+    }
+
+    #[test]
+    fn restore_keeps_a_secret_when_its_endpoint_is_unchanged() {
+        let value = merged(
+            "[scm.gitlab]\nbase_url = \"https://gitlab.com\"\ntoken = \"[REDACTED]\"\nlabel = \"new\"",
+            "[scm.gitlab]\nbase_url = \"https://gitlab.com\"\ntoken = \"fake-gitlab\"\nlabel = \"old\"",
+        );
+        assert_eq!(
+            value["scm"]["gitlab"]["token"].as_str(),
+            Some("fake-gitlab")
+        );
+    }
+
+    #[test]
+    fn restore_treats_a_kept_secret_endpoint_as_unchanged() {
+        let value = merged(
+            "[notifiers.discord]\nwebhook_url = \"[REDACTED]\"\ntoken = \"[REDACTED]\"",
+            "[notifiers.discord]\nwebhook_url = \"https://discord.invalid/fake\"\ntoken = \"fake-bot\"",
+        );
+        assert!(unrestored(&value).is_empty(), "{value:?}");
+        assert_eq!(
+            value["notifiers"]["discord"]["token"].as_str(),
+            Some("fake-bot")
+        );
+    }
+
+    #[test]
+    fn restore_scopes_an_endpoint_to_its_own_table() {
+        let value = merged(
+            "[mcp.x]\nurl = \"https://mcp.invalid\"\n[mcp.x.headers]\nAuthorization = \"[REDACTED]\"\n\
+             [mcp.y]\nurl = \"https://new.invalid\"",
+            "[mcp.x]\nurl = \"https://mcp.invalid\"\n[mcp.x.headers]\nAuthorization = \"fake-bearer\"\n\
+             [mcp.y]\nurl = \"https://old.invalid\"",
+        );
+        assert_eq!(
+            value["mcp"]["x"]["headers"]["Authorization"].as_str(),
+            Some("fake-bearer")
+        );
+
+        let value = merged(
+            "[gateway]\npublic_url = \"https://new.invalid\"\n[gateway.child]\ntoken = \"[REDACTED]\"",
+            "[gateway]\npublic_url = \"https://old.invalid\"\n[gateway.child]\ntoken = \"fake-child\"",
+        );
+        assert_eq!(
+            value["gateway"]["child"]["token"].as_str(),
+            Some("fake-child")
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_all_refuses_a_redirected_secret_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        let mut on_disk = valid_document();
+        lookup_mut(&mut on_disk, "issues.linear")
+            .and_then(Value::as_table_mut)
+            .unwrap()
+            .insert(
+                "api_url".to_string(),
+                Value::String("https://api.linear.invalid".to_string()),
+            );
+        let base = toml::to_string_pretty(&on_disk).unwrap();
+        fs::write(&path, &base).unwrap();
+        let mut incoming = on_disk.clone();
+        let linear = lookup_mut(&mut incoming, "issues.linear")
+            .and_then(Value::as_table_mut)
+            .unwrap();
+        linear.insert(
+            "api_url".to_string(),
+            Value::String("https://evil.invalid".to_string()),
+        );
+        linear.insert("api_key".to_string(), Value::String(REDACTED.to_string()));
+
+        let error = write_validated(&path, None, move |current| restore_all(incoming, &current))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ConfigErrorCode::Invalid);
+        assert_eq!(
+            error.message,
+            "Re-enter issues.linear.api_key when changing issues.linear.api_url"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_does_not_open_the_file() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        let fifo = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || sender.send(writable(&probe)));
+
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(
+            result,
+            Ok(true),
+            "writable() blocked opening the file for writing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_reports_a_missing_file_in_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let read_only = tempfile::Builder::new()
+            .tempfile_in(directory.path())
+            .is_err();
+
+        let result = writable(&directory.path().join("claudear.toml"));
+
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result, !read_only);
+    }
+
+    fn config_with_maps(order: &[&str]) -> Config {
+        let mut config = Config {
+            workspace: "/tmp/repos".into(),
+            ..Config::default()
+        };
+        for name in order {
+            let provider = config
+                .agent
+                .providers
+                .entry((*name).to_string())
+                .or_default();
+            for key in order {
+                provider
+                    .env
+                    .insert(format!("{}_KEY", key.to_uppercase()), (*key).to_string());
+            }
+            config
+                .notifiers
+                .helpscout
+                .templates
+                .insert(format!("inbox-{name}"), (*name).to_string());
+            config
+                .users
+                .insert((*name).to_string(), UserConfig::default());
+        }
+        config
+    }
+
+    #[test]
+    fn render_is_deterministic_and_sorts_map_keys() {
+        let names = ["delta", "alpha", "foxtrot", "charlie", "echo", "bravo"];
+        let mut reversed = names;
+        reversed.reverse();
+
+        let first = render(&config_with_maps(&names)).unwrap();
+        let second = render(&config_with_maps(&reversed)).unwrap();
+
+        assert_eq!(first, second);
+        let mut sorted = names;
+        sorted.sort_unstable();
+        let positions = |pattern: fn(&str) -> String| -> Vec<usize> {
+            sorted
+                .iter()
+                .map(|name| {
+                    first
+                        .find(&pattern(name))
+                        .unwrap_or_else(|| panic!("{} missing:\n{first}", pattern(name)))
+                })
+                .collect()
+        };
+        let patterns: [fn(&str) -> String; 4] = [
+            |name| format!("[agent.providers.{name}]\n"),
+            |name| format!("\n{}_KEY = ", name.to_uppercase()),
+            |name| format!("inbox-{name} = "),
+            |name| format!("[users.{name}]\n"),
+        ];
+        for pattern in patterns {
+            let found = positions(pattern);
+            assert!(found.is_sorted(), "{found:?} not sorted:\n{first}");
+        }
+        assert_eq!(
+            redact(&config_with_maps(&names)).unwrap().content,
+            redact(&config_with_maps(&reversed)).unwrap().content
+        );
+    }
+
+    #[test]
+    fn render_matches_struct_serialization_for_a_config_without_maps() {
+        let config = valid_document().try_into::<Config>().unwrap();
+        assert_eq!(
+            render(&config).unwrap(),
+            toml::to_string_pretty(&config).unwrap()
+        );
+    }
+
+    #[test]
+    fn every_hash_map_config_field_is_sorted_on_render() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../claudear-config/src/config.rs");
+        let content = fs::read_to_string(&source).expect("readable config source");
+        let field = regex_lite::Regex::new(r"(?m)^\s*pub\s+(\w+)\s*:\s*[\w:]*HashMap<")
+            .expect("valid field regex");
+        let names: Vec<&str> = field
+            .captures_iter(&content)
+            .map(|captures| captures.get(1).unwrap().as_str())
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "the guard matched no fields; the regex is stale"
+        );
+        for name in names {
+            assert!(
+                MAP_PATHS
+                    .iter()
+                    .any(|path| path.rsplit('.').next() == Some(name)),
+                "HashMap field `{name}` has no entry in MAP_PATHS, so its keys render in \
+                 random order"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_wait_for_an_in_progress_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        fs::write(&path, "workspace = \"/tmp/repos\"\n").unwrap();
+        let held = HeldWriteLock::acquire();
+
+        let read = tokio::spawn({
+            let path = path.clone();
+            async move { read_locked(&path).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !read.is_finished(),
+            "the read did not wait for the write lock"
+        );
+
+        held.release();
+        assert_eq!(
+            read.await.unwrap().unwrap(),
+            b"workspace = \"/tmp/repos\"\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_validated_keeps_the_file_owner() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        fs::write(&path, "").unwrap();
+        let original = fs::metadata(&path).unwrap();
+        let directory_group = fs::metadata(directory.path()).unwrap().gid();
+        if let Some(group) = supplementary_groups()
+            .into_iter()
+            .find(|group| *group != original.gid() && *group != directory_group)
+        {
+            std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
+        }
+        let before = fs::metadata(&path).unwrap();
+
+        write_validated(&path, None, |_| Ok(valid_document()))
+            .await
+            .unwrap();
+
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("fake-linear-key"));
+    }
+
+    #[cfg(unix)]
+    fn supplementary_groups() -> Vec<libc::gid_t> {
+        // SAFETY: a zero-length query writes nothing and returns the group count.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups = vec![libc::gid_t::default(); usize::try_from(count).unwrap_or(0)];
+        // SAFETY: `groups` has room for `count` entries.
+        let filled = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        groups.truncate(usize::try_from(filled).unwrap_or(0));
+        groups
     }
 }

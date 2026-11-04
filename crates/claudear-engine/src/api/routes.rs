@@ -5,6 +5,7 @@ use super::config_file::{self, ConfigFileError, OptionalSection};
 use crate::retry::RetryManager;
 use axum::{
     extract::{
+        rejection::JsonRejection,
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
@@ -2642,7 +2643,7 @@ async fn get_config_handler(
     _user: AdminUser,
     State(state): State<ApiState>,
 ) -> Result<Json<ConfigResponse>, ConfigFileError> {
-    let bytes = tokio::fs::read(&state.config_path)
+    let bytes = config_file::read_locked(&state.config_path)
         .await
         .map_err(|error| ConfigFileError::unreadable(format!("Failed to read config: {error}")))?;
     let content = String::from_utf8(bytes)
@@ -2680,7 +2681,7 @@ async fn get_config_handler(
 async fn put_config_handler(
     user: AdminUser,
     State(state): State<ApiState>,
-    Json(body): Json<ConfigUpdateRequest>,
+    body: Result<Json<ConfigUpdateRequest>, JsonRejection>,
 ) -> Response {
     if !check_api_rate_limit(user.0.id) {
         return (
@@ -2689,7 +2690,11 @@ async fn put_config_handler(
         )
             .into_response();
     }
-    match save_config(&state, body).await {
+    let result = match body {
+        Ok(Json(update)) => save_config(&state, update).await,
+        Err(rejection) => Err(ConfigFileError::rejected(&rejection)),
+    };
+    match result {
         Ok(saved) => Json(saved).into_response(),
         Err(error) => error.into_response(),
     }
@@ -2699,14 +2704,13 @@ async fn save_config(
     state: &ApiState,
     body: ConfigUpdateRequest,
 ) -> Result<ConfigSaveResponse, ConfigFileError> {
-    let mut incoming: toml::Value = toml::from_str(&body.content)
-        .map_err(|error| ConfigFileError::invalid(format!("Invalid TOML config: {error}")))?;
-    let current = config_file::read_document(&state.config_path).await?;
-    config_file::restore(&mut incoming, &current);
-
-    let outcome =
-        config_file::write_validated(&state.config_path, incoming, body.revision.as_deref())
-            .await?;
+    let incoming = config_file::parse_document(&body.content)?;
+    let outcome = config_file::write_validated(
+        &state.config_path,
+        body.revision.as_deref(),
+        move |current| config_file::restore_all(incoming, &current),
+    )
+    .await?;
 
     Ok(ConfigSaveResponse {
         ok: true,
@@ -8252,6 +8256,228 @@ mod tests {
             "{body}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    fn config_router_with(content: &str) -> (Router, String, tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, content).unwrap();
+        let (router, token) = config_file_router(path.clone(), "admin");
+        (router, token, directory, path)
+    }
+
+    #[tokio::test]
+    async fn test_get_config_omits_lines_of_an_unparseable_file() {
+        let content = "workspace = \"/tmp/repos\"\n\n[scm.github]\ntoken = fake-secret-unquoted\n";
+        let (router, token, _directory, _path) = config_router_with(content);
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(
+            !body.to_string().contains("fake-secret-unquoted"),
+            "secret leaked: {body}"
+        );
+        assert!(
+            body["error"].as_str().unwrap().contains("(line 4)"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_config_omits_lines_of_unparseable_content() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({
+                    "content": "workspace = \"/tmp/repos\"\n[scm.github]\ntoken = fake-typed-secret\n"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(
+            !body.to_string().contains("fake-typed-secret"),
+            "secret leaked: {body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_omits_values_from_type_errors() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({
+                    "content": "workspace = \"/tmp/repos\"\npoll_interval_ms = \"fake-misplaced-secret\"\n"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert!(
+            !body.to_string().contains("fake-misplaced-secret"),
+            "secret leaked: {body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_rejects_a_malformed_body_as_invalid() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": 5 }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(body["error"].is_string(), "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_refuses_a_kept_secret_for_a_changed_host() {
+        let content = format!(
+            "{FAKE_CONFIG_FILE}\n[notifiers.email]\nsmtp_host = \"smtp.invalid\"\n\
+             smtp_password = \"fake-route-smtp-password\"\n"
+        );
+        let (router, token, _directory, path) = config_router_with(&content);
+        let loaded = json_body(
+            router
+                .clone()
+                .oneshot(auth_get("/api/config", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let redacted = loaded["content"].as_str().unwrap();
+        let redirected = redacted.replace(
+            "smtp_host = \"smtp.invalid\"",
+            "smtp_host = \"evil.invalid\"",
+        );
+        assert_ne!(redirected, redacted);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": redirected, "revision": loaded["revision"] }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert_eq!(
+            body["error"],
+            "Re-enter notifiers.email.smtp_password when changing notifiers.email.smtp_host"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn test_get_config_redacts_pushover_and_twilio_identifiers() {
+        let content = format!(
+            "{FAKE_CONFIG_FILE}\n[notifiers.sms]\naccount_sid = \"fake-route-twilio-sid\"\n\n\
+             [notifiers.push]\nuser_key = \"fake-route-pushover-user\"\n\n\
+             [users.jake]\npush_user_key = \"fake-route-pushover-registry\"\n"
+        );
+        let (router, token, _directory, _path) = config_router_with(&content);
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        for fake in [
+            "fake-route-twilio-sid",
+            "fake-route-pushover-user",
+            "fake-route-pushover-registry",
+        ] {
+            assert!(!body.to_string().contains(fake), "{fake} leaked: {body}");
+        }
+        let secret_paths = body["secret_paths"].to_string();
+        for path in [
+            "notifiers.sms.account_sid",
+            "notifiers.push.user_key",
+            "users.jake.push_user_key",
+        ] {
+            assert!(secret_paths.contains(path), "{path}: {secret_paths}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_config_waits_for_an_in_progress_write() {
+        let (router, token, _directory, _path) = config_router_with(FAKE_CONFIG_FILE);
+        let held = config_file::HeldWriteLock::acquire();
+
+        let request = tokio::spawn(router.oneshot(auth_get("/api/config", &token)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !request.is_finished(),
+            "GET /api/config read the file during a write"
+        );
+
+        held.release();
+        assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_restores_secrets_from_the_file_it_writes_over() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+        let loaded = json_body(
+            router
+                .clone()
+                .oneshot(auth_get("/api/config", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let held = config_file::HeldWriteLock::acquire();
+
+        let request = tokio::spawn(router.oneshot(auth_put_json(
+            "/api/config",
+            &token,
+            serde_json::json!({ "content": loaded["content"] }),
+        )));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::fs::write(
+            &path,
+            FAKE_CONFIG_FILE.replace("fake-route-github-token", "fake-rotated-github-token"),
+        )
+        .unwrap();
+        held.release();
+
+        assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("fake-rotated-github-token"), "{on_disk}");
+        assert!(!on_disk.contains("fake-route-github-token"), "{on_disk}");
     }
 
     #[tokio::test]
