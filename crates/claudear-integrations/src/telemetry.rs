@@ -11,7 +11,7 @@ use crate::scm::{
     CodeReview, PostReviewAction, PrInfo, PrStatus, PrSummary, RemoteRepo, ReviewComment,
     ScmProvider, ScmRelease,
 };
-use crate::source::IssueSource;
+use crate::source::{ConversationStatus, IssueSource, ReporterReply};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
@@ -60,6 +60,43 @@ impl IssueSource for InstrumentedSource {
     }
     async fn list_open_issues(&self, title_filter: &str) -> Result<Vec<Issue>> {
         self.inner.list_open_issues(title_filter).await
+    }
+    async fn list_conversations(&self, status: Option<&str>) -> Result<Vec<Issue>> {
+        self.inner.list_conversations(status).await
+    }
+
+    async fn reply_to_reporter(
+        &self,
+        issue_id: &str,
+        body: &str,
+        status: Option<ConversationStatus>,
+    ) -> ReporterReply {
+        let outcome = self.inner.reply_to_reporter(issue_id, body, status).await;
+        match &outcome {
+            ReporterReply::Sent => {
+                tracing::info!(component = self.inner.name(), issue_id = %issue_id, "Replied to reporter");
+            }
+            ReporterReply::Rejected(reason) => {
+                tracing::warn!(component = self.inner.name(), issue_id = %issue_id, reason = %reason, "Reporter reply rejected");
+            }
+            ReporterReply::Unconfirmed(reason) => {
+                tracing::warn!(component = self.inner.name(), issue_id = %issue_id, reason = %reason, "Reporter reply unconfirmed");
+            }
+        }
+        outcome
+    }
+
+    async fn mark_spam(&self, issue_id: &str) -> Result<()> {
+        match self.inner.mark_spam(issue_id).await {
+            Ok(()) => {
+                tracing::info!(component = self.inner.name(), issue_id = %issue_id, "Marked conversation as spam");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(component = self.inner.name(), issue_id = %issue_id, error = %e, "Failed to mark conversation as spam");
+                Err(e)
+            }
+        }
     }
 
     async fn fetch_issues(&self) -> Result<Vec<Issue>> {

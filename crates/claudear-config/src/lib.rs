@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod environment;
+pub mod security_inbox;
 pub mod users;
 
 pub use config::*;
