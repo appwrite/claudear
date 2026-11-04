@@ -1300,6 +1300,11 @@ export async function fetchMyTokens(): Promise<ApiToken[]> {
   return fetchJson(`${API_BASE}/tokens`)
 }
 
+/** Mint a token for the current user. `expires_at` is RFC3339; the secret is returned once. */
+export async function createMyToken(data: { name: string; expires_at?: string }): Promise<CreatedToken> {
+  return postJson(`${API_BASE}/tokens`, data)
+}
+
 /** Admin: every token with its owner. */
 export async function fetchAllTokens(): Promise<ApiTokenWithOwner[]> {
   return fetchJson(`${API_BASE}/tokens/all`)
