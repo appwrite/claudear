@@ -8358,4 +8358,915 @@ mod tests {
         assert!(summary.avg_secs.is_none());
         assert!(summary.max_secs.is_none());
     }
+
+    mod identity_authorization {
+        use super::{auth_get, auth_put_json, create_test_tracker, test_config};
+        use crate::api::create_api_router_with_dashboard;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::Router;
+        use claudear_config::config::{Config, UserConfig};
+        use claudear_config::users::UserRegistry;
+        use claudear_core::identity::{Identities, IdentityField, IdentityOrigin, UserStatus};
+        use claudear_storage::{DirectoryUser, DirectoryWrite, FixAttemptTracker, IdentityWrite};
+        use http_body_util::BodyExt;
+        use serde_json::{json, Value};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tower::ServiceExt;
+        use tower_cookies::CookieManagerLayer;
+
+        /// The API write limiter is process-wide and keyed by user id, so each harness
+        /// creates filler users first to give its acting users ids no other test writes as.
+        const FILLER_BASE: usize = 5000;
+        const LANE_WIDTH: usize = 10;
+        static NEXT_LANE: AtomicUsize = AtomicUsize::new(0);
+
+        const ADMIN_EMAIL: &str = "identity-admin@example.com";
+        const VIEWER_EMAIL: &str = "identity-viewer@example.com";
+        const OTHER_EMAIL: &str = "identity-other@example.com";
+        const VIEWER_DISCORD_ID: &str = "452316113016193041";
+        const OTHER_DISCORD_ID: &str = "452316113016193042";
+        const CONFIG_DISCORD_ID: &str = "452316113016193043";
+        const SLACK_ID: &str = "U0123456789";
+        const SMS_NUMBER: &str = "+14155550123";
+        const PUSH_USER_KEY: &str = "abcdefghij0123456789ABCDEFGHIJ";
+        const TELEGRAM_CHAT_ID: &str = "-1001234567";
+        const CONFLICT_MESSAGE: &str = "already belongs to another person";
+
+        struct Account {
+            id: i64,
+            token: String,
+        }
+
+        struct Harness {
+            router: Router,
+            tracker: Arc<dyn FixAttemptTracker>,
+            registry: UserRegistry,
+            admin: Account,
+            viewer: Account,
+            other: Account,
+        }
+
+        impl Harness {
+            fn new(users: HashMap<String, UserConfig>) -> Self {
+                let tracker = create_test_tracker();
+                let lane = NEXT_LANE.fetch_add(1, Ordering::Relaxed);
+                let fillers: Vec<DirectoryWrite> = (0..FILLER_BASE + lane * LANE_WIDTH)
+                    .map(|index| DirectoryWrite {
+                        user: DirectoryUser::New {
+                            email: format!("identity-filler{index}@example.com"),
+                            name: "Filler".to_string(),
+                            role: "viewer".to_string(),
+                            password_hash: "unused-hash".to_string(),
+                            status: UserStatus::Active,
+                        },
+                        identities: None,
+                        invite: None,
+                    })
+                    .collect();
+                tracker
+                    .save_directory(&fillers)
+                    .expect("create filler users");
+                let admin = account(&tracker, ADMIN_EMAIL, "Admin", "admin");
+                let viewer = account(&tracker, VIEWER_EMAIL, "Viewer", "viewer");
+                let other = account(&tracker, OTHER_EMAIL, "Other", "viewer");
+                let config = Config {
+                    users,
+                    ..test_config()
+                };
+                let registry = UserRegistry::new(config.users.clone());
+                let router = create_api_router_with_dashboard(
+                    config,
+                    tracker.clone(),
+                    PathBuf::from("claudear.toml"),
+                    tracker.subscribe_indexing_progress(),
+                    None,
+                    registry.clone(),
+                )
+                .layer(CookieManagerLayer::new());
+                Self {
+                    router,
+                    tracker,
+                    registry,
+                    admin,
+                    viewer,
+                    other,
+                }
+            }
+
+            async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
+                let response = self
+                    .router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("response");
+                let status = response.status();
+                let bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                let body = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).expect("json body")
+                };
+                (status, body)
+            }
+
+            /// Store a console row directly, bypassing the API and its write limiter.
+            fn seed(&self, user_id: i64, slug: Option<&str>, identities: Identities) {
+                self.tracker
+                    .save_directory(&[DirectoryWrite {
+                        user: DirectoryUser::Existing {
+                            user_id,
+                            name: None,
+                            role: None,
+                        },
+                        identities: Some(IdentityWrite {
+                            slug: slug.map(str::to_string),
+                            identities,
+                        }),
+                        invite: None,
+                    }])
+                    .expect("seed identities");
+                crate::registry::reload(&self.registry, self.tracker.as_ref());
+            }
+
+            fn person(&self, source: &str, handle: &str) -> Option<String> {
+                self.registry
+                    .resolve(source, handle)
+                    .map(|person| person.slug)
+            }
+
+            fn stored_user_ids(&self) -> Vec<i64> {
+                self.tracker
+                    .list_user_identities()
+                    .expect("list identities")
+                    .into_iter()
+                    .map(|entry| entry.user_id)
+                    .collect()
+            }
+        }
+
+        fn account(
+            tracker: &Arc<dyn FixAttemptTracker>,
+            email: &str,
+            name: &str,
+            role: &str,
+        ) -> Account {
+            let id = tracker
+                .create_user(email, "unused-hash", name, role)
+                .expect("create user");
+            let token = tracker
+                .create_session(id, "2099-12-31 23:59:59")
+                .expect("create session");
+            Account { id, token }
+        }
+
+        fn identities_uri(user_id: i64) -> String {
+            format!("/api/users/{user_id}/identities")
+        }
+
+        fn console_key(user_id: i64) -> String {
+            format!("console-{user_id}")
+        }
+
+        fn auth_delete(uri: &str, token: &str) -> Request<Body> {
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("cookie", format!("claudear_session={token}"))
+                .body(Body::empty())
+                .expect("request")
+        }
+
+        fn anonymous(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
+            let builder = Request::builder().method(method).uri(uri);
+            match body {
+                Some(body) => builder
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string())),
+                None => builder.body(Body::empty()),
+            }
+            .expect("request")
+        }
+
+        fn sensitive_identities(github: &str, discord_id: &str) -> Identities {
+            Identities {
+                github_usernames: vec![github.to_string()],
+                discord_id: Some(discord_id.to_string()),
+                email: Some(format!("notify-{github}@example.com")),
+                push_user_key: Some(PUSH_USER_KEY.to_string()),
+                sms_number: Some(SMS_NUMBER.to_string()),
+                whatsapp_number: Some(SMS_NUMBER.to_string()),
+                telegram_chat_id: Some(TELEGRAM_CHAT_ID.to_string()),
+                ..Identities::default()
+            }
+        }
+
+        fn chief_config() -> HashMap<String, UserConfig> {
+            HashMap::from([(
+                "ceo".to_string(),
+                UserConfig {
+                    github_usernames: vec!["chief-gh".to_string()],
+                    discord_id: Some(CONFIG_DISCORD_ID.to_string()),
+                    email: Some("chief@example.com".to_string()),
+                    ..UserConfig::default()
+                },
+            )])
+        }
+
+        fn violation_fields(body: &Value) -> Vec<String> {
+            let mut fields: Vec<String> = body["violations"]
+                .as_array()
+                .expect("violations")
+                .iter()
+                .map(|violation| violation["field"].as_str().expect("field").to_string())
+                .collect();
+            fields.sort();
+            fields
+        }
+
+        fn assert_redacted(person: &Value) {
+            assert_eq!(person["redacted"], true);
+            assert_eq!(person["email"], Value::Null);
+            for field in IdentityField::ALL
+                .into_iter()
+                .filter(|field| field.is_sensitive())
+            {
+                assert_eq!(
+                    person["identities"][field.as_str()],
+                    Value::Null,
+                    "{} must be redacted",
+                    field.as_str()
+                );
+            }
+        }
+
+        fn find_person(people: &Value, user_id: i64) -> &Value {
+            people
+                .as_array()
+                .expect("array")
+                .iter()
+                .find(|person| person["user_id"] == user_id)
+                .expect("person listed")
+        }
+
+        #[tokio::test]
+        async fn admin_writes_another_users_identities_and_reads_them_back() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({
+                        "github_usernames": ["viewer-gh"],
+                        "discord_id": VIEWER_DISCORD_ID,
+                        "sms_number": SMS_NUMBER,
+                    }),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["user_id"], harness.viewer.id);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["slug"], console_key(harness.viewer.id));
+            assert_eq!(body["redacted"], false);
+
+            for token in [&harness.admin.token, &harness.viewer.token] {
+                let (status, read) = harness.send(auth_get(&uri, token)).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(read["redacted"], false);
+                assert_eq!(read["email"], VIEWER_EMAIL);
+                assert_eq!(read["identities"], body["identities"]);
+                assert_eq!(read["identities"]["github_usernames"], json!(["viewer-gh"]));
+                assert_eq!(read["identities"]["discord_id"], VIEWER_DISCORD_ID);
+                assert_eq!(read["identities"]["sms_number"], SMS_NUMBER);
+            }
+            assert_eq!(
+                harness.person("github", "viewer-gh"),
+                Some(console_key(harness.viewer.id))
+            );
+        }
+
+        #[tokio::test]
+        async fn viewer_writes_and_resets_their_own_identities() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({
+                        "github_usernames": ["@Viewer-GH"],
+                        "telegram_chat_id": TELEGRAM_CHAT_ID,
+                    }),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "active");
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["slug"], console_key(harness.viewer.id));
+            assert_eq!(body["redacted"], false);
+            assert_eq!(body["email"], VIEWER_EMAIL);
+            assert_eq!(body["name"], "Viewer");
+            assert_eq!(body["identities"]["github_usernames"], json!(["Viewer-GH"]));
+            assert_eq!(body["identities"]["telegram_chat_id"], TELEGRAM_CHAT_ID);
+            assert!(body["updated_at"].is_string());
+            assert_eq!(
+                harness.person("github", "viewer-gh"),
+                Some(console_key(harness.viewer.id))
+            );
+
+            let (status, body) = harness.send(auth_delete(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "unset");
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!([]));
+            assert!(harness.stored_user_ids().is_empty());
+            assert_eq!(harness.person("github", "viewer-gh"), None);
+        }
+
+        #[tokio::test]
+        async fn viewer_cannot_write_or_reset_another_users_identities() {
+            let harness = Harness::new(HashMap::new());
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("other-gh", OTHER_DISCORD_ID),
+            );
+
+            for target in [harness.other.id, harness.admin.id] {
+                let (status, body) = harness
+                    .send(auth_put_json(
+                        &identities_uri(target),
+                        &harness.viewer.token,
+                        json!({"github_usernames": ["sneaky-gh"]}),
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(body, json!({"error": "Forbidden"}));
+            }
+
+            let (status, _) = harness
+                .send(auth_delete(
+                    &identities_uri(harness.other.id),
+                    &harness.viewer.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+
+            let (status, _) = harness
+                .send(auth_put_json(
+                    &identities_uri(999_999_999),
+                    &harness.viewer.token,
+                    json!({"github_usernames": ["sneaky-gh"]}),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a viewer must not learn whether another user id exists"
+            );
+
+            let (status, _) = harness
+                .send(auth_put_json(
+                    &identities_uri(999_999_999),
+                    &harness.admin.token,
+                    json!({"github_usernames": ["sneaky-gh"]}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            assert_eq!(harness.stored_user_ids(), vec![harness.other.id]);
+            assert_eq!(harness.person("github", "sneaky-gh"), None);
+            assert_eq!(
+                harness.person("github", "other-gh"),
+                Some(console_key(harness.other.id))
+            );
+        }
+
+        #[tokio::test]
+        async fn only_an_admin_sets_the_person_key() {
+            let harness = Harness::new(chief_config());
+            harness.seed(harness.other.id, Some("other-key"), Identities::default());
+            let uri = identities_uri(harness.viewer.id);
+
+            for body in [
+                json!({"slug": "viewer-key"}),
+                json!({"slug": ""}),
+                json!({"slug": "viewer-key", "github_usernames": ["viewer-gh"]}),
+            ] {
+                let (status, _) = harness
+                    .send(auth_put_json(&uri, &harness.viewer.token, body))
+                    .await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+            }
+            assert_eq!(harness.stored_user_ids(), vec![harness.other.id]);
+            assert_eq!(harness.person("github", "viewer-gh"), None);
+
+            for slug in ["Bad Slug", "console-7"] {
+                let (status, body) = harness
+                    .send(auth_put_json(
+                        &uri,
+                        &harness.admin.token,
+                        json!({"slug": slug}),
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "slug {slug:?}");
+                assert_eq!(violation_fields(&body), vec!["slug"]);
+            }
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({"slug": "other-key"}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(violation_fields(&body), vec!["slug"]);
+            assert_eq!(
+                harness.registry.origin("other-key"),
+                Some(IdentityOrigin::Console)
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({"slug": "ceo"}),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "an admin links a console user to a config-only person by key"
+            );
+            assert_eq!(body["slug"], "ceo");
+            assert_eq!(
+                harness.registry.origin("ceo"),
+                Some(IdentityOrigin::Console)
+            );
+            assert_eq!(harness.person("github", "chief-gh"), None);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({"slug": "viewer-key"}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["slug"], "viewer-key");
+            assert_eq!(harness.registry.origin("ceo"), Some(IdentityOrigin::Config));
+            assert_eq!(
+                harness.person("github", "chief-gh"),
+                Some("ceo".to_string())
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"discord_id": VIEWER_DISCORD_ID}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["slug"], "viewer-key");
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("viewer-key")
+                    .and_then(|person| person.discord_id),
+                Some(VIEWER_DISCORD_ID.to_string())
+            );
+            assert!(harness
+                .registry
+                .get_by_slug(&console_key(harness.viewer.id))
+                .is_some());
+        }
+
+        #[tokio::test]
+        async fn viewer_reads_other_people_redacted_and_themselves_in_full() {
+            let harness = Harness::new(HashMap::new());
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("other-gh", OTHER_DISCORD_ID),
+            );
+            harness.seed(
+                harness.viewer.id,
+                None,
+                sensitive_identities("viewer-gh", VIEWER_DISCORD_ID),
+            );
+
+            let (status, other) = harness
+                .send(auth_get(
+                    &identities_uri(harness.other.id),
+                    &harness.viewer.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_redacted(&other);
+            assert_eq!(other["name"], "Other");
+            assert_eq!(other["origin"], "console");
+            assert_eq!(other["identities"]["github_usernames"], json!(["other-gh"]));
+            assert_eq!(other["identities"]["discord_id"], OTHER_DISCORD_ID);
+
+            let (status, own) = harness
+                .send(auth_get(
+                    &identities_uri(harness.viewer.id),
+                    &harness.viewer.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(own["redacted"], false);
+            assert_eq!(own["email"], VIEWER_EMAIL);
+            assert_eq!(own["identities"]["sms_number"], SMS_NUMBER);
+            assert_eq!(own["identities"]["push_user_key"], PUSH_USER_KEY);
+            assert_eq!(own["identities"]["email"], "notify-viewer-gh@example.com");
+
+            let (status, other) = harness
+                .send(auth_get(
+                    &identities_uri(harness.other.id),
+                    &harness.admin.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(other["redacted"], false);
+            assert_eq!(other["email"], OTHER_EMAIL);
+            assert_eq!(other["identities"]["telegram_chat_id"], TELEGRAM_CHAT_ID);
+        }
+
+        #[tokio::test]
+        async fn identity_list_redacts_only_other_people_for_a_viewer() {
+            let harness = Harness::new(HashMap::new());
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("other-gh", OTHER_DISCORD_ID),
+            );
+            harness.seed(
+                harness.viewer.id,
+                None,
+                sensitive_identities("viewer-gh", VIEWER_DISCORD_ID),
+            );
+
+            let (status, people) = harness
+                .send(auth_get("/api/identities", &harness.viewer.token))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            let other = find_person(&people, harness.other.id);
+            assert_redacted(other);
+            assert_eq!(other["identities"]["github_usernames"], json!(["other-gh"]));
+            assert_redacted(find_person(&people, harness.admin.id));
+            let own = find_person(&people, harness.viewer.id);
+            assert_eq!(own["redacted"], false);
+            assert_eq!(own["email"], VIEWER_EMAIL);
+            assert_eq!(own["identities"]["sms_number"], SMS_NUMBER);
+
+            let (status, people) = harness
+                .send(auth_get("/api/identities", &harness.admin.token))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(people
+                .as_array()
+                .expect("array")
+                .iter()
+                .all(|person| person["redacted"] == false));
+            let other = find_person(&people, harness.other.id);
+            assert_eq!(other["email"], OTHER_EMAIL);
+            assert_eq!(other["identities"]["sms_number"], SMS_NUMBER);
+        }
+
+        #[tokio::test]
+        async fn invalid_values_are_rejected_per_field_without_echoing_them() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            for (field, value, body) in [
+                ("discord_id", "123", json!({"discord_id": "123"})),
+                ("sms_number", "12345678", json!({"sms_number": "12345678"})),
+                (
+                    "github_usernames",
+                    "-bad-",
+                    json!({"github_usernames": ["-bad-"]}),
+                ),
+                ("email", "not-an-email", json!({"email": "not-an-email"})),
+            ] {
+                let (status, response) = harness
+                    .send(auth_put_json(&uri, &harness.viewer.token, body))
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+                assert_eq!(response["error"], "Invalid identities");
+                assert_eq!(violation_fields(&response), vec![field]);
+                let message = response["violations"][0]["message"]
+                    .as_str()
+                    .expect("message");
+                if field != "github_usernames" {
+                    assert!(
+                        !message.contains(value),
+                        "{field} violation must not echo the value"
+                    );
+                }
+            }
+
+            let (status, response) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({
+                        "discord_id": "123",
+                        "sms_number": "12345678",
+                        "github_usernames": ["-bad-"],
+                        "email": "not-an-email",
+                    }),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                violation_fields(&response),
+                vec!["discord_id", "email", "github_usernames", "sms_number"]
+            );
+
+            assert!(harness.stored_user_ids().is_empty());
+            assert_eq!(harness.person("github", "-bad-"), None);
+        }
+
+        #[tokio::test]
+        async fn handles_owned_by_another_person_conflict_for_every_role() {
+            let harness = Harness::new(chief_config());
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("taken-gh", OTHER_DISCORD_ID),
+            );
+            let uri = identities_uri(harness.viewer.id);
+
+            for (token, body, field) in [
+                (
+                    &harness.viewer.token,
+                    json!({"github_usernames": ["Taken-GH"]}),
+                    "github_usernames",
+                ),
+                (
+                    &harness.viewer.token,
+                    json!({"github_usernames": ["chief-gh"]}),
+                    "github_usernames",
+                ),
+                (
+                    &harness.viewer.token,
+                    json!({"discord_id": OTHER_DISCORD_ID}),
+                    "discord_id",
+                ),
+                (
+                    &harness.admin.token,
+                    json!({"github_usernames": ["chief-gh"]}),
+                    "github_usernames",
+                ),
+            ] {
+                let (status, response) = harness.send(auth_put_json(&uri, token, body)).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{field}");
+                assert_eq!(violation_fields(&response), vec![field]);
+                let message = response["violations"][0]["message"]
+                    .as_str()
+                    .expect("message");
+                assert!(message.contains(CONFLICT_MESSAGE), "{message}");
+                assert!(!message.contains("ceo"), "{message}");
+                assert!(
+                    !message.contains(&console_key(harness.other.id)),
+                    "{message}"
+                );
+                assert!(!message.contains("Other"), "{message}");
+            }
+            assert_eq!(harness.stored_user_ids(), vec![harness.other.id]);
+            assert_eq!(
+                harness.person("github", "chief-gh"),
+                Some("ceo".to_string())
+            );
+            assert_eq!(
+                harness.person("github", "taken-gh"),
+                Some(console_key(harness.other.id))
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"sms_number": SMS_NUMBER, "email": "notify-taken-gh@example.com"}),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "notification targets may be shared between people"
+            );
+            assert_eq!(body["identities"]["sms_number"], SMS_NUMBER);
+        }
+
+        #[tokio::test]
+        async fn config_person_becomes_console_on_save_and_reverts_on_reset() {
+            let harness = Harness::new(HashMap::from([(
+                "jake".to_string(),
+                UserConfig {
+                    github_usernames: vec!["jake-gh".to_string()],
+                    discord_id: Some(CONFIG_DISCORD_ID.to_string()),
+                    email: Some("Identity-Viewer@Example.com".to_string()),
+                    ..UserConfig::default()
+                },
+            )]));
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "config");
+            assert_eq!(body["slug"], "jake");
+            assert_eq!(body["updated_at"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
+            assert_eq!(body["identities"]["discord_id"], CONFIG_DISCORD_ID);
+            assert_eq!(
+                harness.registry.origin("jake"),
+                Some(IdentityOrigin::Config)
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"slack_id": SLACK_ID}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["slug"], "jake");
+            assert!(body["updated_at"].is_string());
+            assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
+            assert_eq!(body["identities"]["discord_id"], CONFIG_DISCORD_ID);
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+            assert_eq!(
+                harness.registry.origin("jake"),
+                Some(IdentityOrigin::Console)
+            );
+            assert_eq!(
+                harness.person("github", "jake-gh"),
+                Some("jake".to_string())
+            );
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("jake")
+                    .and_then(|person| person.slack_id),
+                Some(SLACK_ID.to_string())
+            );
+
+            let (status, body) = harness.send(auth_delete(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "config");
+            assert_eq!(body["slug"], "jake");
+            assert_eq!(body["updated_at"], Value::Null);
+            assert_eq!(body["identities"]["slack_id"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
+            assert_eq!(
+                harness.registry.origin("jake"),
+                Some(IdentityOrigin::Config)
+            );
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("jake")
+                    .and_then(|person| person.slack_id),
+                None
+            );
+            assert!(harness.stored_user_ids().is_empty());
+
+            let (status, body) = harness
+                .send(auth_get(
+                    &identities_uri(harness.other.id),
+                    &harness.admin.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "unset");
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn sparse_updates_keep_earlier_fields() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            for body in [
+                json!({"github_usernames": ["viewer-gh"], "slack_id": SLACK_ID}),
+                json!({"discord_id": VIEWER_DISCORD_ID}),
+            ] {
+                let (status, _) = harness
+                    .send(auth_put_json(&uri, &harness.viewer.token, body))
+                    .await;
+                assert_eq!(status, StatusCode::OK);
+            }
+            let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["identities"]["github_usernames"], json!(["viewer-gh"]));
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+            assert_eq!(body["identities"]["discord_id"], VIEWER_DISCORD_ID);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"discord_id": ""}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["identities"]["discord_id"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!(["viewer-gh"]));
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"github_usernames": []}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["identities"]["github_usernames"], json!([]));
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+            assert_eq!(harness.person("github", "viewer-gh"), None);
+        }
+
+        #[tokio::test]
+        async fn identity_email_never_links_a_viewer_to_a_config_person() {
+            let harness = Harness::new(chief_config());
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"email": "chief@example.com", "github_usernames": ["viewer-gh"]}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "active");
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["slug"], console_key(harness.viewer.id));
+            assert_eq!(body["identities"]["email"], "chief@example.com");
+
+            let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["slug"], console_key(harness.viewer.id));
+
+            assert_eq!(
+                harness.person("github", "chief-gh"),
+                Some("ceo".to_string())
+            );
+            assert_eq!(harness.registry.origin("ceo"), Some(IdentityOrigin::Config));
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("ceo")
+                    .and_then(|person| person.discord_id),
+                Some(CONFIG_DISCORD_ID.to_string())
+            );
+            assert_eq!(
+                harness.person("github", "viewer-gh"),
+                Some(console_key(harness.viewer.id))
+            );
+        }
+
+        #[tokio::test]
+        async fn identity_endpoints_require_a_session() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+            let update = json!({"github_usernames": ["anonymous-gh"]});
+
+            for request in [
+                anonymous("GET", "/api/identities", None),
+                anonymous("GET", &uri, None),
+                anonymous("PUT", &uri, Some(update.clone())),
+                anonymous("DELETE", &uri, None),
+                auth_get(&uri, "not-a-session"),
+                auth_put_json(&uri, "not-a-session", update.clone()),
+                auth_delete(&uri, "not-a-session"),
+            ] {
+                let (status, _) = harness.send(request).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+            }
+            assert!(harness.stored_user_ids().is_empty());
+            assert_eq!(harness.person("github", "anonymous-gh"), None);
+        }
+    }
 }
