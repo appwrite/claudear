@@ -1399,3 +1399,43 @@ export async function saveDeployQaConfig(
 ): Promise<DeployQaSaveResponse> {
   return putJson(`${API_BASE}/deploy-qa/config`, { settings, revision })
 }
+
+export type FeatureCategory = 'source' | 'scm' | 'notifier' | 'automation' | 'intelligence' | 'platform'
+
+export type FeatureSettingValue =
+  | string
+  | number
+  | boolean
+  | null
+  | FeatureSettingValue[]
+  | { [name: string]: FeatureSettingValue }
+
+export interface FeatureSetting {
+  name: string
+  value: FeatureSettingValue
+}
+
+export interface FeatureSecret {
+  name: string
+  set: boolean
+}
+
+export interface FeatureStatus {
+  key: string
+  label: string
+  description: string
+  category: FeatureCategory
+  configured: boolean
+  enabled: boolean
+  settings: FeatureSetting[]
+  secrets: FeatureSecret[]
+}
+
+export interface FeaturesResponse {
+  features: FeatureStatus[]
+}
+
+export async function fetchFeatures(): Promise<FeatureStatus[]> {
+  const response = await fetchJson<FeaturesResponse>(`${API_BASE}/features`)
+  return response.features
+}
