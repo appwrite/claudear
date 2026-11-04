@@ -169,6 +169,7 @@ describe('DeployQaPage', () => {
   afterEach(() => {
     cleanup()
     globalThis.fetch = originalFetch
+    window.history.replaceState(null, '', '/')
   })
 
   test('viewer sees status and runs but never requests the admin config', async () => {
