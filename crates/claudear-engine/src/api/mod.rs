@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub(crate) mod embedded;
+mod features;
 mod routes;
 mod security;
 mod tokens;
