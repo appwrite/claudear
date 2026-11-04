@@ -7,6 +7,11 @@ use abnegate_http::HttpResponse;
 use async_trait::async_trait;
 use chrono::DateTime;
 use chrono::Utc;
+use claudear_analysis::distribution::AssignmentNotice;
+use claudear_analysis::distribution::Developer;
+use claudear_analysis::distribution::Digest;
+use claudear_analysis::distribution::Markup;
+use claudear_analysis::distribution::PlainText;
 use claudear_config::config::SlackConfig;
 use claudear_config::users::NotificationChannel;
 use claudear_config::users::UserRegistry;
@@ -1055,6 +1060,90 @@ pub(crate) fn build_report_message(report: &Report) -> SlackMessage {
     }
 }
 
+/// Longest text of a Block Kit section, in characters.
+const SECTION_CHARACTER_LIMIT: usize = 3000;
+
+/// Slack markup: `<@id>` mentions, falling back to the GitHub handle for a
+/// developer without a Slack id, and `<url|text>` links.
+pub(crate) struct SlackMarkup;
+
+impl Markup for SlackMarkup {
+    fn mention(&self, developer: &Developer) -> String {
+        developer
+            .slack_id
+            .as_ref()
+            .map_or_else(|| developer.handle(), |id| format!("<@{id}>"))
+    }
+
+    fn link(&self, text: &str, url: &str) -> String {
+        format!("<{url}|{text}>")
+    }
+
+    /// Escapes Slack's control characters, so `<!channel>` or `<@U…>` in a
+    /// title stays text, and breaks bare `@here`-style mentions.
+    fn text(&self, value: &str) -> String {
+        PlainText::break_mentions(
+            &value
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;"),
+        )
+    }
+}
+
+/// Build the Slack message telling a developer they own a PR.
+pub(crate) fn build_pr_assignment_message(notice: &AssignmentNotice) -> SlackMessage {
+    let text = truncate_string(&notice.render(&SlackMarkup), SECTION_CHARACTER_LIMIT);
+    SlackMessage {
+        channel: None,
+        text: text.clone(),
+        blocks: Some(vec![
+            SlackBlock::Section {
+                text: SlackText::mrkdwn(text),
+                fields: None,
+            },
+            SlackBlock::Context {
+                elements: vec![SlackText::mrkdwn(format!("Claudear | {}", timestamp()))],
+            },
+        ]),
+        thread_ts: None,
+    }
+}
+
+/// Build the Slack messages for the PR digest: one per assignee, opening with
+/// the digest title and their mention, with their PRs split across sections
+/// that fit Slack's section limit. Empty when no PR needs anyone.
+pub(crate) fn build_pr_digest_messages(digest: &Digest) -> Vec<SlackMessage> {
+    digest
+        .groups
+        .iter()
+        .map(|group| {
+            let mut blocks = vec![SlackBlock::Section {
+                text: SlackText::mrkdwn(Digest::TITLE),
+                fields: None,
+            }];
+            blocks.extend(
+                group
+                    .pages(&SlackMarkup, digest.generated_at, SECTION_CHARACTER_LIMIT)
+                    .into_iter()
+                    .map(|page| SlackBlock::Section {
+                        text: SlackText::mrkdwn(page),
+                        fields: None,
+                    }),
+            );
+            blocks.push(SlackBlock::Context {
+                elements: vec![SlackText::mrkdwn(format!("Claudear | {}", timestamp()))],
+            });
+            SlackMessage {
+                channel: None,
+                text: group.heading(&SlackMarkup),
+                blocks: Some(blocks),
+                thread_ts: None,
+            }
+        })
+        .collect()
+}
+
 /// Build the Slack message for a human-in-the-loop question.
 pub(crate) fn build_ask_question_message(
     issue: &Issue,
@@ -1181,6 +1270,17 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
 
     async fn notify_report(&self, report: &Report) -> Result<()> {
         self.send(build_report_message(report)).await
+    }
+
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
+        self.send(build_pr_assignment_message(notice)).await
+    }
+
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
+        for message in build_pr_digest_messages(digest) {
+            self.send(message).await?;
+        }
+        Ok(())
     }
 
     async fn ask_question(
@@ -1851,6 +1951,152 @@ mod tests {
             })
             .collect();
         assert!(issue_blocks.len() <= 10);
+    }
+
+    fn pr_developer(login: &str, slack_id: Option<&str>) -> Developer {
+        Developer {
+            login: login.to_string(),
+            discord_id: Some("ignored".to_string()),
+            slack_id: slack_id.map(str::to_string),
+        }
+    }
+
+    fn pr_summary(number: i64) -> claudear_analysis::distribution::PullRequestSummary {
+        claudear_analysis::distribution::PullRequestSummary {
+            url: format!("https://github.com/org/repo/pull/{number}"),
+            repo: "org/repo".to_string(),
+            number,
+            title: format!("Fix {number}"),
+            opened_at: None,
+        }
+    }
+
+    fn section_texts(message: &SlackMessage) -> Vec<String> {
+        message
+            .blocks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|block| match block {
+                SlackBlock::Section { text, .. } => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_pr_assignment_message_pings_the_slack_user() {
+        let message = build_pr_assignment_message(&AssignmentNotice {
+            developer: pr_developer("amy", Some("U42")),
+            pull_request: pr_summary(7),
+            reason: claudear_core::types::AssignmentReason::Requester,
+            previous: None,
+        });
+
+        assert_eq!(
+            message.text,
+            "<@U42> you're responsible for getting \
+             <https://github.com/org/repo/pull/7|org/repo#7> over the line: Fix 7\n\
+             You asked for this work."
+        );
+        assert_eq!(section_texts(&message), vec![message.text.clone()]);
+    }
+
+    #[test]
+    fn test_pr_messages_never_ping_from_the_title() {
+        let mut pull_request = pr_summary(7);
+        pull_request.title = "<!channel> <!here> <!everyone> <@U9> @here & co".to_string();
+        let notice = AssignmentNotice {
+            developer: pr_developer("amy", Some("U42")),
+            pull_request: pull_request.clone(),
+            reason: claudear_core::types::AssignmentReason::Requester,
+            previous: None,
+        };
+        let digest = Digest {
+            groups: vec![claudear_analysis::distribution::DigestGroup {
+                developer: pr_developer("amy", Some("U42")),
+                pull_requests: vec![pull_request],
+            }],
+            generated_at: Utc::now(),
+        };
+
+        let mut texts = section_texts(&build_pr_assignment_message(&notice));
+        texts.extend(section_texts(&build_pr_digest_messages(&digest)[0]));
+
+        for text in &texts {
+            for mention in ["<!channel>", "<!here>", "<!everyone>", "<@U9>", "@here"] {
+                assert!(!text.contains(mention), "{mention} in {text}");
+            }
+        }
+        assert!(texts[0].starts_with("<@U42> "));
+        assert!(texts[0].contains("&lt;!channel&gt; &lt;!here&gt;"));
+        assert!(texts[0].contains("&amp; co"));
+        assert!(texts[2].starts_with("<@U42> 1 Claudear PR"));
+    }
+
+    #[test]
+    fn test_pr_assignment_message_falls_back_to_the_github_handle() {
+        let message = build_pr_assignment_message(&AssignmentNotice {
+            developer: pr_developer("amy", None),
+            pull_request: pr_summary(7),
+            reason: claudear_core::types::AssignmentReason::Load,
+            previous: None,
+        });
+
+        assert!(message.text.starts_with("@amy you're responsible"));
+    }
+
+    #[test]
+    fn test_pr_digest_messages_one_per_assignee_within_section_limits() {
+        let digest = Digest {
+            groups: vec![
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("amy", Some("U1")),
+                    pull_requests: (1..=100).map(pr_summary).collect(),
+                },
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("bob", Some("U2")),
+                    pull_requests: vec![pr_summary(101)],
+                },
+            ],
+            generated_at: Utc::now(),
+        };
+
+        let messages = build_pr_digest_messages(&digest);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "<@U1> 100 Claudear PRs waiting on you:");
+        let amy = section_texts(&messages[0]);
+        assert_eq!(amy[0], Digest::TITLE);
+        assert!(amy.len() > 2);
+        assert!(amy
+            .iter()
+            .all(|text| text.chars().count() <= SECTION_CHARACTER_LIMIT));
+        assert!(amy[1].starts_with("<@U1> 100 Claudear PRs waiting on you:\n"));
+        assert_eq!(
+            section_texts(&messages[1])[1],
+            "<@U2> 1 Claudear PR waiting on you:\n\
+             • <https://github.com/org/repo/pull/101|org/repo#101> Fix 101"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notify_pr_digest_sends_each_assignee_message() {
+        let notifier =
+            SlackNotifier::with_http_client(webhook_config(), MockSlackHttpClient::success());
+        let digest = Digest {
+            groups: vec![claudear_analysis::distribution::DigestGroup {
+                developer: pr_developer("amy", Some("U1")),
+                pull_requests: vec![pr_summary(1)],
+            }],
+            generated_at: Utc::now(),
+        };
+
+        notifier.notify_pr_digest(&digest).await.unwrap();
+
+        assert_eq!(notifier.http.get_call_count(), 1);
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        assert_eq!(body["text"], "<@U1> 1 Claudear PR waiting on you:");
     }
 
     #[tokio::test]

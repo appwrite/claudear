@@ -3078,8 +3078,8 @@ mod tests {
     use axum::http::Request;
     use claudear_config::config::{
         AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, DeployQaConfig, IssuesConfig,
-        LearningConfig, NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig,
-        ScmConfig,
+        LearningConfig, NotifiersConfig, PrDistributionConfig, PrioritisationConfig,
+        RegressionConfig, RetryConfig, ScmConfig,
     };
     use claudear_core::identity::Role;
     use claudear_core::secret::SecretValue;
@@ -3111,6 +3111,7 @@ mod tests {
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
             deploy_qa: DeployQaConfig::default(),
+            pr_distribution: PrDistributionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),

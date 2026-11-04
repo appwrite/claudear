@@ -233,6 +233,9 @@ weight = 0.2
 # jake@example.com (the email below). The identity email they edit themselves
 # never links. Entries without a dashboard override stay active.
 # Reverting to config in the dashboard brings this entry back.
+#
+# A person with github_usernames (here or in the dashboard) is on the
+# [pr_distribution] roster.
 
 [users.jake]
 # Source identifiers (accepts a single string or a list of strings)
@@ -931,6 +934,49 @@ tag_filter = "not_suffix:-db"
 name = "vibes"
 repo = "appwrite/vibes"
 tag_filter = "any"
+
+# ============================================
+# PR Distribution
+# ============================================
+# Makes one developer responsible for each open Claudear PR and pings them,
+# balanced so no single developer ends up holding every PR. If you're tagged,
+# it's your responsibility to get the PR over the line.
+#
+# The roster is everyone in the user directory (dashboard identities merged with
+# [users]) who owns a GitHub login, plus logins in the [deploy_qa]
+# github_discord_map_path map that nobody owns, minus `excluded`. It is rebuilt
+# for every PR and scheduled run, so dashboard edits apply without a restart.
+# Mentions use each developer's Discord id on Discord (the map fills in a
+# missing one) and Slack id on Slack, and @login elsewhere.
+#
+# Ownership, strongest first: who asked for the work (the issue's resolved
+# [users] assignee, a GitHub issue's assignee or author, or the Discord/Slack
+# user who posted it), CODEOWNERS for the changed files, recent commits to the
+# changed files, then recent commits to the repository. Each PR goes to its
+# strongest owner still under the fair share (open PRs / roster size, rounded
+# up, plus `tolerance`), otherwise to the least-loaded developer. Assignments
+# are sticky until the PR merges or closes or the assignee leaves the roster.
+# Requires scm.github.token.
+
+[pr_distribution]
+# Off by default (default: false)
+enabled = false
+# Assign and ping as soon as Claudear opens a PR (default: true). When false,
+# new PRs are assigned on the next scheduled run.
+notify_on_open = true
+# Send each assignee the PRs still waiting on them on every scheduled run
+# (default: true). When false, the scheduled run pings each new assignee.
+digest = true
+# How often the scheduled run fires: "daily", "weekly-monday" .. "weekly-sunday",
+# or "monthly" (default: "daily"). Any other value fails config loading.
+digest_frequency = "daily"
+# Hour the scheduled run fires, 0-23 UTC (default: 9)
+digest_hour = 9
+# GitHub logins never assigned, e.g. people on leave (default: [])
+excluded = []
+# PRs a developer may hold above the fair share before an owner loses a PR to
+# someone less loaded (default: 0)
+tolerance = 0
 
 # Enables chained follow-up fixes across repositories.
 

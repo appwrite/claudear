@@ -91,6 +91,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "user_directory",
         sql: include_str!("../../../migrations/V15__user_directory.sql"),
     },
+    Migration {
+        version: 16,
+        name: "pr_assignments",
+        sql: include_str!("../../../migrations/V16__pr_assignments.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -323,6 +328,7 @@ mod tests {
         assert!(column_exists(&connection, "users", "status"));
         assert!(table_exists(&connection, "user_invites"));
         assert!(index_exists(&connection, "idx_user_invites_open"));
+        assert!(table_exists(&connection, "pr_assignments"));
     }
 
     #[test]
@@ -578,6 +584,7 @@ mod tests {
             "retrieval_usage",
             "user_identities",
             "user_invites",
+            "pr_assignments",
         ];
 
         for table in expected_tables {

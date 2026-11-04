@@ -162,8 +162,8 @@ mod tests {
     };
     use claudear_storage::{
         ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
-        EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
-        SimilarityStore, UserStore, WebhookStore,
+        EvaluationStore, ExperimentStore, KnowledgeStore, PrAssignmentStore, RegressionStore,
+        RepoStore, SimilarityStore, UserStore, WebhookStore,
     };
 
     /// Minimal no-op tracker for tests.
@@ -264,6 +264,7 @@ mod tests {
     impl SimilarityStore for NoOpTracker {}
     impl DiscordStore for NoOpTracker {}
     impl DeployQaStore for NoOpTracker {}
+    impl PrAssignmentStore for NoOpTracker {}
 
     fn make_candidate(
         id: &str,
@@ -850,6 +851,7 @@ mod tests {
         impl SimilarityStore for ClusterTrackingTracker {}
         impl DiscordStore for ClusterTrackingTracker {}
         impl DeployQaStore for ClusterTrackingTracker {}
+        impl PrAssignmentStore for ClusterTrackingTracker {}
 
         let config = PrioritisationConfig {
             content_clustering: true,
@@ -2751,6 +2753,7 @@ mod tests {
         impl SimilarityStore for CountingTracker {}
         impl DiscordStore for CountingTracker {}
         impl DeployQaStore for CountingTracker {}
+        impl PrAssignmentStore for CountingTracker {}
 
         let count = Arc::new(AtomicU32::new(0));
         let tracker = CountingTracker {
@@ -2912,6 +2915,7 @@ mod tests {
         impl SimilarityStore for FailingTracker {}
         impl DiscordStore for FailingTracker {}
         impl DeployQaStore for FailingTracker {}
+        impl PrAssignmentStore for FailingTracker {}
 
         let tracker = FailingTracker;
         let clusters = vec![ContentCluster {

@@ -32,6 +32,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
   - [Graceful Shutdown](#graceful-shutdown)
   - [Manual Triggers](#manual-triggers)
   - [PR Management](#pr-management)
+  - [PR Distribution](#pr-distribution-1)
   - [Retry Management](#retry-management)
   - [Dashboard](#dashboard)
   - [Scheduled Reports](#scheduled-reports)
@@ -172,6 +173,11 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Automatically resolves source issues (Linear/Sentry) when PRs merge
 - Exponential backoff retries for failed or closed PRs (configurable max retries)
 - Full lifecycle tracking: Pending -> Success -> Merged -> Resolved (with retry paths)
+
+### PR Distribution
+- Makes one developer responsible for each open Claudear PR and pings them on Discord or Slack as soon as it opens
+- Scores ownership by who asked for the work, CODEOWNERS, and recent commits, then balances so nobody holds more than their fair share
+- Sticky assignments persisted in SQLite, plus a scheduled digest of the PRs still waiting on each assignee
 
 ### Regression Monitoring
 - Hourly checks for 24 hours after a fix deploys
@@ -472,6 +478,7 @@ api_key = "lin_api_xxxx"
 | `retry` | Max retries, base delay, max delay (exponential backoff) |
 | `regression` | Check interval, monitoring duration, event thresholds |
 | `deploy_qa` | Live release-tip watches (tracks, tag filters, Discord `#releases`) |
+| `pr_distribution` | Assign each open Claudear PR to one developer, ping on open, scheduled per-assignee digest |
 | `cascade` | Enable/disable cascading, max depth, per-dependency rules |
 | `learning` | Continuous learning: log extraction, diff analysis, Q&A promotion, repo knowledge |
 | `prioritisation` | Composite scoring weights, blast radius paths, clustering, suppression rules |
@@ -596,6 +603,38 @@ claudear prs monitor
 # Run continuously
 claudear prs monitor --continuous
 ```
+
+### PR Distribution
+
+Every open Claudear PR gets one developer responsible for getting it over the line. Developers come from the [user registry](#user-registry-1): everyone, console identities and `[users]` entries alike, who owns a GitHub login (a login two people list belongs to its registry owner), minus `excluded`. Mentions use the registry's Discord and Slack ids; the `[deploy_qa]` `github-discord-map.json` only fills in a missing Discord id and adds logins nobody in the registry owns. The roster is rebuilt for every PR and scheduled run, so console edits change assignments and mentions without a restart.
+
+```toml
+[pr_distribution]
+enabled = true
+digest_frequency = "daily"         # daily | weekly-monday .. weekly-sunday | monthly; anything else fails to load
+digest_hour = 9                    # UTC
+excluded = ["on-leave-login"]
+tolerance = 0                      # PRs above the fair share an owner may hold
+```
+
+**Ownership.** Each roster developer is scored for a PR, strongest signal first:
+
+| Signal | Points |
+|--------|--------|
+| Asked for the work: the issue's assignee as resolved by the user registry, a GitHub issue's assignee or author, or the Discord/Slack user who posted it | 100 for the closest, 100/n for the n-th |
+| CODEOWNERS (`.github/`, root or `docs/`) names them for the changed files | 40 × share of changed files |
+| Authored recent commits (last 30 per file) to the changed files | 20 × share of those commits |
+| Authored recent commits (last 100) to the repository | 5 × share of those commits |
+
+Team (`@org/team`) and email owners in CODEOWNERS are ignored.
+
+**Mentions.** Only the assignee is ever pinged. PR titles are external text, so every `@` in them is broken with a zero-width space (and Slack's `<`, `>` and `&` are escaped), and Discord messages carry `allowed_mentions` limited to the assignee's user id.
+
+**Balancing.** The fair share is the number of open PRs (already assigned plus waiting) divided by the roster size, rounded up, plus `tolerance`. PRs with the strongest ownership are placed first; each goes to its highest-scoring developer still under the fair share, otherwise to the least-loaded developer. Ties break by login, so the same inputs always give the same assignments.
+
+**Lifecycle.** When Claudear opens a PR it is assigned at once and the assignee is pinged (`notify_on_open`). On the schedule, Claudear reconciles every open Claudear PR: assignments of merged or closed PRs are closed, PRs whose assignee left the roster are handed to someone else, unowned PRs are assigned, and each assignee gets a digest of their PRs that still need them. Assignments are stored in `pr_assignments` and stay with their assignee until one of those happens.
+
+**Which PRs need someone.** A PR is listed (and an unowned one assigned) while it is open and not a draft, unless it is approved with auto-merge on, or its assignee has already reviewed its current head commit and has no outstanding review request. An approved PR without auto-merge is still listed: someone has to merge it.
 
 ### Retry Management
 
