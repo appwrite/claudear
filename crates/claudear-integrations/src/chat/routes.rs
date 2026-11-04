@@ -10,13 +10,17 @@
 //! - The owner, or any admin, may delete a session.
 //! - Sessions from before sessions had owners are listed, read, attached to
 //!   and deleted only by admins.
-//! - A session the caller may not read or delete answers 404, never 403, so
-//!   its existence does not leak; over the websocket the reply is an error
-//!   chunk saying the session was not found.
-//! - The websocket creates a session the caller names but that does not exist
-//!   yet, owned by the caller.
+//! - A session the caller may not read or delete answers 404, never 403,
+//!   exactly as a missing one does, so its existence does not leak; over the
+//!   websocket both get the same error chunk saying the session was not found.
+//! - Only the server names sessions: a websocket message without a session id
+//!   starts a new session under a server-generated id, owned by the caller,
+//!   and one with an id only continues an existing session; it never creates
+//!   one.
+//! - Each read, append and delete applies the caller's scope in the same SQL
+//!   statement, so no ownership check can go stale before the act.
 
-use super::service::{ChatActor, ChatService};
+use super::service::{ChatActor, ChatService, SessionTarget};
 use super::types::*;
 use axum::{
     extract::{
@@ -109,16 +113,18 @@ async fn handle_chat_ws(mut socket: WebSocket, state: ChatState, viewer: ChatVie
             }
         };
 
-        let session_id = request
-            .session_id
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mut target = SessionTarget::requested(request.session_id);
+        let created_session_id = match &target {
+            SessionTarget::New(id) => Some(id.clone()),
+            SessionTarget::Existing(_) => None,
+        };
 
         // Prepare the chat (session, user msg, RAG, prompt, LLM)
         let prepared = match state
             .chat_service
             .prepare_chat(
                 ChatActor::Viewer(&viewer),
-                &session_id,
+                &mut target,
                 &request.message,
                 request.repo_id,
                 request.params.as_ref(),
@@ -131,7 +137,7 @@ async fn handle_chat_ws(mut socket: WebSocket, state: ChatState, viewer: ChatVie
                     delta: String::new(),
                     done: true,
                     sources: None,
-                    session_id: Some(session_id),
+                    session_id: created_session_id,
                     error: Some(e.to_string()),
                     stopped: None,
                 };
@@ -143,6 +149,8 @@ async fn handle_chat_ws(mut socket: WebSocket, state: ChatState, viewer: ChatVie
                 continue;
             }
         };
+
+        let session_id = prepared.session_id.clone();
 
         // Set up streaming channel and cancel flag
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
@@ -228,11 +236,9 @@ async fn handle_chat_ws(mut socket: WebSocket, state: ChatState, viewer: ChatVie
 
         if ws_broken {
             // Still save whatever was generated
-            let _ = state.chat_service.save_assistant_message(
-                &session_id,
-                &accumulated,
-                &prepared.sources,
-            );
+            let _ = state
+                .chat_service
+                .save_assistant_message(&prepared, &accumulated);
             break;
         }
 
@@ -256,10 +262,9 @@ async fn handle_chat_ws(mut socket: WebSocket, state: ChatState, viewer: ChatVie
             .await;
 
         // Save the (possibly partial) response
-        let _ =
-            state
-                .chat_service
-                .save_assistant_message(&session_id, &accumulated, &prepared.sources);
+        let _ = state
+            .chat_service
+            .save_assistant_message(&prepared, &accumulated);
     }
 }
 
@@ -318,10 +323,15 @@ async fn get_session_handler(
     State(state): State<ChatState>,
     Extension(viewer): Extension<ChatViewer>,
 ) -> Result<Json<ChatSession>, StatusCode> {
-    let session = find_session(&state, &id, |session| viewer.can_read(session))?;
+    let scope = viewer.scope();
+    let session = state
+        .tracker
+        .get_chat_session(&id, &scope)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
     let messages = state
         .tracker
-        .get_chat_history(&id, HISTORY_LIMIT)
+        .get_chat_history(&id, &scope, HISTORY_LIMIT)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(ChatSession {
@@ -335,27 +345,15 @@ async fn delete_session_handler(
     Path(id): Path<String>,
     State(state): State<ChatState>,
     Extension(viewer): Extension<ChatViewer>,
-) -> Result<StatusCode, StatusCode> {
-    find_session(&state, &id, |session| viewer.can_delete(session))?;
-    state
+) -> StatusCode {
+    match state
         .tracker
-        .delete_chat_session(&id)
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-/// The session `id` if it exists and `allowed` admits it, otherwise 404.
-fn find_session(
-    state: &ChatState,
-    id: &str,
-    allowed: impl Fn(&ChatSession) -> bool,
-) -> Result<ChatSession, StatusCode> {
-    state
-        .tracker
-        .get_chat_session(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .filter(allowed)
-        .ok_or(StatusCode::NOT_FOUND)
+        .delete_chat_session(&id, &viewer.delete_scope())
+    {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 #[cfg(test)]

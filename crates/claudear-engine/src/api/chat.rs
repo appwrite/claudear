@@ -156,6 +156,7 @@ mod tests {
     use axum::body::Body;
     use claudear_analysis::feedback::EmbeddingConfig;
     use claudear_config::config::{ChatConfig, LlmModelConfig};
+    use claudear_core::types::ChatSessionScope;
     use claudear_integrations::chat::{create_chat_router, CHAT_SESSION_NOT_FOUND};
     use claudear_storage::SqliteTracker;
     use futures::{SinkExt, StreamExt};
@@ -623,6 +624,12 @@ mod tests {
 
     const CSRF_TOKEN: &str = "chat-test-csrf";
 
+    const EVERY_CHAT_SESSION: ChatSessionScope = ChatSessionScope {
+        owner_user_id: None,
+        include_ownerless: true,
+        include_other_owners: true,
+    };
+
     struct SignedIn {
         id: i64,
         cookie: String,
@@ -658,7 +665,7 @@ mod tests {
     fn owned_session(tracker: &Arc<dyn FixAttemptTracker>, id: &str, owner: Option<i64>) {
         tracker.create_chat_session(id, None, owner).unwrap();
         tracker
-            .save_chat_message(id, "user", "private question", None)
+            .save_chat_message(id, &EVERY_CHAT_SESSION, "user", "private question", None)
             .unwrap();
     }
 
@@ -738,7 +745,10 @@ mod tests {
             "a missing session answers the same as another user's"
         );
 
-        assert!(tracker.get_chat_session("mine").unwrap().is_some());
+        assert!(tracker
+            .get_chat_session("mine", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -751,7 +761,10 @@ mod tests {
 
         let (status, _) = send(&router, "DELETE", "/api/chat/sessions/mine", &admin).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(tracker.get_chat_session("mine").unwrap().is_none());
+        assert!(tracker
+            .get_chat_session("mine", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -789,7 +802,10 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "private question");
         let (status, _) = send(&router, "DELETE", "/api/chat/sessions/legacy", &admin).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(tracker.get_chat_session("legacy").unwrap().is_none());
+        assert!(tracker
+            .get_chat_session("legacy", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_none());
     }
 
     async fn serve(router: Router) -> std::net::SocketAddr {
@@ -799,11 +815,11 @@ mod tests {
         address
     }
 
-    async fn chat_over_websocket(
+    async fn raw_reply_over_websocket(
         address: std::net::SocketAddr,
         viewer: &SignedIn,
         session_id: Option<&str>,
-    ) -> Value {
+    ) -> String {
         let mut request = format!("ws://{address}{WEBSOCKET_PATH}")
             .into_client_request()
             .unwrap();
@@ -826,7 +842,15 @@ mod tests {
             .expect("the server replies")
             .expect("the socket stays open")
             .unwrap();
-        serde_json::from_str(reply.to_text().unwrap()).unwrap()
+        reply.to_text().unwrap().to_string()
+    }
+
+    async fn chat_over_websocket(
+        address: std::net::SocketAddr,
+        viewer: &SignedIn,
+        session_id: Option<&str>,
+    ) -> Value {
+        serde_json::from_str(&raw_reply_over_websocket(address, viewer, session_id).await).unwrap()
     }
 
     #[tokio::test]
@@ -844,14 +868,23 @@ mod tests {
             assert_eq!(reply["error"], CHAT_SESSION_NOT_FOUND);
         }
         assert_eq!(
-            tracker.get_chat_history("mine", 10).unwrap().len(),
+            tracker
+                .get_chat_history("mine", &EVERY_CHAT_SESSION, 10)
+                .unwrap()
+                .len(),
             1,
             "a rejected attach saves nothing to the session"
         );
 
         let reply = chat_over_websocket(address, &owner, Some("mine")).await;
         assert_ne!(reply["error"], CHAT_SESSION_NOT_FOUND);
-        assert_eq!(tracker.get_chat_history("mine", 10).unwrap().len(), 2);
+        assert_eq!(
+            tracker
+                .get_chat_history("mine", &EVERY_CHAT_SESSION, 10)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -862,15 +895,77 @@ mod tests {
 
         let reply = chat_over_websocket(address, &owner, None).await;
         let session_id = reply["session_id"].as_str().unwrap();
-        let session = tracker.get_chat_session(session_id).unwrap().unwrap();
-        assert_eq!(session.owner_user_id, Some(owner.id));
-
-        let reply = chat_over_websocket(address, &owner, Some("named-by-client")).await;
-        assert_ne!(reply["error"], CHAT_SESSION_NOT_FOUND);
         let session = tracker
-            .get_chat_session("named-by-client")
+            .get_chat_session(session_id, &EVERY_CHAT_SESSION)
             .unwrap()
             .unwrap();
         assert_eq!(session.owner_user_id, Some(owner.id));
+    }
+
+    #[tokio::test]
+    async fn a_websocket_never_creates_a_session_under_a_client_chosen_id() {
+        let tracker = tracker();
+        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let address = serve(chat_router(&tracker)).await;
+
+        let reply = chat_over_websocket(address, &owner, Some("named-by-client")).await;
+
+        assert_eq!(reply["error"], CHAT_SESSION_NOT_FOUND);
+        assert!(tracker
+            .get_chat_session("named-by-client", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_none());
+        assert!(tracker
+            .list_chat_sessions(&EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_and_a_foreign_chat_session_get_identical_websocket_replies() {
+        let tracker = tracker();
+        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let other = sign_in(&tracker, "other@example.com", "viewer");
+        owned_session(&tracker, "mine", Some(owner.id));
+        let address = serve(chat_router(&tracker)).await;
+
+        let foreign = raw_reply_over_websocket(address, &other, Some("mine")).await;
+        let missing = raw_reply_over_websocket(address, &other, Some("missing")).await;
+
+        assert_eq!(foreign, missing);
+        assert_eq!(
+            tracker
+                .list_chat_sessions(&EVERY_CHAT_SESSION)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_removes_only_a_session_in_the_callers_scope() {
+        let tracker = tracker();
+        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let other = sign_in(&tracker, "other@example.com", "viewer");
+        owned_session(&tracker, "mine", Some(owner.id));
+        let router = chat_router(&tracker);
+
+        let (status, _) = send(&router, "DELETE", "/api/chat/sessions/mine", &other).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(&router, "DELETE", "/api/chat/sessions/missing", &other).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(tracker
+            .get_chat_session("mine", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_some());
+
+        let (status, _) = send(&router, "DELETE", "/api/chat/sessions/mine", &owner).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(tracker
+            .get_chat_session("mine", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_none());
+        let (status, _) = send(&router, "DELETE", "/api/chat/sessions/mine", &owner).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

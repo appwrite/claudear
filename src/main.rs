@@ -3493,11 +3493,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         if let Some(q) = question {
             // One-shot mode
-            let session_id = uuid::Uuid::new_v4().to_string();
             match chat_service
                 .chat(
                     claudear::chat::ChatActor::Operator,
-                    &session_id,
+                    &mut claudear::chat::SessionTarget::fresh(),
                     q,
                     repo_id,
                     None,
@@ -3545,7 +3544,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
             println!();
 
-            let mut session_id = uuid::Uuid::new_v4().to_string();
+            let mut target = claudear::chat::SessionTarget::fresh();
             let stdin = std::io::stdin();
             let mut show_sources = true;
 
@@ -3567,7 +3566,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 match input {
                     "/quit" | "/exit" => break,
                     "/clear" => {
-                        session_id = uuid::Uuid::new_v4().to_string();
+                        target = claudear::chat::SessionTarget::fresh();
                         println!("Session cleared.");
                         continue;
                     }
@@ -3585,7 +3584,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 match chat_service
                     .chat(
                         claudear::chat::ChatActor::Operator,
-                        &session_id,
+                        &mut target,
                         input,
                         repo_id,
                         None,
