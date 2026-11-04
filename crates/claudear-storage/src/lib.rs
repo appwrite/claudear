@@ -1949,11 +1949,6 @@ pub trait DeployQaStore: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
-
-    /// Record who cut a tip's tag when none is stored yet.
-    fn update_deploy_qa_tip_author(&self, _id: i64, _author_login: &str) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// Regression watches and checks (all defaulted).

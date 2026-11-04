@@ -4483,10 +4483,6 @@ impl DeployQaStore for SqliteTracker {
     ) -> Result<()> {
         SqliteTracker::update_deploy_qa_discord_ids(self, id, message_id, thread_id)
     }
-
-    fn update_deploy_qa_tip_author(&self, id: i64, author_login: &str) -> Result<()> {
-        SqliteTracker::update_deploy_qa_tip_author(self, id, author_login)
-    }
 }
 
 impl ChatStore for SqliteTracker {
@@ -8072,20 +8068,6 @@ impl SqliteTracker {
             WHERE id = ?3
             "#,
             params![message_id, thread_id, id],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_deploy_qa_tip_author(&self, id: i64, author_login: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
-            r#"
-            UPDATE deploy_qa_tips
-            SET author_login = ?1,
-                updated_at = datetime('now')
-            WHERE id = ?2 AND author_login IS NULL
-            "#,
-            params![author_login, id],
         )?;
         Ok(())
     }
