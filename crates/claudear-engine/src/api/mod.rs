@@ -3,8 +3,10 @@
 //! Provides REST API for the analytics dashboard.
 
 pub mod auth;
+mod directory;
 pub(crate) mod embedded;
 mod identities;
+mod invites;
 mod routes;
 mod security;
 mod tokens;

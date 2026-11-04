@@ -44,7 +44,7 @@ fn generate_secret() -> String {
     format!("cldr_{}", hex::encode(bytes))
 }
 
-fn hash_secret(secret: &str) -> String {
+pub(crate) fn hash_secret(secret: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
     hex::encode(hasher.finalize())
@@ -118,12 +118,7 @@ pub async fn revoke_token_handler(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> StatusCode {
-    // Admins can revoke any token; everyone else is scoped to their own.
-    let scope = if user.role == "admin" {
-        None
-    } else {
-        Some(user.id)
-    };
+    let scope = if user.is_admin() { None } else { Some(user.id) };
     match state.tracker.delete_api_token(&id, scope) {
         Ok(true) => StatusCode::NO_CONTENT,
         Ok(false) => StatusCode::NOT_FOUND,
