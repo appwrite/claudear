@@ -318,37 +318,43 @@ describe("IdentityForm", () => {
     expect(screen.queryByRole("button", { name: /Revert to config/ })).toBeNull();
   });
 
-  test("explains to a non-admin that reverting keeps the admin-set person key", async () => {
-    const prompts: string[] = [];
-    globalThis.confirm = (message?: string) => {
-      prompts.push(message ?? "");
-      return true;
-    };
-    installFetch([
-      route("GET", "/api/users/3/identities", {
-        status: 200,
-        body: userIdentities(
-          { origin: "console", slug: "jake", updated_at: "2026-11-04 10:00:00" },
-          { github_usernames: ["jakebarnby"] },
-        ),
-      }),
-      route("DELETE", "/api/users/3/identities", {
-        status: 200,
-        body: userIdentities({ origin: "console", slug: "jake", updated_at: "2026-11-04 11:00:00" }),
-      }),
-    ]);
+  for (const [name, reverted] of [
+    [
+      "an admin-set slug the server keeps",
+      userIdentities({ origin: "console", slug: "jake", updated_at: "2026-11-04 11:00:00" }),
+    ],
+    ["a slug equal to the config key the server drops with the row", userIdentities()],
+  ] as const) {
+    test(`tells a non-admin their person key stays for ${name}`, async () => {
+      const prompts: string[] = [];
+      globalThis.confirm = (message?: string) => {
+        prompts.push(message ?? "");
+        return true;
+      };
+      installFetch([
+        route("GET", "/api/users/3/identities", {
+          status: 200,
+          body: userIdentities(
+            { origin: "console", slug: "jake", updated_at: "2026-11-04 10:00:00" },
+            { github_usernames: ["jakebarnby"] },
+          ),
+        }),
+        route("DELETE", "/api/users/3/identities", { status: 200, body: reverted }),
+      ]);
 
-    render(<IdentityForm userId={3} canEditSlug={false} />, { wrapper: Wrapper });
-    await waitFor(() => expect(screen.getByText("Console")).toBeTruthy());
+      render(<IdentityForm userId={3} canEditSlug={false} />, { wrapper: Wrapper });
+      await waitFor(() => expect(screen.getByText("Console")).toBeTruthy());
 
-    fireEvent.click(screen.getByRole("button", { name: /Revert to config/ }));
+      fireEvent.click(screen.getByRole("button", { name: /Revert to config/ }));
 
-    await waitFor(() => expect(screen.getByText("Reverted to config; person key kept")).toBeTruthy());
-    expect(prompts).toHaveLength(1);
-    expect(prompts[0]).toContain('The person key "jake" was set by an admin and is kept.');
-    expect(input("Person key").value).toBe("jake");
-    expect(input("GitHub").value).toBe("");
-  });
+      await waitFor(() => expect(screen.getByText("Reverted to config; person key unchanged")).toBeTruthy());
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]).toContain('Your person key stays "jake".');
+      expect(prompts[0]).not.toContain("is kept");
+      expect(input("Person key").value).toBe("jake");
+      expect(input("GitHub").value).toBe("");
+    });
+  }
 
   test("does not promise an admin that reverting keeps the slug", async () => {
     const prompts: string[] = [];
@@ -369,7 +375,7 @@ describe("IdentityForm", () => {
     fireEvent.click(screen.getByRole("button", { name: /Revert to config/ }));
 
     expect(prompts).toHaveLength(1);
-    expect(prompts[0]).not.toContain("is kept");
+    expect(prompts[0]).not.toContain("person key stays");
     expect(calls.some((call) => call.method === "DELETE")).toBe(false);
   });
 

@@ -133,12 +133,12 @@ function buildUpdate(
 
 function revertPrompt(identities: UserIdentities, canEditSlug: boolean) {
   const prompt = 'Revert to config? Identities saved in the console for this person will be removed.'
-  return keepsSlugOnRevert(identities, canEditSlug)
-    ? `${prompt} The person key "${identities.slug}" was set by an admin and is kept.`
+  return keepsPersonKeyOnRevert(identities, canEditSlug)
+    ? `${prompt} Your person key stays "${identities.slug}".`
     : prompt
 }
 
-function keepsSlugOnRevert(identities: UserIdentities, canEditSlug: boolean) {
+function keepsPersonKeyOnRevert(identities: UserIdentities, canEditSlug: boolean) {
   return !canEditSlug && identities.slug !== null
 }
 
@@ -244,7 +244,7 @@ function IdentityEditor({
 
   const handleRevert = async () => {
     if (!confirm(revertPrompt(identities, canEditSlug))) return
-    const notice = keepsSlugOnRevert(identities, canEditSlug) ? 'Reverted to config; person key kept' : 'Reverted to config'
+    const notice = keepsPersonKeyOnRevert(identities, canEditSlug) ? 'Reverted to config; person key unchanged' : 'Reverted to config'
     setBusy(true)
     try {
       await succeed(await resetUserIdentities(identities.user_id), notice)
