@@ -3,9 +3,7 @@
 
 use super::auth::AuthUser;
 use claudear_core::security::SECURITY_FIX_SOURCE;
-use claudear_core::types::FixAttemptStats;
-
-const MINIMUM_SCAN_BATCH: usize = 100;
+use claudear_core::types::{FixAttemptStats, ProcessingMetric};
 
 pub(super) fn hides_security(user: &AuthUser) -> bool {
     !user.is_admin()
@@ -72,39 +70,18 @@ impl Visibility {
         stats.cannot_fix = stats.cannot_fix.saturating_sub(hidden.cannot_fix);
     }
 
-    /// Rows `offset..offset + limit` of an offset-paged listing, counting
-    /// only the rows this user may see so hidden rows never shorten or
-    /// shift a page.
-    pub(super) fn page<T, E>(
+    /// The source an unfiltered listing must leave out in the store, so a
+    /// page costs the same at any offset.
+    pub(super) fn excluded_source(self, source: Option<&str>) -> Option<&'static str> {
+        self.subtracts_hidden(source).then_some(SECURITY_FIX_SOURCE)
+    }
+
+    pub(super) fn visible_metrics(
         self,
-        mut fetch: impl FnMut(usize, usize) -> Result<Vec<T>, E>,
-        visible: impl Fn(&T) -> bool,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<T>, E> {
-        if !self.hides_security {
-            return fetch(limit, offset);
-        }
-        let batch = limit.max(MINIMUM_SCAN_BATCH);
-        let mut position = 0;
-        let mut skipped = 0;
-        let mut page = Vec::with_capacity(limit);
-        while page.len() < limit {
-            let rows = fetch(batch, position)?;
-            let exhausted = rows.len() < batch;
-            position += rows.len();
-            for row in rows.into_iter().filter(|row| visible(row)) {
-                if skipped < offset {
-                    skipped += 1;
-                } else if page.len() < limit {
-                    page.push(row);
-                }
-            }
-            if exhausted {
-                break;
-            }
-        }
-        Ok(page)
+        mut metrics: Vec<ProcessingMetric>,
+    ) -> Vec<ProcessingMetric> {
+        metrics.retain(|metric| self.shows_optional(metric.source.as_deref()));
+        metrics
     }
 
     /// The first `limit` visible rows of a newest-first listing that only
@@ -166,12 +143,6 @@ mod tests {
             .collect()
     }
 
-    fn paged<'a>(
-        all: &'a [(usize, &'static str)],
-    ) -> impl FnMut(usize, usize) -> Result<Vec<(usize, &'static str)>, Infallible> + 'a {
-        |limit, offset| Ok(all.iter().skip(offset).take(limit).copied().collect())
-    }
-
     #[test]
     fn only_admins_see_security_sources() {
         assert!(Visibility::for_user(&user("admin")).shows(SECURITY_FIX_SOURCE));
@@ -188,38 +159,34 @@ mod tests {
     }
 
     #[test]
-    fn hidden_rows_never_shorten_or_shift_a_page() {
-        let all = rows(500, 2);
+    fn only_unfiltered_non_admin_listings_exclude_the_hidden_source() {
         let viewer = Visibility::for_user(&user("viewer"));
-        let visible = |row: &(usize, &str)| viewer.shows(row.1);
-        let expected: Vec<usize> = all
-            .iter()
-            .filter(|row| visible(row))
-            .map(|row| row.0)
-            .collect();
-
-        for (offset, limit) in [(0, 20), (20, 20), (180, 100), (240, 20), (249, 5)] {
-            let page = viewer
-                .page(paged(&all), visible, offset, limit)
-                .unwrap_or_else(|never| match never {});
-            let indexes: Vec<usize> = page.iter().map(|row| row.0).collect();
-            let end = (offset + limit).min(expected.len());
-            assert_eq!(
-                indexes,
-                expected[offset..end],
-                "offset {offset} limit {limit}"
-            );
-        }
+        assert_eq!(viewer.excluded_source(None), Some(SECURITY_FIX_SOURCE));
+        assert_eq!(viewer.excluded_source(Some("linear")), None);
+        let admin = Visibility::for_user(&user("admin"));
+        assert_eq!(admin.excluded_source(None), None);
     }
 
     #[test]
-    fn admins_page_straight_through() {
-        let all = rows(30, 2);
-        let admin = Visibility::for_user(&user("admin"));
-        let page = admin
-            .page(paged(&all), |row| admin.shows(row.1), 10, 10)
-            .unwrap_or_else(|never| match never {});
-        assert_eq!(page, all[10..20]);
+    fn non_admins_see_only_metrics_outside_the_hidden_source() {
+        let metrics = vec![
+            ProcessingMetric::new("processing_time", 1.0)
+                .with_source(SECURITY_FIX_SOURCE.to_string()),
+            ProcessingMetric::new("processing_time", 2.0).with_source("linear".to_string()),
+            ProcessingMetric::new("processing_time", 3.0),
+        ];
+        let values = |visibility: Visibility| -> Vec<f64> {
+            visibility
+                .visible_metrics(metrics.clone())
+                .into_iter()
+                .map(|metric| metric.metric_value)
+                .collect()
+        };
+        assert_eq!(values(Visibility::for_user(&user("viewer"))), [2.0, 3.0]);
+        assert_eq!(
+            values(Visibility::for_user(&user("admin"))),
+            [1.0, 2.0, 3.0]
+        );
     }
 
     #[test]
@@ -465,6 +432,111 @@ mod tests {
         assert_eq!(stats["total"], 2);
     }
 
+    fn seed_metrics(tracker: &dyn FixAttemptTracker) {
+        for (source, seconds, fetched) in
+            [(SECURITY_FIX_SOURCE, 40.0, 5.0), (OTHER_SOURCE, 20.0, 3.0)]
+        {
+            tracker
+                .record_metric(
+                    &ProcessingMetric::new("processing_time", seconds)
+                        .with_source(source)
+                        .with_tags(serde_json::json!({ "status": "failed" })),
+                )
+                .expect("processing metric");
+            tracker
+                .record_metric(
+                    &ProcessingMetric::new("issues_fetched", fetched).with_source(source),
+                )
+                .expect("pipeline metric");
+        }
+    }
+
+    fn sources_in(rows: &Value) -> Vec<String> {
+        rows.as_array()
+            .expect("rows")
+            .iter()
+            .filter_map(|row| row["source"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn timeseries_total(body: &Value) -> i64 {
+        body["points"]
+            .as_array()
+            .expect("points")
+            .iter()
+            .filter_map(|point| point["total"].as_i64())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn non_admin_aggregates_count_no_security_work() {
+        let harness = Harness::start();
+        seed(harness.tracker.as_ref());
+        seed_metrics(harness.tracker.as_ref());
+
+        let (_, viewer) = harness
+            .get("/api/telemetry/overview", Some(&harness.viewer))
+            .await;
+        let (_, admin) = harness
+            .get("/api/telemetry/overview", Some(&harness.admin))
+            .await;
+        assert_eq!(sources_in(&viewer["source_breakdown"]), [OTHER_SOURCE]);
+        assert!(sources_in(&admin["source_breakdown"]).contains(&SECURITY_FIX_SOURCE.to_string()));
+        assert_eq!(viewer["windows"][2]["processed"], 1);
+        assert_eq!(admin["windows"][2]["processed"], 2);
+        assert_eq!(viewer["processing_time"]["all_time"]["samples"], 1);
+        assert_eq!(admin["processing_time"]["all_time"]["samples"], 2);
+        assert!(!mentions_security(&viewer["top_errors"]), "{viewer}");
+        assert!(mentions_security(&admin["top_errors"]));
+        assert_eq!(viewer["queue"]["retryable_attempts"], 1);
+
+        let (_, viewer) = harness
+            .get("/api/telemetry/pipeline", Some(&harness.viewer))
+            .await;
+        let (_, admin) = harness
+            .get("/api/telemetry/pipeline", Some(&harness.admin))
+            .await;
+        assert_eq!(sources_in(&viewer["per_source"]), [OTHER_SOURCE]);
+        assert_eq!(admin["per_source"].as_array().map(Vec::len), Some(2));
+
+        let (_, viewer) = harness
+            .get("/api/telemetry/latency", Some(&harness.viewer))
+            .await;
+        let (_, admin) = harness
+            .get("/api/telemetry/latency", Some(&harness.admin))
+            .await;
+        assert_eq!(viewer["overall"]["samples"], 1);
+        assert_eq!(admin["overall"]["samples"], 2);
+
+        let (_, viewer) = harness
+            .get("/api/telemetry/timeseries", Some(&harness.viewer))
+            .await;
+        let (_, admin) = harness
+            .get("/api/telemetry/timeseries", Some(&harness.admin))
+            .await;
+        assert_eq!(timeseries_total(&viewer), 1);
+        assert_eq!(timeseries_total(&admin), 2);
+
+        let uri = "/api/metrics?name=processing_time";
+        let (_, viewer) = harness.get(uri, Some(&harness.viewer)).await;
+        let (_, admin) = harness.get(uri, Some(&harness.admin)).await;
+        assert_eq!(sources_in(&viewer), [OTHER_SOURCE]);
+        assert_eq!(admin.as_array().map(Vec::len), Some(2));
+
+        let (_, viewer) = harness
+            .get("/api/analytics/summary", Some(&harness.viewer))
+            .await;
+        let (_, admin) = harness
+            .get("/api/analytics/summary", Some(&harness.admin))
+            .await;
+        assert!(viewer["success_rate_by_source"]
+            .get(SECURITY_FIX_SOURCE)
+            .is_none());
+        assert!(admin["success_rate_by_source"]
+            .get(SECURITY_FIX_SOURCE)
+            .is_some());
+    }
+
     #[tokio::test]
     async fn non_admin_source_filters_for_security_come_back_empty() {
         let harness = Harness::start();
@@ -529,6 +601,40 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn non_admin_issue_pages_skip_security_issues_without_losing_rows() {
+        let harness = Harness::start();
+        for index in 0..30 {
+            let source = if index % 2 == 0 {
+                SECURITY_FIX_SOURCE
+            } else {
+                OTHER_SOURCE
+            };
+            harness
+                .tracker
+                .store_issue(&issue(source, &format!("ISSUE-{index}")))
+                .expect("issue");
+        }
+
+        let mut seen = Vec::new();
+        for page in 1..=3 {
+            let (_, body) = harness
+                .get(
+                    &format!("/api/issues?per_page=5&page={page}"),
+                    Some(&harness.viewer),
+                )
+                .await;
+            assert_eq!(body["total"], 15);
+            let issues = body["issues"].as_array().expect("issues").clone();
+            assert_eq!(issues.len(), 5, "page {page} is full");
+            assert!(issues.iter().all(|issue| issue["source"] == OTHER_SOURCE));
+            seen.extend(issues.into_iter().map(|issue| issue["issue_id"].clone()));
+        }
+        seen.sort_by_key(Value::to_string);
+        seen.dedup();
+        assert_eq!(seen.len(), 15);
     }
 
     #[tokio::test]
