@@ -1,7 +1,9 @@
 //! Shared storage types used across trait signatures and API responses.
 
+use claudear_core::identity::{Identities, UserStatus};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fmt;
 
 /// A user row from the database.
 #[derive(Debug, Clone, Serialize)]
@@ -15,6 +17,97 @@ pub struct UserRow {
     pub avatar_url: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub status: UserStatus,
+}
+
+/// A single-use invite link for an invited user. Only the SHA-256 hash of the
+/// secret is stored, and it is never serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InviteRow {
+    pub id: String,
+    pub user_id: i64,
+    #[serde(skip_serializing)]
+    pub token_hash: String,
+    pub created_by: Option<i64>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub accepted_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+/// The identities to store for one user. Writing replaces the user's whole row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityWrite {
+    pub slug: Option<String>,
+    pub identities: Identities,
+}
+
+/// An invite to insert. `expires_at` is UTC `%Y-%m-%d %H:%M:%S`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InviteWrite {
+    pub token_hash: String,
+    pub expires_at: String,
+    pub created_by: i64,
+}
+
+impl fmt::Debug for InviteWrite {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InviteWrite")
+            .field("expires_at", &self.expires_at)
+            .field("created_by", &self.created_by)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The user a [`DirectoryWrite`] applies to.
+#[derive(Clone, PartialEq, Eq)]
+pub enum DirectoryUser {
+    /// Sparse update of an existing user; `None` leaves the column unchanged.
+    Existing {
+        user_id: i64,
+        name: Option<String>,
+        role: Option<String>,
+    },
+    /// A user to create. `Active` carries a real password hash and no invite;
+    /// `Invited` carries an unusable hash and normally an invite.
+    New {
+        email: String,
+        name: String,
+        role: String,
+        password_hash: String,
+        status: UserStatus,
+    },
+}
+
+impl fmt::Debug for DirectoryUser {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Existing {
+                user_id,
+                name,
+                role,
+            } => formatter
+                .debug_struct("Existing")
+                .field("user_id", user_id)
+                .field("name", name)
+                .field("role", role)
+                .finish(),
+            Self::New { role, status, .. } => formatter
+                .debug_struct("New")
+                .field("role", role)
+                .field("status", status)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// One entry of an all-or-nothing directory write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryWrite {
+    pub user: DirectoryUser,
+    pub identities: Option<IdentityWrite>,
+    pub invite: Option<InviteWrite>,
 }
 
 /// A personal access token row. The secret is never stored or serialized; only

@@ -1,10 +1,10 @@
 //! SQLite-based fix attempt tracker and analytics storage.
 
 use super::types::{
-    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
-    DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,
-    PurgeResult, StoredDependency, StoredDiscordChannel, StoredIndexedRepo, StoredPrReviewComment,
-    StoredRepository, UserRow,
+    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts, DirectoryUser,
+    DirectoryWrite, DiscordKnowledgebaseStats, IdentityWrite, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, InviteRow, PurgeResult, StoredDependency,
+    StoredDiscordChannel, StoredIndexedRepo, StoredPrReviewComment, StoredRepository, UserRow,
 };
 use super::{
     ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
@@ -16,6 +16,7 @@ use crate::vector_index::progress::Progress;
 use crate::vector_index::{embedding_blob, embedding_from_blob, REBUILD_BATCH_SIZE};
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
+use claudear_core::identity::{ConsoleIdentity, Identities, UserStatus};
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
     ExperimentProviderStats, FixAttempt, FixAttemptStats, FixAttemptStatus, FixOutcome,
@@ -47,6 +48,18 @@ const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
+/// Every column [`UserRow::from_row`] reads, in order.
+const USER_COLUMNS: &str =
+    "id, email, password_hash, name, role, avatar_url, created_at, updated_at, status";
+/// [`USER_COLUMNS`] qualified with the `u` alias, for joins.
+const QUALIFIED_USER_COLUMNS: &str =
+    "u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at, u.status";
+/// Every column [`InviteRow::from_row_at`] reads, in order, qualified with the `i` alias.
+const QUALIFIED_INVITE_COLUMNS: &str =
+    "i.id, i.user_id, i.token_hash, i.created_by, i.created_at, i.expires_at, i.accepted_at, i.revoked_at";
+/// Number of columns in [`USER_COLUMNS`], where invite columns start after a user join.
+const USER_COLUMN_COUNT: usize = 9;
+
 impl UserRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -58,8 +71,197 @@ impl UserRow {
             avatar_url: row.get(5)?,
             created_at: row.get(6)?,
             updated_at: row.get(7)?,
+            status: read_status(row, 8)?,
         })
     }
+}
+
+impl InviteRow {
+    fn from_row_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(offset)?,
+            user_id: row.get(offset + 1)?,
+            token_hash: row.get(offset + 2)?,
+            created_by: row.get(offset + 3)?,
+            created_at: row.get(offset + 4)?,
+            expires_at: row.get(offset + 5)?,
+            accepted_at: row.get(offset + 6)?,
+            revoked_at: row.get(offset + 7)?,
+        })
+    }
+}
+
+fn read_status(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<UserStatus> {
+    let value: String = row.get(index)?;
+    value.parse().map_err(|error: String| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, error.into())
+    })
+}
+
+fn read_list(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Vec<String>> {
+    let value: String = row.get(index)?;
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+/// Read the twelve identity columns starting at `offset`, in `user_identities` order.
+fn read_identities(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Identities> {
+    Ok(Identities {
+        linear_names: read_list(row, offset)?,
+        github_usernames: read_list(row, offset + 1)?,
+        sentry_usernames: read_list(row, offset + 2)?,
+        jira_usernames: read_list(row, offset + 3)?,
+        gitlab_usernames: read_list(row, offset + 4)?,
+        discord_id: row.get(offset + 5)?,
+        slack_id: row.get(offset + 6)?,
+        email: row.get(offset + 7)?,
+        push_user_key: row.get(offset + 8)?,
+        sms_number: row.get(offset + 9)?,
+        whatsapp_number: row.get(offset + 10)?,
+        telegram_chat_id: row.get(offset + 11)?,
+    })
+}
+
+fn read_user(connection: &Connection, user_id: i64) -> rusqlite::Result<UserRow> {
+    connection.query_row(
+        &format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?1"),
+        params![user_id],
+        UserRow::from_row,
+    )
+}
+
+fn read_invite(connection: &Connection, id: &str) -> rusqlite::Result<InviteRow> {
+    connection.query_row(
+        &format!("SELECT {QUALIFIED_INVITE_COLUMNS} FROM user_invites i WHERE i.id = ?1"),
+        params![id],
+        |row| InviteRow::from_row_at(row, 0),
+    )
+}
+
+/// Create the user or apply its sparse update, returning the user id.
+fn write_directory_user(connection: &Connection, user: &DirectoryUser) -> Result<i64> {
+    match user {
+        DirectoryUser::Existing {
+            user_id,
+            name,
+            role,
+        } => {
+            let updated = connection.execute(
+                "UPDATE users SET name = COALESCE(?2, name), role = COALESCE(?3, role),
+                     updated_at = CASE WHEN ?2 IS NULL AND ?3 IS NULL THEN updated_at ELSE datetime('now') END
+                 WHERE id = ?1",
+                params![user_id, name, role],
+            )?;
+            if updated == 0 {
+                return Err(claudear_core::error::Error::Database(format!(
+                    "user {user_id} does not exist"
+                )));
+            }
+            Ok(*user_id)
+        }
+        DirectoryUser::New {
+            email,
+            name,
+            role,
+            password_hash,
+            status,
+        } => {
+            connection.execute(
+                "INSERT INTO users (email, password_hash, name, role, status) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![email, password_hash, name, role, status.as_str()],
+            )?;
+            Ok(connection.last_insert_rowid())
+        }
+    }
+}
+
+/// Replace the user's identities row, bumping `updated_at`.
+fn write_identities(connection: &Connection, user_id: i64, write: &IdentityWrite) -> Result<()> {
+    let identities = &write.identities;
+    connection.execute(
+        "INSERT INTO user_identities (
+             user_id, slug, linear_names, github_usernames, sentry_usernames, jira_usernames,
+             gitlab_usernames, discord_id, slack_id, email, push_user_key, sms_number,
+             whatsapp_number, telegram_chat_id, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, datetime('now'))
+         ON CONFLICT(user_id) DO UPDATE SET
+             slug = excluded.slug,
+             linear_names = excluded.linear_names,
+             github_usernames = excluded.github_usernames,
+             sentry_usernames = excluded.sentry_usernames,
+             jira_usernames = excluded.jira_usernames,
+             gitlab_usernames = excluded.gitlab_usernames,
+             discord_id = excluded.discord_id,
+             slack_id = excluded.slack_id,
+             email = excluded.email,
+             push_user_key = excluded.push_user_key,
+             sms_number = excluded.sms_number,
+             whatsapp_number = excluded.whatsapp_number,
+             telegram_chat_id = excluded.telegram_chat_id,
+             updated_at = excluded.updated_at",
+        params![
+            user_id,
+            write.slug,
+            serde_json::to_string(&identities.linear_names)?,
+            serde_json::to_string(&identities.github_usernames)?,
+            serde_json::to_string(&identities.sentry_usernames)?,
+            serde_json::to_string(&identities.jira_usernames)?,
+            serde_json::to_string(&identities.gitlab_usernames)?,
+            identities.discord_id,
+            identities.slack_id,
+            identities.email,
+            identities.push_user_key,
+            identities.sms_number,
+            identities.whatsapp_number,
+            identities.telegram_chat_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Revoke every open invite of the user, expired or not.
+fn revoke_open_invites(connection: &Connection, user_id: i64) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE user_invites SET revoked_at = datetime('now')
+         WHERE user_id = ?1 AND accepted_at IS NULL AND revoked_at IS NULL",
+        params![user_id],
+    )
+}
+
+/// Revoke the user's open invite and insert a new one, returning its id.
+fn replace_invite(
+    connection: &Connection,
+    user_id: i64,
+    token_hash: &str,
+    expires_at: &str,
+    created_by: i64,
+) -> rusqlite::Result<String> {
+    revoke_open_invites(connection, user_id)?;
+    let id = generate_row_id();
+    connection.execute(
+        "INSERT INTO user_invites (id, user_id, token_hash, created_by, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, user_id, token_hash, created_by, expires_at],
+    )?;
+    Ok(id)
+}
+
+/// Set the password and status active, and revoke open invites. False if the user is missing.
+fn activate(connection: &Connection, user_id: i64, password_hash: &str) -> rusqlite::Result<bool> {
+    let updated = connection.execute(
+        "UPDATE users SET password_hash = ?2, status = ?3, updated_at = datetime('now') WHERE id = ?1",
+        params![user_id, password_hash, UserStatus::Active.as_str()],
+    )?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    revoke_open_invites(connection, user_id)?;
+    Ok(true)
 }
 
 impl ApiTokenRow {
@@ -84,8 +286,8 @@ fn generate_session_token() -> String {
     hex::encode(bytes)
 }
 
-/// Generate a short random id (32 hex chars = 16 bytes) for an API token row.
-fn generate_token_id() -> String {
+/// Generate a short random id (32 hex chars = 16 bytes) for an API token or invite row.
+fn generate_row_id() -> String {
     let mut bytes = [0u8; 16];
     rand::rng().fill(&mut bytes);
     hex::encode(bytes)
@@ -4119,40 +4321,40 @@ impl UserStore for SqliteTracker {
     }
 
     fn create_user(&self, email: &str, password_hash: &str, name: &str, role: &str) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
+        let connection = self.acquire_lock()?;
+        connection.execute(
             "INSERT INTO users (email, password_hash, name, role) VALUES (?1, ?2, ?3, ?4)",
             params![email, password_hash, name, role],
         )?;
-        Ok(conn.last_insert_rowid())
+        Ok(connection.last_insert_rowid())
     }
 
     fn get_user_by_email(&self, email: &str) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE email = ?1"
-        )?;
-        let user = stmt
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {USER_COLUMNS} FROM users WHERE email = ?1"
+        ))?;
+        let user = statement
             .query_row(params![email], UserRow::from_row)
             .optional()?;
         Ok(user)
     }
 
     fn get_user_by_id(&self, id: i64) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE id = ?1"
-        )?;
-        let user = stmt.query_row(params![id], UserRow::from_row).optional()?;
+        let connection = self.acquire_lock()?;
+        let mut statement =
+            connection.prepare(&format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?1"))?;
+        let user = statement
+            .query_row(params![id], UserRow::from_row)
+            .optional()?;
         Ok(user)
     }
 
     fn list_users(&self) -> Result<Vec<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users ORDER BY id"
-        )?;
-        let users = stmt
+        let connection = self.acquire_lock()?;
+        let mut statement =
+            connection.prepare(&format!("SELECT {USER_COLUMNS} FROM users ORDER BY id"))?;
+        let users = statement
             .query_map([], UserRow::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(users)
@@ -4167,29 +4369,29 @@ impl UserStore for SqliteTracker {
         role: Option<&str>,
         avatar_url: Option<&str>,
     ) -> Result<bool> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         let mut sets = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        if let Some(e) = email {
+        if let Some(email) = email {
             sets.push("email = ?");
-            values.push(Box::new(e.to_string()));
+            values.push(Box::new(email.to_string()));
         }
-        if let Some(p) = password_hash {
+        if let Some(password_hash) = password_hash {
             sets.push("password_hash = ?");
-            values.push(Box::new(p.to_string()));
+            values.push(Box::new(password_hash.to_string()));
         }
-        if let Some(n) = name {
+        if let Some(name) = name {
             sets.push("name = ?");
-            values.push(Box::new(n.to_string()));
+            values.push(Box::new(name.to_string()));
         }
-        if let Some(r) = role {
+        if let Some(role) = role {
             sets.push("role = ?");
-            values.push(Box::new(r.to_string()));
+            values.push(Box::new(role.to_string()));
         }
-        if let Some(a) = avatar_url {
+        if let Some(avatar_url) = avatar_url {
             sets.push("avatar_url = ?");
-            values.push(Box::new(a.to_string()));
+            values.push(Box::new(avatar_url.to_string()));
         }
 
         if sets.is_empty() {
@@ -4200,27 +4402,29 @@ impl UserStore for SqliteTracker {
         values.push(Box::new(id));
 
         let sql = format!("UPDATE users SET {} WHERE id = ?", sets.join(", "));
-        let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
-        let rows = conn.execute(&sql, params.as_slice())?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            values.iter().map(|value| value.as_ref()).collect();
+        let rows = connection.execute(&sql, params.as_slice())?;
         Ok(rows > 0)
     }
 
     fn delete_user(&self, id: i64) -> Result<bool> {
-        let conn = self.acquire_lock()?;
-        let rows = conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+        let connection = self.acquire_lock()?;
+        let rows = connection.execute("DELETE FROM users WHERE id = ?1", params![id])?;
         Ok(rows > 0)
     }
 
     fn count_users(&self) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        let connection = self.acquire_lock()?;
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
         Ok(count)
     }
 
     fn create_session(&self, user_id: i64, expires_at: &str) -> Result<String> {
         let token = generate_session_token();
-        let conn = self.acquire_lock()?;
-        conn.execute(
+        let connection = self.acquire_lock()?;
+        connection.execute(
             "INSERT INTO sessions (id, user_id, expires_at, last_active_at) VALUES (?1, ?2, ?3, datetime('now'))",
             params![token, user_id, expires_at],
         )?;
@@ -4228,28 +4432,32 @@ impl UserStore for SqliteTracker {
     }
 
     fn get_session_user(&self, token: &str) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {QUALIFIED_USER_COLUMNS}
              FROM sessions s
              JOIN users u ON s.user_id = u.id
-             WHERE s.id = ?1 AND s.expires_at > datetime('now') AND s.last_active_at > datetime('now', '-30 minutes')",
-        )?;
-        let user = stmt
-            .query_row(params![token], UserRow::from_row)
+             WHERE s.id = ?1 AND s.expires_at > datetime('now') AND s.last_active_at > datetime('now', '-30 minutes')
+               AND u.status = ?2"
+        ))?;
+        let user = statement
+            .query_row(
+                params![token, UserStatus::Active.as_str()],
+                UserRow::from_row,
+            )
             .optional()?;
         Ok(user)
     }
 
     fn delete_session(&self, token: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![token])?;
+        let connection = self.acquire_lock()?;
+        connection.execute("DELETE FROM sessions WHERE id = ?1", params![token])?;
         Ok(())
     }
 
     fn cleanup_expired_sessions(&self) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-        let deleted = conn.execute(
+        let connection = self.acquire_lock()?;
+        let deleted = connection.execute(
             "DELETE FROM sessions WHERE expires_at <= datetime('now') OR last_active_at <= datetime('now', '-30 minutes')",
             [],
         )?;
@@ -4257,8 +4465,8 @@ impl UserStore for SqliteTracker {
     }
 
     fn touch_session(&self, token: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
+        let connection = self.acquire_lock()?;
+        connection.execute(
             "UPDATE sessions SET last_active_at = datetime('now') WHERE id = ?1",
             params![token],
         )?;
@@ -4266,8 +4474,8 @@ impl UserStore for SqliteTracker {
     }
 
     fn delete_user_sessions(&self, user_id: i64) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
+        let connection = self.acquire_lock()?;
+        connection.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
         Ok(())
     }
 
@@ -4279,14 +4487,14 @@ impl UserStore for SqliteTracker {
         token_prefix: &str,
         expires_at: Option<&str>,
     ) -> Result<ApiTokenRow> {
-        let id = generate_token_id();
-        let conn = self.acquire_lock()?;
-        conn.execute(
+        let id = generate_row_id();
+        let connection = self.acquire_lock()?;
+        connection.execute(
             "INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, user_id, name, token_hash, token_prefix, expires_at],
         )?;
-        conn.query_row(
+        connection.query_row(
             "SELECT id, user_id, name, token_hash, token_prefix, created_at, last_used_at, expires_at
              FROM api_tokens WHERE id = ?1",
             params![id],
@@ -4296,20 +4504,23 @@ impl UserStore for SqliteTracker {
     }
 
     fn get_user_by_api_token_hash(&self, token_hash: &str) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let user = conn
+        let connection = self.acquire_lock()?;
+        let user = connection
             .query_row(
-                "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at
-                 FROM api_tokens t
-                 JOIN users u ON t.user_id = u.id
-                 WHERE t.token_hash = ?1
-                   AND (t.expires_at IS NULL OR datetime(t.expires_at) > datetime('now'))",
-                params![token_hash],
+                &format!(
+                    "SELECT {QUALIFIED_USER_COLUMNS}
+                     FROM api_tokens t
+                     JOIN users u ON t.user_id = u.id
+                     WHERE t.token_hash = ?1
+                       AND (t.expires_at IS NULL OR datetime(t.expires_at) > datetime('now'))
+                       AND u.status = ?2"
+                ),
+                params![token_hash, UserStatus::Active.as_str()],
                 UserRow::from_row,
             )
             .optional()?;
         if user.is_some() {
-            conn.execute(
+            connection.execute(
                 "UPDATE api_tokens SET last_used_at = datetime('now') WHERE token_hash = ?1",
                 params![token_hash],
             )?;
@@ -4318,25 +4529,25 @@ impl UserStore for SqliteTracker {
     }
 
     fn list_api_tokens(&self, user_id: i64) -> Result<Vec<ApiTokenRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(
             "SELECT id, user_id, name, token_hash, token_prefix, created_at, last_used_at, expires_at
              FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
         )?;
-        let rows = stmt
+        let rows = statement
             .query_map(params![user_id], ApiTokenRow::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     fn list_all_api_tokens(&self) -> Result<Vec<ApiTokenWithOwner>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(
             "SELECT t.id, t.user_id, t.name, t.token_hash, t.token_prefix, t.created_at, t.last_used_at, t.expires_at, u.email, u.name
              FROM api_tokens t JOIN users u ON t.user_id = u.id
              ORDER BY t.last_used_at DESC NULLS LAST, t.created_at DESC",
         )?;
-        let rows = stmt
+        let rows = statement
             .query_map([], |row| {
                 Ok(ApiTokenWithOwner {
                     token: ApiTokenRow::from_row(row)?,
@@ -4349,15 +4560,188 @@ impl UserStore for SqliteTracker {
     }
 
     fn delete_api_token(&self, id: &str, user_id: Option<i64>) -> Result<bool> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         let affected = match user_id {
-            Some(uid) => conn.execute(
+            Some(owner) => connection.execute(
                 "DELETE FROM api_tokens WHERE id = ?1 AND user_id = ?2",
-                params![id, uid],
+                params![id, owner],
             )?,
-            None => conn.execute("DELETE FROM api_tokens WHERE id = ?1", params![id])?,
+            None => connection.execute("DELETE FROM api_tokens WHERE id = ?1", params![id])?,
         };
         Ok(affected > 0)
+    }
+
+    fn list_user_identities(&self) -> Result<Vec<ConsoleIdentity>> {
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(
+            "SELECT ui.user_id, u.email, u.name, ui.slug,
+                    ui.linear_names, ui.github_usernames, ui.sentry_usernames, ui.jira_usernames,
+                    ui.gitlab_usernames, ui.discord_id, ui.slack_id, ui.email, ui.push_user_key,
+                    ui.sms_number, ui.whatsapp_number, ui.telegram_chat_id, ui.updated_at
+             FROM user_identities ui
+             JOIN users u ON u.id = ui.user_id
+             ORDER BY ui.user_id",
+        )?;
+        let identities = statement
+            .query_map([], |row| {
+                Ok(ConsoleIdentity {
+                    user_id: row.get(0)?,
+                    login_email: row.get(1)?,
+                    name: row.get(2)?,
+                    slug: row.get(3)?,
+                    identities: read_identities(row, 4)?,
+                    updated_at: row.get(16)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(identities)
+    }
+
+    fn delete_user_identities(&self, user_id: i64) -> Result<bool> {
+        let connection = self.acquire_lock()?;
+        let deleted = connection.execute(
+            "DELETE FROM user_identities WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    fn save_directory(&self, writes: &[DirectoryWrite]) -> Result<Vec<i64>> {
+        let invites_active_user = writes.iter().any(|write| {
+            write.invite.is_some()
+                && matches!(
+                    write.user,
+                    DirectoryUser::New {
+                        status: UserStatus::Active,
+                        ..
+                    }
+                )
+        });
+        if invites_active_user {
+            return Err(claudear_core::error::Error::Database(
+                "an active user cannot be created with an invite".to_string(),
+            ));
+        }
+
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut user_ids = Vec::with_capacity(writes.len());
+        for write in writes {
+            let user_id = write_directory_user(&transaction, &write.user)?;
+            if let Some(identities) = &write.identities {
+                write_identities(&transaction, user_id, identities)?;
+            }
+            if let Some(invite) = &write.invite {
+                replace_invite(
+                    &transaction,
+                    user_id,
+                    &invite.token_hash,
+                    &invite.expires_at,
+                    invite.created_by,
+                )?;
+            }
+            user_ids.push(user_id);
+        }
+        transaction.commit()?;
+        Ok(user_ids)
+    }
+
+    fn issue_invite(
+        &self,
+        user_id: i64,
+        token_hash: &str,
+        expires_at: &str,
+        created_by: i64,
+    ) -> Result<InviteRow> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = replace_invite(&transaction, user_id, token_hash, expires_at, created_by)?;
+        let invite = read_invite(&transaction, &id)?;
+        transaction.commit()?;
+        Ok(invite)
+    }
+
+    fn revoke_invite(&self, user_id: i64) -> Result<bool> {
+        let connection = self.acquire_lock()?;
+        Ok(revoke_open_invites(&connection, user_id)? > 0)
+    }
+
+    fn get_open_invite_for_user(&self, user_id: i64) -> Result<Option<InviteRow>> {
+        let connection = self.acquire_lock()?;
+        let invite = connection
+            .query_row(
+                &format!(
+                    "SELECT {QUALIFIED_INVITE_COLUMNS} FROM user_invites i
+                     WHERE i.user_id = ?1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL
+                     ORDER BY i.created_at DESC, i.rowid DESC
+                     LIMIT 1"
+                ),
+                params![user_id],
+                |row| InviteRow::from_row_at(row, 0),
+            )
+            .optional()?;
+        Ok(invite)
+    }
+
+    fn find_open_invite(&self, token_hash: &str) -> Result<Option<(InviteRow, UserRow)>> {
+        let connection = self.acquire_lock()?;
+        let found = connection
+            .query_row(
+                &format!(
+                    "SELECT {QUALIFIED_USER_COLUMNS}, {QUALIFIED_INVITE_COLUMNS}
+                     FROM user_invites i
+                     JOIN users u ON u.id = i.user_id
+                     WHERE i.token_hash = ?1
+                       AND i.accepted_at IS NULL
+                       AND i.revoked_at IS NULL
+                       AND datetime(i.expires_at) > datetime('now')
+                       AND u.status = ?2"
+                ),
+                params![token_hash, UserStatus::Invited.as_str()],
+                |row| {
+                    Ok((
+                        InviteRow::from_row_at(row, USER_COLUMN_COUNT)?,
+                        UserRow::from_row(row)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    fn accept_invite(&self, token_hash: &str, password_hash: &str) -> Result<Option<UserRow>> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // One conditional UPDATE claims the invite, so of two concurrent accepts
+        // (even from separate processes) only one can match the open row.
+        let claimed: Option<i64> = transaction
+            .query_row(
+                "UPDATE user_invites SET accepted_at = datetime('now')
+                 WHERE token_hash = ?1
+                   AND accepted_at IS NULL
+                   AND revoked_at IS NULL
+                   AND datetime(expires_at) > datetime('now')
+                   AND user_id IN (SELECT id FROM users WHERE status = ?2)
+                 RETURNING user_id",
+                params![token_hash, UserStatus::Invited.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(user_id) = claimed else {
+            return Ok(None);
+        };
+        activate(&transaction, user_id, password_hash)?;
+        let user = read_user(&transaction, user_id)?;
+        transaction.commit()?;
+        Ok(Some(user))
+    }
+
+    fn activate_user(&self, user_id: i64, password_hash: &str) -> Result<bool> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let activated = activate(&transaction, user_id, password_hash)?;
+        transaction.commit()?;
+        Ok(activated)
     }
 }
 
@@ -22624,6 +23008,703 @@ mod tests {
                 Some(chunk_ids[0]),
                 "embeddings saved after a full delete must be searchable"
             );
+        }
+    }
+
+    mod user_directory {
+        use super::*;
+        use crate::types::InviteWrite;
+        use std::sync::{Arc, Barrier};
+
+        const FUTURE: &str = "2099-12-31 23:59:59";
+        const PAST: &str = "2000-01-01 00:00:00";
+        const UNUSABLE_HASH: &str = "$2b$12$unusable";
+        const PASSWORD_HASH: &str = "$2b$12$chosen";
+
+        fn complete_identities() -> Identities {
+            Identities {
+                linear_names: vec!["Jake Barnby".to_string()],
+                github_usernames: vec!["jakebarnby".to_string(), "jake-alt".to_string()],
+                sentry_usernames: vec!["jake.sentry".to_string()],
+                jira_usernames: vec!["jake.jira".to_string()],
+                gitlab_usernames: vec!["jake.gitlab".to_string()],
+                discord_id: Some("452316113016193024".to_string()),
+                slack_id: Some("U0123456789".to_string()),
+                email: Some("alerts@example.com".to_string()),
+                push_user_key: Some("uQiRzpo4DXghDmr9QzzfQu27cmVRsG".to_string()),
+                sms_number: Some("+14155550123".to_string()),
+                whatsapp_number: Some("+14155550199".to_string()),
+                telegram_chat_id: Some("-1001234567890".to_string()),
+            }
+        }
+
+        fn github(login: &str) -> Identities {
+            Identities {
+                github_usernames: vec![login.to_string()],
+                ..Identities::default()
+            }
+        }
+
+        fn create_admin(tracker: &SqliteTracker) -> i64 {
+            tracker
+                .create_user("admin@example.com", "$2b$12$admin", "Admin", "admin")
+                .unwrap()
+        }
+
+        fn invite(token_hash: &str, expires_at: &str, created_by: i64) -> InviteWrite {
+            InviteWrite {
+                token_hash: token_hash.to_string(),
+                expires_at: expires_at.to_string(),
+                created_by,
+            }
+        }
+
+        fn new_user(email: &str, status: UserStatus) -> DirectoryUser {
+            DirectoryUser::New {
+                email: email.to_string(),
+                name: "Person".to_string(),
+                role: "viewer".to_string(),
+                password_hash: match status {
+                    UserStatus::Active => PASSWORD_HASH,
+                    UserStatus::Invited => UNUSABLE_HASH,
+                }
+                .to_string(),
+                status,
+            }
+        }
+
+        fn identities_write(
+            user_id: i64,
+            slug: Option<&str>,
+            identities: Identities,
+        ) -> DirectoryWrite {
+            DirectoryWrite {
+                user: DirectoryUser::Existing {
+                    user_id,
+                    name: None,
+                    role: None,
+                },
+                identities: Some(IdentityWrite {
+                    slug: slug.map(str::to_string),
+                    identities,
+                }),
+                invite: None,
+            }
+        }
+
+        fn invited_with_invite(tracker: &SqliteTracker, email: &str, token_hash: &str) -> i64 {
+            let admin = tracker.get_user_by_email("admin@example.com").unwrap();
+            let created_by = match admin {
+                Some(admin) => admin.id,
+                None => create_admin(tracker),
+            };
+            tracker
+                .save_directory(&[DirectoryWrite {
+                    user: new_user(email, UserStatus::Invited),
+                    identities: None,
+                    invite: Some(invite(token_hash, FUTURE, created_by)),
+                }])
+                .unwrap()[0]
+        }
+
+        fn count(tracker: &SqliteTracker, table: &str) -> i64 {
+            tracker
+                .acquire_lock()
+                .unwrap()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        }
+
+        fn invite_by_hash(tracker: &SqliteTracker, token_hash: &str) -> InviteRow {
+            tracker
+                .acquire_lock()
+                .unwrap()
+                .query_row(
+                    &format!(
+                        "SELECT {QUALIFIED_INVITE_COLUMNS} FROM user_invites i WHERE i.token_hash = ?1"
+                    ),
+                    params![token_hash],
+                    |row| InviteRow::from_row_at(row, 0),
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn test_user_identities_round_trip_every_field() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("jake@example.com", "hash", "Jake", "admin")
+                .unwrap();
+
+            let ids = tracker
+                .save_directory(&[identities_write(
+                    user_id,
+                    Some("jake"),
+                    complete_identities(),
+                )])
+                .unwrap();
+            assert_eq!(ids, vec![user_id]);
+
+            let listed = tracker.list_user_identities().unwrap();
+            assert_eq!(listed.len(), 1);
+            let entry = &listed[0];
+            assert_eq!(entry.user_id, user_id);
+            assert_eq!(entry.login_email, "jake@example.com");
+            assert_eq!(entry.name, "Jake");
+            assert_eq!(entry.slug.as_deref(), Some("jake"));
+            assert_eq!(entry.identities, complete_identities());
+            assert!(SqliteTracker::parse_datetime(&entry.updated_at).is_ok());
+        }
+
+        #[test]
+        fn test_user_identities_upsert_replaces_the_whole_row() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("jake@example.com", "hash", "Jake", "admin")
+                .unwrap();
+            tracker
+                .save_directory(&[identities_write(
+                    user_id,
+                    Some("jake"),
+                    complete_identities(),
+                )])
+                .unwrap();
+
+            tracker
+                .save_directory(&[identities_write(user_id, None, github("renamed"))])
+                .unwrap();
+
+            let listed = tracker.list_user_identities().unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].slug, None);
+            assert_eq!(listed[0].identities, github("renamed"));
+        }
+
+        #[test]
+        fn test_list_user_identities_skips_users_without_a_row_and_orders_by_id() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            tracker
+                .create_user("plain@example.com", "hash", "Plain", "viewer")
+                .unwrap();
+            let invited = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+            tracker
+                .save_directory(&[
+                    identities_write(invited, None, github("amy")),
+                    identities_write(admin, None, github("admin")),
+                ])
+                .unwrap();
+
+            let listed: Vec<i64> = tracker
+                .list_user_identities()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.user_id)
+                .collect();
+            assert_eq!(listed, vec![admin, invited]);
+        }
+
+        #[test]
+        fn test_delete_user_identities_reports_whether_a_row_existed() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("jake@example.com", "hash", "Jake", "admin")
+                .unwrap();
+            assert!(!tracker.delete_user_identities(user_id).unwrap());
+
+            tracker
+                .save_directory(&[identities_write(user_id, Some("jake"), github("jake"))])
+                .unwrap();
+            assert!(tracker.delete_user_identities(user_id).unwrap());
+            assert!(!tracker.delete_user_identities(user_id).unwrap());
+            assert!(tracker.list_user_identities().unwrap().is_empty());
+            assert!(tracker.get_user_by_id(user_id).unwrap().is_some());
+        }
+
+        #[test]
+        fn test_deleting_a_user_cascades_to_identities_and_invites() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+            tracker
+                .save_directory(&[identities_write(user_id, Some("amy"), github("amy"))])
+                .unwrap();
+            assert_eq!(count(&tracker, "user_invites"), 1);
+
+            assert!(tracker.delete_user(user_id).unwrap());
+
+            assert!(tracker.list_user_identities().unwrap().is_empty());
+            assert_eq!(count(&tracker, "user_identities"), 0);
+            assert_eq!(count(&tracker, "user_invites"), 0);
+        }
+
+        #[test]
+        fn test_users_inserted_without_a_status_read_as_active() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            tracker
+                .acquire_lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO users (email, password_hash, name, role) VALUES ('old@example.com', 'hash', 'Old', 'viewer')",
+                    [],
+                )
+                .unwrap();
+            let created = tracker
+                .create_user("new@example.com", "hash", "New", "admin")
+                .unwrap();
+
+            let old = tracker
+                .get_user_by_email("old@example.com")
+                .unwrap()
+                .unwrap();
+            assert_eq!(old.status, UserStatus::Active);
+            assert_eq!(
+                tracker.get_user_by_id(created).unwrap().unwrap().status,
+                UserStatus::Active
+            );
+            assert!(tracker
+                .list_users()
+                .unwrap()
+                .iter()
+                .all(|user| user.status == UserStatus::Active));
+        }
+
+        #[test]
+        fn test_invited_user_sessions_and_tokens_resolve_only_after_activation() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+            let session = tracker
+                .create_session(user_id, "2099-12-31T23:59:59")
+                .unwrap();
+            tracker
+                .create_api_token(user_id, "mcp", "hash_token", "cldr_a", None)
+                .unwrap();
+
+            assert!(tracker.get_session_user(&session).unwrap().is_none());
+            assert!(tracker
+                .get_user_by_api_token_hash("hash_token")
+                .unwrap()
+                .is_none());
+
+            assert!(tracker.activate_user(user_id, PASSWORD_HASH).unwrap());
+
+            let user = tracker.get_session_user(&session).unwrap().unwrap();
+            assert_eq!(user.status, UserStatus::Active);
+            assert!(tracker
+                .get_user_by_api_token_hash("hash_token")
+                .unwrap()
+                .is_some());
+        }
+
+        #[test]
+        fn test_save_directory_creates_invited_user_with_identities_and_invite() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+
+            let ids = tracker
+                .save_directory(&[DirectoryWrite {
+                    user: new_user("amy@example.com", UserStatus::Invited),
+                    identities: Some(IdentityWrite {
+                        slug: Some("amy".to_string()),
+                        identities: github("amy"),
+                    }),
+                    invite: Some(invite("hash_amy", FUTURE, admin)),
+                }])
+                .unwrap();
+
+            let user = tracker.get_user_by_id(ids[0]).unwrap().unwrap();
+            assert_eq!(user.email, "amy@example.com");
+            assert_eq!(user.status, UserStatus::Invited);
+            assert_eq!(user.password_hash, UNUSABLE_HASH);
+
+            let listed = tracker.list_user_identities().unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].user_id, ids[0]);
+            assert_eq!(listed[0].slug.as_deref(), Some("amy"));
+            assert_eq!(listed[0].identities, github("amy"));
+
+            let open = tracker.get_open_invite_for_user(ids[0]).unwrap().unwrap();
+            assert_eq!(open.token_hash, "hash_amy");
+            assert_eq!(open.created_by, Some(admin));
+            assert_eq!(open.expires_at, FUTURE);
+            let (found, found_user) = tracker.find_open_invite("hash_amy").unwrap().unwrap();
+            assert_eq!(found, open);
+            assert_eq!(found_user.id, ids[0]);
+        }
+
+        #[test]
+        fn test_save_directory_creates_active_user_without_invite() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let ids = tracker
+                .save_directory(&[DirectoryWrite {
+                    user: new_user("bob@example.com", UserStatus::Active),
+                    identities: None,
+                    invite: None,
+                }])
+                .unwrap();
+
+            let user = tracker.get_user_by_id(ids[0]).unwrap().unwrap();
+            assert_eq!(user.status, UserStatus::Active);
+            assert_eq!(user.password_hash, PASSWORD_HASH);
+            assert!(tracker.get_open_invite_for_user(ids[0]).unwrap().is_none());
+            assert!(tracker.list_user_identities().unwrap().is_empty());
+        }
+
+        #[test]
+        fn test_save_directory_rejects_an_active_user_with_an_invite() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+
+            let result = tracker.save_directory(&[
+                DirectoryWrite {
+                    user: new_user("amy@example.com", UserStatus::Invited),
+                    identities: None,
+                    invite: Some(invite("hash_amy", FUTURE, admin)),
+                },
+                DirectoryWrite {
+                    user: new_user("bob@example.com", UserStatus::Active),
+                    identities: None,
+                    invite: Some(invite("hash_bob", FUTURE, admin)),
+                },
+            ]);
+
+            assert!(result.is_err());
+            assert_eq!(tracker.count_users().unwrap(), 1);
+            assert_eq!(count(&tracker, "user_invites"), 0);
+        }
+
+        #[test]
+        fn test_save_directory_rolls_back_the_batch_on_a_duplicate_email() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let existing = tracker
+                .create_user("jake@example.com", "hash", "Jake", "viewer")
+                .unwrap();
+
+            let result = tracker.save_directory(&[
+                identities_write(existing, Some("jake"), github("jake")),
+                DirectoryWrite {
+                    user: new_user("amy@example.com", UserStatus::Invited),
+                    identities: Some(IdentityWrite {
+                        slug: None,
+                        identities: github("amy"),
+                    }),
+                    invite: Some(invite("hash_amy", FUTURE, admin)),
+                },
+                DirectoryWrite {
+                    user: new_user("jake@example.com", UserStatus::Invited),
+                    identities: None,
+                    invite: Some(invite("hash_duplicate", FUTURE, admin)),
+                },
+            ]);
+
+            assert!(result.is_err());
+            assert_eq!(tracker.count_users().unwrap(), 2);
+            assert!(tracker
+                .get_user_by_email("amy@example.com")
+                .unwrap()
+                .is_none());
+            assert_eq!(count(&tracker, "user_identities"), 0);
+            assert_eq!(count(&tracker, "user_invites"), 0);
+        }
+
+        #[test]
+        fn test_save_directory_rolls_back_the_batch_on_a_duplicate_slug() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let first = tracker
+                .create_user("first@example.com", "hash", "First", "viewer")
+                .unwrap();
+            let second = tracker
+                .create_user("second@example.com", "hash", "Second", "viewer")
+                .unwrap();
+
+            let result = tracker.save_directory(&[
+                identities_write(first, Some("jake"), github("first")),
+                identities_write(second, Some("jake"), github("second")),
+            ]);
+
+            assert!(result.is_err());
+            assert_eq!(count(&tracker, "user_identities"), 0);
+        }
+
+        #[test]
+        fn test_save_directory_updates_existing_users_sparsely() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("jake@example.com", "hash", "Jake", "viewer")
+                .unwrap();
+
+            tracker
+                .save_directory(&[DirectoryWrite {
+                    user: DirectoryUser::Existing {
+                        user_id,
+                        name: Some("Jake Barnby".to_string()),
+                        role: None,
+                    },
+                    identities: None,
+                    invite: None,
+                }])
+                .unwrap();
+            let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
+            assert_eq!(user.name, "Jake Barnby");
+            assert_eq!(user.role, "viewer");
+
+            tracker
+                .save_directory(&[DirectoryWrite {
+                    user: DirectoryUser::Existing {
+                        user_id,
+                        name: None,
+                        role: Some("admin".to_string()),
+                    },
+                    identities: None,
+                    invite: None,
+                }])
+                .unwrap();
+            let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
+            assert_eq!(user.name, "Jake Barnby");
+            assert_eq!(user.role, "admin");
+            assert!(tracker.list_user_identities().unwrap().is_empty());
+        }
+
+        #[test]
+        fn test_save_directory_rejects_a_missing_existing_user() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let result = tracker.save_directory(&[identities_write(999, None, github("ghost"))]);
+            assert!(result.is_err());
+            assert_eq!(count(&tracker, "user_identities"), 0);
+        }
+
+        #[test]
+        fn test_save_directory_returns_user_ids_in_entry_order() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let existing = tracker
+                .create_user("jake@example.com", "hash", "Jake", "viewer")
+                .unwrap();
+            let ids = tracker
+                .save_directory(&[
+                    DirectoryWrite {
+                        user: new_user("amy@example.com", UserStatus::Active),
+                        identities: None,
+                        invite: None,
+                    },
+                    identities_write(existing, None, github("jake")),
+                ])
+                .unwrap();
+            let amy = tracker
+                .get_user_by_email("amy@example.com")
+                .unwrap()
+                .unwrap();
+            assert_eq!(ids, vec![amy.id, existing]);
+        }
+
+        #[test]
+        fn test_issue_invite_revokes_the_previous_invite() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_first");
+            let admin = tracker
+                .get_user_by_email("admin@example.com")
+                .unwrap()
+                .unwrap()
+                .id;
+
+            let reissued = tracker
+                .issue_invite(user_id, "hash_second", FUTURE, admin)
+                .unwrap();
+
+            assert_eq!(reissued.user_id, user_id);
+            assert_eq!(reissued.token_hash, "hash_second");
+            assert_eq!(reissued.created_by, Some(admin));
+            assert!(reissued.accepted_at.is_none() && reissued.revoked_at.is_none());
+            assert!(invite_by_hash(&tracker, "hash_first").revoked_at.is_some());
+            assert_eq!(
+                tracker.get_open_invite_for_user(user_id).unwrap(),
+                Some(reissued)
+            );
+            assert!(tracker.find_open_invite("hash_first").unwrap().is_none());
+            assert!(tracker.find_open_invite("hash_second").unwrap().is_some());
+        }
+
+        #[test]
+        fn test_accept_invite_is_single_use_and_activates_the_user() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+
+            let accepted = tracker
+                .accept_invite("hash_amy", PASSWORD_HASH)
+                .unwrap()
+                .unwrap();
+            assert_eq!(accepted.id, user_id);
+            assert_eq!(accepted.status, UserStatus::Active);
+            assert_eq!(accepted.password_hash, PASSWORD_HASH);
+            assert!(invite_by_hash(&tracker, "hash_amy").accepted_at.is_some());
+            assert!(tracker.get_open_invite_for_user(user_id).unwrap().is_none());
+            assert!(tracker.find_open_invite("hash_amy").unwrap().is_none());
+
+            assert!(tracker
+                .accept_invite("hash_amy", "$2b$12$second")
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                tracker
+                    .get_user_by_id(user_id)
+                    .unwrap()
+                    .unwrap()
+                    .password_hash,
+                PASSWORD_HASH
+            );
+        }
+
+        #[test]
+        fn test_accept_invite_rejects_expired_and_revoked_invites() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let expired = invited_with_invite(&tracker, "expired@example.com", "hash_unused");
+            tracker
+                .issue_invite(expired, "hash_expired", PAST, admin)
+                .unwrap();
+            let revoked = invited_with_invite(&tracker, "revoked@example.com", "hash_revoked");
+            assert!(tracker.revoke_invite(revoked).unwrap());
+
+            for token_hash in [
+                "hash_expired",
+                "hash_revoked",
+                "hash_unused",
+                "hash_missing",
+            ] {
+                assert!(
+                    tracker
+                        .accept_invite(token_hash, PASSWORD_HASH)
+                        .unwrap()
+                        .is_none(),
+                    "{token_hash} must not be accepted"
+                );
+            }
+            for user_id in [expired, revoked] {
+                let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
+                assert_eq!(user.status, UserStatus::Invited);
+                assert_eq!(user.password_hash, UNUSABLE_HASH);
+            }
+            assert!(invite_by_hash(&tracker, "hash_expired")
+                .accepted_at
+                .is_none());
+        }
+
+        #[test]
+        fn test_invites_for_active_users_cannot_be_found_or_accepted() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let active = tracker
+                .create_user("jake@example.com", "hash", "Jake", "viewer")
+                .unwrap();
+            tracker
+                .issue_invite(active, "hash_active", FUTURE, admin)
+                .unwrap();
+
+            assert!(tracker.find_open_invite("hash_active").unwrap().is_none());
+            assert!(tracker
+                .accept_invite("hash_active", PASSWORD_HASH)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                tracker
+                    .get_user_by_id(active)
+                    .unwrap()
+                    .unwrap()
+                    .password_hash,
+                "hash"
+            );
+        }
+
+        #[test]
+        fn test_concurrent_accepts_succeed_exactly_once() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let setup = SqliteTracker::new(&path).unwrap();
+            invited_with_invite(&setup, "amy@example.com", "hash_amy");
+            let trackers: Vec<SqliteTracker> =
+                (0..4).map(|_| SqliteTracker::new(&path).unwrap()).collect();
+            let barrier = Arc::new(Barrier::new(trackers.len()));
+
+            let accepted = std::thread::scope(|scope| {
+                let handles: Vec<_> = trackers
+                    .iter()
+                    .map(|tracker| {
+                        let barrier = Arc::clone(&barrier);
+                        scope.spawn(move || {
+                            barrier.wait();
+                            tracker.accept_invite("hash_amy", PASSWORD_HASH).unwrap()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().unwrap())
+                    .count()
+            });
+
+            assert_eq!(accepted, 1);
+        }
+
+        #[test]
+        fn test_activate_user_revokes_open_invites() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+
+            assert!(tracker.activate_user(user_id, PASSWORD_HASH).unwrap());
+
+            let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
+            assert_eq!(user.status, UserStatus::Active);
+            assert_eq!(user.password_hash, PASSWORD_HASH);
+            assert!(invite_by_hash(&tracker, "hash_amy").revoked_at.is_some());
+            assert!(tracker.get_open_invite_for_user(user_id).unwrap().is_none());
+            assert!(!tracker.activate_user(999, PASSWORD_HASH).unwrap());
+        }
+
+        #[test]
+        fn test_open_invite_for_user_includes_expired_invites_that_find_excludes() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_first");
+            tracker
+                .issue_invite(user_id, "hash_expired", PAST, admin)
+                .unwrap();
+
+            let open = tracker.get_open_invite_for_user(user_id).unwrap().unwrap();
+            assert_eq!(open.token_hash, "hash_expired");
+            assert_eq!(open.expires_at, PAST);
+            assert!(tracker.find_open_invite("hash_expired").unwrap().is_none());
+        }
+
+        #[test]
+        fn test_revoke_invite_reports_whether_an_open_invite_existed() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_first");
+            tracker
+                .issue_invite(user_id, "hash_expired", PAST, admin)
+                .unwrap();
+
+            assert!(tracker.revoke_invite(user_id).unwrap());
+            assert!(!tracker.revoke_invite(user_id).unwrap());
+            assert!(tracker.get_open_invite_for_user(user_id).unwrap().is_none());
+            assert!(invite_by_hash(&tracker, "hash_expired")
+                .revoked_at
+                .is_some());
+        }
+
+        #[test]
+        fn test_directory_write_debug_never_prints_hashes_or_emails() {
+            let write = DirectoryWrite {
+                user: new_user("amy@example.com", UserStatus::Invited),
+                identities: None,
+                invite: Some(invite("hash_secret_invite", FUTURE, 1)),
+            };
+            let output = format!("{write:?}");
+            for secret in [UNUSABLE_HASH, "hash_secret_invite", "amy@example.com"] {
+                assert!(!output.contains(secret), "Debug leaked {secret}");
+            }
+            assert!(output.contains("Invited"));
         }
     }
 }

@@ -18,16 +18,17 @@ pub use analytics::{
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteTracker, VectorIndexRebuilder};
 pub use types::{
-    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
-    DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,
-    PurgeResult, StoredDependency, StoredDiscordChannel, StoredIndexedRepo, StoredRepository,
-    UserRow,
+    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts, DirectoryUser,
+    DirectoryWrite, DiscordKnowledgebaseStats, IdentityWrite, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, InviteRow, InviteWrite, PurgeResult, StoredDependency,
+    StoredDiscordChannel, StoredIndexedRepo, StoredRepository, UserRow,
 };
 #[cfg(feature = "sqlite")]
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
+use claudear_core::identity::ConsoleIdentity;
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, DeployQaTip, DeployQaTipStatus,
     ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, IssueTimeline,
@@ -1728,8 +1729,8 @@ pub trait DiscordStore: Send + Sync {
     }
 }
 
-/// User management, sessions, channels, regression, experiments, diagnostics,
-/// User CRUD, sessions, and channel cursors (all defaulted).
+/// User CRUD, sessions, API tokens, the identity directory, invites and channel
+/// cursors (all defaulted).
 pub trait UserStore: Send + Sync {
     /// Retrieve a channel cursor value.
     fn get_channel_cursor(&self, _channel: &str, _cursor_key: &str) -> Result<Option<String>> {
@@ -1861,6 +1862,72 @@ pub trait UserStore: Send + Sync {
     /// that owner (self-service); `None` allows an admin to revoke any token.
     /// Returns whether a row was removed.
     fn delete_api_token(&self, _id: &str, _user_id: Option<i64>) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Every console user with saved identities, invited users included, joined
+    /// with their login email and name, ordered by user id.
+    fn list_user_identities(&self) -> Result<Vec<ConsoleIdentity>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove a user's identities so the person falls back to config. Returns
+    /// whether a row was deleted.
+    fn delete_user_identities(&self, _user_id: i64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Apply every write in one transaction (all or nothing): create or update
+    /// each user, replace their identities and issue their invite. Returns the
+    /// user id of each entry, in order. An `Active` new user with an invite is
+    /// rejected.
+    fn save_directory(&self, _writes: &[DirectoryWrite]) -> Result<Vec<i64>> {
+        Err(claudear_core::error::Error::Other(
+            "save_directory not supported".to_string(),
+        ))
+    }
+
+    /// Revoke the user's open invite (if any) and insert a new one, in one
+    /// transaction. `expires_at` is UTC `%Y-%m-%d %H:%M:%S`.
+    fn issue_invite(
+        &self,
+        _user_id: i64,
+        _token_hash: &str,
+        _expires_at: &str,
+        _created_by: i64,
+    ) -> Result<InviteRow> {
+        Err(claudear_core::error::Error::Other(
+            "issue_invite not supported".to_string(),
+        ))
+    }
+
+    /// Revoke the user's open invite, expired or not. Returns whether one was
+    /// revoked.
+    fn revoke_invite(&self, _user_id: i64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// The user's newest invite that is neither accepted nor revoked, including
+    /// an expired one so callers can report it as expired.
+    fn get_open_invite_for_user(&self, _user_id: i64) -> Result<Option<InviteRow>> {
+        Ok(None)
+    }
+
+    /// The invite behind a token hash if it is open: not accepted, not revoked,
+    /// not expired, and its user is still invited.
+    fn find_open_invite(&self, _token_hash: &str) -> Result<Option<(InviteRow, UserRow)>> {
+        Ok(None)
+    }
+
+    /// Consume an open invite (single-use), set the password, activate the user
+    /// and revoke their other invites. `None` if the invite is not open.
+    fn accept_invite(&self, _token_hash: &str, _password_hash: &str) -> Result<Option<UserRow>> {
+        Ok(None)
+    }
+
+    /// Set the password and status active, and revoke open invites. Returns
+    /// whether the user exists.
+    fn activate_user(&self, _user_id: i64, _password_hash: &str) -> Result<bool> {
         Ok(false)
     }
 }
@@ -2974,6 +3041,22 @@ mod tests {
             assert!(t.get_channel_cursor("ch", "key").unwrap().is_none());
             // set_channel_cursor should succeed silently
             assert!(t.set_channel_cursor("ch", "key", "val").is_ok());
+        }
+
+        #[test]
+        fn test_default_directory_reads_are_empty_and_writes_fail_loudly() {
+            let store = MockUser;
+            assert!(store.list_user_identities().unwrap().is_empty());
+            assert!(!store.delete_user_identities(1).unwrap());
+            assert!(!store.revoke_invite(1).unwrap());
+            assert!(store.get_open_invite_for_user(1).unwrap().is_none());
+            assert!(store.find_open_invite("hash").unwrap().is_none());
+            assert!(store.accept_invite("hash", "password").unwrap().is_none());
+            assert!(!store.activate_user(1, "password").unwrap());
+            assert!(store.save_directory(&[]).is_err());
+            assert!(store
+                .issue_invite(1, "hash", "2099-01-01 00:00:00", 1)
+                .is_err());
         }
     }
 
