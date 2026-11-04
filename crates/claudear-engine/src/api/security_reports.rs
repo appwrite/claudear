@@ -2,8 +2,8 @@
 //! go-live confirmation and awards.
 
 use super::auth::{AdminUser, AuthUser};
-use super::pull_request::PullRequestLocation;
 use super::routes::ApiState;
+use crate::security::SecurityInbox;
 use axum::{
     extract::{rejection::JsonRejection, Path, Query, State},
     http::StatusCode,
@@ -518,21 +518,14 @@ pub async fn pull_request_handler(
     body: Result<Json<PullRequestLink>, JsonRejection>,
 ) -> ApiResult<SecurityVulnerability> {
     let Json(link) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
-    let location =
-        PullRequestLocation::parse(link.pull_request_url.trim()).ok_or(StatusCode::BAD_REQUEST)?;
+    let pull_request_url = link.pull_request_url.trim().to_string();
     let tracker = state.tracker.as_ref();
     let vulnerability = tracker
         .get_security_vulnerability(vulnerability_id)
         .map_err(internal_error)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    if vulnerability
-        .repository
-        .as_deref()
-        .is_some_and(|repository| !location.belongs_to(repository))
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let pull_request_url = location.url();
+    SecurityInbox::linkable_pull_request(&vulnerability, &pull_request_url)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     transition_vulnerability(
         tracker,
         vulnerability_id,

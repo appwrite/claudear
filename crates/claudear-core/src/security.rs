@@ -990,6 +990,7 @@ mod tests {
         assert_eq!(parsed.repository(), "appwrite/appwrite");
         assert!(parsed.belongs_to("Appwrite/Appwrite"));
         assert!(!parsed.belongs_to("attacker/appwrite"));
+        assert!(!parsed.belongs_to("appwrite/appwrite-fork"));
         assert_eq!(
             GithubPullRequest::parse("https://github.com/appwrite-labs/cloud.v2/pull/7")
                 .map(|pull_request| pull_request.repository()),
@@ -1001,6 +1002,7 @@ mod tests {
     fn github_pull_request_rejects_lookalike_and_decorated_urls() {
         for url in [
             "",
+            "not a url",
             "github.com/appwrite/appwrite/pull/1",
             "http://github.com/appwrite/appwrite/pull/1",
             "HTTPS://github.com/appwrite/appwrite/pull/1",
@@ -1011,6 +1013,7 @@ mod tests {
             "https://user@github.com/appwrite/appwrite/pull/1",
             "https://user:secret@github.com/appwrite/appwrite/pull/1",
             "https://github.com:443/appwrite/appwrite/pull/1",
+            "https://github.com:8443/appwrite/appwrite/pull/1",
             "https://www.github.com/appwrite/appwrite/pull/1",
             "https://api.github.com/repos/appwrite/appwrite/pulls/1",
             "https://github.com/appwrite/appwrite/pull/1?tab=files",

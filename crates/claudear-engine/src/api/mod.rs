@@ -4,7 +4,6 @@
 
 pub mod auth;
 pub(crate) mod embedded;
-mod pull_request;
 mod routes;
 mod security;
 mod security_reports;
