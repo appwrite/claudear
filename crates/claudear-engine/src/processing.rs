@@ -3704,43 +3704,55 @@ impl IssueProcessor {
                     }
                 }
             } else {
-                // Agent-based judge (external provider) via structured output. Each
-                // call spawns an agent process, so score chunks with a bounded
-                // concurrent fan-out rather than sequentially.
-                use futures::StreamExt;
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                let scored = AtomicUsize::new(0);
-                {
-                    let issue_summary = &issue_summary;
-                    let tracker = &tracker;
-                    let agent = agent.as_ref();
-                    let scored = &scored;
-                    futures::stream::iter(items.iter())
-                        .for_each_concurrent(RETRIEVAL_JUDGE_CONCURRENCY, |item| async move {
-                            if let Some(score) =
-                                crate::agent_classifier::score_chunk_relevance_via_agent(
-                                    agent,
-                                    issue_summary,
-                                    &item.text,
-                                )
-                                .await
-                            {
-                                match tracker.set_retrieval_quality(
-                                    attempt_id,
-                                    &item.source_kind,
-                                    &item.chunk_ref,
-                                    score,
-                                ) {
-                                    Ok(()) => {
-                                        scored.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    Err(e) => tracing::warn!(error = %e, "Failed to persist retrieval quality score"),
-                                }
-                            }
-                        })
-                        .await;
+                let chunks: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+                let judgment = crate::agent_classifier::judge_relevance_via_agent(
+                    agent.as_ref(),
+                    &issue_summary,
+                    &chunks,
+                    RETRIEVAL_JUDGE_CONCURRENCY,
+                )
+                .await;
+                let mut scored = 0usize;
+                for (index, score) in judgment.scores {
+                    let item = &items[index];
+                    match tracker.set_retrieval_quality(
+                        attempt_id,
+                        &item.source_kind,
+                        &item.chunk_ref,
+                        score,
+                    ) {
+                        Ok(()) => scored += 1,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to persist retrieval quality score")
+                        }
+                    }
                 }
-                scored.into_inner()
+                if let Some(error) = judgment.failure {
+                    tracing::warn!(
+                        short_id = %short_id,
+                        scored,
+                        total,
+                        error = %error,
+                        "Agent retrieval relevance judge failed; skipping the remaining chunks"
+                    );
+                    record_scoring_event(
+                        &tracker,
+                        &source,
+                        &issue_id,
+                        &short_id,
+                        TimelineEventStatus::RetrievalScoringFailed,
+                        format!("Retrieval scoring failed for {short_id}: {error}"),
+                        json!({
+                            "backend": backend,
+                            "reason": "agent_error",
+                            "error": error.to_string(),
+                            "scored": scored,
+                            "total": total,
+                        }),
+                    );
+                    return;
+                }
+                scored
             };
 
             record_scoring_event(

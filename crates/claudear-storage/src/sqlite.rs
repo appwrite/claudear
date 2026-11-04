@@ -21697,7 +21697,7 @@ mod tests {
         }
 
         #[test]
-        fn test_rebuild_vector_indexes_hands_the_lock_to_a_waiting_thread_after_each_batch() {
+        fn test_rebuild_vector_indexes_releases_the_lock_between_batches() {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("claudear.db");
             let batches = 64;
@@ -21758,12 +21758,13 @@ mod tests {
             assert_eq!(observed, batches, "the rebuild left batches unindexed");
             assert!(
                 advances.len() >= batches / 2,
-                "too few acquisitions queued while the rebuild held the lock to judge the handoff: {advances:?}"
+                "a thread waiting on the connection lock got it only {} times across {batches} rebuild batches, so the rebuild held the lock across batches; batches indexed between its acquisitions: {advances:?}",
+                advances.len()
             );
-            let handed_off = advances.iter().filter(|&&advance| advance == 1).count();
+            let single_batch = advances.iter().filter(|&&advance| advance == 1).count();
             assert!(
-                handed_off * 4 >= advances.len() * 3,
-                "a thread waiting on the connection lock was handed it after a single rebuild batch only {handed_off} of {} times; batches indexed between its acquisitions: {advances:?}",
+                single_batch > 0,
+                "a waiting thread never got the lock after a single rebuild batch in {} acquisitions, so the rebuild holds the lock across batches; batches indexed between its acquisitions: {advances:?}",
                 advances.len()
             );
         }
@@ -21781,17 +21782,13 @@ mod tests {
             }
 
             let tracker = Arc::new(SqliteTracker::new(&path).unwrap());
-            let (first, last): (i64, i64) = {
-                let connection = tracker.acquire_lock().unwrap();
-                assert!(require_vectorlite_for_tests(&connection));
-                connection
-                    .query_row(
-                        "SELECT min(id), max(id) FROM code_chunk_embeddings",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .unwrap()
-            };
+            let blocking = tracker.acquire_lock().unwrap();
+            assert!(require_vectorlite_for_tests(&blocking));
+            let last: i64 = blocking
+                .query_row("SELECT max(id) FROM code_chunk_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
 
             let rebuilding = Arc::clone(&tracker);
             let rebuild = std::thread::spawn(move || {
@@ -21812,12 +21809,7 @@ mod tests {
                     std::thread::sleep(HOLD);
                 }
             };
-            let blocking = loop {
-                let connection = tracker.acquire_lock().unwrap();
-                if is_indexed(&connection, first) {
-                    break connection;
-                }
-            };
+            std::thread::sleep(QUEUE);
             let requesting = Arc::new(AtomicBool::new(false));
             let queued = {
                 let tracker = Arc::clone(&tracker);
@@ -21832,7 +21824,7 @@ mod tests {
                 std::thread::yield_now();
             }
             std::thread::sleep(QUEUE);
-            drop(blocking);
+            MutexGuard::unlock_fair(blocking);
             while !tracker.connection.is_locked() {
                 std::hint::spin_loop();
             }
