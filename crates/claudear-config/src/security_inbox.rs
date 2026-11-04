@@ -4,6 +4,8 @@ use crate::config::ReplyAs;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
+pub const HELPSCOUT_SOURCE: &str = "helpscout";
+pub const MAILBOX_ID_METADATA_KEY: &str = "mailbox_id";
 pub const MAILBOX_PROFILE_METADATA_KEY: &str = "mailbox_profile";
 pub const ATTACHMENTS_METADATA_KEY: &str = "attachments";
 pub const CUSTOMER_THREAD_COUNT_METADATA_KEY: &str = "customer_thread_count";
@@ -169,7 +171,13 @@ impl SecurityInboxConfig {
                     .to_string(),
             );
         }
-        Ok(())
+        if self.enabled && self.process_after.is_none() {
+            return Err(
+                "issues.helpscout.security.process_after is required when the security inbox is enabled, so the existing backlog is never processed"
+                    .to_string(),
+            );
+        }
+        self.templates.validate()
     }
 }
 
@@ -189,8 +197,8 @@ impl Default for SecurityRewardConfig {
     }
 }
 
-/// Fixed customer-facing reply templates. `{reason}` and `{fixed_on}` are
-/// substituted by [`render_security_template`].
+/// Fixed customer-facing plain-text reply templates. `{reason}` and
+/// `{fixed_on}` are substituted by [`render_security_template`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecurityTemplates {
@@ -236,6 +244,62 @@ impl Default for SecurityTemplates {
     }
 }
 
+impl SecurityTemplates {
+    fn named(&self) -> [(&'static str, &str); 8] {
+        [
+            ("confirmed", &self.confirmed),
+            ("not_reproducible", &self.not_reproducible),
+            ("already_fixed", &self.already_fixed),
+            ("not_vulnerability", &self.not_vulnerability),
+            ("out_of_scope", &self.out_of_scope),
+            ("duplicate", &self.duplicate),
+            ("fix_live", &self.fix_live),
+            ("fix_live_rewarded", &self.fix_live_rewarded),
+        ]
+    }
+
+    fn required_placeholder(name: &str) -> Option<&'static str> {
+        match name {
+            "not_vulnerability" | "out_of_scope" => Some(REASON_PLACEHOLDER),
+            "already_fixed" => Some(FIXED_ON_PLACEHOLDER),
+            _ => None,
+        }
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for (name, template) in self.named() {
+            let field = format!("issues.helpscout.security.templates.{name}");
+            if template.trim().is_empty() {
+                return Err(format!("{field} must not be empty"));
+            }
+            if let Some(unknown) =
+                placeholders(template).find(|placeholder| !KNOWN_PLACEHOLDERS.contains(placeholder))
+            {
+                return Err(format!(
+                    "{field} uses unknown placeholder {unknown}; only {REASON_PLACEHOLDER} and {FIXED_ON_PLACEHOLDER} are filled in"
+                ));
+            }
+            if let Some(required) = Self::required_placeholder(name) {
+                if !template.contains(required) {
+                    return Err(format!("{field} must contain {required}"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every `{identifier}` token in `template`.
+fn placeholders(template: &str) -> impl Iterator<Item = &str> {
+    template.match_indices('{').filter_map(|(start, _)| {
+        let rest = &template[start + 1..];
+        let length =
+            rest.find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))?;
+        (length > 0 && rest[length..].starts_with('}'))
+            .then(|| &template[start..start + length + 2])
+    })
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SecurityReplyVariables<'a> {
     pub reason: Option<&'a str>,
@@ -244,6 +308,7 @@ pub struct SecurityReplyVariables<'a> {
 
 const REASON_PLACEHOLDER: &str = "{reason}";
 const FIXED_ON_PLACEHOLDER: &str = "{fixed_on}";
+const KNOWN_PLACEHOLDERS: [&str; 2] = [REASON_PLACEHOLDER, FIXED_ON_PLACEHOLDER];
 
 /// Substitute `{reason}` and `{fixed_on}` (as "4 November 2026") in one pass,
 /// so substituted text is never re-scanned. Missing values render empty and
@@ -486,6 +551,77 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("assessment_timeout_secs"));
+    }
+
+    #[test]
+    fn validate_requires_process_after_when_enabled() {
+        let mut config = SecurityInboxConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(config.validate().unwrap_err().contains("process_after"));
+        config.process_after = Some(Utc::now());
+        assert!(config.validate().is_ok());
+        config.enabled = false;
+        config.process_after = None;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_templates() {
+        let mut config = SecurityInboxConfig::default();
+        config.templates.fix_live = " \n ".to_string();
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.contains("templates.fix_live must not be empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_requires_the_placeholders_each_template_fills_in() {
+        for (name, edit) in [
+            (
+                "not_vulnerability",
+                (|templates: &mut SecurityTemplates| {
+                    templates.not_vulnerability = "Hi, not a vulnerability.".to_string()
+                }) as fn(&mut SecurityTemplates),
+            ),
+            ("out_of_scope", |templates| {
+                templates.out_of_scope = "Hi, out of scope.".to_string()
+            }),
+            ("already_fixed", |templates| {
+                templates.already_fixed = "Hi, already fixed. {reason}".to_string()
+            }),
+        ] {
+            let mut config = SecurityInboxConfig::default();
+            edit(&mut config.templates);
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.contains(&format!("templates.{name} must contain")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_placeholders() {
+        let mut config = SecurityInboxConfig::default();
+        config.templates.duplicate = "Hi {name}, this is a duplicate.".to_string();
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("templates.duplicate"), "{error}");
+        assert!(error.contains("{name}"), "{error}");
+
+        config.templates.duplicate = "Hi, {reason} {fixed_on} { } {\"json\": 1} {-} {".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn placeholders_finds_identifier_tokens_only() {
+        assert_eq!(
+            placeholders("{reason} {x_1} { y } {} {fixed_on").collect::<Vec<_>>(),
+            vec!["{reason}", "{x_1}"]
+        );
     }
 
     #[test]

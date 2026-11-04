@@ -9,6 +9,8 @@ use crate::source::helpscout_matches_trigger_tags;
 use async_trait::async_trait;
 use base64::Engine;
 use claudear_config::config::HelpScoutConfig;
+use claudear_config::config::HELPSCOUT_SOURCE;
+use claudear_config::config::MAILBOX_ID_METADATA_KEY;
 use claudear_core::error::Result;
 use claudear_core::types::{Issue, MatchResult};
 use hmac::{Hmac, KeyInit, Mac};
@@ -49,7 +51,7 @@ impl HelpScoutWebhookHandler {
 #[async_trait]
 impl WebhookHandler for HelpScoutWebhookHandler {
     fn source_name(&self) -> &str {
-        "helpscout"
+        HELPSCOUT_SOURCE
     }
 
     fn verify_signature(&self, payload: &[u8], headers: &HashMap<String, String>) -> bool {
@@ -57,7 +59,7 @@ impl WebhookHandler for HelpScoutWebhookHandler {
             Some(s) => s,
             None => {
                 tracing::error!(
-                    source = "helpscout",
+                    source = HELPSCOUT_SOURCE,
                     "No webhook secret configured - rejecting request for security"
                 );
                 return false;
@@ -97,7 +99,7 @@ impl WebhookHandler for HelpScoutWebhookHandler {
             .unwrap_or_else(|| format!("Conversation {number}"));
         let url = format!("https://secure.helpscout.net/conversation/{id}");
 
-        let mut issue = Issue::new(id.to_string(), short_id, title, url, "helpscout");
+        let mut issue = Issue::new(id.to_string(), short_id, title, url, HELPSCOUT_SOURCE);
 
         // Latest customer thread body, else the preview.
         let body = payload
@@ -127,7 +129,7 @@ impl WebhookHandler for HelpScoutWebhookHandler {
 
         let tags = Self::extract_tags(payload);
         if let Some(mailbox_id) = payload.get("mailboxId").and_then(|v| v.as_u64()) {
-            issue.set_metadata("mailbox_id", mailbox_id.to_string());
+            issue.set_metadata(MAILBOX_ID_METADATA_KEY, mailbox_id.to_string());
         }
         issue.set_metadata("tags", &tags);
         issue.set_metadata("labels", &tags);
@@ -147,7 +149,7 @@ impl WebhookHandler for HelpScoutWebhookHandler {
     }
 
     fn matches_criteria(&self, issue: &Issue) -> MatchResult {
-        let mailbox_id: Option<String> = issue.get_metadata("mailbox_id");
+        let mailbox_id: Option<String> = issue.get_metadata(MAILBOX_ID_METADATA_KEY);
         if self.config.treats_as_security(mailbox_id.as_deref()) {
             return MatchResult::not_matched(
                 "Security mailbox conversations are only handled by the security inbox",

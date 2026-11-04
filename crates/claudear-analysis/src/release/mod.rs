@@ -16,6 +16,7 @@ pub use deployment::DeployedPackage;
 pub use deployment::DeploymentResolver;
 pub use deployment::DeploymentStatus;
 pub use deployment::DeploymentTopology;
+pub use deployment::ImageForm;
 pub use deployment::ImageReference;
 pub use deployment::LiveStatus;
 pub use deployment::LockedPackage;
