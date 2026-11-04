@@ -10,6 +10,10 @@ const statusColors: Record<string, string> = {
   resolved: 'bg-green-500/10 text-green-700 dark:text-green-400',
   regressed: 'bg-red-500/10 text-red-700 dark:text-red-400',
   open: 'bg-blue-500/10 text-blue-700 dark:text-blue-400',
+  running: 'bg-blue-500/10 text-blue-700 dark:text-blue-400',
+  verified: 'bg-green-500/10 text-green-700 dark:text-green-400',
+  unverified: 'bg-amber-500/10 text-amber-700 dark:text-amber-400',
+  errored: 'bg-rose-500/10 text-rose-700 dark:text-rose-400',
 }
 
 export function StatusBadge({ status }: { status: string }) {

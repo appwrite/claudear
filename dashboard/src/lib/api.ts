@@ -1269,3 +1269,122 @@ export async function fetchMyTokens(): Promise<ApiToken[]> {
 export async function fetchAllTokens(): Promise<ApiTokenWithOwner[]> {
   return fetchJson(`${API_BASE}/tokens/all`)
 }
+
+export type DeployQaTipStatus = 'pending' | 'running' | 'verified' | 'unverified' | 'failed' | 'errored'
+
+export interface DeployQaTipView {
+  id: number
+  track: string
+  repo: string
+  tag: string
+  status: DeployQaTipStatus
+  published_at: string | null
+  release_url: string | null
+  author_login: string | null
+  attempt_id: number | null
+  discord_message_url: string | null
+  discord_thread_url: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface DeployQaTrackStatus {
+  name: string
+  repo: string
+  tag_filter: string
+  last_seen: DeployQaTipView | null
+  in_flight: boolean
+}
+
+export interface DeployQaStatus {
+  enabled: boolean
+  restart_required: boolean
+  poll_interval_ms: number
+  timeout_secs: number
+  skip_if_previous_running: boolean
+  discord_channel_id: string | null
+  tracks: DeployQaTrackStatus[]
+}
+
+export interface DeployQaTrackSettings {
+  name: string
+  repo: string
+  tag_filter: string
+}
+
+export interface DeployQaSettings {
+  enabled: boolean
+  poll_interval_ms: number
+  skip_if_previous_running: boolean
+  timeout_secs: number
+  discord_channel_id: string | null
+  github_discord_map_path: string | null
+  instructions_path: string | null
+  tracks: DeployQaTrackSettings[]
+}
+
+export interface DeployQaTagFilterKind {
+  kind: string
+  requires_value: boolean
+}
+
+export interface DeployQaConfigResponse {
+  settings: DeployQaSettings
+  tag_filter_kinds: DeployQaTagFilterKind[]
+  track_name_separator: string
+  restart_required: boolean
+  writable: boolean
+  revision: string
+}
+
+export interface DeployQaSaveResponse {
+  ok: true
+  restart_required: boolean
+  revision: string
+  message: string
+}
+
+export type DeployQaSaveError = Error & { status: number; code?: string }
+
+export async function fetchDeployQaStatus(): Promise<DeployQaStatus> {
+  return fetchJson(`${API_BASE}/deploy-qa`)
+}
+
+export async function fetchDeployQaTips(track?: string): Promise<DeployQaTipView[]> {
+  const query = track ? `?${new URLSearchParams({ track })}` : ''
+  const response = await fetchJson<{ tips: DeployQaTipView[] }>(`${API_BASE}/deploy-qa/tips${query}`)
+  return response.tips
+}
+
+export async function fetchDeployQaConfig(): Promise<DeployQaConfigResponse> {
+  return fetchJson(`${API_BASE}/deploy-qa/config`)
+}
+
+export async function saveDeployQaConfig(
+  settings: DeployQaSettings,
+  revision: string,
+): Promise<DeployQaSaveResponse> {
+  const url = `${API_BASE}/deploy-qa/config`
+  Sentry.addBreadcrumb({ category: 'api', message: `PUT ${url}`, level: 'info' })
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-csrf-token': getCsrfToken(),
+    },
+    body: JSON.stringify({ settings, revision }),
+  })
+  if (res.status === 401) {
+    onUnauthorized?.()
+    throw new Error('Unauthorized')
+  }
+  if (!res.ok) {
+    const body: { error?: unknown; code?: unknown } = await res.json().catch(() => ({}))
+    const message = typeof body.error === 'string' ? body.error : `Failed to put ${url}: ${res.status}`
+    const code = typeof body.code === 'string' ? body.code : undefined
+    const error: DeployQaSaveError = Object.assign(new Error(message), { status: res.status, code })
+    Sentry.captureException(error, { tags: { 'api.url': url, 'api.method': 'PUT', 'api.status': String(res.status) } })
+    throw error
+  }
+  return res.json()
+}
