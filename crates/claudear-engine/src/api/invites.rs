@@ -4,10 +4,7 @@
 //! carry it in the URL fragment (`/invite#<secret>`), which browsers never send to the
 //! server, so it stays out of access logs, Sentry transactions and Referer headers.
 
-use super::auth::{
-    check_api_rate_limit, check_ip_rate_limit, extract_client_ip, hash_password, AdminUser,
-    MessageResponse, PASSWORD_LENGTH,
-};
+use super::auth::{extract_client_ip, hash_password, AdminUser, MessageResponse, PASSWORD_LENGTH};
 use super::error::ApiError;
 use super::routes::ApiState;
 use super::tokens::hash_secret;
@@ -128,7 +125,7 @@ pub(crate) async fn issue_invite_handler(
     State(state): State<ApiState>,
     Path(user_id): Path<i64>,
 ) -> Result<Json<UserInvite>, ApiError> {
-    if !check_api_rate_limit(admin.id) {
+    if !state.limiters.api.allow(&admin.id) {
         return Err(ApiError::rate_limited());
     }
     let user = state
@@ -158,7 +155,7 @@ pub(crate) async fn revoke_invite_handler(
     State(state): State<ApiState>,
     Path(user_id): Path<i64>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    if !check_api_rate_limit(admin.id) {
+    if !state.limiters.api.allow(&admin.id) {
         return Err(ApiError::rate_limited());
     }
     let revoked = state
@@ -179,7 +176,7 @@ pub(crate) async fn inspect_invite_handler(
     headers: HeaderMap,
     body: Result<Json<InspectInviteRequest>, JsonRejection>,
 ) -> Result<Json<InviteDetails>, ApiError> {
-    limit_by_ip(&headers)?;
+    limit_by_ip(&state, &headers)?;
     let Json(request) = body?;
     let token_hash = invite_hash(&request.token)?;
     let (invite, user) = state
@@ -200,7 +197,7 @@ pub(crate) async fn accept_invite_handler(
     headers: HeaderMap,
     body: Result<Json<AcceptInviteRequest>, JsonRejection>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    limit_by_ip(&headers)?;
+    limit_by_ip(&state, &headers)?;
     let Json(request) = body?;
     if !PASSWORD_LENGTH.contains(&request.password.len()) {
         return Err(ApiError::invalid_password());
@@ -227,10 +224,10 @@ pub(crate) async fn accept_invite_handler(
     }))
 }
 
-/// Invite endpoints draw from their own per-IP bucket so they never eat the login budget.
-fn limit_by_ip(headers: &HeaderMap) -> Result<(), ApiError> {
-    let ip = extract_client_ip(headers);
-    if check_ip_rate_limit(&format!("invite:{ip}")) {
+/// Invite endpoints draw from their own per-address limit so they never eat the login
+/// budget.
+fn limit_by_ip(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if state.limiters.invite.allow(&extract_client_ip(headers)) {
         Ok(())
     } else {
         Err(ApiError::rate_limited())
@@ -261,9 +258,6 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    /// Users created first so the acting admin's id stays clear of ids other suites
-    /// write as, because the API rate limiter is process-wide.
-    const FILLER_USERS: usize = 1100;
     const CSRF_TOKEN: &str = "invite-tests-csrf";
 
     fn config(public_url: Option<&str>) -> Config {
@@ -354,16 +348,6 @@ mod tests {
     fn test_app() -> TestApp {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
-        for index in 0..FILLER_USERS {
-            tracker
-                .create_user(
-                    &format!("filler{index}@example.com"),
-                    "unused-hash",
-                    "Filler",
-                    "viewer",
-                )
-                .expect("create filler user");
-        }
         let admin = tracker
             .create_user("invites-admin@example.com", "unused-hash", "Admin", "admin")
             .expect("create admin");
@@ -406,7 +390,6 @@ mod tests {
             .uri(uri)
             .header("cookie", cookie)
             .header("x-csrf-token", CSRF_TOKEN)
-            .header("x-forwarded-for", "203.0.113.77")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .expect("request");

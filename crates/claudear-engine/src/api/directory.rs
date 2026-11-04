@@ -6,7 +6,7 @@
 //! the whole batch is stored in one transaction, so a request either applies fully or not
 //! at all.
 
-use super::auth::{check_api_rate_limit, is_valid_login_email, AdminCaller, Role};
+use super::auth::{is_valid_login_email, AdminCaller, Role};
 use super::error::ApiError;
 use super::identities::{
     conflicts_by_plan, plan_update, IdentityPlan, UpdateIdentitiesRequest, UserIdentities,
@@ -142,7 +142,7 @@ pub(crate) async fn put_directory_handler(
     State(state): State<ApiState>,
     body: Result<Json<DirectoryRequest>, JsonRejection>,
 ) -> Result<Json<DirectoryResponse>, ApiError> {
-    if !check_api_rate_limit(admin.id) {
+    if !state.limiters.api.allow(&admin.id) {
         return Err(ApiError::rate_limited());
     }
     let Json(request) = body?;
@@ -383,7 +383,7 @@ fn check_conflicts(registry: &UserRegistry, staged: &[StagedEntry]) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::auth::IP_RATE_LIMIT_MAX_ATTEMPTS;
+    use crate::api::rate_limit::ADDRESS_ATTEMPTS;
     use crate::api::tokens::hash_secret;
     use crate::api::{apply_dashboard_middleware, create_api_router_with_dashboard};
     use axum::body::Body;
@@ -398,9 +398,6 @@ mod tests {
     use tower::ServiceExt;
     use tower_cookies::CookieManagerLayer;
 
-    /// Users created first so the acting users' ids stay clear of ids other suites
-    /// write as, because the API rate limiter is process-wide.
-    const FILLER_USERS: usize = 1300;
     const AMY_DISCORD_ID: &str = "452316113016193024";
 
     struct Caller {
@@ -438,16 +435,6 @@ mod tests {
     fn test_app(with_middleware: bool) -> TestApp {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
-        for index in 0..FILLER_USERS {
-            tracker
-                .create_user(
-                    &format!("filler{index}@example.com"),
-                    "unused-hash",
-                    "Filler",
-                    "viewer",
-                )
-                .expect("create filler user");
-        }
         let admin = caller(&tracker, "directory-admin@example.com", Role::Admin);
         let viewer = caller(&tracker, "directory-viewer@example.com", Role::Viewer);
         let config = Config {
@@ -874,7 +861,7 @@ mod tests {
             )
         };
 
-        for _ in 0..IP_RATE_LIMIT_MAX_ATTEMPTS {
+        for _ in 0..ADDRESS_ATTEMPTS {
             let (status, body) = send(attempt("Bearer cldr_guess".to_string(), PROBE_IP)).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
             assert_eq!(body, json!({"error": "Invalid or expired token"}));

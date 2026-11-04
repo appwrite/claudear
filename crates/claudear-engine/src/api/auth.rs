@@ -8,12 +8,9 @@ use axum::{
 use claudear_core::identity::{normalize_login_email, Identities, UserStatus};
 use claudear_storage::{DirectoryUser, DirectoryWrite, FixAttemptTracker, UserRow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
-use std::sync::Mutex;
-use std::time::Instant;
 use tower_cookies::{Cookie, Cookies};
 
 use super::error::ApiError;
@@ -68,203 +65,6 @@ impl FromStr for Role {
             other => Err(format!("unknown role: {other}")),
         }
     }
-}
-
-/// Maximum number of login attempts per email within the rate limit window.
-const LOGIN_RATE_LIMIT_MAX_ATTEMPTS: usize = 10;
-
-/// Duration of the rate limit window in seconds.
-const LOGIN_RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
-
-/// Maximum number of unique keys (email addresses) tracked in the rate limiter.
-/// When exceeded, the oldest entries are evicted to prevent memory exhaustion.
-const LOGIN_RATE_LIMIT_MAX_KEYS: usize = 10_000;
-
-/// Maximum number of login attempts per IP address within the rate limit window.
-/// More generous than per-email to avoid blocking legitimate users behind shared IPs.
-pub(crate) const IP_RATE_LIMIT_MAX_ATTEMPTS: usize = 100;
-
-/// Duration of the IP rate limit window in seconds.
-const IP_RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
-
-/// In-memory rate limiter for login attempts, keyed by email address.
-/// This protects against brute force attacks on specific accounts and
-/// mitigates CPU exhaustion from repeated bcrypt verification.
-static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// In-memory rate limiter for login attempts, keyed by client IP address.
-/// This prevents a single IP from brute-forcing across many email addresses
-/// and limits distributed credential-stuffing attacks.
-static IP_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Maximum number of API requests per user within the rate limit window.
-/// Applies to sensitive endpoints (profile, avatar, config, user management).
-const API_RATE_LIMIT_MAX_REQUESTS: usize = 30;
-
-/// Duration of the API rate limit window in seconds.
-const API_RATE_LIMIT_WINDOW_SECS: u64 = 60; // 1 minute
-
-/// In-memory rate limiter for sensitive API endpoints, keyed by user ID.
-static API_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Check if a login attempt is allowed for the given key (email).
-/// Returns true if the attempt is within rate limits, false if it should be rejected.
-fn check_login_rate_limit(key: &str) -> bool {
-    let mut limiter = match LOGIN_RATE_LIMITER.lock() {
-        Ok(limiter) => limiter,
-        Err(poisoned) => {
-            tracing::warn!("Login rate limiter mutex was poisoned, recovering");
-            poisoned.into_inner()
-        }
-    };
-
-    let now = Instant::now();
-    let window = std::time::Duration::from_secs(LOGIN_RATE_LIMIT_WINDOW_SECS);
-
-    let attempts = limiter.entry(key.to_string()).or_default();
-
-    // Remove attempts outside the window
-    attempts.retain(|attempt| now.duration_since(*attempt) < window);
-
-    if attempts.len() >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS {
-        return false;
-    }
-
-    attempts.push(now);
-
-    // Sweep expired entries from other keys to prevent unbounded memory growth
-    limiter.retain(|_, attempts| {
-        attempts
-            .iter()
-            .any(|attempt| now.duration_since(*attempt) < window)
-    });
-
-    // Cap total entries to prevent memory exhaustion from distributed attacks
-    if limiter.len() > LOGIN_RATE_LIMIT_MAX_KEYS {
-        // Find and remove entries with the oldest most-recent attempt
-        let mut entries: Vec<(String, Instant)> = limiter
-            .iter()
-            .filter_map(|(key, attempts)| attempts.last().map(|last| (key.clone(), *last)))
-            .collect();
-        entries.sort_by_key(|(_, last)| *last);
-        let to_remove = limiter.len() - LOGIN_RATE_LIMIT_MAX_KEYS;
-        for (key, _) in entries.into_iter().take(to_remove) {
-            limiter.remove(&key);
-        }
-    }
-
-    true
-}
-
-/// Check if a login attempt is allowed for the given IP address.
-/// Returns true if the attempt is within rate limits, false if it should be rejected.
-pub(crate) fn check_ip_rate_limit(ip: &str) -> bool {
-    let mut limiter = match IP_RATE_LIMITER.lock() {
-        Ok(limiter) => limiter,
-        Err(poisoned) => {
-            tracing::warn!("IP rate limiter mutex was poisoned, recovering");
-            poisoned.into_inner()
-        }
-    };
-
-    let now = Instant::now();
-    let window = std::time::Duration::from_secs(IP_RATE_LIMIT_WINDOW_SECS);
-
-    let attempts = limiter.entry(ip.to_string()).or_default();
-
-    // Remove attempts outside the window
-    attempts.retain(|attempt| now.duration_since(*attempt) < window);
-
-    if attempts.len() >= IP_RATE_LIMIT_MAX_ATTEMPTS {
-        return false;
-    }
-
-    attempts.push(now);
-
-    // Sweep expired entries from other keys to prevent unbounded memory growth
-    limiter.retain(|_, attempts| {
-        attempts
-            .iter()
-            .any(|attempt| now.duration_since(*attempt) < window)
-    });
-
-    // Cap total entries to prevent memory exhaustion from distributed attacks
-    if limiter.len() > LOGIN_RATE_LIMIT_MAX_KEYS {
-        let mut entries: Vec<(String, Instant)> = limiter
-            .iter()
-            .filter_map(|(key, attempts)| attempts.last().map(|last| (key.clone(), *last)))
-            .collect();
-        entries.sort_by_key(|(_, last)| *last);
-        let to_remove = limiter.len() - LOGIN_RATE_LIMIT_MAX_KEYS;
-        for (key, _) in entries.into_iter().take(to_remove) {
-            limiter.remove(&key);
-        }
-    }
-
-    true
-}
-
-/// Whether the IP bucket `key` has no attempts left, without spending one.
-pub(crate) fn ip_rate_limit_exhausted(key: &str) -> bool {
-    let limiter = match IP_RATE_LIMITER.lock() {
-        Ok(limiter) => limiter,
-        Err(poisoned) => {
-            tracing::warn!("IP rate limiter mutex was poisoned, recovering");
-            poisoned.into_inner()
-        }
-    };
-    let window = std::time::Duration::from_secs(IP_RATE_LIMIT_WINDOW_SECS);
-    limiter.get(key).is_some_and(|attempts| {
-        attempts
-            .iter()
-            .filter(|attempt| attempt.elapsed() < window)
-            .count()
-            >= IP_RATE_LIMIT_MAX_ATTEMPTS
-    })
-}
-
-/// Reset the API rate limiter. Only for use in tests.
-#[cfg(test)]
-pub(crate) fn reset_api_rate_limiter() {
-    let mut limiter = API_RATE_LIMITER.lock().unwrap();
-    limiter.clear();
-}
-
-/// Check if an API request is allowed for the given user ID.
-/// Applied to sensitive endpoints like profile, avatar, config, and user management.
-pub(crate) fn check_api_rate_limit(user_id: i64) -> bool {
-    let key = user_id.to_string();
-    let mut limiter = match API_RATE_LIMITER.lock() {
-        Ok(limiter) => limiter,
-        Err(poisoned) => {
-            tracing::warn!("API rate limiter mutex was poisoned, recovering");
-            poisoned.into_inner()
-        }
-    };
-
-    let now = Instant::now();
-    let window = std::time::Duration::from_secs(API_RATE_LIMIT_WINDOW_SECS);
-
-    let attempts = limiter.entry(key).or_default();
-    attempts.retain(|attempt| now.duration_since(*attempt) < window);
-
-    if attempts.len() >= API_RATE_LIMIT_MAX_REQUESTS {
-        return false;
-    }
-
-    attempts.push(now);
-
-    // Sweep expired entries
-    limiter.retain(|_, attempts| {
-        attempts
-            .iter()
-            .any(|attempt| now.duration_since(*attempt) < window)
-    });
-
-    true
 }
 
 /// Extract the client IP address from request headers.
@@ -387,8 +187,8 @@ impl FromRequestParts<ApiState> for AdminUser {
 /// An admin authenticated by `Authorization: Bearer <api token>` or, when that header
 /// is absent, by session. With the header present the cookie is never consulted, which
 /// is what makes the CSRF exemption for Bearer requests safe. Failed Bearer attempts
-/// spend the client IP's `bearer:` bucket; once it is empty every Bearer attempt from
-/// that IP is refused before the token is looked up.
+/// spend the client address's bearer limit; once it is spent every Bearer attempt from
+/// that address is refused before the token is looked up.
 #[derive(Debug, Clone)]
 pub(crate) struct AdminCaller(pub AuthUser);
 
@@ -403,8 +203,8 @@ impl FromRequestParts<ApiState> for AdminCaller {
             let AdminUser(user) = AdminUser::from_request_parts(parts, state).await?;
             return Ok(Self(user));
         };
-        let bucket = format!("bearer:{}", extract_client_ip(&parts.headers));
-        if ip_rate_limit_exhausted(&bucket) {
+        let address = extract_client_ip(&parts.headers);
+        if state.limiters.bearer.exhausted(&address) {
             return Err(ApiError::rate_limited());
         }
         let user = authorization
@@ -423,7 +223,7 @@ impl FromRequestParts<ApiState> for AdminCaller {
             .flatten()
             .map(AuthUser::from);
         let Some(user) = user else {
-            check_ip_rate_limit(&bucket);
+            state.limiters.bearer.allow(&address);
             return Err(ApiError::invalid_token());
         };
         user.identify();
@@ -540,13 +340,13 @@ pub async fn login_handler(
     let email = normalize_login_email(&body.email);
 
     // Rate limit login attempts by IP to prevent distributed brute force across many emails
-    if !check_ip_rate_limit(&client_ip) {
+    if !state.limiters.address.allow(&client_ip) {
         tracing::warn!(ip = %client_ip, "Login IP rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
     // Rate limit login attempts by email to prevent brute force and bcrypt CPU exhaustion
-    if !check_login_rate_limit(&email) {
+    if !state.limiters.login.allow(&email) {
         tracing::warn!(ip = %client_ip, "Login rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
@@ -661,7 +461,7 @@ pub async fn update_profile_handler(
     State(state): State<ApiState>,
     Json(body): Json<UpdateProfileRequest>,
 ) -> Result<Json<UserResponse>, StatusCode> {
-    if !check_api_rate_limit(user.id) {
+    if !state.limiters.api.allow(&user.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -679,7 +479,7 @@ pub async fn update_profile_handler(
                 return Err(StatusCode::BAD_REQUEST);
             }
             // Rate limit password change to prevent bcrypt CPU exhaustion
-            if !check_login_rate_limit(&user.email) {
+            if !state.limiters.login.allow(&user.email) {
                 return Err(StatusCode::TOO_MANY_REQUESTS);
             }
             let current_pw = body
@@ -746,7 +546,7 @@ pub async fn upload_avatar_handler(
     State(state): State<ApiState>,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !check_api_rate_limit(user.id) {
+    if !state.limiters.api.allow(&user.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     const MAX_SIZE: usize = 5 * 1024 * 1024; // 5MB
@@ -926,7 +726,7 @@ pub(crate) async fn create_user_handler(
     State(state): State<ApiState>,
     body: Result<Json<CreateUserRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreatedUserResponse>), ApiError> {
-    if !check_api_rate_limit(admin.id) {
+    if !state.limiters.api.allow(&admin.id) {
         return Err(ApiError::rate_limited());
     }
     let Json(body) = body?;
@@ -1042,7 +842,7 @@ pub async fn update_user_handler(
     Path(id): Path<i64>,
     body: Result<Json<UpdateUserRequest>, JsonRejection>,
 ) -> Result<Json<UserResponse>, ApiError> {
-    if !check_api_rate_limit(admin.id) {
+    if !state.limiters.api.allow(&admin.id) {
         return Err(ApiError::rate_limited());
     }
     let Json(body) = body?;
@@ -1107,7 +907,7 @@ pub async fn delete_user_handler(
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    if !check_api_rate_limit(admin.id) {
+    if !state.limiters.api.allow(&admin.id) {
         return Err(ApiError::rate_limited());
     }
 
@@ -1194,9 +994,6 @@ mod tests {
         axum::Router,
         std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
     ) {
-        // Reset API rate limiter to prevent cross-test interference
-        reset_api_rate_limiter();
-
         let tracker: std::sync::Arc<dyn claudear_storage::FixAttemptTracker> =
             std::sync::Arc::new(SqliteTracker::in_memory().unwrap());
         let indexing_rx = tracker.subscribe_indexing_progress();
@@ -1454,46 +1251,6 @@ mod tests {
             .create_session(user_id, "2099-12-31 23:59:59")
             .unwrap();
         (user_id, token)
-    }
-
-    #[test]
-    fn test_rate_limit_rejects_11th_attempt() {
-        // Use a unique email to avoid interference with other tests
-        let key = "ratelimit-11th@unique-test.com";
-        // First 10 attempts should succeed
-        for i in 0..LOGIN_RATE_LIMIT_MAX_ATTEMPTS {
-            assert!(
-                check_login_rate_limit(key),
-                "Attempt {} should be allowed",
-                i + 1
-            );
-        }
-        // 11th attempt should be rejected
-        assert!(
-            !check_login_rate_limit(key),
-            "11th attempt should be rejected"
-        );
-    }
-
-    #[test]
-    fn test_rate_limit_independent_keys() {
-        let key_a = "ratelimit-indep-a@unique-test.com";
-        let key_b = "ratelimit-indep-b@unique-test.com";
-
-        // Exhaust rate limit for key_a
-        for _ in 0..LOGIN_RATE_LIMIT_MAX_ATTEMPTS {
-            check_login_rate_limit(key_a);
-        }
-        assert!(
-            !check_login_rate_limit(key_a),
-            "key_a should be rate-limited"
-        );
-
-        // key_b should still be allowed
-        assert!(
-            check_login_rate_limit(key_b),
-            "key_b should NOT be rate-limited"
-        );
     }
 
     #[tokio::test]
@@ -1940,41 +1697,6 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-real-ip", "   ".parse().unwrap());
         assert_eq!(extract_client_ip(&headers), "unknown");
-    }
-
-    #[test]
-    fn test_ip_rate_limit_allows_within_limit() {
-        let ip = "ip-rate-test-allow-10.0.0.1";
-        for i in 0..10 {
-            assert!(
-                check_ip_rate_limit(ip),
-                "Attempt {} should be allowed",
-                i + 1
-            );
-        }
-    }
-
-    #[test]
-    fn test_ip_rate_limit_rejects_after_max() {
-        let ip = "ip-rate-test-reject-10.0.0.2";
-        for _ in 0..IP_RATE_LIMIT_MAX_ATTEMPTS {
-            check_ip_rate_limit(ip);
-        }
-        assert!(
-            !check_ip_rate_limit(ip),
-            "Should be rejected after max attempts"
-        );
-    }
-
-    #[test]
-    fn test_ip_rate_limit_independent_keys() {
-        let ip_a = "ip-rate-indep-a-10.0.0.3";
-        let ip_b = "ip-rate-indep-b-10.0.0.4";
-        for _ in 0..IP_RATE_LIMIT_MAX_ATTEMPTS {
-            check_ip_rate_limit(ip_a);
-        }
-        assert!(!check_ip_rate_limit(ip_a), "ip_a should be rate-limited");
-        assert!(check_ip_rate_limit(ip_b), "ip_b should NOT be rate-limited");
     }
 
     #[test]
@@ -2669,7 +2391,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_with_valid_png() {
-        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2738,7 +2459,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_invalid_content_type() {
-        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2792,7 +2512,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_wrong_magic_bytes() {
-        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2852,7 +2571,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_no_avatar_field() {
-        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2907,7 +2625,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_valid_jpeg() {
-        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -3124,13 +2841,10 @@ mod tests {
         use claudear_storage::{FixAttemptTracker, SqliteTracker, UserStore};
         use http_body_util::BodyExt;
         use serde_json::{json, Value};
+        use std::collections::HashMap;
         use std::sync::Arc;
         use tower::ServiceExt;
         use tower_cookies::CookieManagerLayer;
-
-        /// Users created first so the admin's id stays clear of ids other suites write
-        /// as, because the API rate limiter is process-wide.
-        const FILLER_USERS: usize = 1500;
 
         struct TestApp {
             router: axum::Router,
@@ -3142,16 +2856,6 @@ mod tests {
         fn test_app() -> TestApp {
             let tracker: Arc<dyn FixAttemptTracker> =
                 Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
-            for index in 0..FILLER_USERS {
-                tracker
-                    .create_user(
-                        &format!("filler{index}@example.com"),
-                        "unused-hash",
-                        "Filler",
-                        "viewer",
-                    )
-                    .expect("create filler user");
-            }
             let admin = tracker
                 .create_user("writes-admin@example.com", "unused-hash", "Admin", "admin")
                 .expect("create admin");

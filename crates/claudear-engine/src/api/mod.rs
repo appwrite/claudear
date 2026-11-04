@@ -8,6 +8,7 @@ pub(crate) mod embedded;
 pub mod error;
 mod identities;
 mod invites;
+mod rate_limit;
 mod routes;
 mod security;
 mod tokens;
@@ -253,8 +254,6 @@ mod tests {
     use std::collections::HashMap;
     use tower::ServiceExt;
 
-    const FILLER_USERS: usize = 800;
-
     fn server(users: HashMap<String, UserConfig>) -> ApiServer {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
@@ -270,16 +269,6 @@ mod tests {
     async fn identity_edits_through_the_server_reach_the_injected_registry() {
         let server = server(HashMap::new());
         let tracker = server.tracker.clone();
-        for index in 0..FILLER_USERS {
-            tracker
-                .create_user(
-                    &format!("filler{index}@example.com"),
-                    "unused-hash",
-                    "Filler",
-                    "viewer",
-                )
-                .expect("create filler user");
-        }
         let admin = tracker
             .create_user("admin@example.com", "unused-hash", "Admin", "admin")
             .expect("create admin");

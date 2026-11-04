@@ -1,6 +1,7 @@
 //! API route handlers for the dashboard.
 
 use super::auth::*;
+use super::rate_limit::RateLimiters;
 use crate::retry::RetryManager;
 use axum::{
     extract::{
@@ -45,6 +46,7 @@ pub struct ApiState {
     /// Held across reload, plan, conflict check, save and reload by every user,
     /// identity and directory write, so two writes never both pass the same check.
     pub identity_writes: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) limiters: Arc<RateLimiters>,
 }
 
 /// Create the API router.
@@ -109,6 +111,7 @@ pub fn create_api_router_full(
         chat_service,
         registry,
         identity_writes: Arc::new(tokio::sync::Mutex::new(())),
+        limiters: Arc::new(RateLimiters::default()),
     };
 
     let api_routes = Router::new()
@@ -2710,7 +2713,7 @@ async fn put_config_handler(
     State(state): State<ApiState>,
     Json(body): Json<ConfigUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !check_api_rate_limit(_user.0.id) {
+    if !state.limiters.api.allow(&_user.0.id) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({ "error": "Rate limit exceeded" })),
@@ -2862,7 +2865,7 @@ async fn put_global_instruction_handler(
     State(state): State<ApiState>,
     Json(body): Json<InstructionUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !check_api_rate_limit(_user.0.id) {
+    if !state.limiters.api.allow(&_user.0.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     state
@@ -2909,7 +2912,7 @@ async fn put_repo_instruction_handler(
     Path(repo): Path<String>,
     Json(body): Json<InstructionUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !check_api_rate_limit(_user.0.id) {
+    if !state.limiters.api.allow(&_user.0.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     state
@@ -8388,22 +8391,15 @@ mod tests {
         use axum::Router;
         use claudear_config::config::{Config, UserConfig};
         use claudear_config::users::UserRegistry;
-        use claudear_core::identity::{Identities, IdentityField, IdentityOrigin, UserStatus};
+        use claudear_core::identity::{Identities, IdentityField, IdentityOrigin};
         use claudear_storage::{DirectoryUser, DirectoryWrite, FixAttemptTracker, IdentityWrite};
         use http_body_util::BodyExt;
         use serde_json::{json, Value};
         use std::collections::HashMap;
         use std::path::PathBuf;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         use tower::ServiceExt;
         use tower_cookies::CookieManagerLayer;
-
-        /// The API write limiter is process-wide and keyed by user id, so each harness
-        /// creates filler users first to give its acting users ids no other test writes as.
-        const FILLER_BASE: usize = 5000;
-        const LANE_WIDTH: usize = 10;
-        static NEXT_LANE: AtomicUsize = AtomicUsize::new(0);
 
         const ADMIN_EMAIL: &str = "identity-admin@example.com";
         const VIEWER_EMAIL: &str = "identity-viewer@example.com";
@@ -8434,23 +8430,6 @@ mod tests {
         impl Harness {
             fn new(users: HashMap<String, UserConfig>) -> Self {
                 let tracker = create_test_tracker();
-                let lane = NEXT_LANE.fetch_add(1, Ordering::Relaxed);
-                let fillers: Vec<DirectoryWrite> = (0..FILLER_BASE + lane * LANE_WIDTH)
-                    .map(|index| DirectoryWrite {
-                        user: DirectoryUser::New {
-                            email: format!("identity-filler{index}@example.com"),
-                            name: "Filler".to_string(),
-                            role: "viewer".to_string(),
-                            password_hash: "unused-hash".to_string(),
-                            status: UserStatus::Active,
-                        },
-                        identities: None,
-                        invite: None,
-                    })
-                    .collect();
-                tracker
-                    .save_directory(&fillers)
-                    .expect("create filler users");
                 let admin = account(&tracker, ADMIN_EMAIL, "Admin", "admin");
                 let viewer = account(&tracker, VIEWER_EMAIL, "Viewer", "viewer");
                 let other = account(&tracker, OTHER_EMAIL, "Other", "viewer");
@@ -9314,14 +9293,6 @@ mod tests {
         use claudear_core::identity::{Identities, UserStatus};
         use claudear_storage::{DirectoryUser, DirectoryWrite, IdentityWrite, InviteWrite};
         use serde_json::{json, Value};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        /// Users created before each app's acting users. The API, login and invite rate
-        /// limiters are process-wide, so every app gets its own slot of user ids, emails
-        /// and client IP, clear of the low ids the rest of the suite writes as.
-        const FILLER_USERS: usize = 5500;
-        const SLOT_WIDTH: usize = 4;
-        static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 
         const PASSWORD: &str = "correct horse battery";
         const INVALID_INVITE: &str = "This invite link is invalid or has expired";
@@ -9356,7 +9327,6 @@ mod tests {
             admin: Account,
             viewer: Account,
             csrf: String,
-            slot: usize,
         }
 
         impl TestApp {
@@ -9369,20 +9339,9 @@ mod tests {
             }
 
             async fn build(public_url: Option<String>) -> Self {
-                let slot = NEXT_SLOT.fetch_add(1, Ordering::SeqCst);
                 let tracker = create_test_tracker();
-                for index in 0..FILLER_USERS + slot * SLOT_WIDTH {
-                    tracker
-                        .create_user(
-                            &format!("filler{index}@invite.test"),
-                            "unused-hash",
-                            "Filler",
-                            "viewer",
-                        )
-                        .expect("create filler user");
-                }
-                let admin = account(&tracker, &format!("admin-{slot}@invite.test"), "admin");
-                let viewer = account(&tracker, &format!("viewer-{slot}@invite.test"), "viewer");
+                let admin = account(&tracker, "admin@invite.test", "admin");
+                let viewer = account(&tracker, "viewer@invite.test", "viewer");
 
                 let mut config = test_config();
                 config.storage_dir = std::env::temp_dir().join("claudear-invite-directory-tests");
@@ -9408,12 +9367,11 @@ mod tests {
                     admin,
                     viewer,
                     csrf,
-                    slot,
                 }
             }
 
             fn email(&self, name: &str) -> String {
-                format!("{name}-{}@invite.test", self.slot)
+                format!("{name}@invite.test")
             }
 
             fn request(
@@ -9425,10 +9383,7 @@ mod tests {
                 body: Option<Value>,
             ) -> Request<Body> {
                 let mut cookies = Vec::new();
-                let mut builder = Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header("x-forwarded-for", format!("203.0.113.{}", self.slot));
+                let mut builder = Request::builder().method(method).uri(uri);
                 match caller {
                     Caller::Anonymous => {}
                     Caller::Session(session) => cookies.push(format!("claudear_session={session}")),
@@ -9810,8 +9765,10 @@ mod tests {
             assert_eq!(accepted, json!({"message": "Invite accepted"}));
             assert_eq!(app.status_of(id), UserStatus::Active);
 
-            let (status, _) = app.login(&app.email("amy"), PASSWORD).await;
+            let (status, body) = app.login(&app.email("amy"), PASSWORD).await;
             assert_eq!(status, StatusCode::OK);
+            let session: Value = serde_json::from_slice(&body).expect("login body");
+            assert_eq!(session["user"]["email"], app.email("amy"));
 
             let (_, user) = app
                 .as_admin(Method::GET, &format!("/api/users/{id}"), None)

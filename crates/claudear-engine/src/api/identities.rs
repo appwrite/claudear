@@ -5,7 +5,7 @@
 //! the sensitive notification targets redacted. A handle that already belongs to a
 //! different person is rejected, and every write reloads the shared registry.
 
-use super::auth::{check_api_rate_limit, AuthUser};
+use super::auth::AuthUser;
 use super::error::ApiError;
 use super::routes::ApiState;
 use crate::registry;
@@ -422,7 +422,7 @@ pub(crate) async fn update_user_identities_handler(
     Path(user_id): Path<i64>,
     body: Result<Json<UpdateIdentitiesRequest>, JsonRejection>,
 ) -> Result<Json<UserIdentities>, ApiError> {
-    authorize_write(&actor, user_id)?;
+    authorize_write(&state, &actor, user_id)?;
     let Json(update) = body?;
     if update.slug.is_some() && !actor.is_admin() {
         return Err(ApiError::forbidden(
@@ -468,7 +468,7 @@ pub(crate) async fn reset_user_identities_handler(
     State(state): State<ApiState>,
     Path(user_id): Path<i64>,
 ) -> Result<Json<UserIdentities>, ApiError> {
-    authorize_write(&actor, user_id)?;
+    authorize_write(&state, &actor, user_id)?;
     let user = find_user(&state, user_id)?;
 
     let _writes = state.identity_writes.lock().await;
@@ -522,8 +522,8 @@ fn save_identities(state: &ApiState, user_id: i64, write: IdentityWrite) -> Resu
     Ok(())
 }
 
-fn authorize_write(actor: &AuthUser, user_id: i64) -> Result<(), ApiError> {
-    if !check_api_rate_limit(actor.id) {
+fn authorize_write(state: &ApiState, actor: &AuthUser, user_id: i64) -> Result<(), ApiError> {
+    if !state.limiters.api.allow(&actor.id) {
         return Err(ApiError::rate_limited());
     }
     if actor.is_admin() || actor.id == user_id {
@@ -586,10 +586,6 @@ mod tests {
     const JAKE_DISCORD_ID: &str = "452316113016193024";
     const ALICE_DISCORD_ID: &str = "452316113016193025";
     const SLACK_ID: &str = "U0123456789";
-
-    /// Users created before the acting users so their ids stay clear of the low ids the
-    /// rest of the suite writes as, because the API rate limiter is process-wide.
-    const FILLER_USERS: usize = 400;
 
     fn config_users() -> HashMap<String, UserConfig> {
         HashMap::from([
@@ -1013,16 +1009,6 @@ mod tests {
     fn test_app() -> TestApp {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
-        for index in 0..FILLER_USERS {
-            tracker
-                .create_user(
-                    &format!("filler{index}@example.com"),
-                    "unused-hash",
-                    "Filler",
-                    "viewer",
-                )
-                .expect("create filler user");
-        }
         let admin = session(&tracker, "jake@example.com", "admin");
         let viewer = session(&tracker, "viewer@example.com", "viewer");
         let config = Config {
@@ -1082,7 +1068,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let people = body.as_array().expect("array");
-        assert_eq!(people.len(), FILLER_USERS + 2);
+        assert_eq!(people.len(), 2);
         let admin = people
             .iter()
             .find(|person| person["user_id"] == app.admin.id)
