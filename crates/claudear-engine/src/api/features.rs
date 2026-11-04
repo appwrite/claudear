@@ -174,6 +174,13 @@ fn serialised(value: &impl Serialize) -> Value {
     serde_json::to_value(value).unwrap_or_default()
 }
 
+fn decimal(value: f32) -> Value {
+    value
+        .to_string()
+        .parse::<f64>()
+        .map_or(Value::Null, Value::from)
+}
+
 fn linear(config: &Config) -> FeatureStatus {
     let feature = FeatureStatus::new(
         "issues.linear",
@@ -852,8 +859,8 @@ fn chat(config: &Config) -> FeatureStatus {
         FeatureCategory::Intelligence,
     )
     .state(true, chat.enabled)
-    .setting("temperature", chat.temperature)
-    .setting("top_p", chat.top_p)
+    .setting("temperature", decimal(chat.temperature))
+    .setting("top_p", decimal(chat.top_p))
     .setting("max_tokens", chat.max_tokens)
     .setting("max_context_chunks", chat.max_context_chunks)
     .setting("max_history_messages", chat.max_history_messages)
@@ -1306,6 +1313,25 @@ mod tests {
             tag_filter: Default::default(),
         }];
         assert_eq!(status(&config), (true, true));
+    }
+
+    #[test]
+    fn f32_settings_report_their_decimal_value() {
+        let mut config = Config::default();
+        config.chat.temperature = 0.7;
+        config.chat.top_p = 0.9;
+        let features = features(&config);
+        let chat = feature(&features, "chat");
+        let reported = |name: &str| {
+            let setting = chat
+                .settings
+                .iter()
+                .find(|setting| setting.name == name)
+                .unwrap_or_else(|| panic!("no setting {name}"));
+            serde_json::to_string(&setting.value).unwrap()
+        };
+        assert_eq!(reported("temperature"), "0.7");
+        assert_eq!(reported("top_p"), "0.9");
     }
 
     #[test]
