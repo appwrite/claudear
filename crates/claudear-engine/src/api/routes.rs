@@ -8358,4 +8358,984 @@ mod tests {
         assert!(summary.avg_secs.is_none());
         assert!(summary.max_secs.is_none());
     }
+
+    mod invite_directory {
+        use super::*;
+        use crate::api::apply_dashboard_middleware;
+        use axum::body::Bytes;
+        use axum::http::Method;
+        use claudear_core::identity::{Identities, UserStatus};
+        use claudear_storage::{DirectoryUser, DirectoryWrite, IdentityWrite, InviteWrite};
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Users created before each app's acting users. The API, login and invite rate
+        /// limiters are process-wide, so every app gets its own slot of user ids, emails
+        /// and client IP, clear of the low ids the rest of the suite writes as.
+        const FILLER_USERS: usize = 5000;
+        const SLOT_WIDTH: usize = 4;
+        static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+        const PASSWORD: &str = "correct horse battery";
+        const INVALID_INVITE: &str = "This invite link is invalid or has expired";
+        const PUBLIC_URL: &str = "https://claudear.example.com/";
+        const DISCORD_ID: &str = "452316113016193024";
+        const SLACK_ID: &str = "U0123456789";
+        const LINK_PREFIX: &str = "/invite#cldi_";
+        const SECRET_HEX_LENGTH: usize = 64;
+
+        struct Account {
+            id: i64,
+            session: String,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Caller<'a> {
+            Anonymous,
+            Session(&'a str),
+            Bearer(&'a str),
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Csrf {
+            Sent,
+            Omitted,
+        }
+
+        struct TestApp {
+            router: Router,
+            tracker: Arc<dyn FixAttemptTracker>,
+            registry: UserRegistry,
+            admin: Account,
+            viewer: Account,
+            csrf: String,
+            slot: usize,
+        }
+
+        impl TestApp {
+            async fn new() -> Self {
+                Self::build(None).await
+            }
+
+            async fn with_public_url(public_url: &str) -> Self {
+                Self::build(Some(public_url.to_string())).await
+            }
+
+            async fn build(public_url: Option<String>) -> Self {
+                let slot = NEXT_SLOT.fetch_add(1, Ordering::SeqCst);
+                let tracker = create_test_tracker();
+                for index in 0..FILLER_USERS + slot * SLOT_WIDTH {
+                    tracker
+                        .create_user(
+                            &format!("filler{index}@invite.test"),
+                            "unused-hash",
+                            "Filler",
+                            "viewer",
+                        )
+                        .expect("create filler user");
+                }
+                let admin = account(&tracker, &format!("admin-{slot}@invite.test"), "admin");
+                let viewer = account(&tracker, &format!("viewer-{slot}@invite.test"), "viewer");
+
+                let mut config = test_config();
+                config.storage_dir = std::env::temp_dir().join("claudear-invite-directory-tests");
+                config.dashboard.public_url = public_url;
+                let registry = UserRegistry::new(config.users.clone());
+                let router = apply_dashboard_middleware(
+                    create_api_router_with_dashboard(
+                        config,
+                        tracker.clone(),
+                        PathBuf::from("claudear.toml"),
+                        test_indexing_rx(&tracker),
+                        None,
+                        registry.clone(),
+                    ),
+                    false,
+                );
+                let csrf = fetch_csrf(&router).await;
+
+                Self {
+                    router,
+                    tracker,
+                    registry,
+                    admin,
+                    viewer,
+                    csrf,
+                    slot,
+                }
+            }
+
+            fn email(&self, name: &str) -> String {
+                format!("{name}-{}@invite.test", self.slot)
+            }
+
+            fn request(
+                &self,
+                method: Method,
+                uri: &str,
+                caller: Caller<'_>,
+                csrf: Csrf,
+                body: Option<Value>,
+            ) -> Request<Body> {
+                let mut cookies = Vec::new();
+                let mut builder = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("x-forwarded-for", format!("203.0.113.{}", self.slot));
+                match caller {
+                    Caller::Anonymous => {}
+                    Caller::Session(session) => cookies.push(format!("claudear_session={session}")),
+                    Caller::Bearer(token) => {
+                        builder = builder.header("authorization", format!("Bearer {token}"));
+                    }
+                }
+                if csrf == Csrf::Sent {
+                    cookies.push(format!("claudear_csrf={}", self.csrf));
+                    builder = builder.header("x-csrf-token", &self.csrf);
+                }
+                if !cookies.is_empty() {
+                    builder = builder.header("cookie", cookies.join("; "));
+                }
+                match body {
+                    Some(body) => builder
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string())),
+                    None => builder.body(Body::empty()),
+                }
+                .expect("request")
+            }
+
+            async fn send_bytes(&self, request: Request<Body>) -> (StatusCode, Bytes) {
+                let response = self
+                    .router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("response");
+                let status = response.status();
+                let bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                (status, bytes)
+            }
+
+            async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
+                let (status, bytes) = self.send_bytes(request).await;
+                let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                (status, body)
+            }
+
+            async fn call(
+                &self,
+                method: Method,
+                uri: &str,
+                caller: Caller<'_>,
+                body: Option<Value>,
+            ) -> (StatusCode, Value) {
+                self.send(self.request(method, uri, caller, Csrf::Sent, body))
+                    .await
+            }
+
+            async fn as_admin(
+                &self,
+                method: Method,
+                uri: &str,
+                body: Option<Value>,
+            ) -> (StatusCode, Value) {
+                self.call(method, uri, Caller::Session(&self.admin.session), body)
+                    .await
+            }
+
+            async fn put_directory(&self, caller: Caller<'_>, body: Value) -> (StatusCode, Value) {
+                self.send(self.request(
+                    Method::PUT,
+                    "/api/directory",
+                    caller,
+                    Csrf::Omitted,
+                    Some(body),
+                ))
+                .await
+            }
+
+            /// Admin `POST /api/users` without a password; returns the new user's id, the
+            /// invite secret and the response body.
+            async fn create_invited_user(
+                &self,
+                name: &str,
+                identities: Option<Value>,
+            ) -> (i64, String, Value) {
+                let mut request =
+                    json!({"email": self.email(name), "name": name, "role": "viewer"});
+                if let Some(identities) = identities {
+                    request["identities"] = identities;
+                }
+                let (status, body) = self
+                    .as_admin(Method::POST, "/api/users", Some(request))
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "create invited user: {body}");
+                let id = body["id"].as_i64().expect("user id");
+                (id, secret_of(&body["invite"]), body)
+            }
+
+            async fn inspect(&self, token: &str) -> (StatusCode, Value) {
+                self.call(
+                    Method::POST,
+                    "/api/auth/invite/inspect",
+                    Caller::Anonymous,
+                    Some(json!({"token": token})),
+                )
+                .await
+            }
+
+            async fn accept(&self, token: &str, password: &str) -> (StatusCode, Value) {
+                self.call(
+                    Method::POST,
+                    "/api/auth/invite/accept",
+                    Caller::Anonymous,
+                    Some(json!({"token": token, "password": password})),
+                )
+                .await
+            }
+
+            async fn login(&self, email: &str, password: &str) -> (StatusCode, Bytes) {
+                self.send_bytes(self.request(
+                    Method::POST,
+                    "/api/auth/login",
+                    Caller::Anonymous,
+                    Csrf::Omitted,
+                    Some(json!({"email": email, "password": password})),
+                ))
+                .await
+            }
+
+            /// Store an invited user directly, bypassing the HTTP API, with an invite for
+            /// `secret` that expires at `expires_at`.
+            fn seed_invited(
+                &self,
+                email: &str,
+                role: &str,
+                password_hash: &str,
+                secret: &str,
+                expires_at: &str,
+            ) -> i64 {
+                let ids = self
+                    .tracker
+                    .save_directory(&[DirectoryWrite {
+                        user: DirectoryUser::New {
+                            email: email.to_string(),
+                            name: "Seeded".to_string(),
+                            role: role.to_string(),
+                            password_hash: password_hash.to_string(),
+                            status: UserStatus::Invited,
+                        },
+                        identities: None,
+                        invite: Some(InviteWrite {
+                            token_hash: sha256_hex(secret),
+                            expires_at: expires_at.to_string(),
+                            created_by: self.admin.id,
+                        }),
+                    }])
+                    .expect("seed invited user");
+                ids[0]
+            }
+
+            /// Store console identities for an existing user and reload the registry.
+            fn seed_identities(&self, user_id: i64, identities: Identities) {
+                self.tracker
+                    .save_directory(&[DirectoryWrite {
+                        user: DirectoryUser::Existing {
+                            user_id,
+                            name: None,
+                            role: None,
+                        },
+                        identities: Some(IdentityWrite {
+                            slug: None,
+                            identities,
+                        }),
+                        invite: None,
+                    }])
+                    .expect("seed identities");
+                assert!(crate::registry::reload(
+                    &self.registry,
+                    self.tracker.as_ref()
+                ));
+            }
+
+            /// Mint an API token for `user_id` the way `POST /api/tokens` does.
+            fn mint_bearer(&self, user_id: i64) -> String {
+                let secret = format!("cldr_{}", hex::encode(rand::random::<[u8; 24]>()));
+                self.tracker
+                    .create_api_token(
+                        user_id,
+                        "directory load",
+                        &sha256_hex(&secret),
+                        &secret[.."cldr_".len() + 8],
+                        None,
+                    )
+                    .expect("create api token");
+                secret
+            }
+
+            fn user_count(&self) -> i64 {
+                self.tracker.count_users().expect("count users")
+            }
+
+            fn status_of(&self, user_id: i64) -> UserStatus {
+                self.tracker
+                    .get_user_by_id(user_id)
+                    .expect("get user")
+                    .expect("user exists")
+                    .status
+            }
+        }
+
+        fn account(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: &str) -> Account {
+            let id = tracker
+                .create_user(email, "unused-hash", email, role)
+                .expect("create user");
+            let session = tracker
+                .create_session(id, "2099-12-31 23:59:59")
+                .expect("create session");
+            Account { id, session }
+        }
+
+        /// Read the CSRF cookie the middleware issues on a plain `GET`, as the SPA does.
+        async fn fetch_csrf(router: &Router) -> String {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/health")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .find_map(|cookie| cookie.strip_prefix("claudear_csrf="))
+                .and_then(|cookie| cookie.split(';').next())
+                .map(str::to_string)
+                .expect("claudear_csrf cookie")
+        }
+
+        fn sha256_hex(secret: &str) -> String {
+            hex::encode(Sha256::digest(secret.as_bytes()))
+        }
+
+        fn invite_secret() -> String {
+            format!("cldi_{}", hex::encode(rand::random::<[u8; 32]>()))
+        }
+
+        fn timestamp(offset: Duration) -> String {
+            (Utc::now() + offset)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        }
+
+        fn password_hash(password: &str) -> String {
+            bcrypt::hash(password, 4).expect("bcrypt hash")
+        }
+
+        /// The secret from a `UserInvite`, asserting the link shape on the way.
+        fn secret_of(invite: &Value) -> String {
+            let link = invite["invite_link"].as_str().expect("invite_link");
+            assert!(link.starts_with(LINK_PREFIX), "invite link shape: {link}");
+            let secret = link.trim_start_matches("/invite#").to_string();
+            assert_eq!(secret.len(), "cldi_".len() + SECRET_HEX_LENGTH);
+            secret
+        }
+
+        fn invalid_invite() -> Value {
+            json!({"error": INVALID_INVITE})
+        }
+
+        #[tokio::test]
+        async fn post_users_without_a_password_creates_an_invited_user() {
+            let app = TestApp::new().await;
+
+            let (id, _, body) = app.create_invited_user("amy", None).await;
+            assert_eq!(body["status"], "invited");
+            assert_eq!(body["email"], app.email("amy"));
+            assert!(body["invite"]["invite_url"].is_null());
+            assert_eq!(body["invite_expires_at"], body["invite"]["expires_at"]);
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+
+            let (status, user) = app
+                .as_admin(Method::GET, &format!("/api/users/{id}"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(user["status"], "invited");
+            assert_eq!(user["invite_expires_at"], body["invite"]["expires_at"]);
+
+            let (status, active) = app
+                .as_admin(
+                    Method::POST,
+                    "/api/users",
+                    Some(json!({
+                        "email": app.email("bob"),
+                        "name": "Bob",
+                        "role": "viewer",
+                        "password": PASSWORD,
+                    })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{active}");
+            assert_eq!(active["status"], "active");
+            assert!(active["invite"].is_null());
+            assert!(active["invite_expires_at"].is_null());
+        }
+
+        #[tokio::test]
+        async fn public_url_makes_the_invite_link_absolute() {
+            let app = TestApp::with_public_url(PUBLIC_URL).await;
+
+            let (_, _, body) = app.create_invited_user("amy", None).await;
+            let link = body["invite"]["invite_link"].as_str().expect("invite_link");
+            assert_eq!(
+                body["invite"]["invite_url"],
+                format!("{}{link}", PUBLIC_URL.trim_end_matches('/'))
+            );
+        }
+
+        #[tokio::test]
+        async fn post_users_identities_for_an_invited_user_are_live_in_the_registry() {
+            let app = TestApp::new().await;
+
+            let (id, _, _) = app
+                .create_invited_user("amy", Some(json!({"github_usernames": ["amy"]})))
+                .await;
+
+            let person = app.registry.resolve("github", "amy").expect("amy resolves");
+            let people = app.registry.users();
+            assert!(people.contains_key(&person.slug));
+            assert_eq!(
+                people[&person.slug].github_usernames,
+                vec!["amy".to_string()]
+            );
+
+            let (status, identities) = app
+                .as_admin(Method::GET, &format!("/api/users/{id}/identities"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(identities["status"], "invited");
+            assert_eq!(identities["identities"]["github_usernames"], json!(["amy"]));
+        }
+
+        #[tokio::test]
+        async fn an_invite_is_inspected_then_accepted_then_the_user_logs_in() {
+            let app = TestApp::new().await;
+            let (id, secret, _) = app.create_invited_user("amy", None).await;
+
+            let (status, details) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::OK, "{details}");
+            assert_eq!(details["name"], "amy");
+            assert_eq!(details["email"], app.email("amy"));
+            assert!(details["expires_at"].is_string());
+
+            let (status, _) = app
+                .send(app.request(
+                    Method::POST,
+                    "/api/auth/invite/inspect",
+                    Caller::Anonymous,
+                    Csrf::Omitted,
+                    Some(json!({"token": secret})),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "inspect needs the CSRF header"
+            );
+
+            let (status, _) = app.accept(&secret, "short").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+
+            let (status, accepted) = app.accept(&secret, PASSWORD).await;
+            assert_eq!(status, StatusCode::OK, "{accepted}");
+            assert_eq!(accepted, json!({"message": "Invite accepted"}));
+            assert_eq!(app.status_of(id), UserStatus::Active);
+
+            let (status, _) = app.login(&app.email("amy"), PASSWORD).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let (_, user) = app
+                .as_admin(Method::GET, &format!("/api/users/{id}"), None)
+                .await;
+            assert_eq!(user["status"], "active");
+            assert!(user["invite_expires_at"].is_null());
+        }
+
+        #[tokio::test]
+        async fn login_for_an_invited_user_matches_a_wrong_password() {
+            let app = TestApp::new().await;
+            let active = app.email("active");
+            app.tracker
+                .create_user(&active, &password_hash(PASSWORD), "Active", "viewer")
+                .expect("create active user");
+            let invited = app.email("invited");
+            // A real hash for the right password, so only the status gate can refuse it.
+            app.seed_invited(
+                &invited,
+                "admin",
+                &password_hash(PASSWORD),
+                &invite_secret(),
+                &timestamp(Duration::days(7)),
+            );
+
+            let (wrong_status, wrong_body) = app.login(&active, "not the password").await;
+            let (invited_status, invited_body) = app.login(&invited, PASSWORD).await;
+            let (unknown_status, unknown_body) = app.login(&app.email("unknown"), PASSWORD).await;
+
+            assert_eq!(wrong_status, StatusCode::UNAUTHORIZED);
+            assert_eq!(invited_status, StatusCode::UNAUTHORIZED);
+            assert_eq!(unknown_status, StatusCode::UNAUTHORIZED);
+            assert_eq!(invited_body, wrong_body);
+            assert_eq!(unknown_body, wrong_body);
+        }
+
+        #[tokio::test]
+        async fn an_accepted_invite_cannot_be_reused() {
+            let app = TestApp::new().await;
+            let (_, secret, _) = app.create_invited_user("amy", None).await;
+
+            let (status, _) = app.accept(&secret, PASSWORD).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let (status, body) = app.accept(&secret, "another password").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, body) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+
+            let (status, _) = app.login(&app.email("amy"), PASSWORD).await;
+            assert_eq!(status, StatusCode::OK, "the first password still stands");
+        }
+
+        #[tokio::test]
+        async fn an_expired_invite_is_rejected() {
+            let app = TestApp::new().await;
+            let original = invite_secret();
+            let id = app.seed_invited(
+                &app.email("late"),
+                "viewer",
+                &password_hash("never-used-password"),
+                &original,
+                &timestamp(Duration::days(7)),
+            );
+            let expired = invite_secret();
+            app.tracker
+                .issue_invite(
+                    id,
+                    &sha256_hex(&expired),
+                    &timestamp(-Duration::days(1)),
+                    app.admin.id,
+                )
+                .expect("issue expired invite");
+
+            for secret in [&expired, &original] {
+                let (status, body) = app.inspect(secret).await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(body, invalid_invite());
+                let (status, body) = app.accept(secret, PASSWORD).await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(body, invalid_invite());
+            }
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+        }
+
+        #[tokio::test]
+        async fn a_revoked_invite_is_rejected() {
+            let app = TestApp::new().await;
+            let (id, secret, _) = app.create_invited_user("amy", None).await;
+            let uri = format!("/api/users/{id}/invite");
+
+            let (status, body) = app.as_admin(Method::DELETE, &uri, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body, json!({"message": "Invite revoked"}));
+
+            let (status, body) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, _) = app.accept(&secret, PASSWORD).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            let (status, _) = app.as_admin(Method::DELETE, &uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "no open invite is left");
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+        }
+
+        #[tokio::test]
+        async fn reissuing_an_invite_invalidates_the_previous_link() {
+            let app = TestApp::new().await;
+            let (id, previous, _) = app.create_invited_user("amy", None).await;
+
+            let (status, invite) = app
+                .as_admin(Method::POST, &format!("/api/users/{id}/invite"), None)
+                .await;
+            assert!(status.is_success(), "re-issue: {status} {invite}");
+            let current = secret_of(&invite);
+            assert_ne!(current, previous);
+            assert!(invite["invite_url"].is_null());
+            assert!(invite["expires_at"].is_string());
+
+            let (status, body) = app.inspect(&previous).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, _) = app.accept(&previous, PASSWORD).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            let (status, _) = app.inspect(&current).await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _) = app.accept(&current, PASSWORD).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn issuing_an_invite_for_an_active_user_conflicts() {
+            let app = TestApp::new().await;
+
+            let (status, body) = app
+                .as_admin(
+                    Method::POST,
+                    &format!("/api/users/{}/invite", app.viewer.id),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, json!({"error": "User is already active"}));
+
+            let (status, _) = app
+                .as_admin(Method::POST, "/api/users/999999/invite", None)
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn viewers_cannot_manage_users_invites_or_the_directory() {
+            let app = TestApp::new().await;
+            let (id, _, _) = app.create_invited_user("amy", None).await;
+            let viewer = Caller::Session(&app.viewer.session);
+            let invite_uri = format!("/api/users/{id}/invite");
+            let directory = json!({"users": [{
+                "email": app.email("eve"), "name": "Eve", "role": "admin",
+            }]});
+            let count = app.user_count();
+
+            let (status, _) = app
+                .call(
+                    Method::POST,
+                    "/api/users",
+                    viewer,
+                    Some(json!({"email": app.email("eve"), "name": "Eve", "role": "admin"})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "POST /api/users");
+            let (status, _) = app.call(Method::POST, &invite_uri, viewer, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "POST invite");
+            let (status, _) = app.call(Method::DELETE, &invite_uri, viewer, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "DELETE invite");
+            let (status, _) = app
+                .call(
+                    Method::PUT,
+                    "/api/directory",
+                    viewer,
+                    Some(directory.clone()),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "PUT /api/directory by session"
+            );
+
+            let token = app.mint_bearer(app.viewer.id);
+            let (status, _) = app.put_directory(Caller::Bearer(&token), directory).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "PUT /api/directory by Bearer"
+            );
+
+            assert_eq!(app.user_count(), count);
+            assert!(app
+                .tracker
+                .get_open_invite_for_user(id)
+                .expect("open invite")
+                .is_some());
+        }
+
+        #[tokio::test]
+        async fn directory_takes_an_admin_bearer_without_csrf_but_not_a_bare_session() {
+            let app = TestApp::new().await;
+            let token = app.mint_bearer(app.admin.id);
+            let entry = |name: &str| json!({"users": [{"email": app.email(name), "name": name, "role": "viewer"}]});
+
+            let (status, body) = app
+                .put_directory(Caller::Bearer(&token), entry("amy"))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["users"][0]["created"], true);
+
+            let (status, _) = app
+                .put_directory(Caller::Session(&app.admin.session), entry("bob"))
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "a session still needs CSRF");
+
+            let mut request = app.request(
+                Method::PUT,
+                "/api/directory",
+                Caller::Session(&app.admin.session),
+                Csrf::Sent,
+                Some(entry("carl")),
+            );
+            request.headers_mut().insert(
+                "authorization",
+                "Bearer cldr_not-a-real-token".parse().expect("header"),
+            );
+            let (status, _) = app.send(request).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a bad Bearer never falls back to the cookie"
+            );
+
+            let (status, _) = app
+                .call(
+                    Method::POST,
+                    "/api/users",
+                    Caller::Bearer(&token),
+                    Some(json!({"email": app.email("dan"), "name": "Dan", "role": "viewer"})),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "Bearer is accepted only on PUT /api/directory"
+            );
+
+            for name in ["bob", "carl", "dan"] {
+                assert!(app
+                    .tracker
+                    .get_user_by_email(&app.email(name))
+                    .expect("lookup")
+                    .is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn bearer_token_of_an_invited_user_is_rejected() {
+            let app = TestApp::new().await;
+            let id = app.seed_invited(
+                &app.email("pending-admin"),
+                "admin",
+                &password_hash("never-used-password"),
+                &invite_secret(),
+                &timestamp(Duration::days(7)),
+            );
+            let token = app.mint_bearer(id);
+            let count = app.user_count();
+
+            let (status, _) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [{"email": app.email("amy"), "name": "Amy", "role": "viewer"}]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(app.user_count(), count);
+        }
+
+        #[tokio::test]
+        async fn directory_invited_users_are_live_in_the_registry() {
+            let app = TestApp::new().await;
+            let token = app.mint_bearer(app.admin.id);
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [{
+                        "email": app.email("amy"), "name": "Amy", "role": "viewer",
+                        "identities": {
+                            "github_usernames": ["amy"],
+                            "discord_id": DISCORD_ID,
+                            "slack_id": SLACK_ID,
+                        },
+                    }]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let entry = &body["users"][0];
+            assert_eq!(entry["email"], app.email("amy"));
+            assert_eq!(entry["created"], true);
+            assert_eq!(entry["status"], "invited");
+            assert_eq!(entry["identities"]["status"], "invited");
+            assert_eq!(
+                entry["identities"]["identities"]["github_usernames"],
+                json!(["amy"])
+            );
+            secret_of(&entry["invite"]);
+            let id = entry["user_id"].as_i64().expect("user id");
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+
+            let person = app.registry.resolve("github", "amy").expect("amy resolves");
+            assert_eq!(person.discord_id.as_deref(), Some(DISCORD_ID));
+            assert_eq!(
+                app.registry.discord_id_for_github("amy").as_deref(),
+                Some(DISCORD_ID)
+            );
+            let people = app.registry.users();
+            assert_eq!(
+                people[&person.slug].slack_id.as_deref(),
+                Some(SLACK_ID),
+                "registry.users() lists the invited person"
+            );
+        }
+
+        #[tokio::test]
+        async fn directory_rejects_the_whole_batch_when_one_entry_is_invalid() {
+            let app = TestApp::new().await;
+            let token = app.mint_bearer(app.admin.id);
+            let count = app.user_count();
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [
+                        {"email": app.email("amy"), "name": "Amy", "role": "viewer",
+                         "identities": {"github_usernames": ["amy"]}},
+                        {"email": app.email("bob"), "name": "Bob", "role": "viewer",
+                         "identities": {"discord_id": "not-a-snowflake"}},
+                    ]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], "Invalid directory entries");
+            let violations = body["violations"].as_array().expect("violations");
+            assert!(violations
+                .iter()
+                .any(|violation| violation["email"] == app.email("bob")
+                    && violation["field"] == "discord_id"));
+
+            let duplicate = json!({"email": app.email("carl"), "name": "Carl", "role": "viewer"});
+            let (status, _) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [duplicate.clone(), duplicate]}),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "duplicate email in one batch"
+            );
+
+            let (status, _) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [{"email": app.email("dan")}]}),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "an unknown email needs a name and role"
+            );
+
+            assert_eq!(app.user_count(), count);
+            assert!(app
+                .tracker
+                .get_user_by_email(&app.email("amy"))
+                .expect("lookup")
+                .is_none());
+            assert!(app.registry.resolve("github", "amy").is_none());
+        }
+
+        #[tokio::test]
+        async fn directory_updates_an_existing_user_sparsely_without_an_invite() {
+            let app = TestApp::new().await;
+            app.seed_identities(
+                app.viewer.id,
+                Identities {
+                    github_usernames: vec!["jake-old".to_string()],
+                    discord_id: Some(DISCORD_ID.to_string()),
+                    ..Identities::default()
+                },
+            );
+            let token = app.mint_bearer(app.admin.id);
+            let count = app.user_count();
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [{
+                        "email": app.email("viewer"),
+                        "name": "Jake",
+                        "identities": {"linear_names": ["Jake Barnby"]},
+                    }]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let entry = &body["users"][0];
+            assert_eq!(entry["user_id"], app.viewer.id);
+            assert_eq!(entry["created"], false);
+            assert_eq!(entry["status"], "active");
+            assert!(entry["invite"].is_null());
+            let identities = &entry["identities"]["identities"];
+            assert_eq!(identities["github_usernames"], json!(["jake-old"]));
+            assert_eq!(identities["discord_id"], DISCORD_ID);
+            assert_eq!(identities["linear_names"], json!(["Jake Barnby"]));
+
+            assert_eq!(app.user_count(), count);
+            let user = app
+                .tracker
+                .get_user_by_id(app.viewer.id)
+                .expect("get user")
+                .expect("user exists");
+            assert_eq!(user.name, "Jake");
+            assert_eq!(user.role, "viewer");
+            assert!(app
+                .tracker
+                .get_open_invite_for_user(app.viewer.id)
+                .expect("open invite")
+                .is_none());
+            assert!(app.registry.resolve("linear", "Jake Barnby").is_some());
+        }
+
+        #[tokio::test]
+        async fn deleting_a_user_removes_them_from_the_registry() {
+            let app = TestApp::new().await;
+            let id = app
+                .tracker
+                .create_user(&app.email("leaver"), "unused-hash", "Leaver", "viewer")
+                .expect("create user");
+            app.seed_identities(
+                id,
+                Identities {
+                    github_usernames: vec!["leaver".to_string()],
+                    ..Identities::default()
+                },
+            );
+            let person = app
+                .registry
+                .resolve("github", "leaver")
+                .expect("leaver resolves before the delete");
+
+            let (status, body) = app
+                .as_admin(Method::DELETE, &format!("/api/users/{id}"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            assert!(app.registry.resolve("github", "leaver").is_none());
+            assert!(!app.registry.users().contains_key(&person.slug));
+        }
+    }
 }
