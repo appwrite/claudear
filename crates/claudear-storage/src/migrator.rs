@@ -4,7 +4,7 @@
 //! Each file must be named `V<N>__<description>.sql` (e.g. `V1__initial_schema.sql`).
 //! Migrations are applied in version order and tracked in a `schema_migrations` table.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 /// A single compiled-in migration.
 struct Migration {
@@ -112,12 +112,7 @@ fn run_migrations(connection: &Connection, migrations: &[Migration]) -> Result<(
         )
         .map_err(|error| format!("Failed to create schema_migrations table: {error}"))?;
 
-    let current: u32 = connection
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )
+    let current = schema_version(connection)
         .map_err(|error| format!("Failed to query schema version: {error}"))?;
 
     migrations
@@ -126,15 +121,38 @@ fn run_migrations(connection: &Connection, migrations: &[Migration]) -> Result<(
         .try_for_each(|migration| apply(connection, migration))
 }
 
+fn schema_version(connection: &Connection) -> rusqlite::Result<u32> {
+    connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )
+}
+
 /// Apply one migration and record its version atomically, so a failure or crash
 /// part-way never leaves a half-applied schema or a version that will re-run.
+///
+/// The transaction takes the write lock before re-reading the version, so when two
+/// processes migrate one database at once the second waits and then skips what the
+/// first already applied instead of re-running it.
 fn apply(connection: &Connection, migration: &Migration) -> Result<(), String> {
-    let transaction = connection.unchecked_transaction().map_err(|error| {
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+        .map_err(|error| {
+            format!(
+                "Failed to begin migration V{}_{}: {error}",
+                migration.version, migration.name
+            )
+        })?;
+
+    let current = schema_version(&transaction).map_err(|error| {
         format!(
-            "Failed to begin migration V{}_{}: {error}",
-            migration.version, migration.name
+            "Failed to query schema version before V{}: {error}",
+            migration.version
         )
     })?;
+    if current >= migration.version {
+        return Ok(());
+    }
 
     transaction.execute_batch(migration.sql).map_err(|error| {
         format!(
@@ -568,5 +586,99 @@ mod tests {
                 "Table '{table}' should exist"
             );
         }
+    }
+
+    fn file_connection(path: &std::path::Path) -> Connection {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        connection
+    }
+
+    fn migrate_concurrently(path: &std::path::Path, migrations: &'static [Migration]) {
+        let setup = file_connection(path);
+        setup
+            .query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        run_migrations(&setup, &[]).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let path = path.to_path_buf();
+                std::thread::spawn(move || {
+                    let connection = file_connection(&path);
+                    barrier.wait();
+                    run_migrations(&connection, migrations)
+                })
+            })
+            .collect();
+        for worker in workers {
+            let outcome = worker.join().expect("migration thread panicked");
+            assert_eq!(outcome, Ok(()), "both processes must finish migrating");
+        }
+    }
+
+    #[test]
+    fn test_reapplying_a_recorded_migration_is_skipped() {
+        let connection = Connection::open_in_memory().unwrap();
+        let migration = Migration {
+            version: 1,
+            name: "create_probe",
+            sql: "CREATE TABLE skip_probe (id INTEGER PRIMARY KEY);",
+        };
+        run_migrations(&connection, std::slice::from_ref(&migration)).unwrap();
+
+        apply(&connection, &migration).unwrap();
+
+        assert_eq!(applied_count(&connection), 1);
+        assert!(connection.is_autocommit());
+    }
+
+    #[test]
+    fn test_concurrent_migrations_apply_each_version_once() {
+        const SLOW: &[Migration] = &[
+            Migration {
+                version: 1,
+                name: "slow_table",
+                sql: "CREATE TABLE slow_probe AS
+                      WITH RECURSIVE counter(value) AS (
+                          SELECT 1 UNION ALL SELECT value + 1 FROM counter WHERE value < 400000
+                      )
+                      SELECT value FROM counter;",
+            },
+            Migration {
+                version: 2,
+                name: "add_column",
+                sql: "ALTER TABLE slow_probe ADD COLUMN label TEXT;",
+            },
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+
+        migrate_concurrently(&path, SLOW);
+
+        let connection = file_connection(&path);
+        assert_eq!(applied_version(&connection), 2);
+        assert_eq!(applied_count(&connection), 2);
+        assert_eq!(row_count(&connection, "slow_probe"), 400_000);
+        assert!(column_exists(&connection, "slow_probe", "label"));
+    }
+
+    #[test]
+    fn test_concurrent_startup_applies_the_real_schema_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+
+        migrate_concurrently(&path, MIGRATIONS);
+
+        let connection = file_connection(&path);
+        assert_eq!(applied_version(&connection), latest_version());
+        assert_eq!(applied_count(&connection), MIGRATIONS.len());
+        assert!(column_exists(&connection, "users", "status"));
+        assert!(table_exists(&connection, "user_invites"));
     }
 }
