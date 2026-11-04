@@ -32,12 +32,49 @@ const statusOptions = [
   { value: 'declined', label: 'Declined' },
 ]
 
-const sourceOptions = [
-  { value: 'sentry', label: 'Sentry' },
-  { value: 'linear', label: 'Linear' },
-  { value: 'jira', label: 'Jira' },
-  { value: 'github', label: 'GitHub' },
-]
+type SourceName =
+  | 'linear'
+  | 'sentry'
+  | 'jira'
+  | 'gitlab'
+  | 'github_issues'
+  | 'github_code_scanning'
+  | 'discord'
+  | 'slack'
+  | 'helpscout'
+  | 'whatsapp'
+  | 'telegram'
+  | 'deploy_qa'
+
+const sourceLabels: Record<SourceName, string> = {
+  linear: 'Linear',
+  sentry: 'Sentry',
+  jira: 'Jira',
+  gitlab: 'GitLab',
+  github_issues: 'GitHub Issues',
+  github_code_scanning: 'GitHub Code Scanning',
+  discord: 'Discord',
+  slack: 'Slack',
+  helpscout: 'HelpScout',
+  whatsapp: 'WhatsApp',
+  telegram: 'Telegram',
+  deploy_qa: 'Deploy QA',
+}
+
+const sourceOptions = Object.entries(sourceLabels).map(([value, label]) => ({ value, label }))
+
+function isSourceName(source: string): source is SourceName {
+  return Object.prototype.hasOwnProperty.call(sourceLabels, source)
+}
+
+function sourceLabel(source: string): string {
+  return isSourceName(source) ? sourceLabels[source] : source
+}
+
+function attemptIdFromLocation(): number | null {
+  const id = new URLSearchParams(window.location.search).get('id')
+  return id !== null && /^[1-9]\d*$/.test(id) ? Number(id) : null
+}
 
 interface AttemptRow {
   id: number
@@ -60,7 +97,7 @@ export default function AttemptsPage() {
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
-  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [selectedId, setSelectedId] = useState<number | null>(attemptIdFromLocation)
   const [selectedLog, setSelectedLog] = useState<SelectedExecutionLog | null>(null)
   const [retrievalId, setRetrievalId] = useState<number | null>(null)
 
@@ -126,7 +163,7 @@ export default function AttemptsPage() {
     {
       key: 'source',
       header: 'Source',
-      render: row => <span className="capitalize">{row.source}</span>,
+      render: row => <span>{sourceLabel(row.source)}</span>,
     },
     {
       key: 'pr_url',
@@ -260,7 +297,7 @@ export default function AttemptsPage() {
                 <CardHeader>
                   <CardTitle>Attempt Detail: {detail.attempt.short_id}</CardTitle>
                   <CardDescription>
-                    {detail.attempt.source} - {detail.attempt.issue_id}
+                    {sourceLabel(detail.attempt.source)} - {detail.attempt.issue_id}
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
