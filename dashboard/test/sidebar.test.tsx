@@ -3,6 +3,7 @@ import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/re
 import { Router, RouterProvider } from "../src/router";
 import { Sidebar } from "../src/components/layout/sidebar";
 import { AuthProvider } from "../src/lib/auth";
+import { resetPrefetchedRoutes } from "../src/lib/route-prefetch";
 
 function jsonResponse(data: unknown, status = 200) {
   return {
@@ -166,13 +167,35 @@ describe("Sidebar", () => {
     expect(window.location.pathname).toBe("/users");
   });
 
-  test("does not show admin section for non-admin user", async () => {
+  test("non-admin user sees Users but not the admin section", async () => {
     renderSidebarWithAuth("/", { id: 2, email: "user@test.com", name: "Regular", role: "viewer" });
     await waitFor(() => {
       expect(screen.getByText("Regular")).toBeTruthy();
     });
+    expect(screen.getByText("Users")).toBeTruthy();
     expect(screen.queryByText("Config")).toBeNull();
+    expect(screen.queryByText("Admin")).toBeNull();
+  });
+
+  test("non-admin Users button navigates to /users without prefetching the admin user list", async () => {
+    renderSidebarWithAuth("/", { id: 2, email: "user@test.com", name: "Regular", role: "viewer" });
+    await waitFor(() => {
+      expect(screen.getByText("Users")).toBeTruthy();
+    });
+    resetPrefetchedRoutes();
+    const usersBtn = screen.getByText("Users").closest("button");
+    fireEvent.mouseEnter(usersBtn!);
+    fireEvent.focus(usersBtn!);
+    const requested = (globalThis.fetch as unknown as ReturnType<typeof mock>).mock.calls.map(([input]) => String(input));
+    expect(requested.some((url) => url.endsWith("/api/users"))).toBe(false);
+    fireEvent.click(usersBtn!);
+    expect(window.location.pathname).toBe("/users");
+  });
+
+  test("signed-out sidebar shows neither Users nor Config", () => {
+    renderSidebar();
     expect(screen.queryByText("Users")).toBeNull();
+    expect(screen.queryByText("Config")).toBeNull();
   });
 
   test("shows user name and email when loaded", async () => {

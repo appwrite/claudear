@@ -2,17 +2,42 @@ import { useState } from 'react'
 import useSWR from 'swr'
 import {
   fetchUsers, createUser, updateUser, deleteUser,
-  fetchUserTokens, createUserToken, revokeToken,
-  type UserRecord, type ApiToken, type CreatedToken,
+  fetchUserTokens, createUserToken, revokeToken, fetchIdentities,
+  type UserRecord, type ApiToken, type CreatedToken, type UserIdentities,
 } from '../lib/api'
 import { parseUTCDate } from '../lib/formatters'
 import { useAuth } from '../lib/auth'
 import { UsersTableSkeleton } from '../components/shared/page-skeletons'
 import { TimeAgo } from '../components/shared/time-ago'
-import { Plus, Pencil, Trash2, X, Copy, Check, KeyRound } from 'lucide-react'
+import { IdentityForm, IDENTITIES_KEY } from '../components/users/identity-form'
+import { IdentitySummary } from '../components/users/identity-summary'
+import { Plus, Pencil, Trash2, X, Copy, Check, KeyRound, Fingerprint } from 'lucide-react'
 
 export default function UsersPage() {
   const { user: currentUser } = useAuth()
+  if (!currentUser) return null
+  if (currentUser.role !== 'admin') return <MyIdentities userId={currentUser.id} />
+  return <UserDirectory currentUserId={currentUser.id} />
+}
+
+function MyIdentities({ userId }: { userId: number }) {
+  return (
+    <div className="space-y-6">
+      <title>My identities — Claudear</title>
+      <div>
+        <h2 className="text-2xl font-bold">My identities</h2>
+        <p className="text-sm text-muted-foreground">
+          The handles Claudear uses to recognise you across trackers and to reach you in chat.
+        </p>
+      </div>
+      <div className="border rounded-lg p-6 bg-card">
+        <IdentityForm userId={userId} canEditSlug={false} />
+      </div>
+    </div>
+  )
+}
+
+function UserDirectory({ currentUserId }: { currentUserId: number }) {
   const [showForm, setShowForm] = useState(false)
   const [editingUser, setEditingUser] = useState<UserRecord | null>(null)
   const [actionError, setActionError] = useState('')
@@ -23,10 +48,8 @@ export default function UsersPage() {
     isLoading,
     mutate,
   } = useSWR<UserRecord[]>('users', fetchUsers)
-
-  if (currentUser?.role !== 'admin') {
-    return <div className="text-muted-foreground text-sm">You don't have permission to manage users.</div>
-  }
+  const { data: identities = [] } = useSWR<UserIdentities[]>(IDENTITIES_KEY, fetchIdentities)
+  const identitiesByUser = new Map(identities.map((entry) => [entry.user_id, entry]))
 
   const handleDelete = async (id: number) => {
     if (!confirm('Delete this user?')) return
@@ -60,6 +83,7 @@ export default function UsersPage() {
 
       {showForm && (
         <UserForm
+          key={editingUser?.id ?? 'new'}
           user={editingUser}
           onSave={() => {
             setShowForm(false)
@@ -80,6 +104,7 @@ export default function UsersPage() {
                 <th className="text-left p-3 font-medium">Name</th>
                 <th className="text-left p-3 font-medium">Email</th>
                 <th className="text-left p-3 font-medium">Role</th>
+                <th className="text-left p-3 font-medium">Identities</th>
                 <th className="text-left p-3 font-medium">Created</th>
                 <th className="text-right p-3 font-medium">Actions</th>
               </tr>
@@ -94,6 +119,7 @@ export default function UsersPage() {
                       u.role === 'admin' ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'
                     }`}>{u.role}</span>
                   </td>
+                  <td className="p-3"><IdentitySummary identities={identitiesByUser.get(u.id)} /></td>
                   <td className="p-3 text-muted-foreground">{parseUTCDate(u.created_at).toLocaleDateString()}</td>
                   <td className="p-3 text-right space-x-1">
                     <button
@@ -103,7 +129,7 @@ export default function UsersPage() {
                     >
                       <Pencil className="h-4 w-4" />
                     </button>
-                    {u.id !== currentUser?.id && (
+                    {u.id !== currentUserId && (
                       <button
                         onClick={() => handleDelete(u.id)}
                         className="p-1.5 rounded hover:bg-destructive/10 text-destructive"
@@ -218,7 +244,16 @@ function UserForm({
       </form>
 
       {user ? (
-        <UserTokens key={user.id} userId={user.id} />
+        <>
+          <div className="mt-6 pt-4 border-t space-y-3">
+            <div className="flex items-center gap-2">
+              <Fingerprint className="h-4 w-4 text-muted-foreground" />
+              <h4 className="font-medium text-sm">Identities</h4>
+            </div>
+            <IdentityForm key={user.id} userId={user.id} canEditSlug />
+          </div>
+          <UserTokens key={user.id} userId={user.id} />
+        </>
       ) : (
         <p className="mt-6 pt-4 border-t text-xs text-muted-foreground">
           Save the user first, then re-open to create API tokens for them.
@@ -228,7 +263,6 @@ function UserForm({
   )
 }
 
-/** Inline API-token management for a single user, shown in the edit form. */
 function UserTokens({ userId }: { userId: number }) {
   const { data: tokens = [], isLoading, mutate } = useSWR<ApiToken[]>(
     ['user-tokens', userId],
@@ -351,7 +385,6 @@ function UserTokens({ userId }: { userId: number }) {
   )
 }
 
-/** A read-only secret field with a copy button and transient "copied" state. */
 function SecretReveal({ secret }: { secret: string }) {
   const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const handleCopy = async () => {
