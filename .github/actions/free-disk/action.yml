@@ -1,0 +1,23 @@
+name: Free disk space
+description: Remove preinstalled SDKs and images that the Rust jobs never use, so the compiled cache fits on the runner disk.
+runs:
+  using: composite
+  steps:
+    - name: Remove unused toolchains and images
+      shell: bash
+      run: |
+        sudo rm -rf \
+          /usr/share/dotnet \
+          /usr/local/lib/android \
+          /opt/ghc \
+          /usr/local/.ghcup \
+          /opt/hostedtoolcache/CodeQL \
+          /usr/local/share/boost \
+          /usr/share/swift \
+          /usr/local/julia* \
+          /opt/microsoft \
+          /opt/google/chrome \
+          /usr/local/share/chromium \
+          /usr/local/share/powershell &
+        docker image prune --all --force > /dev/null &
+        wait

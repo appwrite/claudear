@@ -26,6 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
       - name: Install system dependencies
         run: sudo apt-get install -y mold
 
@@ -74,6 +77,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
       - name: Install system dependencies
         run: sudo apt-get install -y mold
 
@@ -118,6 +124,9 @@ jobs:
           - claudear
     steps:
       - uses: actions/checkout@v7
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
 
       - name: Install system dependencies
         run: sudo apt-get install -y mold
