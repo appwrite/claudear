@@ -1379,8 +1379,6 @@ export interface DeployQaSaveResponse {
   message: string
 }
 
-export type DeployQaSaveError = Error & { status: number; code?: string }
-
 export async function fetchDeployQaStatus(): Promise<DeployQaStatus> {
   return fetchJson(`${API_BASE}/deploy-qa`)
 }
@@ -1399,27 +1397,5 @@ export async function saveDeployQaConfig(
   settings: DeployQaSettings,
   revision: string,
 ): Promise<DeployQaSaveResponse> {
-  const url = `${API_BASE}/deploy-qa/config`
-  Sentry.addBreadcrumb({ category: 'api', message: `PUT ${url}`, level: 'info' })
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-csrf-token': getCsrfToken(),
-    },
-    body: JSON.stringify({ settings, revision }),
-  })
-  if (res.status === 401) {
-    onUnauthorized?.()
-    throw new Error('Unauthorized')
-  }
-  if (!res.ok) {
-    const body: { error?: unknown; code?: unknown } = await res.json().catch(() => ({}))
-    const message = typeof body.error === 'string' ? body.error : `Failed to put ${url}: ${res.status}`
-    const code = typeof body.code === 'string' ? body.code : undefined
-    const error: DeployQaSaveError = Object.assign(new Error(message), { status: res.status, code })
-    Sentry.captureException(error, { tags: { 'api.url': url, 'api.method': 'PUT', 'api.status': String(res.status) } })
-    throw error
-  }
-  return res.json()
+  return putJson(`${API_BASE}/deploy-qa/config`, { settings, revision })
 }

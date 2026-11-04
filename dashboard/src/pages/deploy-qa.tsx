@@ -2,6 +2,7 @@ import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import useSWR, { useSWRConfig } from 'swr'
 import { AlertTriangle, CheckCircle2, Info, Loader2, Plus, RotateCcw, Save, Trash2 } from 'lucide-react'
 import {
+  ApiError,
   fetchDeployQaConfig,
   fetchDeployQaStatus,
   fetchDeployQaTips,
@@ -121,9 +122,8 @@ function toSettings(draft: SettingsDraft, kinds: DeployQaTagFilterKind[]): Deplo
 }
 
 function describeSaveFailure(error: unknown): SaveFailure {
-  const message = error instanceof Error ? error.message : String(error)
-  const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined
-  return { message, code: typeof code === 'string' ? code : undefined }
+  if (error instanceof ApiError) return { message: error.message, code: error.code }
+  return { message: error instanceof Error ? error.message : String(error) }
 }
 
 function ExternalLink({ href, children }: { href: string | null; children: ReactNode }) {
