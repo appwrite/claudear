@@ -641,6 +641,8 @@ poll_interval_ms = 300000
 # live on Cloud, and answered with the fixed templates below. A security
 # mailbox always sends real customer replies, so reply_as = "note" on it is a
 # config error. Generic paths (webhooks, notes, MCP listing) never handle it.
+# A security mailbox does not inherit the top-level trigger_tags: unset means
+# every conversation. Mailbox ids must not have surrounding whitespace.
 #
 # [[issues.helpscout.mailboxes]]
 # id = "249891"              # Security <security@appwrite.io>
@@ -656,7 +658,7 @@ poll_interval_ms = 300000
 # Security inbox. Requires a mailbox with the security profile.
 # [issues.helpscout.security]
 # enabled = true
-# process_after = "2026-11-05T00:00:00Z"   # never touch the existing backlog
+# process_after = "2026-11-05T00:00:00Z"   # required: never touch the existing backlog
 # spam_action = "close"                     # "close" or "spam"
 # default_repository = "appwrite-labs/cloud"
 # owner_mention = "<@DISCORD_USER_ID>"      # prefixed to owner pings
@@ -675,10 +677,12 @@ poll_interval_ms = 300000
 # campaign = "SecurityResearchers"
 # credits = 100
 #
-# Customer reply templates (plain text). {reason} and {fixed_on} are filled in.
-# Defaults are built in; override any of: confirmed, not_reproducible,
-# already_fixed, not_vulnerability, out_of_scope, duplicate, fix_live,
-# fix_live_rewarded.
+# Customer reply templates (plain text, HTML-escaped when sent; line breaks are
+# kept). {reason} and {fixed_on} are filled in and are the only placeholders;
+# not_vulnerability and out_of_scope must contain {reason}, already_fixed must
+# contain {fixed_on}. Defaults are built in; override any of: confirmed,
+# not_reproducible, already_fixed, not_vulnerability, out_of_scope, duplicate,
+# fix_live, fix_live_rewarded.
 # [issues.helpscout.security.templates]
 # not_vulnerability = "Hi,\n\n... {reason}\n\nBest regards,\nAppwrite Security Team"
 #

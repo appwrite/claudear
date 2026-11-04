@@ -8,7 +8,7 @@ pub use crate::security_inbox::{
     HelpScoutMailboxConfig, MailboxProfile, SecurityDeploymentConfig, SecurityInboxConfig,
     SecurityReplyVariables, SecurityRewardConfig, SecurityTemplates, SpamAction,
     ATTACHMENTS_METADATA_KEY, CUSTOMER_THREAD_COUNT_METADATA_KEY, DEFAULT_SECURITY_SCOPE,
-    MAILBOX_PROFILE_METADATA_KEY,
+    HELPSCOUT_SOURCE, MAILBOX_ID_METADATA_KEY, MAILBOX_PROFILE_METADATA_KEY,
 };
 use claudear_core::error::{Error, Result};
 use claudear_core::secret::SecretValue;
@@ -2026,10 +2026,18 @@ impl HelpScoutConfig {
             .unwrap_or(self.reply_as)
     }
 
+    /// The mailbox's own `trigger_tags`, else the top-level ones. A security
+    /// mailbox never inherits the support tags: unset means every
+    /// conversation.
     pub fn trigger_tags_for(&self, mailbox_id: &str) -> &[String] {
-        self.mailbox(mailbox_id)
-            .and_then(|mailbox| mailbox.trigger_tags.as_deref())
-            .unwrap_or(&self.trigger_tags)
+        match self.mailbox(mailbox_id) {
+            Some(mailbox) => match mailbox.trigger_tags.as_deref() {
+                Some(tags) => tags,
+                None if mailbox.profile == MailboxProfile::Security => &[],
+                None => &self.trigger_tags,
+            },
+            None => &self.trigger_tags,
+        }
     }
 
     pub fn trigger_status_for(&self, mailbox_id: &str) -> &str {
@@ -2046,14 +2054,13 @@ impl HelpScoutConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        for id in &self.mailbox_ids {
+            validate_mailbox_id("issues.helpscout.mailbox_ids[]", id)?;
+        }
         let mut seen: Vec<&str> = Vec::new();
         for mailbox in &self.mailboxes {
-            let id = mailbox.id.trim();
-            if id.is_empty() {
-                return Err(Error::config(
-                    "issues.helpscout.mailboxes[].id must not be empty",
-                ));
-            }
+            let id = mailbox.id.as_str();
+            validate_mailbox_id("issues.helpscout.mailboxes[].id", id)?;
             if seen.contains(&id) {
                 return Err(Error::config(format!(
                     "issues.helpscout.mailboxes lists mailbox '{id}' more than once"
@@ -2075,6 +2082,20 @@ impl HelpScoutConfig {
         }
         self.security.validate().map_err(Error::config)
     }
+}
+
+/// Mailbox ids are compared exactly against the ids HelpScout returns, so a
+/// padded id would silently never match.
+fn validate_mailbox_id(field: &str, id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(Error::config(format!("{field} must not be empty")));
+    }
+    if id != id.trim() {
+        return Err(Error::config(format!(
+            "{field} '{id}' must not have surrounding whitespace"
+        )));
+    }
+    Ok(())
 }
 
 /// Severity of a GitHub code-scanning alert.
@@ -4580,6 +4601,86 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("more than once"));
+    }
+
+    #[test]
+    fn test_helpscout_mailbox_ids_with_surrounding_whitespace_are_rejected() {
+        for (toml, field) in [
+            (
+                format!(
+                    "{SUPPORT_HELPSCOUT_TOML}{}",
+                    SECURITY_MAILBOX_TOML.replace("id = \"249891\"", "id = \" 249891\"")
+                ),
+                "issues.helpscout.mailboxes[].id ' 249891'",
+            ),
+            (
+                format!(
+                    "{SUPPORT_HELPSCOUT_TOML}{}",
+                    SECURITY_MAILBOX_TOML.replace("id = \"249891\"", "id = \"249891\\n\"")
+                ),
+                "issues.helpscout.mailboxes[].id",
+            ),
+            (
+                format!(
+                    "{}{SECURITY_MAILBOX_TOML}",
+                    SUPPORT_HELPSCOUT_TOML.replace("[\"249877\"]", "[\"249877 \"]")
+                ),
+                "issues.helpscout.mailbox_ids[] '249877 '",
+            ),
+        ] {
+            let config = parse_helpscout(&toml);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains("surrounding whitespace"), "{error}");
+        }
+        for toml in [
+            format!(
+                "{SUPPORT_HELPSCOUT_TOML}{}",
+                SECURITY_MAILBOX_TOML.replace("id = \"249891\"", "id = \"\"")
+            ),
+            format!(
+                "{}{SECURITY_MAILBOX_TOML}",
+                SUPPORT_HELPSCOUT_TOML.replace("[\"249877\"]", "[\"\"]")
+            ),
+        ] {
+            let error = parse_helpscout(&toml).validate().unwrap_err().to_string();
+            assert!(error.contains("must not be empty"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_helpscout_security_mailbox_does_not_inherit_support_trigger_tags() {
+        let config = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}{}\n[[issues.helpscout.mailboxes]]\nid = \"249877\"\nreply_as = \"note\"\n",
+            SECURITY_MAILBOX_TOML.replace("trigger_tags = []\n", "")
+        ));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert_eq!(helpscout.mailboxes[0].trigger_tags, None);
+        assert!(helpscout.trigger_tags_for("249891").is_empty());
+        assert_eq!(
+            helpscout.trigger_tags_for("249877"),
+            ["auto-implement".to_string(), "claude".to_string()]
+        );
+
+        let explicit = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}{}",
+            SECURITY_MAILBOX_TOML.replace("trigger_tags = []", "trigger_tags = [\"report\"]")
+        ));
+        assert_eq!(
+            explicit.helpscout().unwrap().trigger_tags_for("249891"),
+            ["report".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_helpscout_security_enabled_requires_process_after() {
+        let config = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}{}",
+            SECURITY_MAILBOX_TOML.replace("process_after = \"2026-11-05T00:00:00Z\"\n", "")
+        ));
+        assert_eq!(config.helpscout().unwrap().security.process_after, None);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("process_after"), "{error}");
     }
 
     #[test]
