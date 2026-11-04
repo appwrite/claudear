@@ -3,10 +3,14 @@
 //! SQL files are included at compile time from the `migrations/` directory.
 //! Each file must be named `V<N>__<description>.sql` (e.g. `V1__initial_schema.sql`).
 //! Migrations are applied in version order and tracked in a `schema_migrations` table.
+//! Every migration whose version is not recorded there is applied, so versions
+//! may have gaps and a lower version merged after a higher one still runs.
 
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 /// A single compiled-in migration.
+#[derive(Clone, Copy)]
 struct Migration {
     version: u32,
     name: &'static str,
@@ -91,9 +95,12 @@ const MIGRATIONS: &[Migration] = &[
 /// Run all pending migrations against the given connection.
 ///
 /// Creates the `schema_migrations` tracking table if it doesn't exist,
-/// then applies any migrations whose version exceeds the current maximum.
+/// then applies, in version order, every migration not yet recorded in it.
 pub fn run(conn: &Connection) -> Result<(), String> {
-    // Create tracking table
+    apply(conn, MIGRATIONS)
+}
+
+fn apply(conn: &Connection, migrations: &[Migration]) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
@@ -103,21 +110,15 @@ pub fn run(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to create schema_migrations table: {e}"))?;
 
-    // Get current version
-    let current: u32 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Failed to query schema version: {e}"))?;
+    let applied = applied_versions(conn)?;
 
-    // Apply pending migrations in order
-    for m in MIGRATIONS {
-        if m.version <= current {
-            continue;
-        }
+    let mut pending: Vec<&Migration> = migrations
+        .iter()
+        .filter(|migration| !applied.contains(&migration.version))
+        .collect();
+    pending.sort_by_key(|migration| migration.version);
 
+    for m in pending {
         conn.execute_batch(m.sql)
             .map_err(|e| format!("Migration V{}_{} failed: {e}", m.version, m.name))?;
 
@@ -129,6 +130,18 @@ pub fn run(conn: &Connection) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn applied_versions(conn: &Connection) -> Result<HashSet<u32>, String> {
+    let mut statement = conn
+        .prepare("SELECT version FROM schema_migrations")
+        .map_err(|e| format!("Failed to query applied migrations: {e}"))?;
+    let versions = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|e| format!("Failed to query applied migrations: {e}"))?
+        .collect::<Result<HashSet<u32>, _>>()
+        .map_err(|e| format!("Failed to read applied migrations: {e}"))?;
+    Ok(versions)
 }
 
 #[cfg(test)]
@@ -244,6 +257,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_deploy_qa, 1);
+    }
+
+    #[test]
+    fn test_a_lower_version_added_after_a_higher_one_is_applied() {
+        let conn = Connection::open_in_memory().unwrap();
+        let first = Migration {
+            version: 1,
+            name: "first",
+            sql: "CREATE TABLE first (id INTEGER);",
+        };
+        let late = Migration {
+            version: 2,
+            name: "late",
+            sql: "CREATE TABLE late (id INTEGER);",
+        };
+        let third = Migration {
+            version: 3,
+            name: "third",
+            sql: "CREATE TABLE third (id INTEGER);",
+        };
+
+        apply(&conn, &[first, third]).unwrap();
+        apply(&conn, &[first, late, third]).unwrap();
+
+        let late_tables: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'late'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(late_tables, 1);
+        assert_eq!(applied_count(&conn), 3);
     }
 
     #[test]
