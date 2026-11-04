@@ -187,8 +187,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Durable last-seen watches for GitHub release tips (separate from regression inclusion tracking)
 - Tag filters (`any`, `suffix:-db`, `not_suffix:-db`, `prefix:apps/console/`) per track, so tracks can split one repo's tags, including a monorepo's app-namespaced bare tags
 - Live QA agent enqueue — runs real checks against the release from a private per-run directory, and is told never to open fix PRs for a release announcement
-- Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + mapped `@releaser`
-- Bare tags (no GitHub release, so GitHub's release feed never posts them) are announced in `#releases` by Claudear, and their outcome replies under that announcement
+- Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + mapped `@releaser`; a post of its own when nothing announced the tip
 
 ### Notifications
 - **Discord**: Webhook messages + bot reply polling for Q&A, rich embeds, thread tracking
@@ -788,9 +787,7 @@ On a new tip Claudear:
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
    - **Unverified** — nothing failed, but a PR is `LIVE BLOCKED`, the footer is `DEPLOY_QA_VERDICT: UNVERIFIED`, or the footer is missing: reply, no @, so blocked checks never page the releaser but are never reported as verified either.
    - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser via `github-discord-map.json` (reusing the announcement's existing thread when it already has one).
-   - **No announcement found** — rare: a release whose announcement is no longer among the last 50 `#releases` messages, or a bare tag whose announcement failed to post. The outcome is posted as a message of its own naming the repo and tag, so it is never dropped. FAIL still `@`s the releaser.
-
-**Bare-tag announcements.** `#releases` is fed by GitHub's own Discord webhook, which posts GitHub releases only, so a bare tag such as `apps/console/1.2.141` would go unannounced. When the poller enqueues a tip with no GitHub release, Claudear posts the announcement itself through the deploy-QA Discord bot: the repo, track and tag, the version, the compare range since the track's previous tag, the workflow run the tag push started, and the releaser. The releaser is whoever cut the tag: the tagger of an annotated tag (when the tagged commit carries the tagger's email on a GitHub account, since git records no login), else the tagged commit's author, else the account whose push started the run. Bots and GitHub's `web-flow` never count. The releaser is shown as a Discord mention through `github-discord-map.json`, then `[users]` `github_usernames`, without pinging them. The announcement's message id is stored on the tip and the releaser is stored as its author, so the outcome replies under the announcement and FAIL threads under it and `@`s the releaser, exactly as for a release. Announcing is idempotent: a tip whose announcement id is stored is never announced again, before posting Claudear reuses an announcement of its own for that tag already in the channel, and a tip that already has a verdict is never announced late. A tip with a GitHub release is never announced by Claudear.
+   - **No announcement** — a bare tag, such as a console release, has no GitHub release for the release feed to announce, so when none of the last 50 `#releases` messages announces the tip, the outcome is posted as a message of its own naming the repo and tag. FAIL still `@`s the releaser when the tip has one; a bare tag has no release author, so it posts without the mention.
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
 
