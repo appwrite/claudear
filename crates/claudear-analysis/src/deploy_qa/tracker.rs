@@ -748,17 +748,17 @@ mod tests {
     async fn tags_fallback_when_releases_empty() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
         let config = config(
-            vec![track("vibes", "appwrite/vibes", DeployQaTagFilter::Any)],
+            vec![track("website", "appwrite/website", DeployQaTagFilter::Any)],
             true,
         );
         let http = MapMockHttp::new()
             .on(
-                "https://api.github.com/repos/appwrite/vibes/releases",
+                "https://api.github.com/repos/appwrite/website/releases",
                 200,
                 "[]",
             )
             .on(
-                "https://api.github.com/repos/appwrite/vibes/git/matching-refs/tags/",
+                "https://api.github.com/repos/appwrite/website/git/matching-refs/tags/",
                 200,
                 &references_json(&["v0.4.0"]),
             );
@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(result[0].tip.as_ref().unwrap().tag, "v0.4.0");
         assert_eq!(
             store
-                .get_last_seen_deploy_qa_tip("vibes")
+                .get_last_seen_deploy_qa_tip("website")
                 .unwrap()
                 .unwrap()
                 .tag,
@@ -1181,21 +1181,21 @@ mod tests {
     #[tokio::test]
     async fn tags_fallback_takes_the_highest_version_over_name_order() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let vibes = track("vibes", "appwrite/vibes", DeployQaTagFilter::Any);
+        let website = track("website", "appwrite/website", DeployQaTagFilter::Any);
         let http = MapMockHttp::new()
             .on(
-                "https://api.github.com/repos/appwrite/vibes/releases",
+                "https://api.github.com/repos/appwrite/website/releases",
                 200,
                 "[]",
             )
             .on(
-                "https://api.github.com/repos/appwrite/vibes/git/matching-refs/tags/",
+                "https://api.github.com/repos/appwrite/website/git/matching-refs/tags/",
                 200,
                 &references_json(&["v0.1.0", "v0.10.0", "v0.9.0"]),
             );
-        let tracker = poller(http, store, config(vec![vibes.clone()], true));
+        let tracker = poller(http, store, config(vec![website.clone()], true));
 
-        let tip = tracker.poll_track(&vibes).await.unwrap().tip.unwrap();
+        let tip = tracker.poll_track(&website).await.unwrap().tip.unwrap();
 
         assert_eq!(tip.tag, "v0.10.0");
         assert!(tip
@@ -1207,7 +1207,7 @@ mod tests {
     #[tokio::test]
     async fn tags_fallback_reads_every_tag_not_just_the_first_page() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let vibes = track("vibes", "appwrite/vibes", DeployQaTagFilter::Any);
+        let website = track("website", "appwrite/website", DeployQaTagFilter::Any);
         let names: Vec<String> = (0..40)
             .map(|index| format!("archive-{index:02}"))
             .chain(["v1.0.0".to_string(), "v2.0.0".to_string()])
@@ -1215,18 +1215,18 @@ mod tests {
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let http = MapMockHttp::new()
             .on(
-                "https://api.github.com/repos/appwrite/vibes/releases",
+                "https://api.github.com/repos/appwrite/website/releases",
                 200,
                 "[]",
             )
             .on(
-                "https://api.github.com/repos/appwrite/vibes/git/matching-refs/tags/",
+                "https://api.github.com/repos/appwrite/website/git/matching-refs/tags/",
                 200,
                 &references_json(&names),
             );
-        let tracker = poller(http, store, config(vec![vibes.clone()], true));
+        let tracker = poller(http, store, config(vec![website.clone()], true));
 
-        let tip = tracker.poll_track(&vibes).await.unwrap().tip.unwrap();
+        let tip = tracker.poll_track(&website).await.unwrap().tip.unwrap();
 
         assert_eq!(tip.tag, "v2.0.0");
     }
