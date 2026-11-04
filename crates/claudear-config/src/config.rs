@@ -5884,8 +5884,8 @@ repo = "appwrite-labs/edge"
 tag_filter = "not_suffix:-db"
 
 [[deploy_qa.tracks]]
-name = "vibes"
-repo = "appwrite/vibes"
+name = "website"
+repo = "appwrite/website"
 tag_filter = "any"
 
 [[deploy_qa.tracks]]
@@ -5915,7 +5915,7 @@ tag_filter = "prefix:apps/console/"
                 config.deploy_qa.tracks[2].tag_filter,
                 DeployQaTagFilter::NotSuffix("-db".into())
             );
-            assert_eq!(config.deploy_qa.tracks[3].repo, "appwrite/vibes");
+            assert_eq!(config.deploy_qa.tracks[3].repo, "appwrite/website");
             assert_eq!(
                 config.deploy_qa.tracks[4].tag_filter,
                 DeployQaTagFilter::Prefix("apps/console/".into())
@@ -8750,7 +8750,7 @@ sms_number = "+1111111111"
             &[
                 ("edge-db", "appwrite-labs/edge"),
                 ("edge-network", "appwrite-labs/edge"),
-                ("vibes", "appwrite/vibes"),
+                ("website", "appwrite/website"),
             ],
         );
         assert!(config.validate().is_ok());
@@ -8762,7 +8762,7 @@ sms_number = "+1111111111"
             true,
             &[
                 ("cloud", "appwrite-labs/cloud"),
-                ("cloud", "appwrite/vibes"),
+                ("cloud", "appwrite/website"),
             ],
         );
         let error = config.validate().unwrap_err().to_string();
