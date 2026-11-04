@@ -11,6 +11,7 @@ use claudear_analysis::distribution::AssignmentNotice;
 use claudear_analysis::distribution::Developer;
 use claudear_analysis::distribution::Digest;
 use claudear_analysis::distribution::Markup;
+use claudear_analysis::distribution::PlainText;
 use claudear_config::config::SlackConfig;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Error;
@@ -1080,6 +1081,17 @@ impl Markup for SlackMarkup {
     fn link(&self, text: &str, url: &str) -> String {
         format!("<{url}|{text}>")
     }
+
+    /// Escapes Slack's control characters, so `<!channel>` or `<@U…>` in a
+    /// title stays text, and breaks bare `@here`-style mentions.
+    fn text(&self, value: &str) -> String {
+        PlainText::break_mentions(
+            &value
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;"),
+        )
+    }
 }
 
 /// Build the Slack message telling a developer they own a PR.
@@ -1990,6 +2002,38 @@ mod tests {
              You asked for this work."
         );
         assert_eq!(section_texts(&message), vec![message.text.clone()]);
+    }
+
+    #[test]
+    fn test_pr_messages_never_ping_from_the_title() {
+        let mut pull_request = pr_summary(7);
+        pull_request.title = "<!channel> <!here> <!everyone> <@U9> @here & co".to_string();
+        let notice = AssignmentNotice {
+            developer: pr_developer("amy", Some("U42")),
+            pull_request: pull_request.clone(),
+            reason: claudear_core::types::AssignmentReason::Requester,
+            previous: None,
+        };
+        let digest = Digest {
+            groups: vec![claudear_analysis::distribution::DigestGroup {
+                developer: pr_developer("amy", Some("U42")),
+                pull_requests: vec![pull_request],
+            }],
+            generated_at: Utc::now(),
+        };
+
+        let mut texts = section_texts(&build_pr_assignment_message(&notice));
+        texts.extend(section_texts(&build_pr_digest_messages(&digest)[0]));
+
+        for text in &texts {
+            for mention in ["<!channel>", "<!here>", "<!everyone>", "<@U9>", "@here"] {
+                assert!(!text.contains(mention), "{mention} in {text}");
+            }
+        }
+        assert!(texts[0].starts_with("<@U42> "));
+        assert!(texts[0].contains("&lt;!channel&gt; &lt;!here&gt;"));
+        assert!(texts[0].contains("&amp; co"));
+        assert!(texts[2].starts_with("<@U42> 1 Claudear PR"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ use claudear_analysis::inference::{
 use claudear_analysis::qa::build_correlation_id;
 use claudear_analysis::repo::{worktree_path, GitOps, RepoRelationships};
 use claudear_config::config::Config;
+use claudear_config::config::DigestFrequency;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
@@ -2853,25 +2854,20 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// The schedule of the PR distribution run, or `None` when
-    /// `[pr_distribution]` is disabled or its digest frequency is unknown. The
-    /// caller (housekeeping loop) owns the returned schedule and its
-    /// `last_sent_at` cadence state.
+    /// `[pr_distribution]` is disabled. The caller (housekeeping loop) owns
+    /// the returned schedule and its `last_sent_at` cadence state.
     pub fn pr_distribution_schedule(&self) -> Option<ReportSchedule> {
         let distribution = &self.config.pr_distribution;
         if !distribution.enabled {
             return None;
         }
-        let Some(frequency) = ReportFrequency::parse(&distribution.digest_frequency) else {
-            tracing::error!(
-                component = "pr_distribution",
-                frequency = %distribution.digest_frequency,
-                "Unknown pr_distribution.digest_frequency; scheduled PR distribution disabled"
-            );
-            return None;
-        };
         Some(ReportSchedule {
             name: "pr-distribution".to_string(),
-            frequency,
+            frequency: match distribution.digest_frequency {
+                DigestFrequency::Daily => ReportFrequency::Daily,
+                DigestFrequency::Weekly(day) => ReportFrequency::Weekly(day),
+                DigestFrequency::Monthly => ReportFrequency::Monthly,
+            },
             hour: distribution.digest_hour,
             enabled: true,
             last_sent_at: None,
@@ -6360,7 +6356,7 @@ mod tests {
 
         let schedule = watcher_with_pr_distribution(|distribution| {
             distribution.enabled = true;
-            distribution.digest_frequency = "weekly-friday".to_string();
+            distribution.digest_frequency = DigestFrequency::Weekly(chrono::Weekday::Fri);
             distribution.digest_hour = 16;
         })
         .pr_distribution_schedule()
@@ -6372,12 +6368,13 @@ mod tests {
         assert_eq!(schedule.hour, 16);
         assert!(schedule.last_sent_at.is_none());
 
-        assert!(watcher_with_pr_distribution(|distribution| {
+        let monthly = watcher_with_pr_distribution(|distribution| {
             distribution.enabled = true;
-            distribution.digest_frequency = "fortnightly".to_string();
+            distribution.digest_frequency = DigestFrequency::Monthly;
         })
         .pr_distribution_schedule()
-        .is_none());
+        .unwrap();
+        assert_eq!(monthly.frequency, ReportFrequency::Monthly);
     }
 
     #[tokio::test]

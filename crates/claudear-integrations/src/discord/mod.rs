@@ -10,6 +10,6 @@ mod types;
 pub use client::{DiscordClient, DiscordHttpClient, ReqwestDiscordClient};
 pub use thread_manager::ThreadManager;
 pub use types::{
-    CreateMessageParams, CreateThreadParams, DiscordChannel, DiscordMessage,
+    AllowedMentions, CreateMessageParams, CreateThreadParams, DiscordChannel, DiscordMessage,
     DiscordMessageReference, DiscordThread, DiscordUser, MessageEmbed, ThreadState,
 };

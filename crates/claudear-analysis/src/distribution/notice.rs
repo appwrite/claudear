@@ -6,16 +6,31 @@ use chrono::DateTime;
 use chrono::Utc;
 use claudear_core::types::AssignmentReason;
 
-/// How a channel mentions a developer and links a URL.
+/// Placed after every `@` in external text so no channel reads it as a
+/// mention (`@everyone`, `@here`, `<@id>`, `@login`) while it still reads the
+/// same.
+pub const MENTION_BREAK: char = '\u{200B}';
+
+/// How a channel mentions a developer, links a URL, and shows external text.
 pub trait Markup {
     /// Text that mentions `developer`.
     fn mention(&self, developer: &Developer) -> String;
     /// Text linking `url` as `text`.
     fn link(&self, text: &str, url: &str) -> String;
+    /// `value`, which came from outside Claudear (a PR title), made safe to
+    /// show: it must never ping anyone.
+    fn text(&self, value: &str) -> String;
 }
 
 /// Markup for channels with no native mentions or links.
 pub struct PlainText;
+
+impl PlainText {
+    /// `value` with every `@` broken by [`MENTION_BREAK`].
+    pub fn break_mentions(value: &str) -> String {
+        value.replace('@', &format!("@{MENTION_BREAK}"))
+    }
+}
 
 impl Markup for PlainText {
     fn mention(&self, developer: &Developer) -> String {
@@ -24,6 +39,10 @@ impl Markup for PlainText {
 
     fn link(&self, text: &str, url: &str) -> String {
         format!("{text} ({url})")
+    }
+
+    fn text(&self, value: &str) -> String {
+        Self::break_mentions(value)
     }
 }
 
@@ -51,12 +70,13 @@ impl PullRequestSummary {
     /// One digest line: the linked PR, its title, and how long it has been open.
     pub fn line(&self, markup: &dyn Markup, now: DateTime<Utc>) -> String {
         let link = markup.link(&self.label(), &self.url);
+        let title = markup.text(&self.title);
         match self.opened_at {
             Some(opened_at) => {
                 let days = (now - opened_at).num_days().max(0);
-                format!("• {link} {} (open {days}d)", self.title)
+                format!("• {link} {title} (open {days}d)")
             }
-            None => format!("• {link} {}", self.title),
+            None => format!("• {link} {title}"),
         }
     }
 }
@@ -93,11 +113,14 @@ impl AssignmentNotice {
             "{} you're responsible for getting {} over the line: {}\n{}",
             markup.mention(&self.developer),
             markup.link(&self.pull_request.label(), &self.pull_request.url),
-            self.pull_request.title,
+            markup.text(&self.pull_request.title),
             explain(self.reason),
         );
         if let Some(previous) = &self.previous {
-            text.push_str(&format!(" Taking over from @{previous}."));
+            text.push_str(&format!(
+                " Taking over from {}.",
+                markup.text(&format!("@{previous}"))
+            ));
         }
         text
     }
@@ -241,6 +264,10 @@ mod tests {
         fn link(&self, text: &str, url: &str) -> String {
             format!("[{text}]({url})")
         }
+
+        fn text(&self, value: &str) -> String {
+            PlainText::break_mentions(value)
+        }
     }
 
     fn now() -> DateTime<Utc> {
@@ -297,9 +324,39 @@ mod tests {
             previous: Some("bob".into()),
         };
 
-        assert!(notice
-            .format_text()
-            .ends_with("Shared out to balance the review load. Taking over from @bob."));
+        assert!(notice.format_text().ends_with(&format!(
+            "Shared out to balance the review load. Taking over from @{MENTION_BREAK}bob."
+        )));
+    }
+
+    #[test]
+    fn external_titles_never_carry_a_working_mention() {
+        let mut pull_request = summary(7, None);
+        pull_request.title = "@everyone fix <@123> for @here".into();
+        let notice = AssignmentNotice {
+            developer: developer("amy", "42"),
+            pull_request: pull_request.clone(),
+            reason: AssignmentReason::Requester,
+            previous: None,
+        };
+        let group = DigestGroup {
+            developer: developer("amy", "42"),
+            pull_requests: vec![pull_request],
+        };
+
+        for text in [
+            notice.render(&Chat),
+            notice.format_text(),
+            group.render(&Chat, now()),
+            group.render(&PlainText, now()),
+        ] {
+            for mention in ["@everyone", "@here", "<@123>"] {
+                assert!(!text.contains(mention), "{mention} in {text}");
+            }
+            assert!(text.contains(&format!("@{MENTION_BREAK}everyone fix")));
+        }
+        assert!(notice.render(&Chat).starts_with("<@42> "));
+        assert!(group.render(&Chat, now()).starts_with("<@42> "));
     }
 
     #[test]

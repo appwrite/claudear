@@ -25,6 +25,7 @@ pub use notice::DigestGroup;
 pub use notice::Markup;
 pub use notice::PlainText;
 pub use notice::PullRequestSummary;
+pub use notice::MENTION_BREAK;
 pub use ownership::Candidate;
 pub use ownership::Evidence;
 pub use pull_request::Attention;

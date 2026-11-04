@@ -2,6 +2,7 @@
 
 use super::Notifier;
 use crate::ask_reply_inbox;
+use crate::discord::AllowedMentions;
 use crate::discord::CreateMessageParams;
 use crate::discord::DiscordClient;
 use crate::discord::DiscordMessageReference;
@@ -15,6 +16,7 @@ use claudear_analysis::distribution::AssignmentNotice;
 use claudear_analysis::distribution::Developer;
 use claudear_analysis::distribution::Digest;
 use claudear_analysis::distribution::Markup;
+use claudear_analysis::distribution::PlainText;
 use claudear_config::config::DiscordConfig;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Error;
@@ -192,8 +194,21 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     }
 
     async fn send(&self, message: DiscordMessage) -> Result<Option<SentMessageInfo>> {
+        self.send_allowing(message, None).await
+    }
+
+    /// Send a message, letting it ping only what `allowed_mentions` permits
+    /// when set.
+    async fn send_allowing(
+        &self,
+        message: DiscordMessage,
+        allowed_mentions: Option<AllowedMentions>,
+    ) -> Result<Option<SentMessageInfo>> {
         if let Some(ref webhook_url) = self.config.webhook_url {
-            let body = serde_json::to_value(&message)?;
+            let mut body = serde_json::to_value(&message)?;
+            if let Some(allowed_mentions) = &allowed_mentions {
+                body["allowed_mentions"] = serde_json::to_value(allowed_mentions)?;
+            }
             let url_with_wait = if webhook_url.expose().contains('?') {
                 format!("{}&wait=true", webhook_url.expose())
             } else {
@@ -224,7 +239,8 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         if let Some(ref client) = self.bot_client {
             if let Some(ref channel_id) = self.config.channel_id {
                 if !channel_id.is_empty() {
-                    let params = Self::to_create_message_params(&message);
+                    let mut params = Self::to_create_message_params(&message);
+                    params.allowed_mentions = allowed_mentions;
                     let sent = client.send_message(channel_id, params).await?;
                     return Ok(Some(SentMessageInfo {
                         message_id: sent.id,
@@ -350,6 +366,7 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
             tts: None,
             embeds,
             message_reference: None,
+            allowed_mentions: None,
         }
     }
 
@@ -1235,36 +1252,59 @@ impl Markup for DiscordMarkup {
     fn link(&self, text: &str, url: &str) -> String {
         format!("[{text}](<{url}>)")
     }
-}
 
-/// Build the Discord message telling a developer they own a PR. The text is
-/// the message content, not an embed, so the mention pings.
-pub(crate) fn build_pr_assignment_message(notice: &AssignmentNotice) -> DiscordMessage {
-    DiscordMessage {
-        content: Some(truncate_string(
-            &notice.render(&DiscordMarkup),
-            MESSAGE_CHARACTER_LIMIT,
-        )),
-        embeds: None,
+    fn text(&self, value: &str) -> String {
+        PlainText::break_mentions(value)
     }
 }
 
-/// Build the Discord messages for the PR digest: the title, then each
-/// assignee's PRs, split to fit Discord's content limit with the mention on
-/// the first page. Empty when no PR needs anyone.
-pub(crate) fn build_pr_digest_messages(digest: &Digest) -> Vec<DiscordMessage> {
+/// Mentions a PR message may ping: only `developer`, never `@everyone`,
+/// `@here`, roles or anyone named in a PR title.
+fn pr_allowed_mentions(developer: Option<&Developer>) -> AllowedMentions {
+    AllowedMentions::users(developer.and_then(|developer| developer.discord_id.clone()))
+}
+
+/// Build the Discord message telling a developer they own a PR, with the
+/// mentions it may ping. The text is the message content, not an embed, so
+/// the mention pings.
+pub(crate) fn build_pr_assignment_message(
+    notice: &AssignmentNotice,
+) -> (DiscordMessage, AllowedMentions) {
+    (
+        DiscordMessage {
+            content: Some(truncate_string(
+                &notice.render(&DiscordMarkup),
+                MESSAGE_CHARACTER_LIMIT,
+            )),
+            embeds: None,
+        },
+        pr_allowed_mentions(Some(&notice.developer)),
+    )
+}
+
+/// Build the Discord messages for the PR digest, each with the mentions it
+/// may ping: the title, then each assignee's PRs, split to fit Discord's
+/// content limit with the mention on the first page. Empty when no PR needs
+/// anyone.
+pub(crate) fn build_pr_digest_messages(digest: &Digest) -> Vec<(DiscordMessage, AllowedMentions)> {
     if digest.is_empty() {
         return Vec::new();
     }
-    std::iter::once(Digest::TITLE.to_string())
-        .chain(digest.groups.iter().flat_map(|group| {
-            group.pages(&DiscordMarkup, digest.generated_at, MESSAGE_CHARACTER_LIMIT)
-        }))
-        .map(|content| DiscordMessage {
-            content: Some(content),
-            embeds: None,
-        })
-        .collect()
+    let message = |content: String| DiscordMessage {
+        content: Some(content),
+        embeds: None,
+    };
+    std::iter::once((
+        message(Digest::TITLE.to_string()),
+        pr_allowed_mentions(None),
+    ))
+    .chain(digest.groups.iter().flat_map(|group| {
+        group
+            .pages(&DiscordMarkup, digest.generated_at, MESSAGE_CHARACTER_LIMIT)
+            .into_iter()
+            .map(|page| (message(page), pr_allowed_mentions(Some(&group.developer))))
+    }))
+    .collect()
 }
 
 /// Build the Discord message for a human-in-the-loop question.
@@ -1465,13 +1505,14 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     }
 
     async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
-        let _ = self.send(build_pr_assignment_message(notice)).await?;
+        let (message, allowed_mentions) = build_pr_assignment_message(notice);
+        let _ = self.send_allowing(message, Some(allowed_mentions)).await?;
         Ok(())
     }
 
     async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
-        for message in build_pr_digest_messages(digest) {
-            let _ = self.send(message).await?;
+        for (message, allowed_mentions) in build_pr_digest_messages(digest) {
+            let _ = self.send_allowing(message, Some(allowed_mentions)).await?;
         }
         Ok(())
     }
@@ -4140,7 +4181,7 @@ mod tests {
 
     #[test]
     fn test_pr_assignment_message_pings_the_discord_user_in_content() {
-        let message = build_pr_assignment_message(&AssignmentNotice {
+        let (message, allowed_mentions) = build_pr_assignment_message(&AssignmentNotice {
             developer: pr_developer("amy", Some("42")),
             pull_request: pr_summary(7),
             reason: claudear_core::types::AssignmentReason::CodeOwner,
@@ -4156,11 +4197,33 @@ mod tests {
                  You own the changed code."
             )
         );
+        assert_eq!(allowed_mentions, AllowedMentions::users(["42".to_string()]));
+    }
+
+    #[test]
+    fn test_pr_assignment_message_never_pings_from_the_title() {
+        let mut pull_request = pr_summary(7);
+        pull_request.title = "@everyone <@&99> ping <@123> and @here".to_string();
+
+        let (message, allowed_mentions) = build_pr_assignment_message(&AssignmentNotice {
+            developer: pr_developer("amy", Some("42")),
+            pull_request,
+            reason: claudear_core::types::AssignmentReason::Requester,
+            previous: None,
+        });
+
+        let content = message.content.unwrap();
+        assert!(content.starts_with("<@42> "));
+        for mention in ["@everyone", "@here", "<@&99>", "<@123>"] {
+            assert!(!content.contains(mention), "{mention} in {content}");
+        }
+        assert!(allowed_mentions.parse.is_empty());
+        assert_eq!(allowed_mentions.users, vec!["42".to_string()]);
     }
 
     #[test]
     fn test_pr_assignment_message_falls_back_to_the_github_handle() {
-        let message = build_pr_assignment_message(&AssignmentNotice {
+        let (message, allowed_mentions) = build_pr_assignment_message(&AssignmentNotice {
             developer: pr_developer("amy", None),
             pull_request: pr_summary(7),
             reason: claudear_core::types::AssignmentReason::Load,
@@ -4171,6 +4234,7 @@ mod tests {
             .content
             .unwrap()
             .starts_with("@amy you're responsible"));
+        assert_eq!(allowed_mentions, AllowedMentions::users([]));
     }
 
     #[test]
@@ -4189,10 +4253,19 @@ mod tests {
             generated_at: Utc::now(),
         };
 
-        let contents: Vec<String> = build_pr_digest_messages(&digest)
-            .into_iter()
-            .map(|message| message.content.unwrap())
+        let messages = build_pr_digest_messages(&digest);
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|(message, _)| message.content.clone().unwrap())
             .collect();
+        let pinged: Vec<Vec<String>> = messages
+            .iter()
+            .map(|(_, allowed_mentions)| allowed_mentions.users.clone())
+            .collect();
+        assert_eq!(
+            pinged,
+            vec![Vec::new(), vec!["1".to_string()], vec!["2".to_string()]]
+        );
 
         assert_eq!(contents.len(), 3);
         assert_eq!(contents[0], Digest::TITLE);
@@ -4214,11 +4287,15 @@ mod tests {
         let messages = build_pr_digest_messages(&digest);
 
         assert!(messages.len() > 2);
-        assert!(messages
-            .iter()
-            .all(|message| message.content.as_ref().unwrap().chars().count()
-                <= MESSAGE_CHARACTER_LIMIT));
+        assert!(messages.iter().all(|(message, _)| message
+            .content
+            .as_ref()
+            .unwrap()
+            .chars()
+            .count()
+            <= MESSAGE_CHARACTER_LIMIT));
         assert!(messages[1]
+            .0
             .content
             .as_ref()
             .unwrap()
@@ -4256,6 +4333,10 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("<@1> 1 Claudear PR"));
+        assert_eq!(
+            body["allowed_mentions"],
+            serde_json::json!({ "parse": [], "users": ["1"] })
+        );
     }
 
     #[test]

@@ -890,7 +890,7 @@ pub struct PrDistributionConfig {
     pub digest: bool,
     /// How often the scheduled run fires: "daily", "weekly-monday" …
     /// "weekly-sunday", or "monthly" (default: "daily").
-    pub digest_frequency: String,
+    pub digest_frequency: DigestFrequency,
     /// Hour the scheduled run fires, 0-23 UTC (default: 9).
     pub digest_hour: u32,
     /// GitHub logins never assigned, e.g. people on leave (default: empty).
@@ -901,6 +901,88 @@ pub struct PrDistributionConfig {
     /// GitHub login → Discord user map. Falls back to
     /// `[deploy_qa] github_discord_map_path` when unset.
     pub github_discord_map_path: Option<String>,
+}
+
+/// How often the `[pr_distribution]` scheduled run fires.
+///
+/// Written as "daily", "monthly", or "weekly-<day>" with the day in full or
+/// abbreviated ("weekly-friday", "weekly-fri"); anything else fails to load,
+/// so a typo can never silently switch the scheduled run off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum DigestFrequency {
+    /// Every day.
+    #[default]
+    Daily,
+    /// Once a week, on the given day.
+    Weekly(chrono::Weekday),
+    /// On the first of every month.
+    Monthly,
+}
+
+impl DigestFrequency {
+    const DAILY: &str = "daily";
+    const MONTHLY: &str = "monthly";
+    const WEEKLY_PREFIX: &str = "weekly-";
+}
+
+impl std::str::FromStr for DigestFrequency {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let normalized = value.trim().to_lowercase();
+        match normalized.as_str() {
+            Self::DAILY => return Ok(Self::Daily),
+            Self::MONTHLY => return Ok(Self::Monthly),
+            _ => {}
+        }
+        normalized
+            .strip_prefix(Self::WEEKLY_PREFIX)
+            .and_then(|day| day.parse::<chrono::Weekday>().ok())
+            .map(Self::Weekly)
+            .ok_or_else(|| {
+                format!(
+                    "unsupported digest_frequency '{value}': expected \
+                     \"{}\", \"{}\" or \"{}<day>\" (e.g. \"weekly-monday\")",
+                    Self::DAILY,
+                    Self::MONTHLY,
+                    Self::WEEKLY_PREFIX
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for DigestFrequency {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl std::fmt::Display for DigestFrequency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let day = |day: &chrono::Weekday| match day {
+            chrono::Weekday::Mon => "monday",
+            chrono::Weekday::Tue => "tuesday",
+            chrono::Weekday::Wed => "wednesday",
+            chrono::Weekday::Thu => "thursday",
+            chrono::Weekday::Fri => "friday",
+            chrono::Weekday::Sat => "saturday",
+            chrono::Weekday::Sun => "sunday",
+        };
+        match self {
+            Self::Daily => write!(f, "{}", Self::DAILY),
+            Self::Weekly(weekday) => write!(f, "{}{}", Self::WEEKLY_PREFIX, day(weekday)),
+            Self::Monthly => write!(f, "{}", Self::MONTHLY),
+        }
+    }
+}
+
+impl From<DigestFrequency> for String {
+    fn from(frequency: DigestFrequency) -> Self {
+        frequency.to_string()
+    }
 }
 
 impl PrDistributionConfig {
@@ -926,7 +1008,7 @@ impl Default for PrDistributionConfig {
             enabled: false,
             notify_on_open: true,
             digest: true,
-            digest_frequency: "daily".to_string(),
+            digest_frequency: DigestFrequency::Daily,
             digest_hour: 9,
             excluded: Vec::new(),
             tolerance: 0,
@@ -5770,7 +5852,10 @@ monitoring_duration_hours = 12
         assert!(!config.pr_distribution.enabled);
         assert!(config.pr_distribution.notify_on_open);
         assert!(config.pr_distribution.digest);
-        assert_eq!(config.pr_distribution.digest_frequency, "daily");
+        assert_eq!(
+            config.pr_distribution.digest_frequency,
+            DigestFrequency::Daily
+        );
         assert_eq!(config.pr_distribution.digest_hour, 9);
         assert!(config.pr_distribution.excluded.is_empty());
         assert_eq!(config.pr_distribution.tolerance, 0);
@@ -5794,13 +5879,68 @@ monitoring_duration_hours = 12
         assert!(distribution.enabled);
         assert!(!distribution.notify_on_open);
         assert!(distribution.digest);
-        assert_eq!(distribution.digest_frequency, "weekly-monday");
+        assert_eq!(
+            distribution.digest_frequency,
+            DigestFrequency::Weekly(chrono::Weekday::Mon)
+        );
         assert_eq!(distribution.digest_hour, 14);
         assert_eq!(distribution.excluded, vec!["alice".to_string()]);
         assert_eq!(distribution.tolerance, 2);
         assert_eq!(
             distribution.github_discord_map_path.as_deref(),
             Some("/etc/claudear/map.json")
+        );
+    }
+
+    #[test]
+    fn test_digest_frequency_parses_every_supported_spelling() {
+        for (text, frequency) in [
+            ("daily", DigestFrequency::Daily),
+            ("Monthly", DigestFrequency::Monthly),
+            (
+                "weekly-friday",
+                DigestFrequency::Weekly(chrono::Weekday::Fri),
+            ),
+            (
+                " WEEKLY-tue ",
+                DigestFrequency::Weekly(chrono::Weekday::Tue),
+            ),
+        ] {
+            assert_eq!(text.parse::<DigestFrequency>(), Ok(frequency), "{text}");
+        }
+        for frequency in [
+            DigestFrequency::Daily,
+            DigestFrequency::Monthly,
+            DigestFrequency::Weekly(chrono::Weekday::Sun),
+        ] {
+            assert_eq!(frequency.to_string().parse(), Ok(frequency));
+        }
+    }
+
+    #[test]
+    fn test_pr_distribution_rejects_an_unsupported_digest_frequency() {
+        for text in ["fortnightly", "weekly", "weekly-someday", ""] {
+            assert!(text.parse::<DigestFrequency>().is_err(), "{text}");
+        }
+        let error = toml::from_str::<Config>(
+            "[pr_distribution]\nenabled = true\ndigest_frequency = \"fortnightly\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsupported digest_frequency 'fortnightly'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_pr_distribution_round_trips_through_toml() {
+        let config: Config =
+            toml::from_str("[pr_distribution]\ndigest_frequency = \"weekly-wed\"\n").unwrap();
+        let written = toml::to_string(&config.pr_distribution).unwrap();
+        assert!(
+            written.contains("digest_frequency = \"weekly-wednesday\""),
+            "{written}"
         );
     }
 

@@ -952,7 +952,7 @@ notify_on_open = true
 # (default: true). When false, the scheduled run pings each new assignee.
 digest = true
 # How often the scheduled run fires: "daily", "weekly-monday" .. "weekly-sunday",
-# or "monthly" (default: "daily")
+# or "monthly" (default: "daily"). Any other value fails config loading.
 digest_frequency = "daily"
 # Hour the scheduled run fires, 0-23 UTC (default: 9)
 digest_hour = 9

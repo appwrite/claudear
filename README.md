@@ -608,7 +608,7 @@ Every open Claudear PR gets one developer responsible for getting it over the li
 ```toml
 [pr_distribution]
 enabled = true
-digest_frequency = "daily"         # daily | weekly-monday .. weekly-sunday | monthly
+digest_frequency = "daily"         # daily | weekly-monday .. weekly-sunday | monthly; anything else fails to load
 digest_hour = 9                    # UTC
 excluded = ["on-leave-login"]
 tolerance = 0                      # PRs above the fair share an owner may hold
@@ -625,6 +625,8 @@ github_discord_map_path = "/etc/claudear/github-discord-map.json"  # defaults to
 | Authored recent commits (last 100) to the repository | 5 × share of those commits |
 
 Team (`@org/team`) and email owners in CODEOWNERS are ignored.
+
+**Mentions.** Only the assignee is ever pinged. PR titles are external text, so every `@` in them is broken with a zero-width space (and Slack's `<`, `>` and `&` are escaped), and Discord messages carry `allowed_mentions` limited to the assignee's user id.
 
 **Balancing.** The fair share is the number of open PRs (already assigned plus waiting) divided by the roster size, rounded up, plus `tolerance`. PRs with the strongest ownership are placed first; each goes to its highest-scoring developer still under the fair share, otherwise to the least-loaded developer. Ties break by login, so the same inputs always give the same assignments.
 
