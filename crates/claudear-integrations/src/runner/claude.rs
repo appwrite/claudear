@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -387,6 +387,20 @@ impl FinalResult {
             .join("\n");
         (!message.is_empty()).then_some(message)
     }
+}
+
+/// The error for a structured query that produced no structured output,
+/// naming why: the CLI's own error message (an exhausted usage limit, an expired
+/// login), else how the CLI exited.
+fn missing_structured_output(
+    cli_error: Option<String>,
+    exit: &std::io::Result<ExitStatus>,
+) -> Error {
+    let reason = cli_error.unwrap_or_else(|| match exit {
+        Ok(status) => format!("CLI {status}"),
+        Err(error) => format!("CLI wait failed: {error}"),
+    });
+    Error::runner(format!("no structured output in response: {reason}"))
 }
 
 /// A finished run: its [`AgentResult`] plus the CLI's [`FinalResult`], which
@@ -920,6 +934,7 @@ The PR title should include the issue ID: {}
         let collect = async {
             let mut lines = BufReader::new(stdout).lines();
             let mut structured: Option<serde_json::Value> = None;
+            let mut cli_error: Option<String> = None;
             loop {
                 let Some(Ok(Some(line))) =
                     Self::next_output_line(&mut lines, &mut drain, label, "stdout").await
@@ -930,35 +945,56 @@ The PR title should include the issue ID: {}
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(StreamEvent::Result {
-                    structured_output: Some(v),
-                    ..
-                }) = serde_json::from_str::<StreamEvent>(trimmed)
-                {
-                    structured = Some(v);
+                match serde_json::from_str::<StreamEvent>(trimmed) {
+                    Ok(StreamEvent::Result {
+                        structured_output,
+                        result,
+                        errors,
+                        is_error,
+                        ..
+                    }) => {
+                        if let Some(value) = structured_output {
+                            structured = Some(value);
+                        }
+                        if let Some(message) = FinalResult::new(result, errors, is_error).error() {
+                            cli_error = Some(message);
+                        }
+                    }
+                    Ok(StreamEvent::RateLimitEvent {
+                        rate_limit_info, ..
+                    }) => {
+                        let status = rate_limit_info
+                            .and_then(|info| info.status)
+                            .unwrap_or_default();
+                        if status != "allowed" && status != "allowed_warning" {
+                            cli_error
+                                .get_or_insert_with(|| format!("Claude rate limit hit: {status}"));
+                        }
+                    }
+                    _ => {}
                 }
             }
-            structured
+            (structured, cli_error)
         };
         // The timeout bounds only the CLI: cancelling finish mid-sweep leaves
         // its sweep running detached, and finishing again signals leftovers twice.
         let reap = async {
-            let exited = tokio::time::timeout(timeout, group.wait(&mut child))
+            let exit = tokio::time::timeout(timeout, group.wait(&mut child))
                 .await
-                .is_ok();
+                .ok();
             group.finish().await;
-            exited
+            exit
         };
 
-        let (structured, exited) = tokio::join!(collect, reap);
-        if !exited {
+        let ((structured, cli_error), exit) = tokio::join!(collect, reap);
+        let Some(exit) = exit else {
             return Err(Error::runner(format!(
                 "structured query timed out after {}s",
                 timeout.as_secs()
             )));
-        }
+        };
 
-        structured.ok_or_else(|| Error::runner("no structured output in response"))
+        structured.ok_or_else(|| missing_structured_output(cli_error, &exit))
     }
 
     /// Attempt to reproduce a reported issue, read-only. Returns a structured
@@ -3565,6 +3601,71 @@ mod tests {
         assert!(
             !escaped_running,
             "process {escaped} that ignores SIGTERM outlived the sweep's grace"
+        );
+    }
+
+    /// The error a structured query returns against a stub CLI emitting
+    /// `events` and exiting with `exit_code`.
+    #[cfg(unix)]
+    fn structured_query_error(events: &[serde_json::Value], exit_code: i32) -> String {
+        let script = fake_cli_script("", events, exit_code);
+        let structured = with_fake_cli(&script, |runner, directory| {
+            block_on(async {
+                tokio::time::timeout(
+                    RUN_DEADLINE,
+                    runner.structured_query("prompt", "{}", directory),
+                )
+                .await
+            })
+        });
+        structured
+            .expect("the query must end within its deadline")
+            .expect_err("a run without structured output must fail")
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_structured_query_reports_the_cli_error_when_there_is_no_structured_output() {
+        const EXPIRED_LOGIN: &str =
+            "Failed to authenticate: OAuth session expired and could not be refreshed";
+        let error = structured_query_error(
+            &[
+                assistant_text_event(EXPIRED_LOGIN),
+                result_event(EXPIRED_LOGIN, true),
+            ],
+            1,
+        );
+        assert!(
+            error.contains(EXPIRED_LOGIN),
+            "the CLI's own error must be reported: {error}"
+        );
+
+        let error = structured_query_error(
+            &[
+                json!({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "rateLimitType": "seven_day"}}),
+                result_event(USAGE_LIMIT_MESSAGE, true),
+            ],
+            1,
+        );
+        assert!(
+            error.contains(USAGE_LIMIT_MESSAGE),
+            "the usage-limit notice must be reported: {error}"
+        );
+
+        let error = structured_query_error(
+            &[json!({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}})],
+            1,
+        );
+        assert!(
+            error.contains("rate limit hit: rejected"),
+            "a rejected rate limit must be reported: {error}"
+        );
+
+        let error = structured_query_error(&[], 3);
+        assert!(
+            error.contains("exit status: 3"),
+            "the CLI's exit status must be reported: {error}"
         );
     }
 
