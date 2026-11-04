@@ -30,7 +30,7 @@ Claudear posts the outcome under the automated release announcement in `#release
 
 - **All verified** (`ALL_VERIFIED`, nothing blocked): a reply on the release announcement, **no @**.
 - **Unverified** (`UNVERIFIED`: nothing failed, but a LIVE-TESTABLE check was blocked or incomplete): a reply on the release announcement, **no @**.
-- **FAIL** (`FAIL`: a LIVE-TESTABLE PR failed): a thread under the release announcement that **@s the releaser**, mapped from their GitHub login via `github-discord-map.json`.
+- **FAIL** (`FAIL`: a LIVE-TESTABLE PR failed): a thread under the release announcement that **@s the releaser**, mapped from their GitHub login through the user registry, with `github-discord-map.json` as the fallback.
 
 Your report becomes the post, so keep it short: one bullet per PR, no curl dumps or URL walls. Detail stays in the attempt log.
 

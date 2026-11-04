@@ -175,7 +175,7 @@
             <ol>
             <li>Dashboard identities replace the <code>[users.&lt;key&gt;]</code> entry with the same person key, in full: a field set only in config does not survive the override.</li>
             <li><code>[users]</code> entries without a dashboard override stay active, as seed and fallback.</li>
-            <li><code>github-discord-map.json</code> is consulted only when no person in the registry with that GitHub login has a <code>discord_id</code>.</li>
+            <li><code>github-discord-map.json</code> is consulted only when the person who owns that GitHub login in the registry has no <code>discord_id</code>, or no person owns the login.</li>
             </ol>
             <p>A dashboard user's person key is the slug an admin set on them, otherwise the <code>[users]</code> key whose <code>email</code> matches their <strong>login</strong> email (login emails are case-insensitive and stored lowercased), otherwise <code>console-&lt;user id&gt;</code>. The identity <code>email</code> field, which users edit themselves, never links. Notification targets (<code>email</code>, <code>sms_number</code>, <code>whatsapp_number</code>, <code>push_user_key</code>, <code>telegram_chat_id</code>) may be shared between people; any other handle that already belongs to someone else is rejected.</p>
             <p>Edits apply without a restart: instantly in the process that served them, and within one housekeeping cycle in any other process sharing the database. Global references such as <code>[notifiers.discord] user_id = "jake"</code> are resolved each time a notification is sent, so they follow dashboard edits too.</p>

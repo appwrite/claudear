@@ -784,7 +784,7 @@ On a new tip Claudear:
 4. Classifies the agent's report, records the tip as `verified`, `unverified` or `failed`, and posts the outcome under the release announcement in Discord `#releases` (the agent never posts itself):
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
    - **Unverified** — nothing failed, but a PR is `LIVE BLOCKED`, the footer is `DEPLOY_QA_VERDICT: UNVERIFIED`, or the footer is missing: reply, no @, so blocked checks never page the releaser but are never reported as verified either.
-   - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser (reusing the announcement's existing thread when it already has one). The releaser's GitHub login is looked up in the [user registry](#user-registry-1) first, console identities and `[users]` entries alike, so invited users count too; `github-discord-map.json` is consulted only when no person with that login has a `discord_id`. A releaser found in neither gets no mention.
+   - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser (reusing the announcement's existing thread when it already has one). The releaser's GitHub login is looked up in the [user registry](#user-registry-1) first, console identities and `[users]` entries alike, so invited users count too; `github-discord-map.json` is consulted only when the person who owns that login in the registry has no `discord_id`, or no person owns it. A releaser found in neither gets no mention.
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
 
@@ -889,13 +889,13 @@ Every logged-in user sees **Users** in the dashboard sidebar:
 - **Admins** see every user with an Identities column and edit anyone's identities, person key included, from the user's edit panel.
 - **Everyone else** sees **My identities** there, and the same form under **Settings > My Identities**. They edit only their own handles and cannot change their person key.
 
-The form groups the person key, source handles (Linear, GitHub, Sentry, Jira, GitLab), chat (Discord ID, Slack ID) and notification targets (email, Pushover user key, SMS, WhatsApp, Telegram chat ID). Admins edit the slug the person key comes from; everyone else sees their effective person key read-only. A badge shows where the values come from: **Console**, **From config (key)** or **Not set**. **Revert to config** drops the console identities so the person falls back to their `[users]` entry. When a non-admin reverts, their person key never changes: if an admin set their slug to anything other than the config key their login email matches, the slug is kept and only the identities are cleared; otherwise the row is removed, which leaves that config key in place anyway.
+The form groups the person key, source handles (Linear, GitHub, Sentry, Jira, GitLab), chat (Discord ID, Slack ID) and notification targets (email, Pushover user key, SMS, WhatsApp, Telegram chat ID). Admins edit the slug the person key comes from; everyone else sees their effective person key read-only. A badge shows where the values come from: **Console**, **From config (key)** or **Not set**. **Revert to config** drops the console identities so the person falls back to their `[users]` entry. When a non-admin reverts, a slug an admin set to anything other than the config key their login email matches is kept, and only the identities are cleared. Otherwise the row is removed and their person key falls back to config: the `[users]` key their login email matches, or none (**Not set**) when no unclaimed config entry matches, so a `console-<user id>` key does not survive.
 
 #### Precedence
 
 1. A console user's identities replace the `[users.<key>]` entry with the same person key, in full: a field set only in config does not survive the override.
 2. `[users]` entries without a console override stay active, as seed and fallback.
-3. `github-discord-map.json` is consulted only when no person in the registry with that GitHub login has a `discord_id`.
+3. `github-discord-map.json` is consulted only when the person who owns that GitHub login in the registry has no `discord_id`, or no person owns the login.
 
 A console user's person key is, in order:
 
@@ -909,7 +909,7 @@ When a handle is claimed twice, console users win over config entries, then lowe
 
 Edits apply without a restart: instantly in the process that served the write, and within one housekeeping cycle in any other process sharing the database, such as a standalone `claudear dashboard`.
 
-Global notifier references, such as `[notifiers.discord] user_id = "jake"`, `[notifiers.slack] user_id`, `[notifiers.email] to_addresses`, `[notifiers.push] user_key` and `[notifiers.sms] to_numbers`, are resolved to a person's handle each time a notification is sent rather than once at startup, so console edits apply to them too. A value that names no person is used as-is. The weekly repetitive digest resolves its `[notifiers.discord] user_id` mention the same way.
+Global notifier references, such as `[notifiers.discord] user_id = "jake"`, `[notifiers.slack] user_id`, `[notifiers.email] to_addresses`, `[notifiers.push] user_key` and `[notifiers.sms] to_numbers`, are resolved to a person's handle each time a notification is sent rather than once at startup, so console edits apply to them too. A value that names no person is used as-is. The weekly repetitive digest currently posts as plain text without the on-call mention, because instrumented notifiers do not yet forward `notify_repetitive_digest`; once they do, the mention resolves through the registry like every other notifier reference.
 
 #### Who can do what
 

@@ -903,9 +903,9 @@ skip_if_previous_running = true
 timeout_secs = 1800
 discord_channel_id = "990878183580651571"
 # GitHub login -> Discord user map for the FAIL @releaser mention, used only
-# when no person in the user registry ([users] or dashboard identities) with
-# that GitHub login has a discord_id. Use an absolute path: a relative one
-# breaks under systemd and drops the mention.
+# when the person who owns that GitHub login in the user registry ([users] or
+# dashboard identities) has no discord_id, or no person owns the login. Use an
+# absolute path: a relative one breaks under systemd and drops the mention.
 github_discord_map_path = "/etc/claudear/github-discord-map.json"
 # Optional; defaults to the bundled playbooks/deploy_qa.md. When set, use an
 # absolute path: a relative one breaks under systemd and disables deploy_qa.
@@ -1360,7 +1360,10 @@ reindex_interval_hours = 6.0
 # frequently and posts them once a week to your notifier(s), mentioning
 # notifiers.discord.user_id on Discord so a human can act. Report-only: it does
 # not change the fix pipeline. Requires a configured Sentry source + Discord
-# webhook.
+# webhook. The digest currently posts as plain text without the on-call
+# mention, because instrumented notifiers do not yet forward
+# notify_repetitive_digest; once they do, the mention resolves through the
+# registry like every other notifier reference.
 
 # Enable the weekly digest (default: false)
 enabled = false
