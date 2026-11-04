@@ -4,7 +4,7 @@
 use super::history::{self, History};
 use super::notify::ReviewReason;
 use super::prompt::{self, HistoryCommit, ReportPrompt};
-use super::scrub::scrub_assessment;
+use super::scrub::{scrub_assessment, scrub_internal};
 use super::SecurityInbox;
 use chrono::{DateTime, NaiveDate, Utc};
 use claudear_analysis::inference::{resolve_repo_for_cascade, RepoResolution};
@@ -25,6 +25,9 @@ const REPOSITORY_SYNC_ALLOWANCE: Duration = Duration::from_secs(10 * 60);
 const NO_FIX_CHOICE: &str = "none";
 const MERGED_AT_DETAIL_KEY: &str = "merged_at";
 const FIXED_BY_COMMIT_DETAIL_KEY: &str = "fixed_by_commit";
+const NAMED_REPOSITORY_DETAIL_KEY: &str = "named_repository";
+const REPOSITORY_URL_PREFIXES: &[&str] = &["https://github.com/", "github.com/"];
+const REPOSITORY_SUFFIX: &str = ".git";
 
 /// The longest one assessment can legitimately hold a report in `Assessing`:
 /// both Phase A runs, screening, the history check, the duplicate judge and
@@ -125,6 +128,9 @@ pub(crate) enum Verdict {
     NotVulnerability,
     OutOfScope,
     NeedsHuman(ReviewReason),
+    /// The assessment placed the defect in a repository that is not indexed,
+    /// so the checked repository's verdict cannot be trusted.
+    UnindexedRepository(String),
 }
 
 impl Verdict {
@@ -132,7 +138,19 @@ impl Verdict {
         match self {
             Self::NeedsHuman(reason) => Some(*reason),
             Self::FixedAfterReport(_) => Some(ReviewReason::FixFoundInHistory),
+            Self::UnindexedRepository(_) => Some(ReviewReason::UnindexedRepository),
             _ => None,
+        }
+    }
+
+    /// Record what an admin needs to review this verdict in its event detail.
+    pub(crate) fn record(&self, detail: &mut Value) {
+        match self {
+            Self::FixedAfterReport(merged) => merged.record(detail),
+            Self::UnindexedRepository(repository) => {
+                detail[NAMED_REPOSITORY_DETAIL_KEY] = scrub_internal(repository).into();
+            }
+            _ => {}
         }
     }
 }
@@ -212,6 +230,39 @@ impl PhaseA {
     }
 }
 
+/// The repository Phase A placed the defect in, when it is a plausible
+/// `owner/name` other than the one it checked.
+fn redirected_repository<'a>(phase: &'a PhaseA, checkout: &Checkout) -> Option<&'a str> {
+    let affected = repository_name(&phase.affected_repository)?;
+    (!affected.eq_ignore_ascii_case(repository_name(&checkout.repository)?)).then_some(affected)
+}
+
+/// `owner/name` from an agent-supplied repository reference, tolerating a
+/// GitHub URL prefix, surrounding slashes and a `.git` suffix.
+fn repository_name(reference: &str) -> Option<&str> {
+    let trimmed = reference.trim();
+    let unprefixed = REPOSITORY_URL_PREFIXES
+        .iter()
+        .find_map(|prefix| {
+            trimmed
+                .get(..prefix.len())
+                .filter(|head| head.eq_ignore_ascii_case(prefix))
+                .map(|_| &trimmed[prefix.len()..])
+        })
+        .unwrap_or(trimmed)
+        .trim_matches('/');
+    let name = unprefixed
+        .strip_suffix(REPOSITORY_SUFFIX)
+        .unwrap_or(unprefixed);
+    let plausible = name.split('/').count() == 2
+        && name.split('/').all(|part| !part.is_empty())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_./".contains(character))
+        && !name.contains("..");
+    plausible.then_some(name)
+}
+
 #[derive(Debug, Deserialize)]
 struct PhaseB {
     fixed_by_commit: String,
@@ -231,12 +282,16 @@ impl SecurityInbox {
     ) -> Result<AssessmentResult> {
         let mut checkout = self.checkout(resolution).await?;
         let mut phase = self.phase_a(report, &checkout).await?;
-        if let Some(affected) = self.redirected_repository(&phase, &checkout) {
-            let redirected = resolve_repo_for_cascade(self.inferrer.as_ref(), &affected);
-            if redirected.is_resolved() {
-                checkout = self.checkout(&redirected).await?;
-                phase = self.phase_a(report, &checkout).await?;
-            }
+        if let Some(affected) = redirected_repository(&phase, &checkout) {
+            let Some(redirected) = self.indexed_resolution(affected)? else {
+                return Ok(AssessmentResult {
+                    assessment: phase.assessment(),
+                    verdict: Verdict::UnindexedRepository(affected.to_string()),
+                    repository: None,
+                });
+            };
+            checkout = self.checkout(&redirected).await?;
+            phase = self.phase_a(report, &checkout).await?;
         }
         let assessment = phase.assessment();
         let verdict = match phase.outcome {
@@ -288,15 +343,22 @@ impl SecurityInbox {
         })
     }
 
-    fn redirected_repository(&self, phase: &PhaseA, checkout: &Checkout) -> Option<String> {
-        let affected = phase.affected_repository.trim();
-        let plausible = affected.split('/').count() == 2
-            && affected
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-_./".contains(character))
-            && !affected.contains("..");
-        (plausible && !affected.eq_ignore_ascii_case(&checkout.repository))
-            .then(|| affected.to_string())
+    /// The indexed repository named `repository`, ignoring case, or `None`
+    /// when the index does not hold it.
+    fn indexed_resolution(&self, repository: &str) -> Result<Option<RepoResolution>> {
+        let Some(inferrer) = self.inferrer.as_ref() else {
+            return Ok(None);
+        };
+        let name = inferrer.with_index(|index| {
+            Ok(index
+                .list()
+                .into_iter()
+                .find(|indexed| indexed.name.eq_ignore_ascii_case(repository))
+                .map(|indexed| indexed.name.clone()))
+        })?;
+        Ok(name
+            .map(|name| resolve_repo_for_cascade(Some(inferrer), &name))
+            .filter(RepoResolution::is_resolved))
     }
 
     async fn phase_a(&self, report: &ReportText, checkout: &Checkout) -> Result<PhaseA> {
@@ -440,5 +502,87 @@ mod tests {
         detail[FIXED_BY_COMMIT_DETAIL_KEY] = "--output".into();
         assert_eq!(MergedFix::from_detail(&detail), None);
         assert_eq!(MergedFix::from_detail(&json!({})), None);
+    }
+
+    #[test]
+    fn repository_references_normalise_to_owner_and_name() {
+        for (reference, expected) in [
+            ("appwrite/console", Some("appwrite/console")),
+            ("  Appwrite/Console  ", Some("Appwrite/Console")),
+            ("/appwrite/console/", Some("appwrite/console")),
+            ("appwrite/console.git", Some("appwrite/console")),
+            (
+                "https://github.com/appwrite/console",
+                Some("appwrite/console"),
+            ),
+            (
+                "HTTPS://GitHub.com/appwrite/console.git",
+                Some("appwrite/console"),
+            ),
+            ("github.com/appwrite/console", Some("appwrite/console")),
+            ("", None),
+            ("   ", None),
+            ("appwrite", None),
+            ("appwrite/console/src", None),
+            ("appwrite/", None),
+            ("/console", None),
+            ("appwrite/../etc", None),
+            ("appwrite/con sole", None),
+            ("https://gitlab.com/appwrite/console", None),
+        ] {
+            assert_eq!(repository_name(reference), expected, "{reference:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_different_repository_redirects_the_assessment() {
+        let checkout = Checkout {
+            project_dir: PathBuf::new(),
+            repository: "appwrite/appwrite".to_string(),
+            default_branch: "main".to_string(),
+        };
+        let phase = |affected: &str| -> PhaseA {
+            serde_json::from_value(json!({
+                "outcome": "valid",
+                "affected_repository": affected,
+            }))
+            .unwrap()
+        };
+        assert_eq!(redirected_repository(&phase(""), &checkout), None);
+        assert_eq!(redirected_repository(&phase("appwrite"), &checkout), None);
+        assert_eq!(
+            redirected_repository(&phase("Appwrite/Appwrite"), &checkout),
+            None
+        );
+        assert_eq!(
+            redirected_repository(
+                &phase("https://github.com/appwrite/appwrite.git"),
+                &checkout
+            ),
+            None
+        );
+        assert_eq!(
+            redirected_repository(&phase("appwrite/console"), &checkout),
+            Some("appwrite/console")
+        );
+    }
+
+    #[test]
+    fn an_unindexed_repository_records_its_scrubbed_name() {
+        let mut detail = json!({});
+        Verdict::UnindexedRepository("appwrite/console".to_string()).record(&mut detail);
+        assert_eq!(
+            detail[NAMED_REPOSITORY_DETAIL_KEY],
+            json!("appwrite/console")
+        );
+        Verdict::UnindexedRepository("appwrite-labs/cloud".to_string()).record(&mut detail);
+        assert_eq!(
+            detail[NAMED_REPOSITORY_DETAIL_KEY],
+            json!(super::super::scrub::REDACTED)
+        );
+        assert_eq!(
+            Verdict::UnindexedRepository(String::new()).review_reason(),
+            Some(ReviewReason::UnindexedRepository)
+        );
     }
 }

@@ -28,6 +28,7 @@ use std::sync::Mutex;
 const REPORT_BODY: &str = "The logout endpoint leaves the session token valid, so a stolen token keeps working after logout.";
 const SUBJECT: &str = "Session token survives logout";
 const REPOSITORY: &str = "appwrite/appwrite";
+const OTHER_REPOSITORY: &str = "appwrite/console";
 const PULL_REQUEST: &str = "https://github.com/appwrite/appwrite/pull/42";
 const MERGE_COMMIT: &str = "a1b2c3d4e5f60718";
 const TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
@@ -516,6 +517,17 @@ impl Harness {
         }
     }
 
+    /// Index `repository` as `name` alongside the default repository.
+    fn index(&mut self, name: &str, repository: &Repository) {
+        let mut index = RepoIndex::new();
+        for (name, repository) in [(REPOSITORY, &self.repository), (name, repository)] {
+            let mut indexed = IndexedRepo::new(name, repository.clone.clone());
+            indexed.scm_url = repository.origin.to_string_lossy().to_string();
+            index.add_repo(indexed);
+        }
+        self.inbox.inferrer = Some(RepoInferrer::new(index));
+    }
+
     fn resolution(&self) -> RepoResolution {
         RepoResolution::Resolved {
             project_dir: self.repository.clone.clone(),
@@ -854,6 +866,110 @@ async fn a_valid_report_is_confirmed_pending_and_starts_a_fix() {
         }]
     );
     assert_eq!(harness.pings_containing("new valid report"), 1);
+}
+
+fn assessment_naming(repository: &str) -> Value {
+    let mut response = assessment_response("valid");
+    response["affected_repository"] = json!(repository);
+    response
+}
+
+#[tokio::test]
+async fn an_assessment_naming_an_unindexed_repository_goes_to_needs_human() {
+    for (named, recorded) in [
+        (OTHER_REPOSITORY, OTHER_REPOSITORY),
+        ("appwrite-labs/billing", "[redacted]"),
+    ] {
+        let harness = Harness::new();
+        harness
+            .agent
+            .respond(Query::Assessment, assessment_naming(named));
+        let route = harness
+            .route(&report_issue("1", REPORT_BODY, reported(0)))
+            .await;
+
+        assert!(matches!(route, SecurityRoute::Done { .. }), "{route:?}");
+        let report = harness.report("1");
+        assert_eq!(report.state, SecurityReportState::NeedsHuman);
+        assert_eq!(report.outcome, None);
+        assert_eq!(report.vulnerability_id, None);
+        assert_eq!(report.affected_repository, None);
+        assert!(harness.source.replies().is_empty());
+        assert!(reply_kinds(&harness.tracker, report.id).is_empty());
+        assert_eq!(harness.agent.calls_of(Query::Assessment).len(), 1);
+        assert!(harness.agent.calls_of(Query::History).is_empty());
+        assert!(harness.agent.calls_of(Query::Duplicate).is_empty());
+        assert!(harness
+            .tracker
+            .get_attempt(SECURITY_FIX_SOURCE, "SEC-1")
+            .unwrap()
+            .is_none());
+        assert_eq!(harness.pings().len(), 1, "{:?}", harness.pings());
+        assert_eq!(harness.pings_containing("unindexed_repository"), 1);
+        assert_eq!(harness.pings_containing(named), 0);
+        let needs_human = harness.timeline(report.id).pop().unwrap();
+        assert_eq!(needs_human.kind, SecurityEventKind::NeedsHuman);
+        assert_eq!(needs_human.detail["reason"], json!("unindexed_repository"));
+        assert_eq!(needs_human.detail["named_repository"], json!(recorded));
+        assert_eq!(needs_human.detail["repository"], Value::Null);
+    }
+}
+
+#[tokio::test]
+async fn an_assessment_naming_the_checked_repository_keeps_its_verdict() {
+    for named in [
+        "",
+        REPOSITORY,
+        "Appwrite/Appwrite",
+        " https://github.com/appwrite/appwrite.git ",
+        "not a repository",
+    ] {
+        let harness = Harness::new();
+        harness
+            .agent
+            .respond(Query::Assessment, assessment_naming(named));
+        let route = harness
+            .route(&report_issue("1", REPORT_BODY, reported(0)))
+            .await;
+
+        assert!(
+            matches!(route, SecurityRoute::RunFix(_)),
+            "{named:?}: {route:?}"
+        );
+        let report = harness.report("1");
+        assert_eq!(report.state, SecurityReportState::Tracking);
+        assert_eq!(report.affected_repository.as_deref(), Some(REPOSITORY));
+        assert_eq!(harness.agent.calls_of(Query::Assessment).len(), 1);
+        assert_eq!(harness.pings_containing("unindexed_repository"), 0);
+    }
+}
+
+#[tokio::test]
+async fn an_assessment_naming_an_indexed_repository_is_rerun_there() {
+    let other = Repository::new();
+    let mut harness = Harness::new();
+    harness.index(OTHER_REPOSITORY, &other);
+    harness
+        .agent
+        .queue(Query::Assessment, Ok(assessment_naming("Appwrite/Console")));
+    let route = harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+
+    assert!(matches!(route, SecurityRoute::RunFix(_)), "{route:?}");
+    let assessments = harness.agent.calls_of(Query::Assessment);
+    assert_eq!(assessments.len(), 2);
+    assert_eq!(assessments[0].project_dir, harness.repository.clone);
+    assert_eq!(assessments[1].project_dir, other.clone);
+    let report = harness.report("1");
+    assert_eq!(report.state, SecurityReportState::Tracking);
+    assert_eq!(
+        report.affected_repository.as_deref(),
+        Some(OTHER_REPOSITORY)
+    );
+    let vulnerability = harness.vulnerability(report.vulnerability_id.unwrap());
+    assert_eq!(vulnerability.repository.as_deref(), Some(OTHER_REPOSITORY));
+    assert_eq!(harness.pings_containing("unindexed_repository"), 0);
 }
 
 #[tokio::test]

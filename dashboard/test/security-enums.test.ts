@@ -7,6 +7,7 @@ import {
   SECURITY_OUTCOMES,
   SECURITY_REPLY_KINDS,
   SECURITY_REPORT_STATES,
+  SECURITY_REVIEW_REASONS,
   SECURITY_SEVERITIES,
   VULNERABILITY_STATES,
 } from "../src/lib/api";
@@ -34,6 +35,15 @@ function serverEnums(): Map<string, string[]> {
   return enums;
 }
 
+function serverReviewReasons(): string[] {
+  const source = readFileSync(
+    new URL("../../crates/claudear-engine/src/security/notify.rs", import.meta.url),
+    "utf8",
+  );
+  const body = source.match(/impl ReviewReason\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  return [...body.matchAll(/=>\s*"([^"]+)"/g)].map(([, value]) => value);
+}
+
 describe("security enums", () => {
   test("every server security enum has a dashboard list", () => {
     const enums = serverEnums();
@@ -46,5 +56,11 @@ describe("security enums", () => {
       const known = new Set(dashboardValues[name]);
       expect({ name, missing: values.filter((value) => !known.has(value)) }).toEqual({ name, missing: [] });
     }
+  });
+
+  test("the dashboard knows every review reason the server can send", () => {
+    const reasons = serverReviewReasons();
+    expect(reasons.length).toBeGreaterThan(0);
+    expect([...reasons].sort()).toEqual([...SECURITY_REVIEW_REASONS].sort());
   });
 });

@@ -67,7 +67,10 @@ fn reply_outcome(verdict: &Verdict) -> Option<SecurityOutcome> {
         Verdict::AlreadyFixed { .. } => Some(SecurityOutcome::AlreadyFixed),
         Verdict::NotVulnerability => Some(SecurityOutcome::NotVulnerability),
         Verdict::OutOfScope => Some(SecurityOutcome::OutOfScope),
-        Verdict::Valid | Verdict::FixedAfterReport(_) | Verdict::NeedsHuman(_) => None,
+        Verdict::Valid
+        | Verdict::FixedAfterReport(_)
+        | Verdict::NeedsHuman(_)
+        | Verdict::UnindexedRepository(_) => None,
     }
 }
 
@@ -313,9 +316,7 @@ impl SecurityInbox {
             };
             let mut detail = assessment.detail("needs_human", repository.as_deref());
             detail["reason"] = reason.as_str().into();
-            if let Some(merged) = merged {
-                merged.record(&mut detail);
-            }
+            verdict.record(&mut detail);
             let moved = self.tracker.transition_security_report(
                 report.id,
                 SecurityReportState::Assessing,

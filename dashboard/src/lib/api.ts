@@ -1365,6 +1365,7 @@ export const SECURITY_REVIEW_REASONS = [
   'unverifiable_fix',
   'attachment_evidence',
   'untracked_repository',
+  'unindexed_repository',
   'pull_request_closed',
   'fix_failed',
   'reply_unconfirmed',
@@ -1372,6 +1373,8 @@ export const SECURITY_REVIEW_REASONS = [
   'fix_found_in_history',
   'reply_failed',
   'missing_merge_commit',
+  'registration_failed',
+  'invalid_pull_request',
 ] as const
 export type SecurityReviewReason = (typeof SECURITY_REVIEW_REASONS)[number]
 
