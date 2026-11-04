@@ -706,17 +706,57 @@ export function getCsrfToken(): string {
   return match ? decodeURIComponent(match[1]) : ''
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url)
+export class ApiError extends Error {
+  readonly status: number
+  readonly code?: string
+
+  constructor(status: number, message: string, code?: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+  }
+}
+
+type ApiMethod = 'GET' | 'POST' | 'PUT' | 'DELETE'
+
+const failureVerbs: Record<ApiMethod, string> = {
+  GET: 'fetch',
+  POST: 'post',
+  PUT: 'put',
+  DELETE: 'delete',
+}
+
+async function readApiError(res: Response, url: string, method: ApiMethod): Promise<ApiError> {
+  let body: unknown
+  try {
+    body = await res.json()
+  } catch {
+    body = undefined
+  }
+  const payload = typeof body === 'object' && body !== null ? (body as { error?: unknown; code?: unknown }) : {}
+  const message = typeof payload.error === 'string'
+    ? payload.error
+    : `Failed to ${failureVerbs[method]} ${url}: ${res.status}`
+  const code = typeof payload.code === 'string' ? payload.code : undefined
+  return new ApiError(res.status, message, code)
+}
+
+async function ensureOk(res: Response, url: string, method: ApiMethod): Promise<void> {
   if (res.status === 401) {
     onUnauthorized?.()
     throw new Error('Unauthorized')
   }
   if (!res.ok) {
-    const err = new Error(`Failed to fetch ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'GET', 'api.status': String(res.status) } })
+    const err = await readApiError(res, url, method)
+    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': method, 'api.status': String(res.status) } })
     throw err
   }
+}
+
+async function fetchJson<T>(url: string): Promise<T> {
+  const res = await fetch(url)
+  await ensureOk(res, url, 'GET')
   return res.json()
 }
 
@@ -730,15 +770,7 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
     },
     body: body ? JSON.stringify(body) : undefined,
   })
-  if (res.status === 401) {
-    onUnauthorized?.()
-    throw new Error('Unauthorized')
-  }
-  if (!res.ok) {
-    const err = new Error(`Failed to post ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'POST', 'api.status': String(res.status) } })
-    throw err
-  }
+  await ensureOk(res, url, 'POST')
   if (res.status === 204) return undefined as T
   return res.json()
 }
@@ -753,15 +785,7 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
     },
     body: JSON.stringify(body),
   })
-  if (res.status === 401) {
-    onUnauthorized?.()
-    throw new Error('Unauthorized')
-  }
-  if (!res.ok) {
-    const err = new Error(`Failed to put ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'PUT', 'api.status': String(res.status) } })
-    throw err
-  }
+  await ensureOk(res, url, 'PUT')
   return res.json()
 }
 
@@ -771,15 +795,7 @@ async function deleteRequest(url: string): Promise<void> {
     method: 'DELETE',
     headers: { 'x-csrf-token': getCsrfToken() },
   })
-  if (res.status === 401) {
-    onUnauthorized?.()
-    throw new Error('Unauthorized')
-  }
-  if (!res.ok) {
-    const err = new Error(`Failed to delete ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'DELETE', 'api.status': String(res.status) } })
-    throw err
-  }
+  await ensureOk(res, url, 'DELETE')
 }
 
 // Existing
