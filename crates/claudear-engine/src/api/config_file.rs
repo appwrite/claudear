@@ -1739,8 +1739,11 @@ mod tests {
 
     const UNQUOTED_SECRET_FILE: &str = "[scm.github]\ntoken = fake-secret-unquoted\n";
 
-    fn assert_omits(message: &str, secret: &str) {
-        assert!(!message.contains(secret), "{secret} leaked: {message}");
+    fn assert_omits(message: &str, forbidden: &str) {
+        assert!(
+            !message.contains(forbidden),
+            "the message repeats a value it must omit"
+        );
     }
 
     #[test]

@@ -1218,19 +1218,19 @@ mod tests {
             ("notifiers.sms", "account_sid"),
             ("notifiers.push", "user_key"),
         ] {
-            let secret = |features: &[FeatureStatus]| {
+            let reported_set = |features: &[FeatureStatus]| {
                 feature(features, key)
                     .secrets
                     .iter()
-                    .find(|secret| secret.name == name)
-                    .map(|secret| secret.set)
+                    .find(|entry| entry.name == name)
+                    .map(|entry| entry.set)
             };
             assert_eq!(
-                secret(&configured),
+                reported_set(&configured),
                 Some(true),
                 "{key} {name} should be set"
             );
-            if let Some(set) = secret(&default) {
+            if let Some(set) = reported_set(&default) {
                 assert!(!set, "{key} {name} should not be set by default");
             }
         }
