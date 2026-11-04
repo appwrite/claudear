@@ -460,10 +460,13 @@ fn contains_token(text: &str, token: &str) -> bool {
         })
 }
 
+/// A `/` before a namespaced token (`console/0.3.0`) means the text names a
+/// longer tag (`apps/console/0.3.0`); before a plain version it is a path.
 fn bounded_before(before: &str, token: &str) -> bool {
     match before.chars().next_back() {
         None => true,
         Some('.') => !token.starts_with(char::is_alphanumeric),
+        Some('/') => !token.contains('/'),
         Some(neighbour) => !extends_token(neighbour),
     }
 }
@@ -1071,6 +1074,79 @@ mod tests {
         );
     }
 
+    /// GitHub's release feed post for a console release, titled with
+    /// `title_name` (the tag, or a release name that differs from it).
+    fn console_release_announcement(id: &str, title_name: &str) -> Value {
+        let mut message = announcement(id, CONSOLE_REPO, CONSOLE_TAG);
+        message["embeds"][0]["title"] = json!(format!(
+            "[{CONSOLE_REPO}] New release published: {title_name}"
+        ));
+        message
+    }
+
+    #[tokio::test]
+    async fn console_release_is_found_by_its_url_whatever_its_title_names() {
+        for title_name in [CONSOLE_TAG, "Console 1.2.141"] {
+            let (discord, _) = reporter(
+                vec![
+                    announcement("4000", CONSOLE_REPO, "2.7.0"),
+                    console_release_announcement(RELEASE_MESSAGE, title_name),
+                    announcement("1000", CONSOLE_REPO, "apps/console/1.2.140"),
+                ],
+                false,
+            );
+
+            assert_eq!(
+                discord
+                    .find_release_message(&console_tip())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(RELEASE_MESSAGE),
+                "a console release titled '{title_name}' links its slashed release URL"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn namespaced_tag_never_matches_a_longer_tag_in_a_title() {
+        let (discord, _) = reporter(
+            vec![announcement("3000", CONSOLE_REPO, "apps/console/0.3.0")],
+            false,
+        );
+        let mut package = DeployQaTip::new("console-sdk", CONSOLE_REPO, "console/0.3.0");
+        package.html_url = None;
+
+        assert_eq!(discord.find_release_message(&package).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn console_outcome_replies_under_githubs_release_announcement() {
+        let store = MemoryStore::new(console_tip());
+        let (discord, requests) = reporter(
+            vec![
+                announcement("4000", CONSOLE_REPO, "2.7.0"),
+                console_release_announcement(RELEASE_MESSAGE, "Console 1.2.141"),
+            ],
+            false,
+        );
+
+        report(
+            &store,
+            &discord,
+            &verdict_report("LIVE PASS", VERDICT_ALL_VERIFIED),
+        )
+        .await;
+
+        let posted = posts(&requests);
+        assert_eq!(posted.len(), 1, "{posted:?}");
+        assert_reply_without_mention(&posted[0]);
+        assert_eq!(
+            store.tip().discord_message_id.as_deref(),
+            Some(RELEASE_MESSAGE)
+        );
+    }
+
     #[tokio::test]
     async fn discord_id_write_failure_after_posting_is_not_an_error() {
         let store = MemoryStore::read_only_discord_ids(tip());
@@ -1460,6 +1536,22 @@ mod tests {
             ("compare/1.2.3...1.2.4", "1.2.3", false),
             ("compare/1.2.3..1.2.4", "1.2.3", false),
             ("compare/1.2.2...1.2.3", "1.2.3", false),
+            (
+                "published: apps/console/1.2.141",
+                "apps/console/1.2.141",
+                true,
+            ),
+            ("published: apps/console/1.2.141", "console/1.2.141", false),
+            (
+                "published: apps/console/1.2.1410",
+                "apps/console/1.2.141",
+                false,
+            ),
+            (
+                "published: apps/console/1.2.141-rc.1",
+                "apps/console/1.2.141",
+                false,
+            ),
             ("[appwrite-labs/cloud]", "appwrite-labs/cloud", true),
             ("appwrite-labs/cloud-sdk", "appwrite-labs/cloud", false),
             ("anything", "", false),
