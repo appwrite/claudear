@@ -889,7 +889,7 @@ Every logged-in user sees **Users** in the dashboard sidebar:
 - **Admins** see every user with an Identities column and edit anyone's identities, person key included, from the user's edit panel.
 - **Everyone else** sees **My identities** there, and the same form under **Settings > My Identities**. They edit only their own handles and cannot change their person key.
 
-The form groups the person key, source handles (Linear, GitHub, Sentry, Jira, GitLab), chat (Discord ID, Slack ID) and notification targets (email, Pushover user key, SMS, WhatsApp, Telegram chat ID). Admins edit the slug the person key comes from; everyone else sees their effective person key read-only. A badge shows where the values come from: **Console**, **From config (key)** or **Not set**. **Revert to config** drops the console identities so the person falls back to their `[users]` entry. When a non-admin reverts and an admin set their slug, the slug is kept, so they stay linked to the same person key.
+The form groups the person key, source handles (Linear, GitHub, Sentry, Jira, GitLab), chat (Discord ID, Slack ID) and notification targets (email, Pushover user key, SMS, WhatsApp, Telegram chat ID). Admins edit the slug the person key comes from; everyone else sees their effective person key read-only. A badge shows where the values come from: **Console**, **From config (key)** or **Not set**. **Revert to config** drops the console identities so the person falls back to their `[users]` entry. When a non-admin reverts, their person key never changes: if an admin set their slug to anything other than the config key their login email matches, the slug is kept and only the identities are cleared; otherwise the row is removed, which leaves that config key in place anyway.
 
 #### Precedence
 
@@ -972,14 +972,14 @@ Every non-2xx response from the users, identities, invite and directory endpoint
 { "error": "Invalid identities", "violations": [{ "field": "discord_id", "message": "Discord ID must be a 17-20 digit Discord user ID" }] }
 ```
 
-Typical messages are `"Not authenticated"`, `"Admin access required"`, `"Invalid role"`, `"Password must be 8-72 bytes"` and `"A user with this email already exists"`. `POST /api/auth/login` keeps its own 401 body.
+Typical messages are `"Not authenticated"`, `"Invalid or expired token"` (a bad Bearer token), `"Admin access required"`, `"Invalid role"`, `"Password must be 8-72 bytes"`, `"A user with this email already exists"`, `"User not found"`, `"You can only change your own identities"` and `"Only an admin can change the person key"`. `POST /api/auth/login` keeps its own 401 body.
 
 | Endpoint | Who | Result |
 |----------|-----|--------|
 | `GET /api/identities` | Any logged-in user | `UserIdentities[]` for every user; non-admins get others redacted |
 | `GET /api/users/{id}/identities` | Any logged-in user | `UserIdentities`; redacted for a non-admin reading someone else. 404 if the user does not exist |
 | `PUT /api/users/{id}/identities` | Admin, or self | Sparse update; returns `UserIdentities`. 400 invalid values, 403 not admin and not self or a non-admin sending `slug`, 404 no such user, 409 a handle or slug belongs to another person |
-| `DELETE /api/users/{id}/identities` | Admin, or self | Drops the console identities (revert to config); returns the now-effective `UserIdentities`. An admin removes the row entirely; a non-admin whose row has an admin-set `slug` keeps that slug and loses only the identities. 403, 404 as above |
+| `DELETE /api/users/{id}/identities` | Admin, or self | Drops the console identities (revert to config); returns the now-effective `UserIdentities`. An admin removes the row entirely. A non-admin whose row has an admin-set `slug` other than the config key their login email matches keeps that slug and loses only the identities; otherwise their row is removed too, which keeps the same person key. 403, 404 as above |
 | `POST /api/users` | Admin | Creates a user; returns 201 `CreatedUserResponse`. `password` (8-72 bytes) is optional: without it the user is invited and `invite` is set. Optional `identities` takes an update body. 409 if the email exists, compared case-insensitively |
 | `POST /api/users/{id}/invite` | Admin | Issues or re-issues an invite; the previous link stops working. Returns `UserInvite`. 404 no such user, 409 `{"error": "User is already active"}` |
 | `DELETE /api/users/{id}/invite` | Admin | Revokes the open invite; returns `{"message": "Invite revoked"}`. 404 if there is none |
