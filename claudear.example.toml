@@ -1218,8 +1218,10 @@ max_plan_monthly_cost = 0.0
 hourly_engineer_rate = 150.0
 
 # Address people use to reach the dashboard, used to build absolute invite
-# links (invite_url). Unset, the API returns only the relative
-# /invite#cldi_... link and invite_url is null. A trailing slash is fine.
+# links (invite_url). It must be the dashboard's origin with no sub-path,
+# because the dashboard is served from /. Unset, the API returns only the
+# relative /invite#cldi_... link and invite_url is null. A trailing slash is
+# fine.
 # Env override: CLAUDEAR_DASHBOARD_PUBLIC_URL (empty means unset).
 # public_url = "https://claudear.example.com"
 
@@ -1358,8 +1360,7 @@ reindex_interval_hours = 6.0
 # frequently and posts them once a week to your notifier(s), mentioning
 # notifiers.discord.user_id on Discord so a human can act. Report-only: it does
 # not change the fix pipeline. Requires a configured Sentry source + Discord
-# webhook. The Discord post only goes out once PR #194's InstrumentedNotifier
-# forwarding fix lands.
+# webhook.
 
 # Enable the weekly digest (default: false)
 enabled = false

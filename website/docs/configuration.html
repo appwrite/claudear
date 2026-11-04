@@ -177,7 +177,7 @@
             <li><code>[users]</code> entries without a dashboard override stay active, as seed and fallback.</li>
             <li><code>github-discord-map.json</code> is consulted only when no person in the registry with that GitHub login has a <code>discord_id</code>.</li>
             </ol>
-            <p>A dashboard user's person key is the slug an admin set on them, otherwise the <code>[users]</code> key whose <code>email</code> matches their <strong>login</strong> email, otherwise <code>console-&lt;user id&gt;</code>. The identity <code>email</code> field, which users edit themselves, never links. Notification targets (<code>email</code>, <code>sms_number</code>, <code>whatsapp_number</code>, <code>push_user_key</code>, <code>telegram_chat_id</code>) may be shared between people; any other handle that already belongs to someone else is rejected.</p>
+            <p>A dashboard user's person key is the slug an admin set on them, otherwise the <code>[users]</code> key whose <code>email</code> matches their <strong>login</strong> email (login emails are case-insensitive and stored lowercased), otherwise <code>console-&lt;user id&gt;</code>. The identity <code>email</code> field, which users edit themselves, never links. Notification targets (<code>email</code>, <code>sms_number</code>, <code>whatsapp_number</code>, <code>push_user_key</code>, <code>telegram_chat_id</code>) may be shared between people; any other handle that already belongs to someone else is rejected.</p>
             <p>Edits apply without a restart: instantly in the process that served them, and within one housekeeping cycle in any other process sharing the database. Global references such as <code>[notifiers.discord] user_id = "jake"</code> are resolved each time a notification is sent, so they follow dashboard edits too.</p>
           </div>
         </details>
@@ -494,7 +494,7 @@
             <ul>
             <li><code>max_plan_monthly_cost</code>: monthly cost of your Claude Max plan, used to estimate per-fix cost when token pricing is unavailable. Set to <code>0</code> to disable.</li>
             <li><code>hourly_engineer_rate</code>: hourly engineer rate for cost-savings calculations (default: <code>75.0</code>).</li>
-            <li><code>public_url</code>: the address people use to reach the dashboard, such as <code>https://claudear.example.com</code>. When set, invite responses include an absolute <code>invite_url</code>; otherwise only the relative <code>/invite#cldi_...</code> link is returned and you prefix it with your dashboard's address. Env override: <code>CLAUDEAR_DASHBOARD_PUBLIC_URL</code>.</li>
+            <li><code>public_url</code>: the address people use to reach the dashboard, such as <code>https://claudear.example.com</code>. It must be the dashboard's origin with no sub-path, because the dashboard is served from <code>/</code>. When set, invite responses include an absolute <code>invite_url</code>; otherwise only the relative <code>/invite#cldi_...</code> link is returned and you prefix it with your dashboard's address. Env override: <code>CLAUDEAR_DASHBOARD_PUBLIC_URL</code>.</li>
             </ul>
           </div>
         </details>
@@ -1328,8 +1328,10 @@ max_plan_monthly_cost = 0.0
 hourly_engineer_rate = 75.0
 
 # Address people use to reach the dashboard, used to build absolute invite
-# links (invite_url). Unset, the API returns only the relative
-# /invite#cldi_... link and invite_url is null. A trailing slash is fine.
+# links (invite_url). It must be the dashboard&#39;s origin with no sub-path,
+# because the dashboard is served from /. Unset, the API returns only the
+# relative /invite#cldi_... link and invite_url is null. A trailing slash is
+# fine.
 # Env override: CLAUDEAR_DASHBOARD_PUBLIC_URL (empty means unset).
 # public_url = &quot;https://claudear.example.com&quot;
 

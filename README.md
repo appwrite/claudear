@@ -889,7 +889,7 @@ Every logged-in user sees **Users** in the dashboard sidebar:
 - **Admins** see every user with an Identities column and edit anyone's identities, person key included, from the user's edit panel.
 - **Everyone else** sees **My identities** there, and the same form under **Settings > My Identities**. They edit only their own handles and cannot change their person key.
 
-The form groups the person key, source handles (Linear, GitHub, Sentry, Jira, GitLab), chat (Discord ID, Slack ID) and notification targets (email, Pushover user key, SMS, WhatsApp, Telegram chat ID). A badge shows where the values come from: **Console**, **From config (key)** or **Not set**. **Revert to config** drops the console identities so the person falls back to their `[users]` entry.
+The form groups the person key, source handles (Linear, GitHub, Sentry, Jira, GitLab), chat (Discord ID, Slack ID) and notification targets (email, Pushover user key, SMS, WhatsApp, Telegram chat ID). Admins edit the slug the person key comes from; everyone else sees their effective person key read-only. A badge shows where the values come from: **Console**, **From config (key)** or **Not set**. **Revert to config** drops the console identities so the person falls back to their `[users]` entry. When a non-admin reverts and an admin set their slug, the slug is kept, so they stay linked to the same person key.
 
 #### Precedence
 
@@ -903,13 +903,13 @@ A console user's person key is, in order:
 2. otherwise the `[users.<key>]` entry whose `email` matches their **login** email, case-insensitively, unless an admin-set slug already claims that key;
 3. otherwise `console-<user id>`.
 
-The identity `email` field never links a console user to a config entry, because users edit it themselves; only the login email (which only admins change) or an admin-set slug does. `console-<user id>` always stays an alias, so issues resolved to it earlier keep resolving after a slug is added. The first time someone saves identities for a person who comes from config, the config values are the starting point and the config key becomes their slug, so saving one field never drops the others.
+Login emails are compared case-insensitively everywhere (login, user creation, the bulk load and config matching) and stored trimmed and lowercased, so `Amy@Example.com` and `amy@example.com` are one user. The identity `email` field never links a console user to a config entry, because users edit it themselves; only the login email (which only admins change) or an admin-set slug does. `console-<user id>` always stays an alias, so issues resolved to it earlier keep resolving after a slug is added. The first time someone saves identities for a person who comes from config, the config values are the starting point and the config key becomes their slug, so saving one field never drops the others.
 
 When a handle is claimed twice, console users win over config entries, then lower user ids and keys win. GitHub and GitLab logins match case-insensitively; every other handle matches exactly.
 
 Edits apply without a restart: instantly in the process that served the write, and within one housekeeping cycle in any other process sharing the database, such as a standalone `claudear dashboard`.
 
-Global notifier references, such as `[notifiers.discord] user_id = "jake"`, `[notifiers.slack] user_id`, `[notifiers.email] to_addresses`, `[notifiers.push] user_key` and `[notifiers.sms] to_numbers`, are resolved to a person's handle each time a notification is sent rather than once at startup, so console edits apply to them too. A value that names no person is used as-is. The weekly repetitive digest mentions `[notifiers.discord] user_id`, but it only reaches Discord once PR #194's `InstrumentedNotifier` forwarding fix lands.
+Global notifier references, such as `[notifiers.discord] user_id = "jake"`, `[notifiers.slack] user_id`, `[notifiers.email] to_addresses`, `[notifiers.push] user_key` and `[notifiers.sms] to_numbers`, are resolved to a person's handle each time a notification is sent rather than once at startup, so console edits apply to them too. A value that names no person is used as-is. The weekly repetitive digest resolves its `[notifiers.discord] user_id` mention the same way.
 
 #### Who can do what
 
@@ -917,7 +917,7 @@ Global notifier references, such as `[notifiers.discord] user_id = "jake"`, `[no
 |--------|-------|---------------------------------------------|
 | Read the directory (`GET /api/identities`) | Everyone, in full | Everyone; other users redacted |
 | Read one user's identities | Anyone, in full | Self in full; others redacted |
-| Edit identities or revert to config | Anyone | Self only (403 otherwise) |
+| Edit identities or revert to config | Anyone | Self only (403 otherwise); reverting keeps an admin-set slug |
 | Set a person key (`slug`) | Yes | No (403) |
 | Create users, issue or revoke invites | Yes | No (403) |
 | Bulk load (`PUT /api/directory`) | Yes, by session or Bearer API token | No (403) |
@@ -950,11 +950,11 @@ An admin can add a person who has no password yet: leave the password blank unde
 - Their identities are live in the registry at once, so assignee matching, mentions and the deploy-QA `@releaser` reach them before they ever log in.
 - They cannot log in, and their sessions and API tokens are ignored, until they accept. A login attempt gets the same 401 as a wrong password.
 
-The invite link is `/invite#cldi_...`. It is single-use, expires after 7 days, and is shown only when issued: **Copy invite link** on the user's row issues a new one, which invalidates the previous link, and **Revoke invite** cancels it. The secret sits in the URL fragment, which browsers never send to the server, so it stays out of access logs, Sentry and `Referer` headers; the invite page also strips it from the address bar. The person opens the link, sets a password (8-72 characters), then signs in normally; accepting does not log them in.
+The invite link is `/invite#cldi_...`. It is single-use, expires after 7 days, and is shown only when issued: **Copy invite link** on the user's row issues a new one, which invalidates the previous link, so the dashboard asks first while that link is still open; **Revoke invite** cancels it. The secret sits in the URL fragment, which browsers never send to the server, so it stays out of access logs, Sentry and `Referer` headers; the invite page also strips it from the address bar. The person opens the link, sets a password (8-72 bytes of UTF-8, so fewer characters for non-ASCII passwords), then signs in normally; accepting does not log them in and removes the secret from the page's history entry.
 
 Setting a password any other way also activates an invited user and revokes their open invite: an admin setting `password` with `PUT /api/users/{id}`, or `claudear users seed` for that email.
 
-Set `[dashboard] public_url` (or `CLAUDEAR_DASHBOARD_PUBLIC_URL`) to the address people use to reach the dashboard and the API returns absolute links in `invite_url`. Without it `invite_url` is `null`; prefix `invite_link` with your dashboard's address (the dashboard does this for you with the address in your browser).
+Set `[dashboard] public_url` (or `CLAUDEAR_DASHBOARD_PUBLIC_URL`) to the address people use to reach the dashboard and the API returns absolute links in `invite_url`. It must be the dashboard's origin (scheme, host and optional port) with no sub-path: the dashboard is served from `/`, so a link under a sub-path such as `https://example.com/claudear/invite#...` does not open the invite page. Without it `invite_url` is `null`; prefix `invite_link` with your dashboard's address (the dashboard does this for you with the address in your browser).
 
 ```toml
 [dashboard]
@@ -963,19 +963,28 @@ public_url = "https://claudear.example.com"
 
 #### Identity API
 
-Unless noted, these endpoints need a dashboard session cookie and return 401 without one. Every `POST`, `PUT` and `DELETE` also needs an `x-csrf-token` header matching the `claudear_csrf` cookie, which the dashboard sets on every response. The one exception is `PUT /api/directory` sent with an `Authorization: Bearer` API token: it is the only dashboard endpoint that accepts Bearer, and with Bearer it needs no CSRF header. Writes are rate-limited per user and return 429 over the limit. Errors from these endpoints are JSON: `{"error": "...", "violations": [{"field": "...", "message": "..."}]}`, where `violations` is present for 400 and 409.
+Unless noted, these endpoints need a dashboard session cookie and return 401 without one. Every `POST`, `PUT` and `DELETE` also needs an `x-csrf-token` header matching the `claudear_csrf` cookie, which the dashboard sets on every response. The one exception is `PUT /api/directory` sent with an `Authorization: Bearer` API token: it is the only dashboard endpoint that accepts Bearer, and with Bearer it needs no CSRF header. Writes are rate-limited per user and return 429 over the limit.
+
+Every non-2xx response from the users, identities, invite and directory endpoints, including 401 and 403 rejections, is JSON with a human-readable `error`, plus `violations` when specific fields are at fault (most 400 and 409 responses):
+
+```json
+{ "error": "A user with this email already exists" }
+{ "error": "Invalid identities", "violations": [{ "field": "discord_id", "message": "Discord ID must be a 17-20 digit Discord user ID" }] }
+```
+
+Typical messages are `"Not authenticated"`, `"Admin access required"`, `"Invalid role"`, `"Password must be 8-72 bytes"` and `"A user with this email already exists"`. `POST /api/auth/login` keeps its own 401 body.
 
 | Endpoint | Who | Result |
 |----------|-----|--------|
 | `GET /api/identities` | Any logged-in user | `UserIdentities[]` for every user; non-admins get others redacted |
 | `GET /api/users/{id}/identities` | Any logged-in user | `UserIdentities`; redacted for a non-admin reading someone else. 404 if the user does not exist |
 | `PUT /api/users/{id}/identities` | Admin, or self | Sparse update; returns `UserIdentities`. 400 invalid values, 403 not admin and not self or a non-admin sending `slug`, 404 no such user, 409 a handle or slug belongs to another person |
-| `DELETE /api/users/{id}/identities` | Admin, or self | Drops the console identities (revert to config); returns the now-effective `UserIdentities`. 403, 404 as above |
-| `POST /api/users` | Admin | Creates a user; returns 201 `CreatedUserResponse`. `password` (8-72) is optional: without it the user is invited and `invite` is set. Optional `identities` takes an update body. 409 if the email exists |
+| `DELETE /api/users/{id}/identities` | Admin, or self | Drops the console identities (revert to config); returns the now-effective `UserIdentities`. An admin removes the row entirely; a non-admin whose row has an admin-set `slug` keeps that slug and loses only the identities. 403, 404 as above |
+| `POST /api/users` | Admin | Creates a user; returns 201 `CreatedUserResponse`. `password` (8-72 bytes) is optional: without it the user is invited and `invite` is set. Optional `identities` takes an update body. 409 if the email exists, compared case-insensitively |
 | `POST /api/users/{id}/invite` | Admin | Issues or re-issues an invite; the previous link stops working. Returns `UserInvite`. 404 no such user, 409 `{"error": "User is already active"}` |
 | `DELETE /api/users/{id}/invite` | Admin | Revokes the open invite; returns `{"message": "Invite revoked"}`. 404 if there is none |
 | `POST /api/auth/invite/inspect` | Anyone with the link | Body `{"token": "cldi_..."}`; returns `{"name", "email", "expires_at"}` |
-| `POST /api/auth/invite/accept` | Anyone with the link | Body `{"token": "cldi_...", "password": "..."}`; returns `{"message": "Invite accepted"}`. 400 if the password is not 8-72 characters |
+| `POST /api/auth/invite/accept` | Anyone with the link | Body `{"token": "cldi_...", "password": "..."}`; returns `{"message": "Invite accepted"}`. 400 if the password is not 8-72 bytes |
 | `PUT /api/directory` | Admin, by session or Bearer | Bulk create-or-update by email, all or nothing |
 
 The two invite endpoints need no session but still need the CSRF header, which the invite page sends. Any invalid, expired, used or revoked token gets the same 404 `{"error": "This invite link is invalid or has expired"}`. They are rate-limited per IP in a bucket of their own, separate from login, and return 429 over the limit.
@@ -988,8 +997,9 @@ The two invite endpoints need no session but still need the CSRF header, which t
 {
   "user_id": 3,
   "name": "Jake",
-  "email": "jake@example.com",
+  "login_email": "jake@example.com",
   "status": "active",
+  "person_key": "jake",
   "slug": "jake",
   "origin": "console",
   "redacted": false,
@@ -1011,7 +1021,11 @@ The two invite endpoints need no session but still need the CSRF header, which t
 }
 ```
 
-`origin` is `"console"` when the user has saved identities, `"config"` when they have none but their login email matches a `[users.<key>]` entry (identities come from config and `slug` is that key), and `"unset"` otherwise (`slug` is `null`, identities are empty). `updated_at` is `null` unless `origin` is `"console"`.
+- `login_email` is the user's console login email, `null` when `redacted`. It is not the identity `email` under `identities`, which is a notification target.
+- `person_key` is the effective registry key: the admin-set slug, the matching `[users.<key>]` key, or `console-<user id>`. It is `null` only when `origin` is `"unset"`.
+- `slug` is the slug an admin set explicitly, or `null`. It is what an update's `slug` field writes, and it is always `null` when `origin` is `"config"`.
+- `origin` is `"console"` when the user has saved identities, `"config"` when they have none but their login email matches a `[users.<key>]` entry (identities come from config and `person_key` is that key), and `"unset"` otherwise (identities are empty).
+- `updated_at` is `null` unless `origin` is `"console"`.
 
 An update body names only the fields to change; every field is optional and unknown fields are rejected:
 
@@ -1095,7 +1109,7 @@ To load a directory with curl:
 
 4. Send each new person their link, then revoke the token under **API Tokens**.
 
-A Bearer request ignores cookies. A bad, expired or revoked token gets 401; a token whose owner is not an active admin gets 403. Any admin API token, including one minted for MCP, can call this endpoint, so use a dedicated token for the load and revoke it afterwards.
+A Bearer request ignores cookies. A bad, expired or revoked token gets 401, and so does a token whose owner is still invited, because invited users' tokens are ignored until they accept; an active viewer's token gets 403. Any admin API token, including one minted for MCP, can call this endpoint, so use a dedicated token for the load and revoke it afterwards.
 
 The response lists each entry in request order:
 
@@ -1110,7 +1124,14 @@ The response lists each entry in request order:
 }
 ```
 
-Failures use the same error shape as the other identity endpoints, with the entry's `email` on each violation and `field` one of `email`, `name`, `role` or an identity field: 400 `{"error": "Invalid directory entries", "violations": [{"email": "amy@example.com", "field": "discord_id", "message": "..."}]}` for invalid entries, and 409 in the same shape for handle or slug conflicts.
+Failures use the same error shape as the other identity endpoints, with the entry's `email` on each violation and `field` one of `email`, `name`, `role` or an identity field: 400 `{"error": "Invalid directory entries", "violations": [{"email": "amy@example.com", "field": "discord_id", "message": "..."}]}` for invalid entries, and 409 in the same shape for handle or slug conflicts. Each result row's `identities` is a `UserIdentities`.
+
+#### Known limitations
+
+Handle and slug conflicts are checked against the registry as it was before the write, so two changes that are only consistent once both apply are rejected with 409. Make them in two steps:
+
+- **Relinking a config-matched user to a different slug.** While a user's identities still come from config (`origin: "config"`), the config handles copied into the write still belong to that `[users.<key>]` entry, so setting a new `slug` in the same request conflicts with it. Save their identities first, which makes them a console user with that key as their slug, then change the slug. The old `[users.<key>]` entry is no longer overridden after the relink and becomes active again; remove it from `claudear.toml` if it is no longer needed.
+- **Moving a handle between two people in one `PUT /api/directory` batch.** Remove the handle from the first person in one request, then add it to the second in another.
 
 ---
 
