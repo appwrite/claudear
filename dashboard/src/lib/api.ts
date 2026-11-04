@@ -1141,17 +1141,36 @@ export async function fetchRepoLearning(repo: string): Promise<RepoLearningRespo
 }
 
 
+export type ConfigErrorCode = 'invalid' | 'read_only' | 'revision_mismatch' | 'unreadable'
+
+export interface OptionalConfigSection {
+  key: string
+  template: string
+}
+
 export interface ConfigResponse {
   content: string
-  path: string
+  secret_paths: string[]
+  runtime_overrides: string[]
+  restart_required: boolean
+  writable: boolean
+  revision: string
+  optional_sections: OptionalConfigSection[]
+}
+
+export interface SaveConfigResponse {
+  ok: true
+  restart_required: boolean
+  revision: string
+  message: string
 }
 
 export async function fetchConfig(): Promise<ConfigResponse> {
   return fetchJson(`${API_BASE}/config`)
 }
 
-export async function saveConfig(content: string): Promise<{ ok: boolean; message: string }> {
-  return putJson(`${API_BASE}/config`, { content })
+export async function saveConfig(content: string, revision?: string): Promise<SaveConfigResponse> {
+  return putJson(`${API_BASE}/config`, revision === undefined ? { content } : { content, revision })
 }
 
 

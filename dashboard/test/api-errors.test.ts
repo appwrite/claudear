@@ -56,7 +56,7 @@ describe("ApiError", () => {
   test("surfaces the server error message and code from a PUT", async () => {
     mockFetch(400, { kind: "json", data: { error: "Config validation failed: X", code: "invalid" } });
 
-    const error = await captureError(saveConfig("bad"));
+    const error = await captureError(saveConfig("bad", "rev-1"));
 
     expect(error).toBeInstanceOf(ApiError);
     const apiError = error as ApiError;
@@ -114,5 +114,23 @@ describe("ApiError", () => {
     expect(error).not.toBeInstanceOf(ApiError);
     expect((error as Error).message).toBe("Unauthorized");
     expect(unauthorizedCount).toBe(1);
+  });
+
+  test("sends the revision with saveConfig only when given", async () => {
+    const bodies: unknown[] = [];
+    globalThis.fetch = mock((_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ ok: true, restart_required: true, revision: "rev-2", message: "saved" }),
+      });
+    }) as unknown as typeof fetch;
+
+    const result = await saveConfig("a = 1", "rev-1");
+    await saveConfig("a = 2");
+
+    expect(result.revision).toBe("rev-2");
+    expect(bodies).toEqual([{ content: "a = 1", revision: "rev-1" }, { content: "a = 2" }]);
   });
 });
