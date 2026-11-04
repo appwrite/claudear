@@ -1879,6 +1879,10 @@ async fn a_fix_request_carries_no_report_text_or_reporter_reference() {
     assert!(request.context.contains("<<<UNTRUSTED assessment "));
     assert!(request.context.contains("Write a failing test"));
     assert!(request.context.contains("neutral title"));
+    assert!(request.context.contains("Name the branch neutrally"));
+    assert!(request
+        .context
+        .contains("Never reuse the working directory name"));
 }
 
 #[tokio::test]

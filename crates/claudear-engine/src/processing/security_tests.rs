@@ -23,6 +23,7 @@ const HOST: &str = "billing.svc.cluster.local";
 struct ExecutedRun {
     prompt: String,
     issue: Option<Issue>,
+    project_dir: PathBuf,
 }
 
 /// An agent that builds its fix prompts with the real Claude prompt builder,
@@ -99,11 +100,12 @@ impl AgentRunner for RecordingAgent {
         prompt: &str,
         issue: Option<&Issue>,
         _: Option<i64>,
-        _: &Path,
+        project_dir: &Path,
     ) -> Result<AgentResult> {
         self.runs.lock().unwrap().push(ExecutedRun {
             prompt: prompt.to_string(),
             issue: issue.cloned(),
+            project_dir: project_dir.to_path_buf(),
         });
         Ok(self.result.clone())
     }
@@ -568,6 +570,57 @@ async fn a_security_fix_reaches_the_agent_with_only_the_neutral_brief() {
     assert_eq!(agent_issue.short_id, "SEC-7");
     assert_eq!(agent_issue.url, "");
     assert!(agent_issue.description.is_none());
+}
+
+#[tokio::test]
+async fn a_security_fix_runs_in_a_neutrally_named_worktree_that_is_cleaned_up() {
+    for agent in [
+        RecordingAgent::succeeding(),
+        RecordingAgent::failing("the fix did not build"),
+    ] {
+        let repository = LocalRepository::new();
+        let mut fixture = Fixture::new(agent.clone());
+        let issue = security_fix_issue();
+        let expected = issue_worktree_path(&repository.workspace(), "appwrite/appwrite", &issue);
+        fixture.run_security_fix(&repository, issue, BRIEF).await;
+
+        let runs = agent.runs();
+        assert_eq!(runs.len(), 1, "the fix agent must run once");
+        let directory = runs[0].project_dir.to_string_lossy().to_string();
+        assert!(!directory.contains("SEC-"), "{directory}");
+        let name = runs[0]
+            .project_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(!name.to_ascii_uppercase().contains("SEC"), "{name}");
+        assert_ne!(name, "SEC-7");
+        assert_eq!(runs[0].project_dir, expected);
+        assert!(
+            !expected.exists(),
+            "the worktree the fix ran in must be removed: {directory}"
+        );
+    }
+}
+
+#[test]
+fn a_support_fix_keeps_its_short_id_worktree() {
+    let workspace = Path::new("/var/lib/claudear/workspaces");
+    let issue = helpscout_issue(Some(SUPPORT_MAILBOX));
+    assert_eq!(
+        issue_worktree_path(workspace, "appwrite/appwrite", &issue),
+        worktree_path(workspace, "appwrite/appwrite", "HS-8812")
+    );
+    let security = issue_worktree_path(workspace, "appwrite/appwrite", &security_fix_issue());
+    assert_eq!(
+        security.parent(),
+        Some(Path::new("/var/lib/claudear/workspaces/appwrite-worktrees"))
+    );
+    assert_eq!(
+        security,
+        issue_worktree_path(workspace, "appwrite/appwrite", &security_fix_issue())
+    );
 }
 
 #[tokio::test]

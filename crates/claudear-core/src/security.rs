@@ -3,12 +3,15 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
 
 pub const SECURITY_FIX_SOURCE: &str = "security";
 
 const SECURITY_FIX_SHORT_ID_PREFIX: &str = "SEC-";
+const SECURITY_FIX_WORKTREE_PREFIX: &str = "fix-";
+const SECURITY_FIX_WORKTREE_HASH_BYTES: usize = 6;
 const MAX_PUBLIC_REASON_CHARS: usize = 1000;
 const MAX_CONFIRMED_TITLE_CHARS: usize = 200;
 const MAX_CONFIRMED_SUMMARY_CHARS: usize = 5000;
@@ -19,6 +22,18 @@ const PULL_SEGMENT: &str = "pull";
 
 pub fn security_fix_short_id(vulnerability_id: i64) -> String {
     format!("{SECURITY_FIX_SHORT_ID_PREFIX}{vulnerability_id}")
+}
+
+/// The worktree directory name for the security fix `short_id`. The fix
+/// agent sees its working directory and may reuse it in a public branch
+/// name, so it carries no `SEC-` prefix or id; it is stable for one
+/// `short_id` so every run and cleanup finds the same directory.
+pub fn security_fix_worktree_key(short_id: &str) -> String {
+    let digest = Sha256::digest(short_id.as_bytes());
+    format!(
+        "{SECURITY_FIX_WORKTREE_PREFIX}{}",
+        hex::encode(&digest[..SECURITY_FIX_WORKTREE_HASH_BYTES])
+    )
 }
 
 /// Parses only the canonical `SEC-<id>` form, so every accepted value maps
@@ -1056,6 +1071,18 @@ mod tests {
             parse_security_fix_short_id(&security_fix_short_id(i64::MAX)),
             Some(i64::MAX)
         );
+    }
+
+    #[test]
+    fn worktree_key_is_stable_neutral_and_distinct_per_fix() {
+        let key = security_fix_worktree_key(&security_fix_short_id(7));
+        assert_eq!(key, security_fix_worktree_key("SEC-7"));
+        assert_ne!(key, security_fix_worktree_key("SEC-8"));
+        assert!(key.starts_with(SECURITY_FIX_WORKTREE_PREFIX), "{key}");
+        let digits = &key[SECURITY_FIX_WORKTREE_PREFIX.len()..];
+        assert_eq!(digits.len(), SECURITY_FIX_WORKTREE_HASH_BYTES * 2);
+        assert!(digits.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!key.to_ascii_uppercase().contains("SEC"), "{key}");
     }
 
     #[test]

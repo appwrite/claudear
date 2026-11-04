@@ -17,7 +17,7 @@ use claudear_analysis::repo::{worktree_path, GitOps};
 use claudear_config::config::{Config, MAILBOX_ID_METADATA_KEY};
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
-use claudear_core::security::SECURITY_FIX_SOURCE;
+use claudear_core::security::{security_fix_worktree_key, SECURITY_FIX_SOURCE};
 use claudear_core::types::{
     ActionKind, ActivityLogEntry, AgentResult, AskRequest, ErrorPattern, Issue, ProcessingMetric,
     QaKnowledgeEntry, ReplyKind, RetrievalUsageRecord, TimelineEventStatus, TriageVerdict,
@@ -31,6 +31,7 @@ use claudear_integrations::scm::{PrReviewState, ReviewWatcher};
 use claudear_storage::{classify_error, compute_error_hash, FixAttemptTracker};
 use serde_json::json;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -184,6 +185,21 @@ pub(crate) fn refuse_security_issue() -> ProcessingOutcome {
 /// every generic side channel.
 fn is_security_fix(issue: &Issue) -> bool {
     issue.source == SECURITY_FIX_SOURCE
+}
+
+/// The worktree `issue` is fixed in. A security fix's directory is named
+/// neutrally, because the fix agent sees it and may reuse it in a branch
+/// name on a public repository.
+fn issue_worktree_path(workspace: &Path, repo_name: &str, issue: &Issue) -> PathBuf {
+    if is_security_fix(issue) {
+        worktree_path(
+            workspace,
+            repo_name,
+            &security_fix_worktree_key(&issue.short_id),
+        )
+    } else {
+        worktree_path(workspace, repo_name, &issue.short_id)
+    }
 }
 
 /// Whether the fix `prompt` for the security fix `issue` names it, so the
@@ -1083,7 +1099,7 @@ impl IssueProcessor {
             // Create per-issue worktree.
             // For review reruns, check out the actual PR branch so Claude can push
             // to it. For initial runs, use detached HEAD (Claude creates a new branch).
-            let wt_path = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
+            let wt_path = issue_worktree_path(&self.config.workspace, repo_name, issue);
             let wt_result = if let Some(ref branch) = existing_pr_branch {
                 GitOps::create_worktree_on_branch(&project_dir, &wt_path, branch, &checkout_ref)
                     .await
@@ -1121,7 +1137,7 @@ impl IssueProcessor {
 
         // Build effective project dir (worktree or fallback)
         let effective_project_dir = if let Some(repo_name) = resolution.repo_name() {
-            let wt = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
+            let wt = issue_worktree_path(&self.config.workspace, repo_name, issue);
             if !wt.exists() {
                 let error = format!("Worktree disappeared after creation: {:?}", wt);
                 self.mark_failed(source_name, issue, &error).ok();
@@ -1463,11 +1479,8 @@ impl IssueProcessor {
                                 self.reindex_repo(repo_name, &new_project_dir).await;
 
                                 let checkout_ref = format!("origin/{}", detected_branch);
-                                let wt_path = worktree_path(
-                                    &self.config.workspace,
-                                    repo_name,
-                                    &issue.short_id,
-                                );
+                                let wt_path =
+                                    issue_worktree_path(&self.config.workspace, repo_name, issue);
                                 if let Err(e) = GitOps::create_worktree(
                                     &new_project_dir,
                                     &wt_path,
@@ -2620,7 +2633,7 @@ impl IssueProcessor {
         project_dir: &std::path::Path,
     ) {
         if let Some(repo_name) = resolution.repo_name() {
-            let wt_path = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
+            let wt_path = issue_worktree_path(&self.config.workspace, repo_name, issue);
             if wt_path.exists() {
                 if let Err(e) = GitOps::remove_worktree(project_dir, &wt_path).await {
                     tracing::warn!(
