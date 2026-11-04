@@ -218,6 +218,37 @@ describe("ConfigPage", () => {
     expect(webhookSecret.placeholder).toBe("Not set");
   });
 
+  test("matches server secret paths for quoted keys and tables nested under an array entry", async () => {
+    const content = [
+      TRACKS_CONFIG,
+      "[deploy_qa.tracks.notify]",
+      'webhook = "[REDACTED]"',
+      "",
+      "[agent.providers.claude.env]",
+      '"OPENAI_KEY" = "[REDACTED]"',
+      "",
+    ].join("\n");
+    createHarness(
+      "admin",
+      configResponse({
+        content,
+        secret_paths: [
+          ...configResponse().secret_paths,
+          "agent.providers.claude.env.OPENAI_KEY",
+          "deploy_qa.tracks[1].notify.webhook",
+        ],
+      })
+    );
+    await renderConfigPage();
+
+    for (const path of ["agent.providers.claude.env.OPENAI_KEY", "deploy_qa.tracks[1].notify.webhook"]) {
+      const input = screen.getByLabelText(path) as HTMLInputElement;
+      expect(input.type).toBe("password");
+      expect(input.value).toBe("");
+    }
+    expect(document.body.innerHTML).not.toContain("[REDACTED]");
+  });
+
   test("shows the server validation message when a save is rejected", async () => {
     const harness = createHarness("admin");
     harness.replyToNextPut({ status: 400, data: { error: "Config validation failed: X", code: "invalid" } });
