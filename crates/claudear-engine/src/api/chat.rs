@@ -8,14 +8,17 @@ use axum::http::uri::Authority;
 use axum::http::{header, StatusCode, Uri};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::Response;
-use axum::Router;
+use axum::routing::get;
+use axum::{Json, Router};
 use claudear_analysis::feedback::EmbeddingClient;
 use claudear_analysis::repo::code_index::CodeSearchService;
 use claudear_config::config::Config;
 use claudear_integrations::chat::{ChatService, ChatState};
 use claudear_storage::FixAttemptTracker;
+use serde::Serialize;
 use std::sync::Arc;
 
+const STATUS_PATH: &str = "/api/chat/status";
 const WEBSOCKET_PATH: &str = "/api/chat/ws";
 const X_FORWARDED_HOST: &str = "x-forwarded-host";
 const FORWARDED_HOST_PARAMETER: &str = "host";
@@ -52,9 +55,26 @@ pub fn chat_state(
     })
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+struct ChatStatus {
+    enabled: bool,
+}
+
 /// Merge `chat` into `routes` with a dashboard session required on every
-/// chat route; without `chat`, `routes` is returned unchanged.
+/// chat route, and report whether it was mounted at `STATUS_PATH`, which is
+/// mounted either way so the dashboard can check before probing chat routes.
 pub(super) fn mount(routes: Router, chat: Option<Router>, state: ApiState) -> Router {
+    let status = ChatStatus {
+        enabled: chat.is_some(),
+    };
+    let routes = routes.merge(
+        Router::new()
+            .route(
+                STATUS_PATH,
+                get(move |_user: AuthUser| async move { Json(status) }),
+            )
+            .with_state(state.clone()),
+    );
     match chat {
         Some(chat) => routes.merge(chat.route_layer(from_fn_with_state(state, require_session))),
         None => routes,
@@ -125,7 +145,6 @@ mod tests {
     use super::*;
     use crate::api::{apply_dashboard_middleware, create_api_router_full};
     use axum::body::Body;
-    use axum::routing::get;
     use claudear_analysis::feedback::EmbeddingConfig;
     use claudear_storage::SqliteTracker;
     use std::path::PathBuf;
@@ -275,6 +294,85 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    async fn chat_status(router: &Router, headers: &[(&str, &str)]) -> (StatusCode, String) {
+        let mut request = axum::http::Request::builder().uri(STATUS_PATH);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn status_reports_whether_chat_is_mounted() {
+        let tracker = tracker();
+        let token = session(&tracker);
+        let cookie = format!("claudear_session={token}");
+        let without_chat =
+            apply_dashboard_middleware(mount(Router::new(), None, api_state(&tracker)), false);
+
+        assert_eq!(
+            chat_status(&without_chat, &[("cookie", &cookie)]).await,
+            (StatusCode::OK, r#"{"enabled":false}"#.to_string())
+        );
+        assert_eq!(
+            chat_status(&stub_router(&tracker), &[("cookie", &cookie)]).await,
+            (StatusCode::OK, r#"{"enabled":true}"#.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn status_is_mounted_by_the_api_router_without_chat() {
+        let storage = tempfile::tempdir().unwrap();
+        let tracker = tracker();
+        let token = session(&tracker);
+        let mut config = enabled_config();
+        config.storage_dir = storage.path().to_path_buf();
+        let router = apply_dashboard_middleware(
+            create_api_router_full(
+                config,
+                tracker.clone(),
+                PathBuf::from("claudear.toml"),
+                tracker.subscribe_indexing_progress(),
+                None,
+                None,
+            ),
+            false,
+        );
+        let cookie = format!("claudear_session={token}");
+
+        assert_eq!(
+            chat_status(&router, &[("cookie", &cookie)]).await,
+            (StatusCode::OK, r#"{"enabled":false}"#.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn status_requires_a_session() {
+        let tracker = tracker();
+        for router in [
+            apply_dashboard_middleware(mount(Router::new(), None, api_state(&tracker)), false),
+            stub_router(&tracker),
+        ] {
+            assert_eq!(chat_status(&router, &[]).await.0, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                chat_status(&router, &[("cookie", "claudear_session=forged")])
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
     }
 
     #[tokio::test]

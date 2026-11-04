@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
+import useSWR from 'swr'
 import { ApiError, deleteRequest, fetchJson, getWsBase } from './api'
 
 export interface ChatMessage {
@@ -196,8 +197,32 @@ export interface ChatModelsResponse {
   models: ChatModel[]
 }
 
+export interface ChatStatus {
+  enabled: boolean
+}
+
+export interface ChatAvailability {
+  enabled: boolean
+  disabled: boolean
+  error: unknown
+}
+
 export function isChatDisabled(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404
+}
+
+export async function fetchChatStatus(): Promise<ChatStatus> {
+  return fetchJson(`${API_BASE}/chat/status`)
+}
+
+export function useChatAvailability(): ChatAvailability {
+  const { data, error } = useSWR<ChatStatus>('chat-status', fetchChatStatus)
+  const missing = isChatDisabled(error)
+  return {
+    enabled: data?.enabled === true,
+    disabled: data?.enabled === false || missing,
+    error: missing ? undefined : error,
+  }
 }
 
 export async function fetchChatSessions(): Promise<ChatSession[]> {

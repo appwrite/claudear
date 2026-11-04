@@ -5,23 +5,31 @@ import { ChatInput } from '../components/chat/ChatInput'
 import { ChatSessions } from '../components/chat/ChatSessions'
 import { ModelStatus } from '../components/chat/ModelStatus'
 import { ChatDisabledNotice } from '../components/chat/ChatDisabledNotice'
-import { useChat, fetchChatSessions, deleteChatSession, isChatDisabled, type ChatSession } from '../lib/chat'
+import {
+  useChat,
+  useChatAvailability,
+  fetchChatSessions,
+  deleteChatSession,
+  isChatDisabled,
+  type ChatSession,
+} from '../lib/chat'
 import { MessageSquareCode, PanelLeftClose, PanelLeft } from 'lucide-react'
 
 export default function ChatPage() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
+  const chat = useChatAvailability()
   const {
     data: sessions,
     error: sessionsError,
     mutate: mutateSessions,
-  } = useSWR<ChatSession[]>('chat-sessions', fetchChatSessions, {
+  } = useSWR<ChatSession[]>(chat.enabled ? 'chat-sessions' : null, fetchChatSessions, {
     refreshInterval: 10000,
   })
-  const disabled = isChatDisabled(sessionsError)
+  const disabled = chat.disabled || isChatDisabled(sessionsError)
   const available = sessions !== undefined && !disabled
-  const failed = !available && !disabled && sessionsError !== undefined
+  const failed = !available && !disabled && (chat.error ?? sessionsError) !== undefined
 
   const { messages, sendMessage, stopStreaming, isStreaming, isConnected, error, sessionId, clearMessages } =
     useChat(undefined, available)
