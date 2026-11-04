@@ -5,6 +5,7 @@
 pub mod auth;
 mod config_file;
 pub(crate) mod embedded;
+mod features;
 mod routes;
 mod security;
 mod tokens;

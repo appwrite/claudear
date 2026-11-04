@@ -126,6 +126,7 @@ pub fn create_api_router_full(
             get(attempt_retrieval_handler),
         )
         .route("/api/sources", get(sources_handler))
+        .route("/api/features", get(super::features::features_handler))
         .route("/api/retries", get(retries_handler))
         .route("/api/activity", get(activity_handler))
         .route("/api/analytics/summary", get(analytics_summary_handler))
@@ -259,16 +260,22 @@ pub fn create_api_router_full(
     // If dashboard directory is provided, serve from filesystem (development override)
     if let Some(dashboard_path) = dashboard_dir {
         let index_file = dashboard_path.join("index.html");
-        let serve_dir =
-            ServeDir::new(&dashboard_path).not_found_service(ServeFile::new(&index_file));
+        let serve_dir = ServeDir::new(&dashboard_path).fallback(ServeFile::new(&index_file));
 
-        api_routes.fallback_service(serve_dir)
+        api_routes
+            .route("/api", axum::routing::any(api_not_found_handler))
+            .route("/api/{*path}", axum::routing::any(api_not_found_handler))
+            .fallback_service(serve_dir)
     } else if super::embedded::has_dashboard() {
         // Serve the embedded dashboard compiled into the binary
         api_routes.fallback_service(tower::service_fn(super::embedded::embedded_fallback))
     } else {
         api_routes
     }
+}
+
+async fn api_not_found_handler() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 #[derive(Serialize)]
@@ -8361,5 +8368,58 @@ mod tests {
         assert_eq!(summary.samples, 0);
         assert!(summary.avg_secs.is_none());
         assert!(summary.max_secs.is_none());
+    }
+
+    #[tokio::test]
+    async fn dashboard_dir_serves_spa_routes_and_rejects_unknown_api_paths() {
+        let dashboard = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(dashboard.path().join("index.html"), "<html>console</html>").unwrap();
+        std::fs::write(dashboard.path().join("app.js"), "console.log(1)").unwrap();
+        let tracker = create_test_tracker();
+        let config = Config {
+            storage_dir: storage.path().to_path_buf(),
+            ..Config::default()
+        };
+        let router = create_api_router_with_dashboard(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            test_indexing_rx(&tracker),
+            Some(dashboard.path().to_path_buf()),
+        )
+        .layer(CookieManagerLayer::new());
+
+        let request = |uri: &str| Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let body = |response: axum::response::Response| async {
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+
+        for uri in ["/api/nope", "/api", "/api/attempts/1/unknown"] {
+            let response = router.clone().oneshot(request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(
+                !body(response).await.contains("console"),
+                "{uri} served index.html"
+            );
+        }
+
+        for uri in ["/deploy-qa", "/", "/attempts/abc"] {
+            let response = router.clone().oneshot(request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(body(response).await, "<html>console</html>", "{uri}");
+        }
+
+        let response = router.clone().oneshot(request("/app.js")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body(response).await, "console.log(1)");
+
+        let response = router.oneshot(request("/api/health")).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a registered API route must still reach its handler"
+        );
     }
 }
