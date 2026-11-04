@@ -922,7 +922,9 @@ repo = "appwrite-labs/edge"
 tag_filter = "suffix:-db"
 
 # The console deploys from apps/console/<version> tags in the appwrite
-# monorepo, which carry no GitHub release; the repo's releases are the server's.
+# monorepo. Its production workflow publishes each deploy's GitHub release
+# (never marked latest, since the repo's other releases are the server's),
+# which the poller uses; a tag without one is QA'd as a bare tag.
 [[deploy_qa.tracks]]
 name = "console"
 repo = "appwrite/appwrite"
