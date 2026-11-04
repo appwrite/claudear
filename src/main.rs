@@ -493,6 +493,202 @@ enum UsersCommands {
     },
 }
 
+/// What `claudear users seed` did to the admin account.
+#[derive(Debug, PartialEq, Eq)]
+enum SeededAdmin {
+    Created(i64),
+    Updated(i64),
+}
+
+/// Create the admin, or give the existing user with this login email the password, name
+/// and admin role. The password hash is written once: activating an invited user sets it
+/// (and revokes their invites); an active user gets it through the ordinary update.
+fn seed_admin(
+    store: &dyn UserStore,
+    email: &str,
+    password_hash: &str,
+    name: &str,
+) -> claudear_core::error::Result<SeededAdmin> {
+    let role = claudear_core::identity::Role::Admin.as_str();
+    match store.get_user_by_email(email)? {
+        Some(existing) if existing.status == claudear_core::identity::UserStatus::Invited => {
+            store.activate_user(existing.id, password_hash)?;
+            store.update_user(existing.id, None, None, Some(name), Some(role), None)?;
+            Ok(SeededAdmin::Updated(existing.id))
+        }
+        Some(existing) => {
+            store.update_user(
+                existing.id,
+                None,
+                Some(password_hash),
+                Some(name),
+                Some(role),
+                None,
+            )?;
+            Ok(SeededAdmin::Updated(existing.id))
+        }
+        None => Ok(SeededAdmin::Created(store.create_user(
+            email,
+            password_hash,
+            name,
+            role,
+        )?)),
+    }
+}
+
+#[cfg(test)]
+mod seed_admin_tests {
+    use super::*;
+    use claudear_core::identity::UserStatus;
+    use claudear_storage::{DirectoryUser, DirectoryWrite, InviteWrite, UserRow};
+    use std::sync::Mutex;
+
+    const HASH: &str = "$2b$12$seeded";
+
+    struct RecordingStore {
+        user: Option<UserRow>,
+        password_writes: Mutex<usize>,
+    }
+
+    impl RecordingStore {
+        fn with(status: Option<UserStatus>) -> Self {
+            Self {
+                user: status.map(|status| UserRow {
+                    id: 7,
+                    email: "admin@example.com".to_string(),
+                    password_hash: "$2b$12$old".to_string(),
+                    name: "Old".to_string(),
+                    role: "viewer".to_string(),
+                    avatar_url: None,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    status,
+                }),
+                password_writes: Mutex::new(0),
+            }
+        }
+
+        fn password_writes(&self) -> usize {
+            *self.password_writes.lock().unwrap()
+        }
+    }
+
+    impl UserStore for RecordingStore {
+        fn get_user_by_email(&self, _email: &str) -> claudear_core::error::Result<Option<UserRow>> {
+            Ok(self.user.clone())
+        }
+
+        fn create_user(
+            &self,
+            _email: &str,
+            _password_hash: &str,
+            _name: &str,
+            _role: &str,
+        ) -> claudear_core::error::Result<i64> {
+            *self.password_writes.lock().unwrap() += 1;
+            Ok(1)
+        }
+
+        fn update_user(
+            &self,
+            _id: i64,
+            _email: Option<&str>,
+            password_hash: Option<&str>,
+            _name: Option<&str>,
+            _role: Option<&str>,
+            _avatar_url: Option<&str>,
+        ) -> claudear_core::error::Result<bool> {
+            if password_hash.is_some() {
+                *self.password_writes.lock().unwrap() += 1;
+            }
+            Ok(true)
+        }
+
+        fn activate_user(
+            &self,
+            _user_id: i64,
+            _password_hash: &str,
+        ) -> claudear_core::error::Result<bool> {
+            *self.password_writes.lock().unwrap() += 1;
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn writes_the_password_hash_once() {
+        for (status, outcome) in [
+            (None, SeededAdmin::Created(1)),
+            (Some(UserStatus::Active), SeededAdmin::Updated(7)),
+            (Some(UserStatus::Invited), SeededAdmin::Updated(7)),
+        ] {
+            let store = RecordingStore::with(status);
+            assert_eq!(
+                seed_admin(&store, "admin@example.com", HASH, "Admin").unwrap(),
+                outcome
+            );
+            assert_eq!(store.password_writes(), 1, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn creates_then_updates_one_admin_case_insensitively() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let SeededAdmin::Created(id) =
+            seed_admin(&tracker, "Admin@Example.com", HASH, "Admin").unwrap()
+        else {
+            panic!("the first seed must create the admin");
+        };
+        assert_eq!(
+            seed_admin(&tracker, "ADMIN@example.com", "$2b$12$second", "Root").unwrap(),
+            SeededAdmin::Updated(id)
+        );
+
+        let users = tracker.list_users().unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, "admin@example.com");
+        assert_eq!(users[0].password_hash, "$2b$12$second");
+        assert_eq!(users[0].name, "Root");
+        assert_eq!(users[0].role, "admin");
+    }
+
+    #[test]
+    fn activates_an_invited_user_and_revokes_their_invite() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let creator = tracker
+            .create_user("owner@example.com", HASH, "Owner", "admin")
+            .unwrap();
+        let invited = tracker
+            .save_directory(&[DirectoryWrite {
+                user: DirectoryUser::New {
+                    email: "amy@example.com".to_string(),
+                    name: "Amy".to_string(),
+                    role: "viewer".to_string(),
+                    password_hash: "$2b$12$unusable".to_string(),
+                    status: UserStatus::Invited,
+                },
+                identities: None,
+                invite: Some(InviteWrite {
+                    token_hash: "invite-hash".to_string(),
+                    expires_at: "2099-12-31 23:59:59".to_string(),
+                    created_by: creator,
+                }),
+            }])
+            .unwrap()[0];
+
+        assert_eq!(
+            seed_admin(&tracker, "amy@example.com", HASH, "Amy").unwrap(),
+            SeededAdmin::Updated(invited)
+        );
+
+        let user = tracker.get_user_by_id(invited).unwrap().unwrap();
+        assert_eq!(user.status, UserStatus::Active);
+        assert_eq!(user.password_hash, HASH);
+        assert_eq!(user.role, "admin");
+        assert!(tracker.get_open_invite_for_user(invited).unwrap().is_none());
+    }
+}
+
 /// Initialize logging with both console and file output.
 /// Returns a guard that must be kept alive for the duration of the program.
 fn sentry_layer<S>() -> impl tracing_subscriber::Layer<S>
@@ -3373,28 +3569,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 password,
                 name,
             } => {
+                let email = claudear_core::identity::normalize_login_email(email);
                 let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
-                    .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))?;
+                    .map_err(|error| anyhow::anyhow!("Failed to hash password: {}", error))?;
 
-                match db_tracker.get_user_by_email(email)? {
-                    Some(existing) => {
-                        db_tracker.activate_user(existing.id, &hash)?;
-                        db_tracker.update_user(
-                            existing.id,
-                            None,
-                            Some(&hash),
-                            Some(name.as_str()),
-                            Some("admin"),
-                            None,
-                        )?;
-                        println!(
-                            "Updated existing user '{}' (id={}) with new password and admin role",
-                            email, existing.id
-                        );
-                    }
-                    None => {
-                        let id = db_tracker.create_user(email, &hash, name, "admin")?;
-                        println!("Created admin user '{}' (id={})", email, id);
+                match seed_admin(&db_tracker, &email, &hash, name)? {
+                    SeededAdmin::Updated(id) => println!(
+                        "Updated existing user '{}' (id={}) with new password and admin role",
+                        email, id
+                    ),
+                    SeededAdmin::Created(id) => {
+                        println!("Created admin user '{}' (id={})", email, id)
                     }
                 }
             }
