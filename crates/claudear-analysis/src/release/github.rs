@@ -60,6 +60,29 @@ pub struct GitHubTagCommit {
     pub sha: Option<String>,
 }
 
+/// A git reference from `GET /repos/{owner}/{repo}/git/matching-refs/{ref}`.
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubReference {
+    #[serde(rename = "ref")]
+    name: String,
+    object: GitHubReferenceObject,
+}
+
+/// The object a [`GitHubReference`] points at: a commit for a lightweight
+/// tag, an annotated tag object otherwise.
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubReferenceObject {
+    sha: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// Namespace of tag references in a [`GitHubReference`] name.
+const TAG_REFERENCE_NAMESPACE: &str = "refs/tags/";
+
+/// [`GitHubReferenceObject::kind`] of a lightweight tag's target.
+const COMMIT_OBJECT_KIND: &str = "commit";
+
 /// The largest GitHub API response body read where a pull request's diff
 /// or a release comparison's commits and patches can arrive: eight times
 /// abnegate-http's default.
@@ -264,6 +287,41 @@ impl<H: HttpClient> ReleaseClient<H> {
         }
 
         Ok(response.json()?)
+    }
+
+    /// Every tag whose name starts with `prefix`, in GitHub's (name) order.
+    ///
+    /// Reads `git/matching-refs`, which returns all matches in one response,
+    /// so a monorepo's other tags can never crowd an app's tags out of a page
+    /// the way they do in `/tags`.
+    pub async fn get_tags_with_prefix(&self, repo: &str, prefix: &str) -> Result<Vec<GitHubTag>> {
+        let url = format!("https://api.github.com/repos/{repo}/git/matching-refs/tags/{prefix}");
+        let headers = self.build_headers();
+
+        let response = self.http.get(&url, headers).await?;
+
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "GitHub API error ({}): {}",
+                response.status, response.body
+            )));
+        }
+
+        let references: Vec<GitHubReference> = response.json()?;
+        Ok(references
+            .into_iter()
+            .filter_map(|reference| {
+                let name = reference.name.strip_prefix(TAG_REFERENCE_NAMESPACE)?;
+                let commit =
+                    (reference.object.kind == COMMIT_OBJECT_KIND).then_some(GitHubTagCommit {
+                        sha: Some(reference.object.sha),
+                    });
+                Some(GitHubTag {
+                    name: name.to_string(),
+                    commit,
+                })
+            })
+            .collect())
     }
 
     /// Get a specific release by tag.
@@ -980,6 +1038,49 @@ mod tests {
         let tags = client.get_tags("org/repo", 10).await.unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].name, "v1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_get_tags_with_prefix_keeps_slashed_names_and_lightweight_commits() {
+        let mock = MockHttpClient::new(
+            200,
+            r#"[
+                {"ref":"refs/tags/apps/console/1.2.141","object":{"sha":"33e39bc","type":"commit"}},
+                {"ref":"refs/tags/apps/console/1.2.95","object":{"sha":"40384e6","type":"tag"}}
+            ]"#,
+        );
+        let client = ReleaseClient::with_http_client("test-token", mock);
+
+        let tags = client
+            .get_tags_with_prefix("appwrite/appwrite", "apps/console/")
+            .await
+            .unwrap();
+
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].name, "apps/console/1.2.141");
+        assert_eq!(
+            tags[0]
+                .commit
+                .as_ref()
+                .and_then(|commit| commit.sha.as_deref()),
+            Some("33e39bc")
+        );
+        assert_eq!(tags[1].name, "apps/console/1.2.95");
+        assert!(
+            tags[1].commit.is_none(),
+            "an annotated tag's object is a tag, not the commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_tags_with_prefix_reports_api_errors() {
+        let mock = MockHttpClient::new(404, r#"{"message":"Not Found"}"#);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+
+        assert!(client
+            .get_tags_with_prefix("appwrite/missing", "apps/console/")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@ use claudear_core::types::IssueStatus;
 use claudear_core::types::MatchPriority;
 use claudear_core::types::MatchResult;
 use claudear_storage::FixAttemptTracker;
+use semver::Version;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -65,17 +66,60 @@ impl ReleaseTip {
         }
     }
 
-    fn from_tag(repo: &str, tag: GitHubTag) -> Self {
+    /// A tip for a bare tag. With no release notes to read, its body points
+    /// the agent at the changes since `previous`, the track's tag before it.
+    fn from_tag(repo: &str, tag: GitHubTag, previous: Option<&str>) -> Self {
+        let body = previous.map(|previous| {
+            format!(
+                "No GitHub release: `{tag}` is a bare tag. Changes since `{previous}`: \
+                 https://github.com/{repo}/compare/{previous}...{tag}",
+                tag = tag.name,
+            )
+        });
         Self {
             repo: repo.to_string(),
             html_url: format!("https://github.com/{repo}/releases/tag/{}", tag.name),
             name: Some(tag.name.clone()),
             tag: tag.name,
-            body: None,
+            body,
             published_at: None,
             author_login: None,
         }
     }
+}
+
+/// The semantic version `tag` names on a track filtered by `filter`: the
+/// [`DeployQaTagFilter::version`] part, with any leading `v`.
+fn tag_version(filter: &DeployQaTagFilter, tag: &str) -> Option<Version> {
+    let version = filter.version(tag);
+    Version::parse(version.strip_prefix('v').unwrap_or(version)).ok()
+}
+
+/// The newest tag matching `filter` and the one before it, by semantic
+/// version. `/tags` and `git/matching-refs` both list by name, which puts
+/// `1.2.99` above `1.2.141`.
+///
+/// When no matching tag is a semantic version, the first match in listing
+/// order is newest and has no predecessor.
+fn newest_tags(
+    filter: &DeployQaTagFilter,
+    tags: Vec<GitHubTag>,
+) -> Option<(GitHubTag, Option<GitHubTag>)> {
+    let matching: Vec<GitHubTag> = tags
+        .into_iter()
+        .filter(|tag| filter.matches(&tag.name))
+        .collect();
+    let mut versioned: Vec<(Version, GitHubTag)> = matching
+        .iter()
+        .filter_map(|tag| tag_version(filter, &tag.name).map(|version| (version, tag.clone())))
+        .collect();
+    if versioned.is_empty() {
+        return matching.into_iter().next().map(|tag| (tag, None));
+    }
+    versioned.sort_by(|(left, _), (right, _)| right.cmp(left));
+    let mut ordered = versioned.into_iter().map(|(_, tag)| tag);
+    let newest = ordered.next()?;
+    Some((newest, ordered.next()))
 }
 
 /// What the poller did for one track.
@@ -221,16 +265,24 @@ impl<C: HttpClient> DeployQaTracker<C> {
         })
     }
 
-    /// Newest non-draft release matching `filter`.
+    /// Newest non-draft release, or bare tag, matching `filter`.
     ///
-    /// Tags are consulted only when the repo has no published releases at all;
-    /// otherwise a matching tag may belong to an unpublished draft.
+    /// A [`DeployQaTagFilter::Prefix`] track reads the tags under its prefix,
+    /// since a monorepo app may tag deploys that have no release while the
+    /// repo's releases belong to another app. Other tracks consult tags only
+    /// when the repo has no published releases at all; otherwise a matching
+    /// tag may belong to an unpublished draft.
     async fn latest_matching_tip(
         &self,
         repo: &str,
         filter: &DeployQaTagFilter,
     ) -> Result<Option<ReleaseTip>> {
         const PAGE_SIZE: u32 = 30;
+
+        if let DeployQaTagFilter::Prefix(prefix) = filter {
+            let tags = self.client.get_tags_with_prefix(repo, prefix).await?;
+            return self.latest_prefixed_tip(repo, filter, tags).await;
+        }
 
         let published: Vec<GitHubRelease> = self
             .client
@@ -247,13 +299,41 @@ impl<C: HttpClient> DeployQaTracker<C> {
                 .map(|release| ReleaseTip::from_release(repo, release)));
         }
 
-        Ok(self
-            .client
-            .get_tags(repo, PAGE_SIZE)
-            .await?
+        let tags = self.client.get_tags(repo, PAGE_SIZE).await?;
+        Ok(newest_tags(filter, tags).map(|(newest, previous)| {
+            ReleaseTip::from_tag(repo, newest, previous.as_ref().map(|tag| tag.name.as_str()))
+        }))
+    }
+
+    /// The newest of a prefixed track's `tags`, as its published release when
+    /// it has one and as a bare tag otherwise. A prefixed tag that is not a
+    /// semantic version is never a tip: it cannot be ordered.
+    async fn latest_prefixed_tip(
+        &self,
+        repo: &str,
+        filter: &DeployQaTagFilter,
+        tags: Vec<GitHubTag>,
+    ) -> Result<Option<ReleaseTip>> {
+        let versioned = tags
             .into_iter()
-            .find(|tag| filter.matches(&tag.name))
-            .map(|tag| ReleaseTip::from_tag(repo, tag)))
+            .filter(|tag| tag_version(filter, &tag.name).is_some())
+            .collect();
+        let Some((newest, previous)) = newest_tags(filter, versioned) else {
+            return Ok(None);
+        };
+        if let Some(release) = self
+            .client
+            .get_release_by_tag(repo, &newest.name)
+            .await?
+            .filter(|release| !release.draft)
+        {
+            return Ok(Some(ReleaseTip::from_release(repo, release)));
+        }
+        Ok(Some(ReleaseTip::from_tag(
+            repo,
+            newest,
+            previous.as_ref().map(|tag| tag.name.as_str()),
+        )))
     }
 }
 
@@ -272,6 +352,7 @@ pub fn build_deploy_qa_issue(
     playbook: &str,
 ) -> Issue {
     let issue_id = DeployQaTip::issue_id_for(&track.name, &tip.repo, &tip.tag);
+    let version = track.tag_filter.version(&tip.tag);
     let title = format!(
         "[deploy_qa] {} {} — live QA (report only, no fixes)",
         track.name, tip.tag
@@ -282,6 +363,7 @@ pub fn build_deploy_qa_issue(
          - Track: {track}\n\
          - Repo: {repo}\n\
          - Tag: {tag}\n\
+         - Version: {version}\n\
          - URL: {url}\n\
          - Published: {published}\n\
          - Author: {author}\n\n\
@@ -312,7 +394,7 @@ pub fn build_deploy_qa_issue(
 
     let mut issue = Issue::new(
         issue_id,
-        format!("{}-{}", track.name, tip.tag),
+        format!("{}-{version}", track.name),
         title,
         tip.html_url.clone(),
         DEPLOY_QA_SOURCE,
@@ -863,5 +945,281 @@ mod tests {
             .get_deploy_qa_tip("edge-db", "1.0.0-db")
             .unwrap()
             .is_none());
+    }
+
+    const CONSOLE_PREFIX: &str = "apps/console/";
+    const MONOREPO: &str = "appwrite/appwrite";
+    const MONOREPO_RELEASES: &str = "https://api.github.com/repos/appwrite/appwrite/releases";
+    const CONSOLE_REFERENCES: &str =
+        "https://api.github.com/repos/appwrite/appwrite/git/matching-refs/tags/apps/console/";
+
+    fn console_track() -> DeployQaTrackConfig {
+        track(
+            "console",
+            MONOREPO,
+            DeployQaTagFilter::Prefix(CONSOLE_PREFIX.into()),
+        )
+    }
+
+    fn console_release_url(tag: &str) -> String {
+        format!("{MONOREPO_RELEASES}/tags/{tag}")
+    }
+
+    /// `git/matching-refs` output for `tags`, in the name order GitHub lists.
+    fn references_json(tags: &[&str]) -> String {
+        let references: Vec<String> = tags
+            .iter()
+            .map(|tag| {
+                format!(r#"{{"ref":"refs/tags/{tag}","object":{{"sha":"abc","type":"commit"}}}}"#)
+            })
+            .collect();
+        format!("[{}]", references.join(","))
+    }
+
+    fn console_references() -> String {
+        references_json(&[
+            "apps/console/1.2.140",
+            "apps/console/1.2.141",
+            "apps/console/1.2.95",
+            "apps/console/1.2.99",
+        ])
+    }
+
+    #[tokio::test]
+    async fn prefix_track_picks_the_newest_bare_tag_by_version_not_by_name() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let console = console_track();
+        let http = MapMockHttp::new().on(CONSOLE_REFERENCES, 200, &console_references());
+        let tracker = poller(http, store.clone(), config(vec![console.clone()], true));
+
+        let result = tracker.poll_track(&console).await.unwrap();
+
+        assert_eq!(result.action, DeployQaPollAction::Enqueued);
+        let tip = result.tip.expect("an enqueued track should carry its tip");
+        assert_eq!(tip.tag, "apps/console/1.2.141");
+        assert_eq!(
+            tip.html_url,
+            "https://github.com/appwrite/appwrite/releases/tag/apps/console/1.2.141"
+        );
+        let body = tip.body.as_deref().unwrap_or_default();
+        assert!(
+            body.contains(
+                "https://github.com/appwrite/appwrite/compare/apps/console/1.2.140...apps/console/1.2.141"
+            ),
+            "a bare tag's prompt must point at the changes since the previous console tag: {body}"
+        );
+
+        let issue = build_deploy_qa_issue(&console, &tip, bundled_playbook());
+        assert_eq!(issue.id, "console:appwrite/appwrite:apps/console/1.2.141");
+        assert_eq!(issue.short_id, "console-1.2.141");
+        let description = issue.description.as_deref().unwrap_or_default();
+        assert!(description.contains("- Tag: apps/console/1.2.141"));
+        assert!(
+            description.contains("- Version: 1.2.141"),
+            "the agent compares the deployed console against the version, not the tag: {description}"
+        );
+        let stored = store
+            .get_deploy_qa_tip_by_issue_id(&issue.id)
+            .unwrap()
+            .expect("a slashed tag must store and resolve under its issue id");
+        assert_eq!(stored.tag, "apps/console/1.2.141");
+        assert_eq!(stored.track, "console");
+
+        let again = tracker.poll_track(&console).await.unwrap();
+        assert_eq!(again.action, DeployQaPollAction::SkippedDuplicate);
+    }
+
+    #[tokio::test]
+    async fn prefix_track_uses_the_release_when_its_tag_has_one() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let console = console_track();
+        let http = MapMockHttp::new()
+            .on(CONSOLE_REFERENCES, 200, &console_references())
+            .on(
+                &console_release_url("apps/console/1.2.141"),
+                200,
+                &release_json("apps/console/1.2.141", ""),
+            );
+        let tracker = poller(http, store, config(vec![console.clone()], true));
+
+        let tip = tracker
+            .poll_track(&console)
+            .await
+            .unwrap()
+            .tip
+            .expect("the release should be the tip");
+
+        assert_eq!(tip.tag, "apps/console/1.2.141");
+        assert_eq!(tip.body.as_deref(), Some("Adds #42 live route"));
+        assert_eq!(tip.author_login.as_deref(), Some("abnegate"));
+    }
+
+    #[tokio::test]
+    async fn prefix_track_ignores_tags_that_name_no_version() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let console = console_track();
+        let http = MapMockHttp::new().on(
+            CONSOLE_REFERENCES,
+            200,
+            &references_json(&["apps/console/latest", "apps/console/next"]),
+        );
+        let tracker = poller(http, store, config(vec![console.clone()], true));
+
+        let result = tracker.poll_track(&console).await.unwrap();
+
+        assert_eq!(result.action, DeployQaPollAction::NoMatchingTip);
+    }
+
+    #[tokio::test]
+    async fn console_and_server_tracks_on_the_monorepo_each_take_their_own_tags() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let console = console_track();
+        let server = track("server", MONOREPO, DeployQaTagFilter::Any);
+        let releases = format!(
+            "[{}, {}, {}]",
+            release_json("2.7.0", ""),
+            release_json("1.9.10", ""),
+            release_json("cl-1.9.0-5", "")
+        );
+        let http = MapMockHttp::new()
+            .on(MONOREPO_RELEASES, 200, &releases)
+            .on(
+                &console_release_url("apps/console/1.2.141"),
+                404,
+                r#"{"message":"Not Found"}"#,
+            )
+            .on(CONSOLE_REFERENCES, 200, &console_references());
+        let tracker = poller(
+            http,
+            store.clone(),
+            config(vec![server.clone(), console.clone()], true),
+        );
+
+        let results = tracker.poll_once().await;
+
+        let tags: Vec<(String, String)> = results
+            .iter()
+            .map(|result| {
+                (
+                    result.track.clone(),
+                    result
+                        .tip
+                        .as_ref()
+                        .map(|tip| tip.tag.clone())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            tags,
+            vec![
+                ("server".to_string(), "2.7.0".to_string()),
+                ("console".to_string(), "apps/console/1.2.141".to_string()),
+            ]
+        );
+        assert!(results
+            .iter()
+            .all(|result| result.action == DeployQaPollAction::Enqueued));
+        assert!(store
+            .get_deploy_qa_tip("console", "2.7.0")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_deploy_qa_tip("server", "apps/console/1.2.141")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn edge_network_and_database_tracks_never_share_a_tip() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let network = track(
+            "edge",
+            "appwrite-labs/edge",
+            DeployQaTagFilter::NotSuffix("-db".into()),
+        );
+        let database = track(
+            "edge-db",
+            "appwrite-labs/edge",
+            DeployQaTagFilter::Suffix("-db".into()),
+        );
+        let releases = format!(
+            "[{}, {}, {}, {}]",
+            release_json("0.16.10-db", ""),
+            release_json("0.10.61", ""),
+            release_json("0.10.60", ""),
+            release_json("0.16.9-db", "")
+        );
+        let http = MapMockHttp::new().on(
+            "https://api.github.com/repos/appwrite-labs/edge/releases",
+            200,
+            &releases,
+        );
+        let tracker = poller(
+            http,
+            store.clone(),
+            config(vec![network.clone(), database.clone()], true),
+        );
+
+        let results = tracker.poll_once().await;
+
+        assert_eq!(results[0].tip.as_ref().unwrap().tag, "0.10.61");
+        assert_eq!(results[1].tip.as_ref().unwrap().tag, "0.16.10-db");
+        assert!(results
+            .iter()
+            .all(|result| result.action == DeployQaPollAction::Enqueued));
+        assert!(store
+            .get_deploy_qa_tip("edge", "0.16.10-db")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_deploy_qa_tip("edge-db", "0.10.61")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn tags_fallback_takes_the_highest_version_over_name_order() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let vibes = track("vibes", "appwrite/vibes", DeployQaTagFilter::Any);
+        let http = MapMockHttp::new()
+            .on(
+                "https://api.github.com/repos/appwrite/vibes/releases",
+                200,
+                "[]",
+            )
+            .on(
+                "https://api.github.com/repos/appwrite/vibes/tags",
+                200,
+                r#"[{"name":"v0.9.0"},{"name":"v0.10.0"},{"name":"v0.1.0"}]"#,
+            );
+        let tracker = poller(http, store, config(vec![vibes.clone()], true));
+
+        let tip = tracker.poll_track(&vibes).await.unwrap().tip.unwrap();
+
+        assert_eq!(tip.tag, "v0.10.0");
+        assert!(tip
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("compare/v0.9.0...v0.10.0")));
+    }
+
+    #[test]
+    fn newest_tags_keeps_listing_order_when_no_tag_is_a_version() {
+        let tags = vec![
+            GitHubTag {
+                name: "nightly".into(),
+                commit: None,
+            },
+            GitHubTag {
+                name: "stable".into(),
+                commit: None,
+            },
+        ];
+
+        let (newest, previous) = newest_tags(&DeployQaTagFilter::Any, tags).unwrap();
+
+        assert_eq!(newest.name, "nightly");
+        assert!(previous.is_none());
     }
 }
