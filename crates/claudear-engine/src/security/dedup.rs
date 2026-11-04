@@ -8,15 +8,17 @@ use async_trait::async_trait;
 use claudear_analysis::feedback::EmbeddingClient;
 use claudear_core::error::{Error, Result};
 use claudear_core::security::{
-    select_first_reporter, FirstReporterDecision, NewSecurityEvent, NewSecurityVulnerability,
-    SecurityEventKind, SecurityOutcome, SecurityReport, SecurityReportChanges, SecurityReportState,
-    SecurityVulnerability, VulnerabilityState,
+    select_first_reporter, FirstReport, FirstReporterDecision, NewSecurityEvent,
+    NewSecurityVulnerability, SecurityEventKind, SecurityOutcome, SecurityReport,
+    SecurityReportChanges, SecurityReportState, SecurityVulnerability,
+    SecurityVulnerabilityCandidate, VulnerabilityState,
 };
 use claudear_core::types::cosine_similarity_f32;
 use claudear_integrations::runner::SecuritySandbox;
 use serde::Deserialize;
 
 const RECENT_CANDIDATES: usize = 20;
+const MAX_COMPARED_VULNERABILITIES: usize = 1000;
 const NO_DUPLICATE_CHOICE: &str = "none";
 
 #[async_trait]
@@ -49,7 +51,6 @@ pub(crate) struct Registration {
     pub vulnerability: SecurityVulnerability,
 }
 
-/// Where a valid assessment came from, recorded on the report's event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AssessmentOrigin {
     Agent,
@@ -61,6 +62,14 @@ impl AssessmentOrigin {
         match self {
             Self::Agent => "agent",
             Self::Admin => "admin",
+        }
+    }
+
+    /// The state a report holds while this origin registers it.
+    fn registering_state(self) -> SecurityReportState {
+        match self {
+            Self::Agent => SecurityReportState::Assessing,
+            Self::Admin => SecurityReportState::Registering,
         }
     }
 }
@@ -79,6 +88,13 @@ pub(crate) struct ValidReport<'a> {
 }
 
 impl ValidReport<'_> {
+    fn first_report(&self) -> FirstReport {
+        FirstReport {
+            report_id: self.report.id,
+            reported_at: self.report.reported_at,
+        }
+    }
+
     fn event(&self, kind: SecurityEventKind, vulnerability_id: i64) -> NewSecurityEvent {
         let mut detail = self
             .assessment
@@ -101,22 +117,28 @@ impl ValidReport<'_> {
 }
 
 impl SecurityInbox {
-    /// Link a valid, `Assessing` report to its canonical vulnerability.
-    /// Returns `None` when the report left `Assessing` meanwhile.
+    /// Link a valid report to its canonical vulnerability. Returns `None`
+    /// when the report left its registering state meanwhile.
     pub(crate) async fn register(&self, valid: &ValidReport<'_>) -> Result<Option<Registration>> {
         let _registration = self.registration.lock().await;
-        let vulnerabilities = self.tracker.list_security_vulnerabilities(None)?;
-        if let Some(existing) = vulnerabilities
-            .iter()
-            .find(|vulnerability| vulnerability.first_report_id == valid.report.id)
+        if let Some(existing) = self
+            .tracker
+            .find_security_vulnerability_by_first_report(valid.report.id)?
         {
             return self
-                .link_first(valid, existing.clone(), RegistrationKind::Adopted)
+                .link_first(valid, existing, RegistrationKind::Adopted)
                 .await;
         }
         let embedding = self.embedding(valid.assessment).await;
-        let candidates = self.candidates(&vulnerabilities, embedding.as_deref());
+        let compared = self
+            .tracker
+            .list_security_vulnerability_candidates(MAX_COMPARED_VULNERABILITIES)?;
+        let candidates = self.candidates(&compared, embedding.as_deref());
         if let Some(matched) = self.judge(valid.assessment, &candidates).await? {
+            let matched = self
+                .tracker
+                .get_security_vulnerability(matched)?
+                .ok_or_else(|| Error::Other("duplicate vulnerability disappeared".into()))?;
             return self.link_duplicate(valid, matched).await;
         }
         let state = if valid.merged.is_some() {
@@ -155,26 +177,27 @@ impl SecurityInbox {
         }
     }
 
+    /// The vulnerabilities similar enough to compare, most similar first,
+    /// followed by the most recent ones that cannot be scored (no embedding,
+    /// or one of another length). `compared` is newest first.
     fn candidates<'a>(
         &self,
-        vulnerabilities: &'a [SecurityVulnerability],
+        compared: &'a [SecurityVulnerabilityCandidate],
         embedding: Option<&[f32]>,
-    ) -> Vec<&'a SecurityVulnerability> {
+    ) -> Vec<&'a SecurityVulnerabilityCandidate> {
         let Some(embedding) = embedding else {
-            return vulnerabilities
-                .iter()
-                .rev()
-                .take(RECENT_CANDIDATES)
-                .collect();
+            return compared.iter().take(RECENT_CANDIDATES).collect();
         };
-        let threshold = self.config.duplicate_similarity as f32;
-        let mut scored: Vec<(f32, &SecurityVulnerability)> = vulnerabilities
+        let (scorable, unscorable): (Vec<_>, Vec<_>) = compared
             .iter()
-            .filter(|vulnerability| vulnerability.embedding.len() == embedding.len())
-            .map(|vulnerability| {
+            .partition(|candidate| candidate.embedding.len() == embedding.len());
+        let threshold = self.config.duplicate_similarity as f32;
+        let mut scored: Vec<(f32, &SecurityVulnerabilityCandidate)> = scorable
+            .into_iter()
+            .map(|candidate| {
                 (
-                    cosine_similarity_f32(embedding, &vulnerability.embedding),
-                    vulnerability,
+                    cosine_similarity_f32(embedding, &candidate.embedding),
+                    candidate,
                 )
             })
             .filter(|(similarity, _)| *similarity >= threshold)
@@ -183,15 +206,16 @@ impl SecurityInbox {
         scored
             .into_iter()
             .take(self.config.duplicate_candidates)
-            .map(|(_, vulnerability)| vulnerability)
+            .map(|(_, candidate)| candidate)
+            .chain(unscorable.into_iter().take(RECENT_CANDIDATES))
             .collect()
     }
 
     async fn judge(
         &self,
         assessment: &Assessment,
-        candidates: &[&SecurityVulnerability],
-    ) -> Result<Option<SecurityVulnerability>> {
+        candidates: &[&SecurityVulnerabilityCandidate],
+    ) -> Result<Option<i64>> {
         if candidates.is_empty() {
             return Ok(None);
         }
@@ -220,11 +244,10 @@ impl SecurityInbox {
         if verdict.duplicate_of == NO_DUPLICATE_CHOICE {
             return Ok(None);
         }
-        let matched = candidates
-            .iter()
-            .find(|candidate| candidate.id.to_string() == verdict.duplicate_of)
-            .ok_or_else(|| Error::Other("duplicate verdict named an unknown candidate".into()))?;
-        Ok(Some((*matched).clone()))
+        ids.into_iter()
+            .find(|id| id.to_string() == verdict.duplicate_of)
+            .map(Some)
+            .ok_or_else(|| Error::Other("duplicate verdict named an unknown candidate".into()))
     }
 
     async fn link_duplicate(
@@ -234,8 +257,11 @@ impl SecurityInbox {
     ) -> Result<Option<Registration>> {
         let award_exists = self.tracker.get_security_award(matched.id)?.is_some();
         let decision = select_first_reporter(
-            matched.first_reported_at,
-            valid.report.reported_at,
+            FirstReport {
+                report_id: matched.first_report_id,
+                reported_at: matched.first_reported_at,
+            },
+            valid.first_report(),
             award_exists,
         );
         if decision == FirstReporterDecision::Replace
@@ -256,7 +282,7 @@ impl SecurityInbox {
         }
         let moved = self.tracker.transition_security_report(
             valid.report.id,
-            SecurityReportState::Assessing,
+            valid.origin.registering_state(),
             SecurityReportState::Replying,
             &valid.changes(SecurityOutcome::Duplicate, matched.id),
             &valid.event(SecurityEventKind::DuplicateLinked, matched.id),
@@ -275,7 +301,7 @@ impl SecurityInbox {
     ) -> Result<Option<Registration>> {
         let moved = self.tracker.transition_security_report(
             valid.report.id,
-            SecurityReportState::Assessing,
+            valid.origin.registering_state(),
             SecurityReportState::Tracking,
             &valid.changes(SecurityOutcome::Valid, vulnerability.id),
             &valid.event(SecurityEventKind::Assessed, vulnerability.id),

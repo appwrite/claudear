@@ -10,10 +10,15 @@ pub(crate) enum ReviewReason {
     AssessmentFailed,
     AssessmentInconclusive,
     UnverifiableFix,
+    FixFoundInHistory,
     AttachmentEvidence,
+    RegistrationFailed,
     UntrackedRepository,
+    InvalidPullRequest,
     PullRequestClosed,
+    MissingMergeCommit,
     FixFailed,
+    ReplyFailed,
     ReplyUnconfirmed,
     DeploymentCheckFailed,
 }
@@ -24,10 +29,15 @@ impl ReviewReason {
             Self::AssessmentFailed => "assessment_failed",
             Self::AssessmentInconclusive => "assessment_inconclusive",
             Self::UnverifiableFix => "unverifiable_fix",
+            Self::FixFoundInHistory => "fix_found_in_history",
             Self::AttachmentEvidence => "attachment_evidence",
+            Self::RegistrationFailed => "registration_failed",
             Self::UntrackedRepository => "untracked_repository",
+            Self::InvalidPullRequest => "invalid_pull_request",
             Self::PullRequestClosed => "pull_request_closed",
+            Self::MissingMergeCommit => "missing_merge_commit",
             Self::FixFailed => "fix_failed",
+            Self::ReplyFailed => "reply_failed",
             Self::ReplyUnconfirmed => "reply_unconfirmed",
             Self::DeploymentCheckFailed => "deployment_check_failed",
         }
@@ -96,10 +106,14 @@ pub(crate) fn owner_message(
     action: OwnerAction,
     subject: PingSubject,
 ) -> String {
-    let vulnerability = subject
-        .vulnerability_id
-        .map(security_fix_short_id)
-        .unwrap_or_else(|| "SEC--".to_string());
+    let target = match subject.vulnerability_id {
+        Some(vulnerability_id) => format!(
+            "{} / report #{}",
+            security_fix_short_id(vulnerability_id),
+            subject.report_id
+        ),
+        None => format!("report #{}", subject.report_id),
+    };
     let severity = subject
         .severity
         .map(|severity| severity.as_str())
@@ -110,8 +124,7 @@ pub(crate) fn owner_message(
         message.push(' ');
     }
     message.push_str(&format!(
-        "[security] {action} for {vulnerability} / report #{} (severity {severity}).",
-        subject.report_id
+        "[security] {action} for {target} (severity {severity})."
     ));
     if let Some(url) = dashboard_url.filter(|url| !url.trim().is_empty()) {
         message.push_str(&format!(
@@ -160,6 +173,29 @@ mod tests {
     }
 
     #[test]
+    fn every_review_reason_has_a_distinct_name() {
+        let reasons = [
+            ReviewReason::AssessmentFailed,
+            ReviewReason::AssessmentInconclusive,
+            ReviewReason::UnverifiableFix,
+            ReviewReason::FixFoundInHistory,
+            ReviewReason::AttachmentEvidence,
+            ReviewReason::RegistrationFailed,
+            ReviewReason::UntrackedRepository,
+            ReviewReason::InvalidPullRequest,
+            ReviewReason::PullRequestClosed,
+            ReviewReason::MissingMergeCommit,
+            ReviewReason::FixFailed,
+            ReviewReason::ReplyFailed,
+            ReviewReason::ReplyUnconfirmed,
+            ReviewReason::DeploymentCheckFailed,
+        ];
+        let names: std::collections::HashSet<&str> =
+            reasons.iter().map(|reason| reason.as_str()).collect();
+        assert_eq!(names.len(), reasons.len());
+    }
+
+    #[test]
     fn message_without_mention_link_or_vulnerability_stays_minimal() {
         assert_eq!(
             owner_message(
@@ -168,7 +204,7 @@ mod tests {
                 OwnerAction::ReporterFollowUp,
                 PingSubject::report(9)
             ),
-            "[security] reporter follow-up for SEC-- / report #9 (severity unrated)."
+            "[security] reporter follow-up for report #9 (severity unrated)."
         );
     }
 }

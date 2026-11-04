@@ -23,6 +23,7 @@ const reportStateTones: Record<SecurityReportState, Tone> = {
   received: 'info',
   assessing: 'progress',
   needs_human: 'warning',
+  registering: 'progress',
   spam: 'neutral',
   replying: 'progress',
   closed: 'neutral',

@@ -15,9 +15,9 @@ use claudear_config::config::{
 };
 use claudear_core::error::Result;
 use claudear_core::security::{
-    security_fix_short_id, NewSecurityEvent, NewSecurityReport, SecurityEventKind, SecurityOutcome,
-    SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportState,
-    VulnerabilityState, SECURITY_FIX_SOURCE,
+    security_fix_short_id, NewSecurityEvent, NewSecurityReport, ReportTransition,
+    SecurityEventKind, SecurityOutcome, SecurityReplyKind, SecurityReport, SecurityReportChanges,
+    SecurityReportState, VulnerabilityState, SECURITY_FIX_SOURCE,
 };
 use claudear_core::types::Issue;
 use serde_json::json;
@@ -66,14 +66,13 @@ fn reply_outcome(verdict: &Verdict) -> Option<SecurityOutcome> {
         Verdict::AlreadyFixed { .. } => Some(SecurityOutcome::AlreadyFixed),
         Verdict::NotVulnerability => Some(SecurityOutcome::NotVulnerability),
         Verdict::OutOfScope => Some(SecurityOutcome::OutOfScope),
-        Verdict::Valid { .. } | Verdict::NeedsHuman(_) => None,
+        Verdict::Valid | Verdict::FixedAfterReport(_) | Verdict::NeedsHuman(_) => None,
     }
 }
 
 impl SecurityInbox {
-    /// Whether the conversation predates `process_after`, which leaves the
-    /// existing backlog untouched. A conversation without a creation time is
-    /// treated as old.
+    /// A conversation without a creation time is treated as old, so the
+    /// existing backlog stays untouched.
     fn predates_processing(&self, issue: &Issue) -> bool {
         match (self.config.process_after, issue.created_at) {
             (None, _) => false,
@@ -223,7 +222,6 @@ impl SecurityInbox {
         }
     }
 
-    /// Return a claimed report to `Received`, counting the failed attempt.
     fn release(&self, report: &SecurityReport, error: &str) -> Result<()> {
         self.tracker.transition_security_report(
             report.id,
@@ -307,7 +305,16 @@ impl SecurityInbox {
             verdict,
             repository,
         } = result;
-        if let Verdict::NeedsHuman(reason) = verdict {
+        if let Some(reason) = verdict.review_reason() {
+            let merged = match &verdict {
+                Verdict::FixedAfterReport(merged) => Some(merged),
+                _ => None,
+            };
+            let mut detail = assessment.detail("needs_human", repository.as_deref());
+            detail["reason"] = reason.as_str().into();
+            if let Some(merged) = merged {
+                merged.record(&mut detail);
+            }
             let moved = self.tracker.transition_security_report(
                 report.id,
                 SecurityReportState::Assessing,
@@ -315,13 +322,10 @@ impl SecurityInbox {
                 &SecurityReportChanges {
                     assessment_summary: Some(assessment.summary.clone()),
                     affected_repository: repository.clone(),
+                    fixed_by_commit: merged.map(|merged| merged.commit.clone()),
                     ..SecurityReportChanges::default()
                 },
-                &NewSecurityEvent::new(SecurityEventKind::NeedsHuman).with_detail({
-                    let mut detail = assessment.detail("needs_human", repository.as_deref());
-                    detail["reason"] = reason.as_str().into();
-                    detail
-                }),
+                &NewSecurityEvent::new(SecurityEventKind::NeedsHuman).with_detail(detail),
             )?;
             if moved {
                 self.ping(
@@ -365,16 +369,12 @@ impl SecurityInbox {
             self.reply_with_outcome(report.id).await?;
             return Ok(SecurityRoute::done(format!("replied {outcome}")));
         }
-        let merged = match &verdict {
-            Verdict::Valid { merged } => merged.clone(),
-            _ => None,
-        };
         let registration = self
             .register(&ValidReport {
                 report,
                 assessment: &assessment,
                 repository: repository.as_deref(),
-                merged: merged.as_ref(),
+                merged: None,
                 origin: AssessmentOrigin::Agent,
             })
             .await?;
@@ -389,7 +389,6 @@ impl SecurityInbox {
         }
     }
 
-    /// Send the outcome reply of a `Replying` report and close it.
     pub(crate) async fn reply_with_outcome(&self, report_id: i64) -> Result<()> {
         let Some(report) = self.tracker.get_security_report(report_id)? else {
             return Ok(());
@@ -400,13 +399,12 @@ impl SecurityInbox {
         self.ensure_delivered(
             &report,
             kind,
-            (SecurityReportState::Replying, SecurityReportState::Closed),
+            ReportTransition::new(SecurityReportState::Replying, SecurityReportState::Closed),
         )
         .await?;
         Ok(())
     }
 
-    /// Ping for and reply to a freshly registered valid report.
     pub(crate) async fn acknowledge(
         &self,
         report_id: i64,

@@ -18,9 +18,10 @@ use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::security::{
     AwardStatus, DeliveryStatus, NewSecurityAward, NewSecurityEvent, NewSecurityReport,
-    NewSecurityVulnerability, SecurityAward, SecurityEvent, SecurityEventKind, SecurityReply,
-    SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportFilter,
-    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityChanges, VulnerabilityState,
+    NewSecurityVulnerability, ReportTransition, SecurityAward, SecurityEvent, SecurityEventKind,
+    SecurityReply, SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportFilter,
+    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityCandidate,
+    SecurityVulnerabilityChanges, VulnerabilityState,
 };
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
@@ -4585,6 +4586,20 @@ impl SecurityReportStore for SqliteTracker {
         SqliteTracker::get_security_vulnerability(self, id)
     }
 
+    fn find_security_vulnerability_by_first_report(
+        &self,
+        report_id: i64,
+    ) -> Result<Option<SecurityVulnerability>> {
+        SqliteTracker::find_security_vulnerability_by_first_report(self, report_id)
+    }
+
+    fn list_security_vulnerability_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SecurityVulnerabilityCandidate>> {
+        SqliteTracker::list_security_vulnerability_candidates(self, limit)
+    }
+
     fn list_security_vulnerabilities(
         &self,
         state: Option<VulnerabilityState>,
@@ -4619,8 +4634,13 @@ impl SecurityReportStore for SqliteTracker {
         )
     }
 
-    fn claim_security_reply(&self, report_id: i64, kind: SecurityReplyKind) -> Result<bool> {
-        SqliteTracker::claim_security_reply(self, report_id, kind)
+    fn claim_security_reply(
+        &self,
+        report_id: i64,
+        kind: SecurityReplyKind,
+        event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        SqliteTracker::claim_security_reply(self, report_id, kind, event)
     }
 
     fn complete_security_reply(
@@ -4629,8 +4649,12 @@ impl SecurityReportStore for SqliteTracker {
         kind: SecurityReplyKind,
         status: DeliveryStatus,
         error: Option<&str>,
-    ) -> Result<()> {
-        SqliteTracker::complete_security_reply(self, report_id, kind, status, error)
+        event: &NewSecurityEvent,
+        transition: Option<ReportTransition>,
+    ) -> Result<bool> {
+        SqliteTracker::complete_security_reply(
+            self, report_id, kind, status, error, event, transition,
+        )
     }
 
     fn confirm_security_reply(
@@ -4645,6 +4669,10 @@ impl SecurityReportStore for SqliteTracker {
 
     fn list_security_replies(&self, report_id: i64) -> Result<Vec<SecurityReply>> {
         SqliteTracker::list_security_replies(self, report_id)
+    }
+
+    fn list_reports_with_unconfirmed_replies(&self) -> Result<Vec<i64>> {
+        SqliteTracker::list_reports_with_unconfirmed_replies(self)
     }
 
     fn prepare_security_award(

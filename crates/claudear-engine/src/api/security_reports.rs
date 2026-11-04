@@ -391,7 +391,7 @@ fn apply_override(
         } => tracker.transition_security_report(
             id,
             SecurityReportState::NeedsHuman,
-            SecurityReportState::Assessing,
+            SecurityReportState::Registering,
             &SecurityReportChanges::default(),
             &NewSecurityEvent::new(SecurityEventKind::AdminConfirmed)
                 .with_actor(admin.email.clone())
@@ -689,7 +689,6 @@ mod tests {
                     vulnerability.id,
                     vulnerability.first_report_id,
                     &NewSecurityAward {
-                        recipient_email: Some("first@reporter.example".to_string()),
                         campaign: "SecurityResearchers".to_string(),
                         credits: 100,
                     },
@@ -701,7 +700,11 @@ mod tests {
         fn unconfirmed_reply(&self, report_id: i64, kind: SecurityReplyKind) {
             assert!(self
                 .tracker
-                .claim_security_reply(report_id, kind)
+                .claim_security_reply(
+                    report_id,
+                    kind,
+                    &NewSecurityEvent::new(SecurityEventKind::ReplyClaimed),
+                )
                 .expect("claim"));
             self.tracker
                 .complete_security_reply(
@@ -709,6 +712,8 @@ mod tests {
                     kind,
                     DeliveryStatus::Unconfirmed,
                     Some("timeout"),
+                    &NewSecurityEvent::new(SecurityEventKind::ReplyUnconfirmed),
+                    None,
                 )
                 .expect("complete");
         }
@@ -1253,7 +1258,7 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["state"], "assessing");
+        assert_eq!(body["state"], "registering");
         assert!(body["vulnerability_id"].is_null());
         assert!(harness
             .tracker
@@ -1280,6 +1285,18 @@ mod tests {
         assert_eq!(confirmed.len(), 1);
         assert_eq!(confirmed[0].0.id, report.id);
         assert_eq!(confirmed[0].1.id, event.id);
+        assert_eq!(
+            harness
+                .tracker
+                .release_stale_security_assessments(std::time::Duration::ZERO)
+                .expect("sweep"),
+            0,
+            "the stale assessment sweep cannot undo a confirmation"
+        );
+        assert_eq!(
+            report_state(&harness, report.id).state,
+            SecurityReportState::Registering
+        );
     }
 
     #[tokio::test]

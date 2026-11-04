@@ -43,6 +43,7 @@ use dedup::TextEmbedder;
 const HELPSCOUT_SOURCE: &str = "helpscout";
 const MAILBOX_ID_METADATA_KEY: &str = "mailbox_id";
 const SENDING_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+const REPLY_RETRY_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
 /// Whether `issue` belongs to the security inbox and must never reach a
 /// generic pipeline. A HelpScout issue without a mailbox id is treated as
@@ -149,10 +150,14 @@ pub struct SecurityInbox {
     inferrer: Option<RepoInferrer>,
     registration: tokio::sync::Mutex<()>,
     sending_stale_after: Duration,
+    reply_retry_backoff: Duration,
+    stale_assessment_after: Duration,
 }
 
 impl SecurityInbox {
     pub fn new(dependencies: SecurityInboxDependencies) -> Self {
+        let stale_assessment_after =
+            assessment::assessment_deadline(dependencies.config.assessment_timeout());
         Self {
             config: dependencies.config,
             tracker: dependencies.tracker,
@@ -166,6 +171,8 @@ impl SecurityInbox {
             inferrer: dependencies.inferrer,
             registration: tokio::sync::Mutex::new(()),
             sending_stale_after: SENDING_STALE_AFTER,
+            reply_retry_backoff: REPLY_RETRY_BACKOFF,
+            stale_assessment_after,
         }
     }
 
@@ -178,6 +185,18 @@ impl SecurityInbox {
     #[cfg(test)]
     fn with_sending_stale_after(mut self, stale_after: Duration) -> Self {
         self.sending_stale_after = stale_after;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_stale_assessment_after(mut self, stale_after: Duration) -> Self {
+        self.stale_assessment_after = stale_after;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_reply_retry_backoff(mut self, backoff: Duration) -> Self {
+        self.reply_retry_backoff = backoff;
         self
     }
 }

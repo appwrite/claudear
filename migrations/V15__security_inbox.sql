@@ -2,6 +2,8 @@
 -- the customer reply ledger and prepared rewards.
 -- Every *_at column is written by the application in RFC3339 UTC
 -- (YYYY-MM-DDTHH:MM:SSZ) and compared as text, so none has a default.
+-- security_vulnerabilities and security_reports reference each other; SQLite
+-- resolves a foreign key when a row is written, not when a table is created.
 
 CREATE TABLE IF NOT EXISTS security_vulnerabilities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -11,9 +13,9 @@ CREATE TABLE IF NOT EXISTS security_vulnerabilities (
     repository TEXT,
     severity TEXT,
     state TEXT NOT NULL,
-    first_report_id INTEGER NOT NULL,
+    first_report_id INTEGER NOT NULL REFERENCES security_reports (id),
     first_reported_at TEXT NOT NULL,
-    fix_attempt_id INTEGER,
+    fix_attempt_id INTEGER REFERENCES fix_attempts (id),
     pull_request_url TEXT,
     merge_commit TEXT,
     merged_at TEXT,
@@ -82,19 +84,24 @@ CREATE INDEX IF NOT EXISTS idx_security_events_vulnerability_kind
 
 CREATE TABLE IF NOT EXISTS security_replies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    report_id INTEGER NOT NULL,
+    report_id INTEGER NOT NULL REFERENCES security_reports (id),
     kind TEXT NOT NULL,
     status TEXT NOT NULL,
     error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
     claimed_at TEXT NOT NULL,
     completed_at TEXT,
     UNIQUE (report_id, kind)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_security_replies_one_fix_live
+    ON security_replies (report_id)
+    WHERE kind IN ('fix_live', 'fix_live_rewarded');
+
 CREATE TABLE IF NOT EXISTS security_awards (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    vulnerability_id INTEGER NOT NULL UNIQUE,
-    report_id INTEGER NOT NULL,
+    vulnerability_id INTEGER NOT NULL UNIQUE REFERENCES security_vulnerabilities (id),
+    report_id INTEGER NOT NULL REFERENCES security_reports (id),
     recipient_email TEXT,
     campaign TEXT NOT NULL,
     credits INTEGER NOT NULL,

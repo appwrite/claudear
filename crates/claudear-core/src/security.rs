@@ -13,6 +13,9 @@ const MAX_PUBLIC_REASON_CHARS: usize = 1000;
 const MAX_CONFIRMED_TITLE_CHARS: usize = 200;
 const MAX_CONFIRMED_SUMMARY_CHARS: usize = 5000;
 const MAX_REPOSITORY_SEGMENT_CHARS: usize = 100;
+const MAX_GITHUB_OWNER_CHARS: usize = 39;
+const GITHUB_URL_PREFIX: &str = "https://github.com/";
+const PULL_SEGMENT: &str = "pull";
 
 pub fn security_fix_short_id(vulnerability_id: i64) -> String {
     format!("{SECURITY_FIX_SHORT_ID_PREFIX}{vulnerability_id}")
@@ -75,6 +78,7 @@ string_enum! {
         Received => "received",
         Assessing => "assessing",
         NeedsHuman => "needs_human",
+        Registering => "registering",
         Spam => "spam",
         Replying => "replying",
         Closed => "closed",
@@ -97,12 +101,29 @@ impl SecurityReportState {
             ),
             Self::NeedsHuman => matches!(
                 next,
-                Self::Received | Self::Assessing | Self::Replying | Self::Spam
+                Self::Received | Self::Registering | Self::Replying | Self::Spam
             ),
-            Self::Replying => next == Self::Closed,
-            Self::Tracking => next == Self::Resolved,
+            Self::Registering => matches!(next, Self::Tracking | Self::Replying | Self::NeedsHuman),
+            Self::Replying => matches!(next, Self::Closed | Self::NeedsHuman),
+            Self::Tracking => matches!(next, Self::Resolved | Self::NeedsHuman),
             Self::Spam | Self::Closed | Self::Resolved => false,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportTransition {
+    pub from: SecurityReportState,
+    pub to: SecurityReportState,
+}
+
+impl ReportTransition {
+    pub fn new(from: SecurityReportState, to: SecurityReportState) -> Self {
+        Self { from, to }
+    }
+
+    pub fn is_allowed(self) -> bool {
+        self.from.can_transition_to(self.to)
     }
 }
 
@@ -175,6 +196,15 @@ impl SecurityReplyKind {
     pub fn is_terminal(self) -> bool {
         self != Self::Confirmed
     }
+
+    /// A report gets one fix-live reply, rewarded or not.
+    pub fn is_fix_live(self) -> bool {
+        matches!(self, Self::FixLive | Self::FixLiveRewarded)
+    }
+
+    pub fn shares_ledger_entry_with(self, other: Self) -> bool {
+        self == other || (self.is_fix_live() && other.is_fix_live())
+    }
 }
 
 string_enum! {
@@ -245,6 +275,7 @@ string_enum! {
         VulnerabilityCreated => "vulnerability_created",
         DuplicateLinked => "duplicate_linked",
         FirstReporterReplaced => "first_reporter_replaced",
+        ReplyClaimed => "reply_claimed",
         ReplySent => "reply_sent",
         ReplyFailed => "reply_failed",
         ReplyUnconfirmed => "reply_unconfirmed",
@@ -272,17 +303,92 @@ pub enum FirstReporterDecision {
     Replace,
 }
 
-/// Ties keep the existing reporter, and a prepared award pins it for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstReport {
+    pub report_id: i64,
+    pub reported_at: DateTime<Utc>,
+}
+
+impl FirstReport {
+    /// Reports received in the same second are ordered by id, so the
+    /// earlier-stored report always wins.
+    pub fn precedes(self, other: Self) -> bool {
+        (self.reported_at, self.report_id) < (other.reported_at, other.report_id)
+    }
+}
+
+/// A prepared award pins the first reporter for good.
 pub fn select_first_reporter(
-    current_first_reported_at: DateTime<Utc>,
-    candidate_reported_at: DateTime<Utc>,
+    current: FirstReport,
+    candidate: FirstReport,
     award_exists: bool,
 ) -> FirstReporterDecision {
-    if candidate_reported_at < current_first_reported_at && !award_exists {
+    if candidate.precedes(current) && !award_exists {
         FirstReporterDecision::Replace
     } else {
         FirstReporterDecision::KeepExisting
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubPullRequest {
+    pub owner: String,
+    pub name: String,
+    pub number: i64,
+}
+
+impl GithubPullRequest {
+    /// Accepts only `https://github.com/{owner}/{name}/pull/{number}`: no
+    /// other host, userinfo, port, query, fragment or trailing path.
+    pub fn parse(url: &str) -> Option<Self> {
+        let path = url.strip_prefix(GITHUB_URL_PREFIX)?;
+        let mut segments = path.split('/');
+        let (Some(owner), Some(name), Some(PULL_SEGMENT), Some(number), None) = (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ) else {
+            return None;
+        };
+        if !is_github_owner(owner) || !is_repository_segment(name) {
+            return None;
+        }
+        Some(Self {
+            owner: owner.to_string(),
+            name: name.to_string(),
+            number: parse_pull_request_number(number)?,
+        })
+    }
+
+    pub fn repository(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+
+    pub fn belongs_to(&self, repository: &str) -> bool {
+        self.repository().eq_ignore_ascii_case(repository)
+    }
+}
+
+fn is_github_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.len() <= MAX_GITHUB_OWNER_CHARS
+        && !owner.starts_with('-')
+        && !owner.ends_with('-')
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn parse_pull_request_number(value: &str) -> Option<i64> {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -506,6 +612,15 @@ pub struct SecurityVulnerabilityChanges {
     pub live_at: Option<DateTime<Utc>>,
 }
 
+/// The fields deduplication compares a new report against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecurityVulnerabilityCandidate {
+    pub id: i64,
+    pub title: String,
+    pub summary: String,
+    pub embedding: Vec<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SecurityEvent {
     pub id: i64,
@@ -553,6 +668,7 @@ pub struct SecurityReply {
     pub kind: SecurityReplyKind,
     pub status: DeliveryStatus,
     pub error: Option<String>,
+    pub attempts: u32,
     pub claimed_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
 }
@@ -574,7 +690,6 @@ pub struct SecurityAward {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewSecurityAward {
-    pub recipient_email: Option<String>,
     pub campaign: String,
     pub credits: u32,
 }
@@ -638,11 +753,16 @@ mod tests {
             (Assessing, Replying),
             (Assessing, Tracking),
             (NeedsHuman, Received),
-            (NeedsHuman, Assessing),
+            (NeedsHuman, Registering),
             (NeedsHuman, Replying),
             (NeedsHuman, Spam),
+            (Registering, Tracking),
+            (Registering, Replying),
+            (Registering, NeedsHuman),
             (Replying, Closed),
+            (Replying, NeedsHuman),
             (Tracking, Resolved),
+            (Tracking, NeedsHuman),
         ];
         for &from in SecurityReportState::ALL {
             for &to in SecurityReportState::ALL {
@@ -786,11 +906,19 @@ mod tests {
         }
     }
 
+    fn first_report(report_id: i64, seconds: i64) -> FirstReport {
+        FirstReport {
+            report_id,
+            reported_at: Utc.with_ymd_and_hms(2026, 11, 4, 12, 0, 0).unwrap()
+                + chrono::TimeDelta::seconds(seconds),
+        }
+    }
+
     #[test]
     fn select_first_reporter_replaces_only_an_earlier_unawarded_report() {
-        let current = Utc.with_ymd_and_hms(2026, 11, 4, 12, 0, 0).unwrap();
-        let earlier = current - chrono::TimeDelta::seconds(1);
-        let later = current + chrono::TimeDelta::seconds(1);
+        let current = first_report(5, 0);
+        let earlier = first_report(9, -1);
+        let later = first_report(2, 1);
 
         assert_eq!(
             select_first_reporter(current, earlier, false),
@@ -808,6 +936,113 @@ mod tests {
             select_first_reporter(current, earlier, true),
             FirstReporterDecision::KeepExisting
         );
+    }
+
+    #[test]
+    fn select_first_reporter_breaks_a_same_second_tie_on_the_earlier_id() {
+        let current = first_report(5, 0);
+        assert_eq!(
+            select_first_reporter(current, first_report(4, 0), false),
+            FirstReporterDecision::Replace
+        );
+        assert_eq!(
+            select_first_reporter(current, first_report(6, 0), false),
+            FirstReporterDecision::KeepExisting
+        );
+        assert_eq!(
+            select_first_reporter(current, first_report(4, 0), true),
+            FirstReporterDecision::KeepExisting
+        );
+    }
+
+    #[test]
+    fn fix_live_kinds_share_one_ledger_entry() {
+        use SecurityReplyKind::*;
+        for &kind in SecurityReplyKind::ALL {
+            assert_eq!(
+                kind.is_fix_live(),
+                matches!(kind, FixLive | FixLiveRewarded)
+            );
+            for &other in SecurityReplyKind::ALL {
+                assert_eq!(
+                    kind.shares_ledger_entry_with(other),
+                    kind == other || (kind.is_fix_live() && other.is_fix_live()),
+                    "{kind} / {other}"
+                );
+            }
+        }
+        assert!(FixLive.shares_ledger_entry_with(FixLiveRewarded));
+        assert!(!Confirmed.shares_ledger_entry_with(FixLive));
+    }
+
+    #[test]
+    fn github_pull_request_parses_only_the_canonical_url() {
+        let parsed = GithubPullRequest::parse("https://github.com/appwrite/appwrite/pull/42")
+            .expect("canonical url");
+        assert_eq!(
+            parsed,
+            GithubPullRequest {
+                owner: "appwrite".to_string(),
+                name: "appwrite".to_string(),
+                number: 42,
+            }
+        );
+        assert_eq!(parsed.repository(), "appwrite/appwrite");
+        assert!(parsed.belongs_to("Appwrite/Appwrite"));
+        assert!(!parsed.belongs_to("attacker/appwrite"));
+        assert_eq!(
+            GithubPullRequest::parse("https://github.com/appwrite-labs/cloud.v2/pull/7")
+                .map(|pull_request| pull_request.repository()),
+            Some("appwrite-labs/cloud.v2".to_string())
+        );
+    }
+
+    #[test]
+    fn github_pull_request_rejects_lookalike_and_decorated_urls() {
+        for url in [
+            "",
+            "github.com/appwrite/appwrite/pull/1",
+            "http://github.com/appwrite/appwrite/pull/1",
+            "HTTPS://github.com/appwrite/appwrite/pull/1",
+            "https://GitHub.com/appwrite/appwrite/pull/1",
+            "https://evil.example/github.com/appwrite/appwrite/pull/1",
+            "https://github.com.evil.example/appwrite/appwrite/pull/1",
+            "https://github.com@evil.example/appwrite/appwrite/pull/1",
+            "https://user@github.com/appwrite/appwrite/pull/1",
+            "https://user:secret@github.com/appwrite/appwrite/pull/1",
+            "https://github.com:443/appwrite/appwrite/pull/1",
+            "https://www.github.com/appwrite/appwrite/pull/1",
+            "https://api.github.com/repos/appwrite/appwrite/pulls/1",
+            "https://github.com/appwrite/appwrite/pull/1?tab=files",
+            "https://github.com/appwrite/appwrite/pull/1#discussion",
+            "https://github.com/appwrite/appwrite/pull/1/",
+            "https://github.com/appwrite/appwrite/pull/1/files",
+            "https://github.com/appwrite/appwrite/pulls/1",
+            "https://github.com/appwrite/appwrite/issues/1",
+            "https://github.com/appwrite/pull/1",
+            "https://github.com//appwrite/pull/1",
+            "https://github.com/../appwrite/pull/1",
+            "https://github.com/appwrite/../pull/1",
+            "https://github.com/-appwrite/appwrite/pull/1",
+            "https://github.com/appwrite-/appwrite/pull/1",
+            "https://github.com/app_write/appwrite/pull/1",
+            "https://github.com/appwrite/app%2Fwrite/pull/1",
+            "https://github.com/appwrite/appwrite/pull/0",
+            "https://github.com/appwrite/appwrite/pull/01",
+            "https://github.com/appwrite/appwrite/pull/-1",
+            "https://github.com/appwrite/appwrite/pull/+1",
+            "https://github.com/appwrite/appwrite/pull/1a",
+            "https://github.com/appwrite/appwrite/pull/99999999999999999999",
+            "https://github.com/appwrite/appwrite/pull/ 1",
+            " https://github.com/appwrite/appwrite/pull/1",
+        ] {
+            assert_eq!(GithubPullRequest::parse(url), None, "{url:?}");
+        }
+        let long_owner = format!(
+            "https://github.com/{}/appwrite/pull/1",
+            "a".repeat(MAX_GITHUB_OWNER_CHARS + 1)
+        );
+        assert_eq!(GithubPullRequest::parse(&long_owner), None);
     }
 
     #[test]

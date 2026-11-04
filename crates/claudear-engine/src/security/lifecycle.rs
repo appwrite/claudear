@@ -1,7 +1,7 @@
 //! `advance()`: the periodic, idempotent sweep that moves every report and
 //! vulnerability forward from persisted state alone.
 
-use super::assessment::Assessment;
+use super::assessment::{Assessment, MergedFix};
 use super::dedup::{AssessmentOrigin, ValidReport};
 use super::notify::{OwnerAction, PingSubject, ReviewReason};
 use super::replies::{truncated_error, Delivery};
@@ -12,12 +12,11 @@ use claudear_analysis::release::{LiveStatus, RepositoryRole};
 use claudear_core::error::{Error, Result};
 use claudear_core::security::{
     security_fix_short_id, AwardStatus, DeliveryStatus, NewSecurityAward, NewSecurityEvent,
-    SecurityEvent, SecurityEventKind, SecurityReplyKind, SecurityReport, SecurityReportFilter,
-    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityChanges, VulnerabilityState,
-    SECURITY_FIX_SOURCE,
+    ReportTransition, SecurityEvent, SecurityEventKind, SecurityReplyKind, SecurityReport,
+    SecurityReportChanges, SecurityReportFilter, SecurityReportState, SecurityVulnerability,
+    SecurityVulnerabilityChanges, VulnerabilityState, SECURITY_FIX_SOURCE,
 };
 use claudear_core::types::FixAttemptStatus;
-use claudear_storage::parse_pr_url;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -70,16 +69,17 @@ impl SecurityInbox {
     pub async fn advance(&self) -> SecurityAdvanceSummary {
         let mut summary = SecurityAdvanceSummary::default();
         self.register_admin_confirmed(&mut summary).await;
-        let stale_after = self.config.assessment_timeout().saturating_mul(2);
         if let Some(released) = record(
             &mut summary,
             "release_stale_assessments",
-            self.tracker.release_stale_security_assessments(stale_after),
+            self.tracker
+                .release_stale_security_assessments(self.stale_assessment_after),
         ) {
             summary.released = released;
         }
         self.settle_replies(&mut summary).await;
         self.close_overridden_spam(&mut summary).await;
+        self.reconcile_opened_fixes(&mut summary).await;
         self.advance_fixing(&mut summary).await;
         self.advance_merged(&mut summary).await;
         self.advance_live(&mut summary).await;
@@ -95,15 +95,20 @@ impl SecurityInbox {
             return;
         };
         for (report, confirmation) in confirmed {
-            let result = self.register_confirmation(&report, &confirmation).await;
+            let result = self
+                .register_confirmation(&report, &confirmation, summary)
+                .await;
             record(summary, "register_admin_confirmed", result);
         }
     }
 
+    /// Register an admin-confirmed report. A failed registration goes back to
+    /// the admin rather than retrying the agent judge on every sweep.
     async fn register_confirmation(
         &self,
         report: &SecurityReport,
         confirmation: &SecurityEvent,
+        summary: &mut SecurityAdvanceSummary,
     ) -> Result<()> {
         let assessment = confirmed_assessment(&confirmation.detail);
         let repository = confirmation
@@ -111,20 +116,67 @@ impl SecurityInbox {
             .get("repository")
             .and_then(Value::as_str)
             .map(str::to_string)
+            .or_else(|| report.affected_repository.clone())
             .or_else(|| self.config.default_repository.clone());
+        let merged = self.fix_found_in_history(report)?;
         let registration = self
             .register(&ValidReport {
                 report,
                 assessment: &assessment,
                 repository: repository.as_deref(),
-                merged: None,
+                merged: merged.as_ref(),
                 origin: AssessmentOrigin::Admin,
             })
-            .await?;
+            .await;
+        let registration = match registration {
+            Ok(registration) => registration,
+            Err(error) => {
+                let moved = self.tracker.transition_security_report(
+                    report.id,
+                    SecurityReportState::Registering,
+                    SecurityReportState::NeedsHuman,
+                    &SecurityReportChanges::default(),
+                    &NewSecurityEvent::new(SecurityEventKind::NeedsHuman).with_detail(json!({
+                        "reason": ReviewReason::RegistrationFailed.as_str(),
+                        "error": truncated_error(&error.to_string()),
+                    })),
+                )?;
+                if moved {
+                    summary.needs_human += 1;
+                    self.ping(
+                        OwnerAction::NeedsReview(ReviewReason::RegistrationFailed),
+                        PingSubject::report(report.id),
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
         if let Some(registration) = registration {
             self.acknowledge(report.id, &registration).await?;
         }
         Ok(())
+    }
+
+    /// The merged fix the assessment found after the report arrived, when an
+    /// admin confirmed the report it was found for.
+    fn fix_found_in_history(&self, report: &SecurityReport) -> Result<Option<MergedFix>> {
+        if report.fixed_by_commit.is_none() {
+            return Ok(None);
+        }
+        Ok(self
+            .tracker
+            .list_security_timeline(report.id)?
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.report_id == Some(report.id)
+                    && event.kind == SecurityEventKind::NeedsHuman
+                    && event.detail.get("reason").and_then(Value::as_str)
+                        == Some(ReviewReason::FixFoundInHistory.as_str())
+            })
+            .and_then(|event| MergedFix::from_detail(&event.detail))
+            .filter(|merged| report.fixed_by_commit.as_deref() == Some(merged.commit.as_str())))
     }
 
     async fn settle_replies(&self, summary: &mut SecurityAdvanceSummary) {
@@ -158,7 +210,10 @@ impl SecurityInbox {
                     .ensure_delivered(
                         report,
                         kind,
-                        (SecurityReportState::Replying, SecurityReportState::Closed),
+                        ReportTransition::new(
+                            SecurityReportState::Replying,
+                            SecurityReportState::Closed,
+                        ),
                     )
                     .await?;
                 summary.count(delivery);
@@ -199,8 +254,8 @@ impl SecurityInbox {
             .is_none_or(|reply| reply.status == DeliveryStatus::Failed))
     }
 
-    /// A reply still `Sending` long after its claim was interrupted, so it
-    /// may or may not have gone out: never resend it, ask an admin instead.
+    /// A reply still `Sending` long after its claim was interrupted may or
+    /// may not have gone out: never resend it, ask an admin instead.
     async fn expire_stale_sending(&self, report: &SecurityReport) -> Result<()> {
         let stale_after = TimeDelta::from_std(self.sending_stale_after).unwrap_or(TimeDelta::MAX);
         let cutoff = Utc::now()
@@ -215,8 +270,6 @@ impl SecurityInbox {
         Ok(())
     }
 
-    /// Run the spam action for reports an admin marked as spam, whose
-    /// conversation is still open.
     async fn close_overridden_spam(&self, summary: &mut SecurityAdvanceSummary) {
         let Some(reports) = record(
             summary,
@@ -241,6 +294,54 @@ impl SecurityInbox {
             .await;
             record(summary, "close_overridden_spam", result);
         }
+    }
+
+    /// Link pull requests whose fix run succeeded but whose link was never
+    /// recorded, for example because claudear stopped in between.
+    async fn reconcile_opened_fixes(&self, summary: &mut SecurityAdvanceSummary) {
+        let Some(vulnerabilities) = record(
+            summary,
+            "list_awaiting_fix",
+            self.tracker
+                .list_security_vulnerabilities(Some(VulnerabilityState::AwaitingFix)),
+        ) else {
+            return;
+        };
+        for vulnerability in vulnerabilities {
+            let result = self.reconcile_opened_fix(&vulnerability, summary).await;
+            record(summary, "reconcile_opened_fix", result);
+        }
+    }
+
+    async fn reconcile_opened_fix(
+        &self,
+        vulnerability: &SecurityVulnerability,
+        summary: &mut SecurityAdvanceSummary,
+    ) -> Result<()> {
+        let Some(attempt) = self.tracker.get_attempt(
+            SECURITY_FIX_SOURCE,
+            &security_fix_short_id(vulnerability.id),
+        )?
+        else {
+            return Ok(());
+        };
+        let Some(url) = attempt.pr_url.as_deref() else {
+            return Ok(());
+        };
+        if Self::linkable_pull_request(vulnerability, url).is_err() {
+            if self
+                .escalate(
+                    vulnerability.id,
+                    VulnerabilityState::AwaitingFix,
+                    ReviewReason::InvalidPullRequest,
+                )
+                .await?
+            {
+                summary.needs_human += 1;
+            }
+            return Ok(());
+        }
+        self.link_fix(vulnerability.id, Some(attempt.id), url)
     }
 
     async fn advance_fixing(&self, summary: &mut SecurityAdvanceSummary) {
@@ -286,12 +387,36 @@ impl SecurityInbox {
         else {
             return Ok(());
         };
-        let Some((repository, number)) = parse_pr_url(url) else {
-            return self
-                .deployment_check_failed(vulnerability, "unrecognised pull request url")
-                .await;
+        let Ok(pull_request) = Self::linkable_pull_request(vulnerability, url) else {
+            if self
+                .escalate(
+                    vulnerability.id,
+                    VulnerabilityState::Fixing,
+                    ReviewReason::InvalidPullRequest,
+                )
+                .await?
+            {
+                summary.needs_human += 1;
+            }
+            return Ok(());
         };
-        match deployment.pull_request(&repository, number).await {
+        let repository = pull_request.repository();
+        match deployment
+            .pull_request(&repository, pull_request.number)
+            .await
+        {
+            Ok(Some(state)) if state.merged && state.merge_commit_sha.is_none() => {
+                if self
+                    .escalate(
+                        vulnerability.id,
+                        VulnerabilityState::Fixing,
+                        ReviewReason::MissingMergeCommit,
+                    )
+                    .await?
+                {
+                    summary.needs_human += 1;
+                }
+            }
             Ok(Some(state)) if state.merged => {
                 let moved = self.tracker.transition_security_vulnerability(
                     vulnerability.id,
@@ -364,21 +489,24 @@ impl SecurityInbox {
         };
         for vulnerability in vulnerabilities {
             let result = async {
-                let (Some(repository), Some(commit)) =
-                    (&vulnerability.repository, &vulnerability.merge_commit)
-                else {
-                    if self
-                        .escalate(
-                            vulnerability.id,
-                            VulnerabilityState::Merged,
-                            ReviewReason::UntrackedRepository,
-                        )
-                        .await?
-                    {
-                        summary.needs_human += 1;
-                    }
-                    return Ok(());
-                };
+                let (repository, commit) =
+                    match (&vulnerability.repository, &vulnerability.merge_commit) {
+                        (Some(repository), Some(commit)) => (repository, commit),
+                        (repository, _) => {
+                            let reason = if repository.is_none() {
+                                ReviewReason::UntrackedRepository
+                            } else {
+                                ReviewReason::MissingMergeCommit
+                            };
+                            if self
+                                .escalate(vulnerability.id, VulnerabilityState::Merged, reason)
+                                .await?
+                            {
+                                summary.needs_human += 1;
+                            }
+                            return Ok(());
+                        }
+                    };
                 match deployment.commit_status(repository, commit).await {
                     Ok(LiveStatus::Live { versions }) => {
                         if self.tracker.transition_security_vulnerability(
@@ -488,18 +616,16 @@ impl SecurityInbox {
         if vulnerability.state != VulnerabilityState::Live {
             return Ok(());
         }
-        let first_report = self
-            .tracker
-            .get_security_report(vulnerability.first_report_id)?;
-        if self.tracker.prepare_security_award(
-            vulnerability.id,
-            vulnerability.first_report_id,
-            &NewSecurityAward {
-                recipient_email: first_report.and_then(|report| report.reporter_email),
-                campaign: self.config.reward.campaign.clone(),
-                credits: self.config.reward.credits,
-            },
-        )? {
+        if self.is_rewardable(&vulnerability)?
+            && self.tracker.prepare_security_award(
+                vulnerability.id,
+                vulnerability.first_report_id,
+                &NewSecurityAward {
+                    campaign: self.config.reward.campaign.clone(),
+                    credits: self.config.reward.credits,
+                },
+            )?
+        {
             summary.awards_prepared += 1;
         }
         let award = self.tracker.get_security_award(vulnerability.id)?;
@@ -516,12 +642,40 @@ impl SecurityInbox {
                 .ensure_delivered(
                     report,
                     kind,
-                    (SecurityReportState::Tracking, SecurityReportState::Resolved),
+                    ReportTransition::new(
+                        SecurityReportState::Tracking,
+                        SecurityReportState::Resolved,
+                    ),
                 )
                 .await?;
             summary.count(delivery);
         }
         Ok(())
+    }
+
+    /// An agent alone never earns a reward: the vulnerability must have been
+    /// confirmed by an admin, or fixed by a pull request linked to it.
+    fn is_rewardable(&self, vulnerability: &SecurityVulnerability) -> Result<bool> {
+        if vulnerability.pull_request_url.is_some() {
+            return Ok(true);
+        }
+        for report in self
+            .tracker
+            .list_reports_for_vulnerability(vulnerability.id)?
+        {
+            let confirmed = self
+                .tracker
+                .list_security_timeline(report.id)?
+                .iter()
+                .any(|event| {
+                    event.report_id == Some(report.id)
+                        && event.kind == SecurityEventKind::AdminConfirmed
+                });
+            if confirmed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn notify_prepared_awards(&self, summary: &mut SecurityAdvanceSummary) {
