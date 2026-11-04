@@ -1,13 +1,19 @@
 //! Poll GitHub for new release tips and persist last-seen / attempt state.
 
+use crate::deploy_qa::announcement::DeployQaAnnouncement;
+use crate::deploy_qa::announcement::DeployQaAnnouncer;
+use crate::deploy_qa::announcement::DeployRun;
 use crate::deploy_qa::playbook::load_playbook;
 use crate::deploy_qa::playbook::DEPLOY_QA_SOURCE;
 use crate::deploy_qa::probe::VERDICT_ALL_VERIFIED;
 use crate::deploy_qa::probe::VERDICT_FAIL;
 use crate::deploy_qa::probe::VERDICT_PREFIX;
 use crate::deploy_qa::probe::VERDICT_UNVERIFIED;
+use crate::release::GitHubCommit;
 use crate::release::GitHubRelease;
 use crate::release::GitHubTag;
+use crate::release::GitHubWorkflowRun;
+use crate::release::GitIdentity;
 use crate::release::ReleaseClient;
 use abnegate_http::HttpClient;
 use abnegate_http::ReqwestHttpClient;
@@ -49,9 +55,36 @@ pub struct ReleaseTip {
     pub published_at: Option<String>,
     /// HTML URL.
     pub html_url: String,
-    /// GitHub login of the release author.
+    /// GitHub login of the release author, or of whoever cut a bare tag.
     pub author_login: Option<String>,
+    /// Set when the tip is a tag with no GitHub release.
+    pub bare_tag: Option<BareTag>,
 }
+
+/// What a tip with no GitHub release keeps about its tag.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BareTag {
+    /// The track's tag before this one.
+    pub previous: Option<String>,
+    /// The tagged commit, for a lightweight tag.
+    pub commit_sha: Option<String>,
+    /// The annotated tag object, for an annotated tag.
+    pub annotation_sha: Option<String>,
+}
+
+/// What the poller learns about a bare tag before announcing it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BareTagDetails {
+    releaser_login: Option<String>,
+    deploy_run: Option<DeployRun>,
+}
+
+/// Accounts that push and merge for people rather than being one.
+const AUTOMATION_LOGINS: [&str; 1] = ["web-flow"];
+
+const BOT_LOGIN_SUFFIX: &str = "[bot]";
+
+const COMMIT_OBJECT_KIND: &str = "commit";
 
 impl ReleaseTip {
     fn from_release(repo: &str, release: GitHubRelease) -> Self {
@@ -63,6 +96,7 @@ impl ReleaseTip {
             published_at: release.published_at,
             html_url: release.html_url,
             author_login: release.author.map(|author| author.login),
+            bare_tag: None,
         }
     }
 
@@ -76,6 +110,11 @@ impl ReleaseTip {
                 tag = tag.name,
             )
         });
+        let bare_tag = BareTag {
+            previous: previous.map(str::to_string),
+            commit_sha: tag.commit.and_then(|commit| commit.sha),
+            annotation_sha: tag.annotation,
+        };
         Self {
             repo: repo.to_string(),
             html_url: format!("https://github.com/{repo}/releases/tag/{}", tag.name),
@@ -84,8 +123,67 @@ impl ReleaseTip {
             body,
             published_at: None,
             author_login: None,
+            bare_tag: Some(bare_tag),
         }
     }
+}
+
+/// Whether `login` is a person rather than GitHub's merge account or a bot.
+fn is_person(login: &str) -> bool {
+    !login.ends_with(BOT_LOGIN_SUFFIX)
+        && !AUTOMATION_LOGINS
+            .iter()
+            .any(|automation| automation.eq_ignore_ascii_case(login))
+}
+
+/// The login on `commit` whose git identity has `email`.
+fn login_with_email(commit: &GitHubCommit, email: &str) -> Option<String> {
+    let has_email = |identity: &Option<GitIdentity>| {
+        identity
+            .as_ref()
+            .and_then(|identity| identity.email.as_deref())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(email))
+    };
+    [
+        (&commit.commit.author, &commit.author),
+        (&commit.commit.committer, &commit.committer),
+    ]
+    .into_iter()
+    .find(|(identity, account)| has_email(identity) && account.is_some())
+    .and_then(|(_, account)| account.as_ref().map(|account| account.login.clone()))
+}
+
+/// Who cut a bare tag: the tagger of an annotated tag, else the tagged
+/// commit's author, else the account whose push started its workflow run.
+///
+/// Git records a tagger's name and email but no login, so the tagger counts
+/// only when the tagged commit carries that email on a GitHub account.
+fn releaser_login(
+    tagger: Option<&GitIdentity>,
+    commit: Option<&GitHubCommit>,
+    run: Option<&GitHubWorkflowRun>,
+) -> Option<String> {
+    let tagger = tagger
+        .and_then(|tagger| tagger.email.as_deref())
+        .zip(commit)
+        .and_then(|(email, commit)| login_with_email(commit, email));
+    let author =
+        commit.and_then(|commit| commit.author.as_ref().map(|author| author.login.clone()));
+    let actor = run.and_then(|run| run.actor.as_ref().map(|actor| actor.login.clone()));
+    [tagger, author, actor]
+        .into_iter()
+        .flatten()
+        .find(|login| is_person(login))
+}
+
+/// A tip already stored with no announcement still needs one until its QA
+/// run has a verdict.
+fn needs_announcement(stored: &DeployQaTip) -> bool {
+    stored.discord_message_id.is_none()
+        && matches!(
+            stored.status,
+            DeployQaTipStatus::Pending | DeployQaTipStatus::Running | DeployQaTipStatus::Errored
+        )
 }
 
 /// The semantic version `tag` names on a track filtered by `filter`: the
@@ -153,6 +251,7 @@ pub struct DeployQaTracker<C: HttpClient = ReqwestHttpClient> {
     client: ReleaseClient<C>,
     store: Arc<dyn FixAttemptTracker>,
     config: DeployQaConfig,
+    announcer: Option<Arc<dyn DeployQaAnnouncer>>,
 }
 
 impl DeployQaTracker<ReqwestHttpClient> {
@@ -170,6 +269,7 @@ impl DeployQaTracker<ReqwestHttpClient> {
             client: ReleaseClient::new(token),
             store,
             config,
+            announcer: None,
         })
     }
 }
@@ -185,7 +285,16 @@ impl<C: HttpClient> DeployQaTracker<C> {
             client,
             store,
             config,
+            announcer: None,
         }
+    }
+
+    /// Announce new bare-tag tips through `announcer`, since no release feed
+    /// does, and store each announcement's message id on its tip so the QA
+    /// outcome replies under it.
+    pub fn with_announcer(mut self, announcer: Arc<dyn DeployQaAnnouncer>) -> Self {
+        self.announcer = Some(announcer);
+        self
     }
 
     /// Poll every configured track once.
@@ -220,11 +329,15 @@ impl<C: HttpClient> DeployQaTracker<C> {
             });
         };
 
-        if self
-            .store
-            .get_deploy_qa_tip(&track.name, &tip.tag)?
-            .is_some()
-        {
+        if let Some(stored) = self.store.get_deploy_qa_tip(&track.name, &tip.tag)? {
+            if let Some(bare_tag) = tip
+                .bare_tag
+                .as_ref()
+                .filter(|_| self.announcer.is_some() && needs_announcement(&stored))
+            {
+                let details = self.bare_tag_details(&tip, bare_tag).await;
+                self.announce(track, &tip, details, &stored).await;
+            }
             return Ok(DeployQaPollResult {
                 track: track.name.clone(),
                 action: DeployQaPollAction::SkippedDuplicate,
@@ -240,6 +353,17 @@ impl<C: HttpClient> DeployQaTracker<C> {
                 action: DeployQaPollAction::SkippedPreviousRunning,
                 tip: Some(tip),
             });
+        }
+
+        let mut tip = tip;
+        let details = match tip.bare_tag.as_ref() {
+            Some(bare_tag) => Some(self.bare_tag_details(&tip, bare_tag).await),
+            None => None,
+        };
+        if tip.author_login.is_none() {
+            tip.author_login = details
+                .as_ref()
+                .and_then(|details| details.releaser_login.clone());
         }
 
         let mut row = DeployQaTip::new(&track.name, &tip.repo, &tip.tag);
@@ -258,11 +382,117 @@ impl<C: HttpClient> DeployQaTracker<C> {
             });
         }
 
+        if let Some(details) = details {
+            self.announce(track, &tip, details, &stored).await;
+        }
+
         Ok(DeployQaPollResult {
             track: track.name.clone(),
             action: DeployQaPollAction::Enqueued,
             tip: Some(tip),
         })
+    }
+
+    /// Who cut `tip`'s bare tag and the workflow run its push started. A
+    /// lookup that fails only leaves its part unknown.
+    async fn bare_tag_details(&self, tip: &ReleaseTip, bare_tag: &BareTag) -> BareTagDetails {
+        let repo = tip.repo.as_str();
+        let annotated = match bare_tag.annotation_sha.as_deref() {
+            Some(sha) => self
+                .client
+                .get_annotated_tag(repo, sha)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(repo, tag = %tip.tag, %error, "deploy_qa: could not read the annotated tag");
+                    None
+                }),
+            None => None,
+        };
+        let commit_sha = bare_tag.commit_sha.clone().or_else(|| {
+            annotated
+                .as_ref()
+                .filter(|annotated| annotated.object.kind == COMMIT_OBJECT_KIND)
+                .map(|annotated| annotated.object.sha.clone())
+        });
+        let commit = match commit_sha.as_deref() {
+            Some(sha) => self.client.get_commit(repo, sha).await.unwrap_or_else(|error| {
+                tracing::warn!(repo, tag = %tip.tag, %error, "deploy_qa: could not read the tagged commit");
+                None
+            }),
+            None => None,
+        };
+        let runs = self
+            .client
+            .get_push_workflow_runs(repo, &tip.tag)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(repo, tag = %tip.tag, %error, "deploy_qa: could not list the tag's workflow runs");
+                Vec::new()
+            });
+        let run = runs
+            .iter()
+            .find(|run| run.head_sha.is_some() && run.head_sha == commit_sha)
+            .or_else(|| runs.first());
+        BareTagDetails {
+            releaser_login: releaser_login(
+                annotated
+                    .as_ref()
+                    .and_then(|annotated| annotated.tagger.as_ref()),
+                commit.as_ref(),
+                run,
+            ),
+            deploy_run: run.map(|run| DeployRun {
+                name: match (run.name.as_deref(), run.run_number) {
+                    (Some(name), Some(number)) => format!("{name} #{number}"),
+                    (Some(name), None) => name.to_string(),
+                    (None, _) => "Workflow run".to_string(),
+                },
+                url: run.html_url.clone(),
+            }),
+        }
+    }
+
+    /// Announce `tip` and store the announcement's id on `stored`. Failures
+    /// are logged: the outcome reporter posts on its own without one.
+    async fn announce(
+        &self,
+        track: &DeployQaTrackConfig,
+        tip: &ReleaseTip,
+        details: BareTagDetails,
+        stored: &DeployQaTip,
+    ) {
+        let Some(announcer) = self.announcer.as_ref() else {
+            return;
+        };
+        let announcement = DeployQaAnnouncement {
+            track: track.name.clone(),
+            repo: tip.repo.clone(),
+            tag: tip.tag.clone(),
+            version: track.tag_filter.version(&tip.tag).to_string(),
+            tag_url: stored
+                .html_url
+                .clone()
+                .unwrap_or_else(|| tip.html_url.clone()),
+            previous_tag: tip
+                .bare_tag
+                .as_ref()
+                .and_then(|bare_tag| bare_tag.previous.clone()),
+            deploy_run: details.deploy_run,
+            releaser_login: stored.author_login.clone().or(details.releaser_login),
+        };
+        let message_id = match announcer.announce(&announcement).await {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                tracing::warn!(track = %track.name, tag = %tip.tag, %error, "deploy_qa: could not announce the bare tag");
+                return;
+            }
+        };
+        if let Err(error) =
+            self.store
+                .update_deploy_qa_discord_ids(stored.id, Some(&message_id), None)
+        {
+            tracing::warn!(track = %track.name, tag = %tip.tag, %error, "deploy_qa: could not record the announcement id");
+        }
     }
 
     /// Newest non-draft release, or bare tag, matching `filter`.
@@ -558,6 +788,7 @@ mod tests {
             published_at: Some("2026-09-23T01:00:00Z".into()),
             html_url: format!("https://github.com/{repo}/releases/tag/{tag}"),
             author_login: Some("abnegate".into()),
+            bare_tag: None,
         }
     }
 
@@ -748,17 +979,17 @@ mod tests {
     async fn tags_fallback_when_releases_empty() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
         let config = config(
-            vec![track("vibes", "appwrite/vibes", DeployQaTagFilter::Any)],
+            vec![track("website", "appwrite/website", DeployQaTagFilter::Any)],
             true,
         );
         let http = MapMockHttp::new()
             .on(
-                "https://api.github.com/repos/appwrite/vibes/releases",
+                "https://api.github.com/repos/appwrite/website/releases",
                 200,
                 "[]",
             )
             .on(
-                "https://api.github.com/repos/appwrite/vibes/git/matching-refs/tags/",
+                "https://api.github.com/repos/appwrite/website/git/matching-refs/tags/",
                 200,
                 &references_json(&["v0.4.0"]),
             );
@@ -768,7 +999,7 @@ mod tests {
         assert_eq!(result[0].tip.as_ref().unwrap().tag, "v0.4.0");
         assert_eq!(
             store
-                .get_last_seen_deploy_qa_tip("vibes")
+                .get_last_seen_deploy_qa_tip("website")
                 .unwrap()
                 .unwrap()
                 .tag,
@@ -1181,21 +1412,21 @@ mod tests {
     #[tokio::test]
     async fn tags_fallback_takes_the_highest_version_over_name_order() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let vibes = track("vibes", "appwrite/vibes", DeployQaTagFilter::Any);
+        let website = track("website", "appwrite/website", DeployQaTagFilter::Any);
         let http = MapMockHttp::new()
             .on(
-                "https://api.github.com/repos/appwrite/vibes/releases",
+                "https://api.github.com/repos/appwrite/website/releases",
                 200,
                 "[]",
             )
             .on(
-                "https://api.github.com/repos/appwrite/vibes/git/matching-refs/tags/",
+                "https://api.github.com/repos/appwrite/website/git/matching-refs/tags/",
                 200,
                 &references_json(&["v0.1.0", "v0.10.0", "v0.9.0"]),
             );
-        let tracker = poller(http, store, config(vec![vibes.clone()], true));
+        let tracker = poller(http, store, config(vec![website.clone()], true));
 
-        let tip = tracker.poll_track(&vibes).await.unwrap().tip.unwrap();
+        let tip = tracker.poll_track(&website).await.unwrap().tip.unwrap();
 
         assert_eq!(tip.tag, "v0.10.0");
         assert!(tip
@@ -1207,7 +1438,7 @@ mod tests {
     #[tokio::test]
     async fn tags_fallback_reads_every_tag_not_just_the_first_page() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let vibes = track("vibes", "appwrite/vibes", DeployQaTagFilter::Any);
+        let website = track("website", "appwrite/website", DeployQaTagFilter::Any);
         let names: Vec<String> = (0..40)
             .map(|index| format!("archive-{index:02}"))
             .chain(["v1.0.0".to_string(), "v2.0.0".to_string()])
@@ -1215,18 +1446,18 @@ mod tests {
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let http = MapMockHttp::new()
             .on(
-                "https://api.github.com/repos/appwrite/vibes/releases",
+                "https://api.github.com/repos/appwrite/website/releases",
                 200,
                 "[]",
             )
             .on(
-                "https://api.github.com/repos/appwrite/vibes/git/matching-refs/tags/",
+                "https://api.github.com/repos/appwrite/website/git/matching-refs/tags/",
                 200,
                 &references_json(&names),
             );
-        let tracker = poller(http, store, config(vec![vibes.clone()], true));
+        let tracker = poller(http, store, config(vec![website.clone()], true));
 
-        let tip = tracker.poll_track(&vibes).await.unwrap().tip.unwrap();
+        let tip = tracker.poll_track(&website).await.unwrap().tip.unwrap();
 
         assert_eq!(tip.tag, "v2.0.0");
     }
@@ -1237,10 +1468,12 @@ mod tests {
             GitHubTag {
                 name: "nightly".into(),
                 commit: None,
+                annotation: None,
             },
             GitHubTag {
                 name: "stable".into(),
                 commit: None,
+                annotation: None,
             },
         ];
 
@@ -1248,5 +1481,360 @@ mod tests {
 
         assert_eq!(newest.name, "nightly");
         assert!(previous.is_none());
+    }
+
+    const CONSOLE_COMMIT: &str = "https://api.github.com/repos/appwrite/appwrite/commits/abc";
+    const CONSOLE_RUNS: &str = "https://api.github.com/repos/appwrite/appwrite/actions/runs?event=push&branch=apps%2Fconsole%2F1.2.141&per_page=10";
+    const CONSOLE_RUN_URL: &str = "https://github.com/appwrite/appwrite/actions/runs/41684208512";
+
+    /// Records announcements and answers with `announcement-<n>`, failing the
+    /// first `failures` calls.
+    #[derive(Default)]
+    struct RecordingAnnouncer {
+        announcements: Mutex<Vec<DeployQaAnnouncement>>,
+        failures: Mutex<usize>,
+    }
+
+    impl RecordingAnnouncer {
+        fn failing_once() -> Self {
+            Self {
+                failures: Mutex::new(1),
+                ..Self::default()
+            }
+        }
+
+        fn announced(&self) -> Vec<DeployQaAnnouncement> {
+            self.announcements.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl DeployQaAnnouncer for RecordingAnnouncer {
+        async fn announce(&self, announcement: &DeployQaAnnouncement) -> Result<String> {
+            let mut failures = self.failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(claudear_core::error::Error::Other("Discord is down".into()));
+            }
+            let mut announcements = self.announcements.lock().unwrap();
+            announcements.push(announcement.clone());
+            Ok(format!("announcement-{}", announcements.len()))
+        }
+    }
+
+    fn commit_json(
+        author: &str,
+        author_email: &str,
+        committer: &str,
+        committer_email: &str,
+    ) -> String {
+        format!(
+            r#"{{
+                "author": {{ "login": "{author}" }},
+                "committer": {{ "login": "{committer}" }},
+                "commit": {{
+                    "author": {{ "name": "{author}", "email": "{author_email}" }},
+                    "committer": {{ "name": "{committer}", "email": "{committer_email}" }}
+                }}
+            }}"#
+        )
+    }
+
+    fn runs_json(actor: &str) -> String {
+        format!(
+            r#"{{"workflow_runs": [{{
+                "name": "Console / Production",
+                "run_number": 312,
+                "head_sha": "abc",
+                "html_url": "{CONSOLE_RUN_URL}",
+                "actor": {{ "login": "{actor}" }}
+            }}]}}"#
+        )
+    }
+
+    fn console_http() -> MapMockHttp {
+        MapMockHttp::new()
+            .on(CONSOLE_REFERENCES, 200, &console_references())
+            .on(
+                CONSOLE_COMMIT,
+                200,
+                &commit_json(
+                    "atharvadeosthale",
+                    "atharva@appwrite.io",
+                    "web-flow",
+                    "noreply@github.com",
+                ),
+            )
+            .on(CONSOLE_RUNS, 200, &runs_json("atharvadeosthale"))
+    }
+
+    fn announcing_poller(
+        http: MapMockHttp,
+        store: Arc<dyn FixAttemptTracker>,
+        announcer: Arc<RecordingAnnouncer>,
+    ) -> DeployQaTracker<MapMockHttp> {
+        poller(http, store, config(vec![console_track()], true)).with_announcer(announcer)
+    }
+
+    #[tokio::test]
+    async fn new_bare_tag_is_announced_once_with_its_releaser_and_deploy() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let announcer = Arc::new(RecordingAnnouncer::default());
+        let tracker = announcing_poller(console_http(), store.clone(), announcer.clone());
+
+        let first = tracker.poll_once().await;
+        let second = tracker.poll_once().await;
+
+        assert_eq!(first[0].action, DeployQaPollAction::Enqueued);
+        assert_eq!(second[0].action, DeployQaPollAction::SkippedDuplicate);
+        assert_eq!(
+            announcer.announced(),
+            vec![DeployQaAnnouncement {
+                track: "console".into(),
+                repo: MONOREPO.into(),
+                tag: "apps/console/1.2.141".into(),
+                version: "1.2.141".into(),
+                tag_url: "https://github.com/appwrite/appwrite/releases/tag/apps/console/1.2.141"
+                    .into(),
+                previous_tag: Some("apps/console/1.2.140".into()),
+                deploy_run: Some(DeployRun {
+                    name: "Console / Production #312".into(),
+                    url: CONSOLE_RUN_URL.into(),
+                }),
+                releaser_login: Some("atharvadeosthale".into()),
+            }],
+            "a new bare tag is announced exactly once"
+        );
+        let stored = store
+            .get_deploy_qa_tip("console", "apps/console/1.2.141")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.discord_message_id.as_deref(),
+            Some("announcement-1"),
+            "the outcome must reply under the announcement"
+        );
+        assert_eq!(
+            stored.author_login.as_deref(),
+            Some("atharvadeosthale"),
+            "FAIL must be able to @ whoever cut the tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_poller_does_not_announce_a_tip_again() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let before = Arc::new(RecordingAnnouncer::default());
+        announcing_poller(console_http(), store.clone(), before.clone())
+            .poll_once()
+            .await;
+
+        let after = Arc::new(RecordingAnnouncer::default());
+        let results = announcing_poller(console_http(), store, after.clone())
+            .poll_once()
+            .await;
+
+        assert_eq!(before.announced().len(), 1);
+        assert_eq!(results[0].action, DeployQaPollAction::SkippedDuplicate);
+        assert!(after.announced().is_empty(), "{:?}", after.announced());
+    }
+
+    #[tokio::test]
+    async fn a_failed_announcement_is_retried_until_it_lands() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let announcer = Arc::new(RecordingAnnouncer::failing_once());
+        let tracker = announcing_poller(console_http(), store.clone(), announcer.clone());
+
+        tracker.poll_once().await;
+        let unannounced = store
+            .get_deploy_qa_tip("console", "apps/console/1.2.141")
+            .unwrap()
+            .unwrap();
+        tracker.poll_once().await;
+        tracker.poll_once().await;
+
+        assert_eq!(unannounced.discord_message_id, None);
+        assert_eq!(announcer.announced().len(), 1);
+        assert_eq!(
+            store
+                .get_deploy_qa_tip("console", "apps/console/1.2.141")
+                .unwrap()
+                .unwrap()
+                .discord_message_id
+                .as_deref(),
+            Some("announcement-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tip_with_a_verdict_is_never_announced_late() {
+        let sqlite = SqliteTracker::in_memory().unwrap();
+        let reported = sqlite
+            .upsert_deploy_qa_tip(&DeployQaTip::new(
+                "console",
+                MONOREPO,
+                "apps/console/1.2.141",
+            ))
+            .unwrap();
+        sqlite
+            .update_deploy_qa_tip_status(reported.id, DeployQaTipStatus::Verified, None)
+            .unwrap();
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(sqlite);
+        let announcer = Arc::new(RecordingAnnouncer::default());
+
+        announcing_poller(console_http(), store, announcer.clone())
+            .poll_once()
+            .await;
+
+        assert!(announcer.announced().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tips_with_a_release_are_never_announced() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let announcer = Arc::new(RecordingAnnouncer::default());
+        let cloud = track("cloud", "appwrite-labs/cloud", DeployQaTagFilter::Any);
+        let http = console_http()
+            .on(
+                &console_release_url("apps/console/1.2.141"),
+                200,
+                &release_json("apps/console/1.2.141", ""),
+            )
+            .on(
+                "https://api.github.com/repos/appwrite-labs/cloud/releases",
+                200,
+                &format!("[{}]", release_json("1.53.30", "")),
+            );
+        let tracker = poller(
+            http,
+            store.clone(),
+            config(vec![console_track(), cloud], true),
+        )
+        .with_announcer(announcer.clone());
+
+        let results = tracker.poll_once().await;
+
+        assert!(results
+            .iter()
+            .all(|result| result.action == DeployQaPollAction::Enqueued));
+        assert!(
+            announcer.announced().is_empty(),
+            "GitHub's release feed announces released tips: {:?}",
+            announcer.announced()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_annotated_tag_is_released_by_its_tagger() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let announcer = Arc::new(RecordingAnnouncer::default());
+        let references = r#"[
+            {"ref":"refs/tags/apps/console/1.2.140","object":{"sha":"abc","type":"commit"}},
+            {"ref":"refs/tags/apps/console/1.2.141","object":{"sha":"tag141","type":"tag"}}
+        ]"#;
+        let http = MapMockHttp::new()
+            .on(CONSOLE_REFERENCES, 200, references)
+            .on(
+                "https://api.github.com/repos/appwrite/appwrite/git/tags/tag141",
+                200,
+                r#"{
+                    "tagger": { "name": "Arnab", "email": "arnab@appwrite.io" },
+                    "object": { "sha": "def", "type": "commit" }
+                }"#,
+            )
+            .on(
+                "https://api.github.com/repos/appwrite/appwrite/commits/def",
+                200,
+                &commit_json(
+                    "author-login",
+                    "author@appwrite.io",
+                    "ArnabChatterjee20k",
+                    "arnab@appwrite.io",
+                ),
+            )
+            .on(CONSOLE_RUNS, 200, &runs_json("actor-login"));
+        let tracker = announcing_poller(http, store, announcer.clone());
+
+        tracker.poll_once().await;
+
+        assert_eq!(
+            announcer.announced()[0].releaser_login.as_deref(),
+            Some("ArnabChatterjee20k")
+        );
+    }
+
+    fn identity(email: &str) -> GitIdentity {
+        GitIdentity {
+            name: None,
+            email: Some(email.to_string()),
+        }
+    }
+
+    fn account(login: &str) -> Option<crate::release::ReleaseAuthor> {
+        Some(crate::release::ReleaseAuthor {
+            login: login.to_string(),
+        })
+    }
+
+    fn commit(
+        author: Option<&str>,
+        author_email: &str,
+        committer: Option<&str>,
+        committer_email: &str,
+    ) -> GitHubCommit {
+        GitHubCommit {
+            author: author.and_then(account),
+            committer: committer.and_then(account),
+            commit: crate::release::GitHubCommitDetail {
+                author: Some(identity(author_email)),
+                committer: Some(identity(committer_email)),
+            },
+        }
+    }
+
+    fn run(actor: &str) -> GitHubWorkflowRun {
+        GitHubWorkflowRun {
+            name: None,
+            run_number: None,
+            head_sha: None,
+            html_url: CONSOLE_RUN_URL.into(),
+            actor: account(actor),
+        }
+    }
+
+    #[test]
+    fn releaser_is_the_tagger_then_the_commit_author_then_the_run_actor() {
+        let tagged = commit(Some("author"), "author@x.io", Some("tagger"), "Tagger@X.io");
+        let tagger = identity("tagger@x.io");
+        let stranger = identity("someone@x.io");
+        let actor = run("actor");
+
+        assert_eq!(
+            releaser_login(Some(&tagger), Some(&tagged), Some(&actor)).as_deref(),
+            Some("tagger"),
+            "a tagger whose email the tagged commit carries on an account wins"
+        );
+        assert_eq!(
+            releaser_login(Some(&stranger), Some(&tagged), Some(&actor)).as_deref(),
+            Some("author"),
+            "an unresolvable tagger falls back to the commit author"
+        );
+        assert_eq!(
+            releaser_login(None, Some(&tagged), Some(&actor)).as_deref(),
+            Some("author")
+        );
+        let unlinked = commit(None, "author@x.io", Some("web-flow"), "noreply@github.com");
+        assert_eq!(
+            releaser_login(None, Some(&unlinked), Some(&actor)).as_deref(),
+            Some("actor"),
+            "a commit with no author account falls back to the run actor"
+        );
+        let bot_authored = commit(Some("dependabot[bot]"), "bot@x.io", None, "");
+        assert_eq!(
+            releaser_login(None, Some(&bot_authored), Some(&run("web-flow"))),
+            None,
+            "bots and GitHub's merge account are never the releaser"
+        );
+        assert_eq!(releaser_login(None, None, None), None);
     }
 }

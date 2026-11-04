@@ -342,21 +342,14 @@ fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notif
     Arc::new(composite)
 }
 
-/// Build the synthetic live-QA `deploy_qa` issue source.
+/// Build the `[deploy_qa]` Discord reporter and announcer, or `None` when no
+/// bot token or channel is configured or the client cannot be built.
 ///
-/// Returns `None` when `[deploy_qa]` is disabled or the source cannot be built
-/// (e.g. an unreadable playbook). An unreadable GitHub↔Discord map or a Discord
-/// reporter that fails to build only degrades reporting, so the source is still
-/// returned. Every failure is logged. The source is returned unwrapped; callers
-/// add telemetry instrumentation.
-pub fn build_deploy_qa_source(
+/// An unreadable GitHub↔Discord map only disables mentions through it;
+/// `[users]` entries still resolve releasers. Every failure is logged.
+pub fn build_deploy_qa_discord(
     config: &Config,
-    tracker: Arc<dyn storage::FixAttemptTracker>,
-) -> Option<Arc<dyn source::IssueSource>> {
-    if !config.deploy_qa.enabled {
-        return None;
-    }
-
+) -> Option<claudear_integrations::deploy_qa::DeployQaDiscord> {
     let map = match config.deploy_qa.github_discord_map_path.as_deref() {
         Some(path) => deploy_qa::GitHubDiscordMap::load_from_path(path).unwrap_or_else(|e| {
             tracing::warn!(
@@ -375,7 +368,7 @@ pub fn build_deploy_qa_source(
         .map(|token| token.expose().to_string());
     let environment = std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)));
-    let discord = claudear_integrations::deploy_qa::try_build_discord(
+    claudear_integrations::deploy_qa::try_build_discord(
         bot_token.as_deref(),
         config.deploy_qa.discord_channel_id.as_deref(),
         map,
@@ -384,7 +377,26 @@ pub fn build_deploy_qa_source(
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "deploy_qa Discord reporter unavailable; reporting disabled");
         None
-    });
+    })
+    .map(|discord| discord.with_users(users::UserRegistry::new(config.users.clone())))
+}
+
+/// Build the synthetic live-QA `deploy_qa` issue source.
+///
+/// Returns `None` when `[deploy_qa]` is disabled or the source cannot be built
+/// (e.g. an unreadable playbook). An unreadable GitHub↔Discord map or a Discord
+/// reporter that fails to build only degrades reporting, so the source is still
+/// returned. Every failure is logged. The source is returned unwrapped; callers
+/// add telemetry instrumentation.
+pub fn build_deploy_qa_source(
+    config: &Config,
+    tracker: Arc<dyn storage::FixAttemptTracker>,
+) -> Option<Arc<dyn source::IssueSource>> {
+    if !config.deploy_qa.enabled {
+        return None;
+    }
+
+    let discord = build_deploy_qa_discord(config);
 
     match source::DeployQaSource::new(config.deploy_qa.clone(), tracker, discord) {
         Ok(source) => {

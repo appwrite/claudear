@@ -8,8 +8,14 @@
 mod github;
 mod tracker;
 
+pub use github::GitHubAnnotatedTag;
+pub use github::GitHubCommit;
+pub use github::GitHubCommitDetail;
 pub use github::GitHubRelease;
 pub use github::GitHubTag;
+pub use github::GitHubTaggedObject;
+pub use github::GitHubWorkflowRun;
+pub use github::GitIdentity;
 pub use github::PrDetails;
 pub use github::ReleaseAuthor;
 pub use github::ReleaseClient;

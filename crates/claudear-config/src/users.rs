@@ -21,7 +21,7 @@ pub struct ResolvedUser {
 }
 
 /// Registry that resolves issue metadata to user notification targets.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UserRegistry {
     users: HashMap<String, UserConfig>,
 }
