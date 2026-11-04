@@ -17,6 +17,7 @@ use claudear_analysis::distribution::PullRequestSummary;
 use claudear_analysis::distribution::Roster;
 use claudear_config::config::Config;
 use claudear_config::config::PrDistributionConfig;
+use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::AssignmentStatus;
 use claudear_core::types::Issue;
@@ -87,10 +88,13 @@ impl Distributor {
     /// The distributor `config` describes, or `None` when `[pr_distribution]`
     /// is disabled, there is no code host, or nobody is on the roster.
     ///
-    /// The roster is read fresh on each call, so edits to `[users]` or the
-    /// GitHub↔Discord map apply from the next PR or scheduled run.
+    /// The roster is built fresh from `registry` on each call, so console
+    /// identity edits apply from the next PR or scheduled run without a
+    /// restart. The `[deploy_qa]` GitHub↔Discord map is only a fallback for
+    /// what the registry does not know.
     pub fn from_config(
         config: &Config,
+        registry: &UserRegistry,
         store: Arc<dyn FixAttemptTracker>,
         host: Option<Arc<dyn PullRequestHost>>,
         notifier: Arc<dyn Notifier>,
@@ -106,27 +110,27 @@ impl Distributor {
             );
             return None;
         };
-        let map = distribution
+        let map = config
+            .deploy_qa
             .github_discord_map_path
             .as_deref()
-            .or(config.deploy_qa.github_discord_map_path.as_deref())
             .map(|path| {
                 GitHubDiscordMap::load_from_path(path).unwrap_or_else(|error| {
                     tracing::warn!(
                         component = "pr_distribution",
                         path,
                         error = %error,
-                        "Failed to load the GitHub↔Discord map; using [users] only"
+                        "Failed to load the GitHub↔Discord map; using the user registry only"
                     );
                     GitHubDiscordMap::default()
                 })
             })
             .unwrap_or_default();
-        let roster = Roster::new(&config.users, &map, &distribution.excluded);
+        let roster = Roster::new(registry, &map, &distribution.excluded);
         if roster.is_empty() {
             tracing::warn!(
                 component = "pr_distribution",
-                "Nobody on the roster: add GitHub usernames to [users] or a GitHub↔Discord map"
+                "Nobody on the roster: add GitHub usernames to people in the console or [users]"
             );
             return None;
         }
@@ -1084,32 +1088,113 @@ mod tests {
         );
     }
 
+    fn amy(discord_id: &str) -> claudear_config::config::UserConfig {
+        claudear_config::config::UserConfig {
+            github_usernames: vec!["amy".to_string()],
+            discord_id: Some(discord_id.to_string()),
+            ..claudear_config::config::UserConfig::default()
+        }
+    }
+
     #[test]
     fn from_config_needs_the_switch_a_host_and_a_roster() {
         let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
         let host: Arc<dyn PullRequestHost> = Arc::new(FakeHost::default());
         let notifier: Arc<dyn Notifier> = Arc::new(Recorder::default());
-        let mut config = Config::default();
-        config.users.insert(
+        let registry = UserRegistry::new(HashMap::from([(
             "amy".to_string(),
-            claudear_config::config::UserConfig {
-                github_usernames: vec!["amy".to_string()],
-                ..claudear_config::config::UserConfig::default()
-            },
-        );
+            amy("111111111111111111"),
+        )]));
+        let mut config = Config::default();
 
-        let build = |config: &Config, host: Option<Arc<dyn PullRequestHost>>| {
-            Distributor::from_config(config, store.clone(), host, notifier.clone()).is_some()
+        let build =
+            |config: &Config, registry: &UserRegistry, host: Option<Arc<dyn PullRequestHost>>| {
+                Distributor::from_config(config, registry, store.clone(), host, notifier.clone())
+                    .is_some()
+            };
+
+        assert!(!build(&config, &registry, Some(host.clone())));
+        config.pr_distribution.enabled = true;
+        assert!(!build(&config, &registry, None));
+        assert!(build(&config, &registry, Some(host.clone())));
+        config.pr_distribution.excluded = vec!["AMY".to_string()];
+        assert!(!build(&config, &registry, Some(host.clone())));
+        config.deploy_qa.github_discord_map_path =
+            Some("/nonexistent/github-discord-map.json".to_string());
+        assert!(!build(&config, &registry, Some(host.clone())));
+
+        let directory = tempfile::tempdir().unwrap();
+        let map = directory.path().join("github-discord-map.json");
+        std::fs::write(
+            &map,
+            r#"{"byGithubLogin": {"bob": {"discordUserId": "222222222222222222"}}}"#,
+        )
+        .unwrap();
+        config.deploy_qa.github_discord_map_path = Some(map.display().to_string());
+        assert!(build(
+            &config,
+            &UserRegistry::new(HashMap::new()),
+            Some(host)
+        ));
+    }
+
+    #[tokio::test]
+    async fn console_edits_change_who_is_pinged_without_a_restart() {
+        let harness = Harness::new(FakeHost::with([open(1), open(2)]));
+        harness.opened(1);
+        harness.opened(2);
+        let registry = UserRegistry::new(HashMap::from([(
+            "amy".to_string(),
+            amy("111111111111111111"),
+        )]));
+        let mut config = Config::default();
+        config.pr_distribution.enabled = true;
+        let distributor = |registry: &UserRegistry| {
+            Distributor::from_config(
+                &config,
+                registry,
+                harness.store.clone(),
+                Some(harness.host.clone() as Arc<dyn PullRequestHost>),
+                harness.recorder.clone(),
+            )
+            .unwrap()
         };
 
-        assert!(!build(&config, Some(host.clone())));
-        config.pr_distribution.enabled = true;
-        assert!(!build(&config, None));
-        assert!(build(&config, Some(host.clone())));
-        config.pr_distribution.excluded = vec!["AMY".to_string()];
-        assert!(!build(&config, Some(host.clone())));
-        config.pr_distribution.github_discord_map_path =
-            Some("/nonexistent/github-discord-map.json".to_string());
-        assert!(!build(&config, Some(host)));
+        distributor(&registry)
+            .assign_opened(&url(1), &requested_by("amy"))
+            .await
+            .unwrap();
+        registry.replace_console(vec![claudear_core::identity::ConsoleIdentity {
+            user_id: 1,
+            login_email: "amy@example.com".to_string(),
+            name: "Amy".to_string(),
+            slug: Some("amy".to_string()),
+            identities: claudear_core::identity::Identities {
+                github_usernames: vec!["amy".to_string()],
+                discord_id: Some("222222222222222222".to_string()),
+                ..claudear_core::identity::Identities::default()
+            },
+            updated_at: "2026-11-04 10:00:00".to_string(),
+        }]);
+        distributor(&registry)
+            .assign_opened(&url(2), &requested_by("amy"))
+            .await
+            .unwrap();
+
+        let pinged: Vec<Option<String>> = harness
+            .recorder
+            .notices
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|notice| notice.developer.discord_id.clone())
+            .collect();
+        assert_eq!(
+            pinged,
+            vec![
+                Some("111111111111111111".to_string()),
+                Some("222222222222222222".to_string()),
+            ]
+        );
     }
 }

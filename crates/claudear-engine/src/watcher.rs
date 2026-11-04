@@ -2912,6 +2912,7 @@ Create a PR with your changes.{custom_instructions}"#,
     fn distributor(&self) -> Option<Distributor> {
         Distributor::from_config(
             &self.config,
+            &self.user_registry,
             self.tracker.clone(),
             self.github_client
                 .clone()

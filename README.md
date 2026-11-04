@@ -606,7 +606,7 @@ claudear prs monitor --continuous
 
 ### PR Distribution
 
-Every open Claudear PR gets one developer responsible for getting it over the line. Developers come from `[users]` entries with a `github_usernames` value and from the GitHub↔Discord map (`github-discord-map.json`), minus `excluded`.
+Every open Claudear PR gets one developer responsible for getting it over the line. Developers come from the [user registry](#user-registry-1): everyone, console identities and `[users]` entries alike, who owns a GitHub login (a login two people list belongs to its registry owner), minus `excluded`. Mentions use the registry's Discord and Slack ids; the `[deploy_qa]` `github-discord-map.json` only fills in a missing Discord id and adds logins nobody in the registry owns. The roster is rebuilt for every PR and scheduled run, so console edits change assignments and mentions without a restart.
 
 ```toml
 [pr_distribution]
@@ -615,14 +615,13 @@ digest_frequency = "daily"         # daily | weekly-monday .. weekly-sunday | mo
 digest_hour = 9                    # UTC
 excluded = ["on-leave-login"]
 tolerance = 0                      # PRs above the fair share an owner may hold
-github_discord_map_path = "/etc/claudear/github-discord-map.json"  # defaults to [deploy_qa]'s
 ```
 
 **Ownership.** Each roster developer is scored for a PR, strongest signal first:
 
 | Signal | Points |
 |--------|--------|
-| Asked for the work: the issue's resolved `[users]` assignee, a GitHub issue's assignee or author, or the Discord/Slack user who posted it | 100 for the closest, 100/n for the n-th |
+| Asked for the work: the issue's assignee as resolved by the user registry, a GitHub issue's assignee or author, or the Discord/Slack user who posted it | 100 for the closest, 100/n for the n-th |
 | CODEOWNERS (`.github/`, root or `docs/`) names them for the changed files | 40 × share of changed files |
 | Authored recent commits (last 30 per file) to the changed files | 20 × share of those commits |
 | Authored recent commits (last 100) to the repository | 5 × share of those commits |

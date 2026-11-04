@@ -3080,6 +3080,7 @@ impl IssueProcessor {
     async fn assign_opened_pr(&self, pr_url: &str, issue: &Issue) {
         let Some(distributor) = Distributor::from_config(
             &self.config,
+            &self.user_registry,
             self.tracker.clone(),
             self.github_client
                 .clone()

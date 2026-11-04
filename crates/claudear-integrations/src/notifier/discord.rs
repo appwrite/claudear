@@ -5655,6 +5655,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_instrumented_repetitive_digest_pings_the_registry_on_call_user() {
+        let registry = registry_with("jake", discord_person(Some("111111111")));
+        let discord = std::sync::Arc::new(DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry.clone(),
+        ));
+        let notifier = crate::telemetry::InstrumentedNotifier::wrap(discord.clone());
+        let digest = test_digest(vec![repetitive_entry()]);
+
+        notifier.notify_repetitive_digest(&digest).await.unwrap();
+        assert_eq!(sent_content(&discord).as_deref(), Some("<@111111111>"));
+
+        registry.replace_console(vec![console_person(
+            "jake",
+            claudear_core::identity::Identities {
+                discord_id: Some("222222222".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        notifier.notify_repetitive_digest(&digest).await.unwrap();
+        assert_eq!(sent_content(&discord).as_deref(), Some("<@222222222>"));
+    }
+
+    #[tokio::test]
     async fn test_urgent_mention_follows_console_edit_without_rebuild() {
         let registry = registry_with("jake", discord_person(Some("111111111")));
         let notifier = DiscordNotifier::with_http_client_and_registry(

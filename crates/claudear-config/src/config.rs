@@ -880,8 +880,10 @@ impl Default for RepetitiveDigestConfig {
 ///
 /// Makes one developer from the roster responsible for each open Claudear PR,
 /// pings them when the PR opens, and sends each assignee a digest of the PRs
-/// still waiting on them. The roster is every `[users]` entry with a GitHub
-/// username plus every login in the GitHub↔Discord map, minus `excluded`.
+/// still waiting on them. The roster is every person in the shared user
+/// registry (console identities merged with `[users]`) who owns a GitHub
+/// login, plus `[deploy_qa] github_discord_map_path` logins nobody owns, minus
+/// `excluded`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrDistributionConfig {
@@ -903,9 +905,6 @@ pub struct PrDistributionConfig {
     /// How many PRs a developer may hold above the fair share before an owner
     /// loses a PR to someone less loaded (default: 0).
     pub tolerance: usize,
-    /// GitHub login → Discord user map. Falls back to
-    /// `[deploy_qa] github_discord_map_path` when unset.
-    pub github_discord_map_path: Option<String>,
 }
 
 /// How often the `[pr_distribution]` scheduled run fires.
@@ -1017,7 +1016,6 @@ impl Default for PrDistributionConfig {
             digest_hour: 9,
             excluded: Vec::new(),
             tolerance: 0,
-            github_discord_map_path: None,
         }
     }
 }
@@ -5811,7 +5809,6 @@ monitoring_duration_hours = 12
         assert_eq!(config.pr_distribution.digest_hour, 9);
         assert!(config.pr_distribution.excluded.is_empty());
         assert_eq!(config.pr_distribution.tolerance, 0);
-        assert!(config.pr_distribution.github_discord_map_path.is_none());
     }
 
     #[test]
@@ -5823,8 +5820,7 @@ monitoring_duration_hours = 12
              digest_frequency = \"weekly-monday\"\n\
              digest_hour = 14\n\
              excluded = [\"alice\"]\n\
-             tolerance = 2\n\
-             github_discord_map_path = \"/etc/claudear/map.json\"\n",
+             tolerance = 2\n",
         )
         .expect("parse");
         let distribution = config.pr_distribution;
@@ -5838,10 +5834,6 @@ monitoring_duration_hours = 12
         assert_eq!(distribution.digest_hour, 14);
         assert_eq!(distribution.excluded, vec!["alice".to_string()]);
         assert_eq!(distribution.tolerance, 2);
-        assert_eq!(
-            distribution.github_discord_map_path.as_deref(),
-            Some("/etc/claudear/map.json")
-        );
     }
 
     #[test]
