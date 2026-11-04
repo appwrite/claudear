@@ -1591,7 +1591,7 @@ pub struct TelegramConfig {
 }
 
 /// Per-user configuration mapping source identifiers to notification channel IDs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserConfig {
     /// User's display names in Linear (matched against issue assignee).
