@@ -625,6 +625,10 @@ claudear dashboard --dashboard-dir ./dashboard/dist
 - Source-by-source metrics (Linear, Sentry, Discord, GitHub)
 - Recent attempt history with direct PR links
 - Retryable issues with one-click retry
+- Deploy QA: per-track release tips and their QA results, with admin-editable track config
+- Integrations: every source, SCM, notifier and automation with its configured and enabled state
+
+Console config edits are written to `claudear.toml` in normalised form and apply after restart; secrets are write-only; read-only mounts disable saving.
 
 <p align="center">
   <img src="website/assets/screenshots/overview.png" alt="Dashboard overview" width="800" />
@@ -666,6 +670,10 @@ claudear dashboard --dashboard-dir ./dashboard/dist
 | `GET /api/repos/dependencies` | Dependency graph |
 | `GET /api/inference/stats` | Inference success rates |
 | `GET /api/regressions` | Regression checks |
+| `GET /api/deploy-qa` | Deploy QA status per track |
+| `GET /api/deploy-qa/tips` | Recent deploy QA tips (`?track=`) |
+| `GET/PUT /api/deploy-qa/config` | Deploy QA config (admin) |
+| `GET /api/features` | Integration and feature status |
 | `GET /api/telemetry/overview` | Telemetry overview |
 | `GET /api/telemetry/cost-analysis` | Cost analysis |
 
