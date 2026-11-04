@@ -7,8 +7,8 @@ use super::types::{
     StoredRepository, UserRow,
 };
 use super::{
-    ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
-    EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
+    ActivityStore, AttemptScope, AttemptTracker, ChatStore, DeployQaStore, DiscordStore,
+    EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
     SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
 };
 use crate::vector_index::catalog::Catalog;
@@ -27,7 +27,7 @@ use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
     ExperimentProviderStats, FixAttempt, FixAttemptStats, FixAttemptStatus, FixOutcome,
     IssueEmbedding, IssueTimeline, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment,
-    QaKnowledgeEntry, QaMatch, RetrievalUsageRecord, SimilarIssue, SourceStats, TimelineEvent,
+    QaKnowledgeEntry, QaMatch, RetrievalUsageRecord, SimilarIssue, TimelineEvent,
 };
 use parking_lot::{Mutex, MutexGuard};
 use rand::RngExt;
@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod scope;
 mod security_reports;
 mod vector_index_rebuilder;
 
@@ -117,6 +118,50 @@ pub struct SqliteTracker {
 }
 
 impl SqliteTracker {
+    /// Rows of `select` over the named metrics within `scope` recorded since
+    /// `since`, grouped by `group`.
+    fn aggregate_metrics<T>(
+        &self,
+        select: &str,
+        group: &str,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+        scope: AttemptScope,
+        map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>> {
+        if metric_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..metric_names.len())
+            .map(|index| format!("?{}", index + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT {select}
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND {}
+              AND metric_name IN ({placeholders})
+            GROUP BY {group}
+            "#,
+            scope::metric_source("source", 2)
+        );
+        let since = since.format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(metric_names.len() + 2);
+        bindings.push(&since);
+        let excluded = scope.excluded_source();
+        bindings.push(&excluded);
+        for metric_name in metric_names {
+            bindings.push(metric_name);
+        }
+
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bindings.as_slice(), map)?;
+        Ok(rows.flatten().collect())
+    }
+
     /// Create a new SQLite tracker with the given database path.
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
         let connection = Connection::open(db_path)?;
@@ -1430,52 +1475,17 @@ impl AttemptTracker for SqliteTracker {
     }
 
     fn get_stats(&self) -> Result<FixAttemptStats> {
+        self.get_scoped_stats(AttemptScope::All)
+    }
+
+    fn get_scoped_stats(&self, scope: AttemptScope) -> Result<FixAttemptStats> {
         let conn = self.acquire_lock()?;
         let mut stats = FixAttemptStats::default();
-
-        // Overall stats
-        let mut stmt = conn.prepare_cached(
-            r#"
-            SELECT status, COUNT(*) as count
-            FROM fix_attempts
-            GROUP BY status
-            "#,
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
-        })?;
-
-        for row in rows {
-            match row {
-                Ok((status, count)) => {
-                    stats.total += count;
-                    match status.as_str() {
-                        "pending" => stats.pending = count,
-                        "success" => stats.success = count,
-                        "failed" => stats.failed = count,
-                        "merged" => stats.merged = count,
-                        "closed" => stats.closed = count,
-                        "cannot_fix" => stats.cannot_fix = count,
-                        _ => {}
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to read stats row");
-                }
-            }
-        }
-
-        // Stats by source
-        let mut stmt = conn.prepare_cached(
-            r#"
-            SELECT source, status, COUNT(*) as count
-            FROM fix_attempts
-            GROUP BY source, status
-            "#,
-        )?;
-
-        let rows = stmt.query_map([], |row| {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT source, status, COUNT(*) FROM fix_attempts WHERE {} GROUP BY source, status",
+            scope::source("source", 1)
+        ))?;
+        let rows = stmt.query_map(params![scope.excluded_source()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1483,29 +1493,42 @@ impl AttemptTracker for SqliteTracker {
             ))
         })?;
 
-        let mut by_source: HashMap<String, SourceStats> = HashMap::new();
-
         for row in rows {
-            match row {
-                Ok((source, status, count)) => {
-                    let entry = by_source.entry(source).or_default();
-                    entry.total += count;
-                    match status.as_str() {
-                        "success" => entry.success = count,
-                        "failed" => entry.failed = count,
-                        "merged" => entry.merged = count,
-                        "closed" => entry.closed = count,
-                        "cannot_fix" => entry.cannot_fix = count,
-                        _ => {}
-                    }
-                }
+            let (source, status, count) = match row {
+                Ok(row) => row,
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to read source stats row");
+                    tracing::warn!(error = %e, "Failed to read stats row");
+                    continue;
                 }
+            };
+            stats.total += count;
+            let entry = stats.by_source.entry(source).or_default();
+            entry.total += count;
+            match status.as_str() {
+                "pending" => stats.pending += count,
+                "success" => {
+                    stats.success += count;
+                    entry.success += count;
+                }
+                "failed" => {
+                    stats.failed += count;
+                    entry.failed += count;
+                }
+                "merged" => {
+                    stats.merged += count;
+                    entry.merged += count;
+                }
+                "closed" => {
+                    stats.closed += count;
+                    entry.closed += count;
+                }
+                "cannot_fix" => {
+                    stats.cannot_fix += count;
+                    entry.cannot_fix += count;
+                }
+                _ => {}
             }
         }
-
-        stats.by_source = by_source;
 
         Ok(stats)
     }
@@ -1556,8 +1579,8 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::record_metric(self, metric)
     }
 
-    fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
-        SqliteTracker::get_analytics_summary(self)
+    fn get_analytics_summary(&self, scope: AttemptScope) -> Result<AnalyticsSummary> {
+        SqliteTracker::get_analytics_summary(self, scope)
     }
 
     fn get_recent_activities_filtered(
@@ -1605,12 +1628,12 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::get_open_prs(self)
     }
 
-    fn get_pr_analytics(&self) -> Result<claudear_core::types::PrAnalytics> {
-        SqliteTracker::get_pr_analytics(self)
+    fn get_pr_analytics(&self, scope: AttemptScope) -> Result<claudear_core::types::PrAnalytics> {
+        SqliteTracker::get_pr_analytics(self, scope)
     }
 
-    fn get_avg_time_to_pr(&self) -> Result<Option<f64>> {
-        SqliteTracker::get_avg_time_to_pr(self)
+    fn get_avg_time_to_pr(&self, scope: AttemptScope) -> Result<Option<f64>> {
+        SqliteTracker::get_avg_time_to_pr(self, scope)
     }
 
     fn get_rejection_reasons(
@@ -1620,8 +1643,8 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::get_rejection_reasons(self, limit)
     }
 
-    fn get_agent_spawn_count(&self, since_iso: &str) -> Result<i64> {
-        SqliteTracker::get_agent_spawn_count(self, since_iso)
+    fn get_agent_spawn_count(&self, since_iso: &str, scope: AttemptScope) -> Result<i64> {
+        SqliteTracker::get_agent_spawn_count(self, since_iso, scope)
     }
 
     fn get_cost_estimate(
@@ -1629,20 +1652,38 @@ impl ActivityStore for SqliteTracker {
         since_iso: &str,
         max_plan_monthly_cost: f64,
         period_label: &str,
+        scope: AttemptScope,
     ) -> Result<claudear_core::types::CostEstimate> {
-        SqliteTracker::get_cost_estimate(self, since_iso, max_plan_monthly_cost, period_label)
+        SqliteTracker::get_cost_estimate(
+            self,
+            since_iso,
+            max_plan_monthly_cost,
+            period_label,
+            scope,
+        )
     }
 
-    fn get_mttr_trend(&self, weeks: usize) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
-        SqliteTracker::get_mttr_trend(self, weeks)
+    fn get_mttr_trend(
+        &self,
+        weeks: usize,
+        scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
+        SqliteTracker::get_mttr_trend(self, weeks, scope)
     }
 
-    fn get_repo_leaderboard(&self) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
-        SqliteTracker::get_repo_leaderboard(self)
+    fn get_repo_leaderboard(
+        &self,
+        scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
+        SqliteTracker::get_repo_leaderboard(self, scope)
     }
 
-    fn get_commit_trend(&self, days: usize) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
-        SqliteTracker::get_commit_trend(self, days)
+    fn get_commit_trend(
+        &self,
+        days: usize,
+        scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
+        SqliteTracker::get_commit_trend(self, days, scope)
     }
 
     fn list_support_replies(
@@ -1671,8 +1712,15 @@ impl ActivityStore for SqliteTracker {
         since_iso: &str,
         hourly_rate: f64,
         period_label: &str,
+        scope: AttemptScope,
     ) -> Result<claudear_core::types::TimeSavings> {
-        SqliteTracker::get_complexity_time_savings(self, since_iso, hourly_rate, period_label)
+        SqliteTracker::get_complexity_time_savings(
+            self,
+            since_iso,
+            hourly_rate,
+            period_label,
+            scope,
+        )
     }
 
     fn list_prs(
@@ -1743,19 +1791,24 @@ impl ActivityStore for SqliteTracker {
     }
 
     /// Count activity events grouped by type since a timestamp.
-    fn get_activity_type_counts_since(&self, since: DateTime<Utc>) -> Result<HashMap<String, i64>> {
+    fn get_activity_type_counts_since(
+        &self,
+        since: DateTime<Utc>,
+        scope: AttemptScope,
+    ) -> Result<HashMap<String, i64>> {
         let conn = self.acquire_lock()?;
         let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT activity_type, COUNT(*)
             FROM activity_log
-            WHERE timestamp >= ?1
+            WHERE timestamp >= ?1 AND {}
             GROUP BY activity_type
             "#,
-        )?;
+            scope::source("source", 2)
+        ))?;
 
-        let rows = stmt.query_map(params![since_str], |row| {
+        let rows = stmt.query_map(params![since_str, scope.excluded_source()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
 
@@ -2085,46 +2138,17 @@ impl ActivityStore for SqliteTracker {
         &self,
         metric_names: &[&str],
         since: DateTime<Utc>,
+        scope: AttemptScope,
     ) -> Result<HashMap<String, i64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, COUNT(*)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-
-        let mut counts = HashMap::new();
-        for row in rows.flatten() {
-            counts.insert(row.0, row.1);
-        }
-        Ok(counts)
+        let rows = self.aggregate_metrics(
+            "metric_name, COUNT(*)",
+            "metric_name",
+            metric_names,
+            since,
+            scope,
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Get metric sums grouped by name since a timestamp.
@@ -2132,101 +2156,48 @@ impl ActivityStore for SqliteTracker {
         &self,
         metric_names: &[&str],
         since: DateTime<Utc>,
+        scope: AttemptScope,
     ) -> Result<HashMap<String, f64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, SUM(metric_value)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-            ))
-        })?;
-
-        let mut sums = HashMap::new();
-        for row in rows.flatten() {
-            sums.insert(row.0, row.1);
-        }
-        Ok(sums)
+        let rows = self.aggregate_metrics(
+            "metric_name, SUM(metric_value)",
+            "metric_name",
+            metric_names,
+            since,
+            scope,
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                ))
+            },
+        )?;
+        Ok(rows.into_iter().collect())
     }
 
     fn get_metric_sums_by_source_since(
         &self,
         metric_names: &[&str],
         since: DateTime<Utc>,
+        scope: AttemptScope,
     ) -> Result<HashMap<(String, String), f64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, source, SUM(metric_value)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name, source
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-            ))
-        })?;
-
-        let mut sums = HashMap::new();
-        for row in rows.flatten() {
-            if let Some(source) = row.1 {
-                sums.insert((row.0, source), row.2);
-            }
-        }
-        Ok(sums)
+        let rows = self.aggregate_metrics(
+            "metric_name, source, SUM(metric_value)",
+            "metric_name, source",
+            metric_names,
+            since,
+            scope,
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                ))
+            },
+        )?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(name, source, sum)| source.map(|source| ((name, source), sum)))
+            .collect())
     }
 
     /// Prune old activity logs to prevent unbounded growth.
@@ -2821,53 +2792,52 @@ impl ActivityStore for SqliteTracker {
     }
 
     /// Count fix attempts with optional status/source filters.
-    fn count_attempts(&self, status: Option<&str>, source: Option<&str>) -> Result<usize> {
+    fn count_attempts(
+        &self,
+        status: Option<&str>,
+        source: Option<&str>,
+        scope: AttemptScope,
+    ) -> Result<usize> {
         let conn = self.acquire_lock()?;
-        let count: i64 = match (status, source) {
-            (Some(status), Some(source)) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1 AND source = ?2",
-                params![status, source],
-                |row| row.get(0),
-            )?,
-            (Some(status), None) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1",
-                params![status],
-                |row| row.get(0),
-            )?,
-            (None, Some(source)) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE source = ?1",
-                params![source],
-                |row| row.get(0),
-            )?,
-            (None, None) => {
-                conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?
-            }
-        };
+        let count: i64 = conn.query_row(
+            &format!(
+                r#"
+                SELECT COUNT(*) FROM fix_attempts
+                WHERE (?1 IS NULL OR status = ?1)
+                  AND (?2 IS NULL OR source = ?2)
+                  AND {}
+                "#,
+                scope::source("source", 3)
+            ),
+            params![status, source, scope.excluded_source()],
+            |row| row.get(0),
+        )?;
         Ok(count as usize)
     }
 
-    fn list_attempts_excluding_source(
+    fn list_scoped_attempts(
         &self,
         status: Option<&str>,
-        excluded_source: &str,
+        scope: AttemptScope,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(&format!(
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
                    scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
-            WHERE source <> ?1 COLLATE NOCASE
+            WHERE {}
               AND (?2 IS NULL OR status = ?2)
             ORDER BY attempted_at DESC
             LIMIT ?3 OFFSET ?4
             "#,
-        )?;
+            scope::source("source", 1)
+        ))?;
         let rows = stmt.query_map(
-            params![excluded_source, status, limit as i64, offset as i64],
+            params![scope.excluded_source(), status, limit as i64, offset as i64],
             Self::row_to_fix_attempt,
         )?;
         Ok(rows.flatten().collect())
@@ -2879,20 +2849,28 @@ impl ActivityStore for SqliteTracker {
     }
 
     /// List attempts since a timestamp, ordered by attempted time descending.
-    fn list_attempts_since(&self, since: DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+    fn list_attempts_since(
+        &self,
+        since: DateTime<Utc>,
+        scope: AttemptScope,
+    ) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
         let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
                    scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
-            WHERE attempted_at >= ?1
+            WHERE attempted_at >= ?1 AND {}
             ORDER BY attempted_at DESC
             "#,
+            scope::source("source", 2)
+        ))?;
+        let rows = stmt.query_map(
+            params![since_str, scope.excluded_source()],
+            Self::row_to_fix_attempt,
         )?;
-        let rows = stmt.query_map(params![since_str], Self::row_to_fix_attempt)?;
         Ok(rows.flatten().collect())
     }
 
@@ -3867,25 +3845,26 @@ impl EmbeddingStore for SqliteTracker {
             })
     }
 
-    fn list_issues_excluding_source(
+    fn list_scoped_issues(
         &self,
-        excluded_source: &str,
+        scope: AttemptScope,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<IssueEmbedding>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
                    description, url, priority, status, labels, updated_at
             FROM issues
-            WHERE source <> ?1 COLLATE NOCASE
+            WHERE {}
             ORDER BY COALESCE(updated_at, created_at) DESC
             LIMIT ?2 OFFSET ?3
             "#,
-        )?;
+            scope::source("source", 1)
+        ))?;
         let rows = stmt.query_map(
-            params![excluded_source, limit as i64, offset as i64],
+            params![scope.excluded_source(), limit as i64, offset as i64],
             |row| Self::row_to_issue_embedding(row, 8),
         )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -3895,16 +3874,16 @@ impl EmbeddingStore for SqliteTracker {
     }
 
     /// Count issues, optionally filtered by source.
-    fn count_issues(&self, source: Option<&str>) -> Result<usize> {
+    fn count_issues(&self, source: Option<&str>, scope: AttemptScope) -> Result<usize> {
         let conn = self.acquire_lock()?;
-        let count: i64 = match source {
-            Some(s) => conn.query_row(
-                "SELECT COUNT(*) FROM issues WHERE source = ?",
-                params![s],
-                |row| row.get(0),
-            )?,
-            None => conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?,
-        };
+        let count: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM issues WHERE (?1 IS NULL OR source = ?1) AND {}",
+                scope::source("source", 2)
+            ),
+            params![source, scope.excluded_source()],
+            |row| row.get(0),
+        )?;
         Ok(count as usize)
     }
 
@@ -6429,22 +6408,26 @@ impl SqliteTracker {
     }
 
     /// Get a comprehensive analytics summary.
-    pub fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
+    pub fn get_analytics_summary(&self, scope: AttemptScope) -> Result<AnalyticsSummary> {
         let conn = self.acquire_lock()?;
+        let excluded = scope.excluded_source();
 
-        // Get basic stats
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN status IN ('success', 'merged') THEN 1 ELSE 0 END) as successful,
-                SUM(CASE WHEN status = 'merged' THEN 1 ELSE 0 END) as merged
+                COALESCE(SUM(CASE WHEN status IN ('success', 'merged') THEN 1 ELSE 0 END), 0) as successful,
+                COALESCE(SUM(CASE WHEN status = 'merged' THEN 1 ELSE 0 END), 0) as merged
             FROM fix_attempts
+            WHERE {}
             "#,
-        )?;
+            scope::source("source", 1)
+        ))?;
 
         let (total, successful, merged): (i64, i64, i64) = stmt
-            .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_row(params![excluded], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .unwrap_or((0, 0, 0));
 
         let success_rate = if total > 0 {
@@ -6453,35 +6436,38 @@ impl SqliteTracker {
             0.0
         };
 
-        // Get average processing time
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT AVG(duration_secs) FROM claude_executions WHERE duration_secs IS NOT NULL
-            "#,
-        )?;
-        let avg_processing_time: Option<f64> = stmt.query_row([], |row| row.get(0)).ok();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT AVG(duration_secs) FROM claude_executions WHERE duration_secs IS NOT NULL AND {}",
+            scope::attempt("attempt_id", 1)
+        ))?;
+        let avg_processing_time: Option<f64> = stmt
+            .query_row(params![excluded], |row| row.get(0))
+            .ok()
+            .flatten();
 
-        // Get most common error
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT error_type FROM error_patterns ORDER BY occurrence_count DESC LIMIT 1
-            "#,
-        )?;
-        let most_common_error: Option<String> = stmt.query_row([], |row| row.get(0)).ok();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT error_type FROM error_patterns WHERE {} ORDER BY occurrence_count DESC LIMIT 1",
+            scope::sources("sources", 1)
+        ))?;
+        let most_common_error: Option<String> = stmt
+            .query_row(params![excluded], |row| row.get(0))
+            .ok()
+            .flatten();
 
-        // Get success rate by source
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT source,
                    CAST(SUM(CASE WHEN status IN ('success', 'merged') THEN 1 ELSE 0 END) AS REAL) /
                    NULLIF(CAST(COUNT(*) AS REAL), 0) as rate
             FROM fix_attempts
+            WHERE {}
             GROUP BY source
             "#,
-        )?;
+            scope::source("source", 1)
+        ))?;
 
         let mut success_rate_by_source = HashMap::new();
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![excluded], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
         })?;
 
@@ -7202,44 +7188,42 @@ impl SqliteTracker {
         Ok(rows.flatten().collect())
     }
 
-    /// Get PR analytics.
-    pub fn get_pr_analytics(&self) -> Result<claudear_core::types::PrAnalytics> {
+    /// Analytics over the PRs within `scope`.
+    pub fn get_pr_analytics(
+        &self,
+        scope: AttemptScope,
+    ) -> Result<claudear_core::types::PrAnalytics> {
         let conn = self.acquire_lock()?;
+        let excluded = scope.excluded_source();
+        let scoped = scope::pull_request("prs", 1);
 
-        let total: i64 = conn.query_row("SELECT COUNT(*) FROM prs", [], |row| row.get(0))?;
-        let open: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM prs WHERE status = 'open'",
-            [],
-            |row| row.get(0),
+        let (total, open, merged, closed): (i64, i64, i64, i64) = conn.query_row(
+            &format!(
+                r#"
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'merged' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END), 0)
+                FROM prs
+                WHERE {scoped}
+                "#
+            ),
+            params![excluded],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        let merged: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM prs WHERE status = 'merged'",
-            [],
-            |row| row.get(0),
+
+        let (avg_time_to_first_review_mins, avg_time_to_merge_mins, avg_review_cycles): (
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        ) = conn.query_row(
+            &format!(
+                "SELECT AVG(time_to_first_review_mins), AVG(time_to_merge_mins), AVG(review_cycles) FROM prs WHERE {scoped}"
+            ),
+            params![excluded],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let closed: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM prs WHERE status = 'closed'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        let avg_time_to_first_review_mins: Option<f64> = conn.query_row(
-            "SELECT AVG(time_to_first_review_mins) FROM prs WHERE time_to_first_review_mins IS NOT NULL",
-            [],
-            |row| row.get(0),
-        ).ok();
-
-        let avg_time_to_merge_mins: Option<f64> = conn
-            .query_row(
-                "SELECT AVG(time_to_merge_mins) FROM prs WHERE time_to_merge_mins IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-
-        let avg_review_cycles: Option<f64> = conn
-            .query_row("SELECT AVG(review_cycles) FROM prs", [], |row| row.get(0))
-            .ok();
 
         let merge_rate = if merged + closed > 0 {
             Some(merged as f64 / (merged + closed) as f64)
@@ -7247,10 +7231,11 @@ impl SqliteTracker {
             None
         };
 
-        // Get counts by repository
         let mut by_repo = HashMap::new();
-        let mut stmt = conn.prepare("SELECT scm_repo, COUNT(*) FROM prs GROUP BY scm_repo")?;
-        let rows = stmt.query_map([], |row| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT scm_repo, COUNT(*) FROM prs WHERE {scoped} GROUP BY scm_repo"
+        ))?;
+        let rows = stmt.query_map(params![excluded], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
         for row in rows.flatten() {
@@ -7273,17 +7258,22 @@ impl SqliteTracker {
     }
 
     /// Average time from issue attempt to PR creation in minutes.
-    pub fn get_avg_time_to_pr(&self) -> Result<Option<f64>> {
+    pub fn get_avg_time_to_pr(&self, scope: AttemptScope) -> Result<Option<f64>> {
         let conn = self.acquire_lock()?;
         let result: Option<f64> = conn
             .query_row(
-                r#"
-                SELECT AVG((julianday(p.created_at) - julianday(fa.attempted_at)) * 24.0 * 60.0)
-                FROM prs p
-                JOIN fix_attempts fa ON fa.id = p.attempt_id
-                WHERE p.created_at IS NOT NULL AND fa.attempted_at IS NOT NULL
-                "#,
-                [],
+                &format!(
+                    r#"
+                    SELECT AVG((julianday(p.created_at) - julianday(fa.attempted_at)) * 24.0 * 60.0)
+                    FROM prs p
+                    JOIN fix_attempts fa ON fa.id = p.attempt_id
+                    WHERE p.created_at IS NOT NULL AND fa.attempted_at IS NOT NULL
+                      AND {} AND {}
+                    "#,
+                    scope::source("fa.source", 1),
+                    scope::pull_request("p", 1)
+                ),
+                params![scope.excluded_source()],
                 |row| row.get(0),
             )
             .ok()
@@ -7316,11 +7306,14 @@ impl SqliteTracker {
     }
 
     /// Count agent (Claude) spawns since a given ISO timestamp.
-    pub fn get_agent_spawn_count(&self, since_iso: &str) -> Result<i64> {
+    pub fn get_agent_spawn_count(&self, since_iso: &str, scope: AttemptScope) -> Result<i64> {
         let conn = self.acquire_lock()?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM claude_executions WHERE started_at >= ?1",
-            params![since_iso],
+            &format!(
+                "SELECT COUNT(*) FROM claude_executions WHERE started_at >= ?1 AND {}",
+                scope::attempt("attempt_id", 2)
+            ),
+            params![since_iso, scope.excluded_source()],
             |row| row.get(0),
         )?;
         Ok(count)
@@ -7335,29 +7328,36 @@ impl SqliteTracker {
         since_iso: &str,
         max_plan_monthly_cost: f64,
         period_label: &str,
+        scope: AttemptScope,
     ) -> Result<claudear_core::types::CostEstimate> {
         let conn = self.acquire_lock()?;
+        let excluded = scope.excluded_source();
+        let scoped_executions = scope::attempt("attempt_id", 2);
 
-        // Try actual API cost first
         let (api_cost_sum, api_cost_count): (f64, i64) = conn
             .query_row(
-                r#"
-                SELECT COALESCE(SUM(total_cost_usd), 0.0), COUNT(total_cost_usd)
-                FROM claude_executions
-                WHERE started_at >= ?1 AND total_cost_usd IS NOT NULL
-                "#,
-                params![since_iso],
+                &format!(
+                    r#"
+                    SELECT COALESCE(SUM(total_cost_usd), 0.0), COUNT(total_cost_usd)
+                    FROM claude_executions
+                    WHERE started_at >= ?1 AND total_cost_usd IS NOT NULL AND {scoped_executions}
+                    "#
+                ),
+                params![since_iso, excluded],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap_or((0.0, 0));
 
         let fix_count: i64 = conn
             .query_row(
-                r#"
-                SELECT COUNT(*) FROM fix_attempts
-                WHERE status IN ('success', 'merged') AND attempted_at >= ?1
-                "#,
-                params![since_iso],
+                &format!(
+                    r#"
+                    SELECT COUNT(*) FROM fix_attempts
+                    WHERE status IN ('success', 'merged') AND attempted_at >= ?1 AND {}
+                    "#,
+                    scope::source("source", 2)
+                ),
+                params![since_iso, excluded],
                 |row| row.get(0),
             )
             .unwrap_or(0);
@@ -7368,24 +7368,30 @@ impl SqliteTracker {
             // Estimate from plan cost: amortize over total minutes used this month
             let monthly_total_mins: f64 = conn
                 .query_row(
-                    r#"
-                    SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
-                    FROM claude_executions
-                    WHERE started_at >= datetime('now', '-30 days') AND duration_secs IS NOT NULL
-                    "#,
-                    [],
+                    &format!(
+                        r#"
+                        SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
+                        FROM claude_executions
+                        WHERE started_at >= datetime('now', '-30 days') AND duration_secs IS NOT NULL
+                          AND {}
+                        "#,
+                        scope::attempt("attempt_id", 1)
+                    ),
+                    params![excluded],
                     |row| row.get(0),
                 )
                 .unwrap_or(0.0);
 
             let period_mins: f64 = conn
                 .query_row(
-                    r#"
-                    SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
-                    FROM claude_executions
-                    WHERE started_at >= ?1 AND duration_secs IS NOT NULL
-                    "#,
-                    params![since_iso],
+                    &format!(
+                        r#"
+                        SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
+                        FROM claude_executions
+                        WHERE started_at >= ?1 AND duration_secs IS NOT NULL AND {scoped_executions}
+                        "#
+                    ),
+                    params![since_iso, excluded],
                     |row| row.get(0),
                 )
                 .unwrap_or(0.0);
@@ -7400,12 +7406,14 @@ impl SqliteTracker {
             // Fallback: duration-based estimate at $0.05/min
             let total_duration_mins: f64 = conn
                 .query_row(
-                    r#"
-                    SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
-                    FROM claude_executions
-                    WHERE started_at >= ?1 AND duration_secs IS NOT NULL
-                    "#,
-                    params![since_iso],
+                    &format!(
+                        r#"
+                        SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
+                        FROM claude_executions
+                        WHERE started_at >= ?1 AND duration_secs IS NOT NULL AND {scoped_executions}
+                        "#
+                    ),
+                    params![since_iso, excluded],
                     |row| row.get(0),
                 )
                 .unwrap_or(0.0);
@@ -7428,10 +7436,14 @@ impl SqliteTracker {
     }
 
     /// MTTR trend grouped by ISO week buckets.
-    pub fn get_mttr_trend(&self, weeks: usize) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
+    pub fn get_mttr_trend(
+        &self,
+        weeks: usize,
+        scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
         let conn = self.acquire_lock()?;
         let modifier = format!("-{} days", weeks * 7);
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 date(fa.merged_at, 'weekday 0', '-6 days') as week_start,
@@ -7442,11 +7454,13 @@ impl SqliteTracker {
               AND fa.merged_at IS NOT NULL
               AND fa.attempted_at IS NOT NULL
               AND fa.merged_at >= datetime('now', ?1)
+              AND {}
             GROUP BY week_start
             ORDER BY week_start ASC
             "#,
-        )?;
-        let rows = stmt.query_map(params![modifier], |row| {
+            scope::source("fa.source", 2)
+        ))?;
+        let rows = stmt.query_map(params![modifier, scope.excluded_source()], |row| {
             Ok(claudear_core::types::MttrDataPoint {
                 period_start: row.get(0)?,
                 mttr_minutes: row.get(1)?,
@@ -7457,9 +7471,12 @@ impl SqliteTracker {
     }
 
     /// Per-repository leaderboard.
-    pub fn get_repo_leaderboard(&self) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
+    pub fn get_repo_leaderboard(
+        &self,
+        scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 fa.scm_repo,
@@ -7471,11 +7488,13 @@ impl SqliteTracker {
             FROM fix_attempts fa
             LEFT JOIN prs p ON p.attempt_id = fa.id
             WHERE fa.scm_repo IS NOT NULL AND fa.scm_repo != ''
+              AND {}
             GROUP BY fa.scm_repo
             ORDER BY total DESC
             "#,
-        )?;
-        let rows = stmt.query_map([], |row| {
+            scope::source("fa.source", 1)
+        ))?;
+        let rows = stmt.query_map(params![scope.excluded_source()], |row| {
             Ok(claudear_core::types::RepoLeaderboardEntry {
                 repo: row.get(0)?,
                 total: row.get(1)?,
@@ -7496,10 +7515,11 @@ impl SqliteTracker {
     pub fn get_commit_trend(
         &self,
         days: usize,
+        scope: AttemptScope,
     ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
         let conn = self.acquire_lock()?;
         let modifier = format!("-{} days", days);
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 date(started_at) as day,
@@ -7509,11 +7529,13 @@ impl SqliteTracker {
               AND started_at >= datetime('now', ?1)
               AND git_commit_after IS NOT NULL
               AND (git_commit_before IS NULL OR git_commit_after != git_commit_before)
+              AND {}
             GROUP BY day
             ORDER BY day ASC
             "#,
-        )?;
-        let rows = stmt.query_map(params![modifier], |row| {
+            scope::attempt("attempt_id", 2)
+        ))?;
+        let rows = stmt.query_map(params![modifier, scope.excluded_source()], |row| {
             Ok(claudear_core::types::CommitTrendPoint {
                 period_start: row.get(0)?,
                 commits: row.get(1)?,
@@ -7677,9 +7699,10 @@ impl SqliteTracker {
         since_iso: &str,
         hourly_rate: f64,
         period_label: &str,
+        scope: AttemptScope,
     ) -> Result<claudear_core::types::TimeSavings> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 fa.id,
@@ -7691,11 +7714,12 @@ impl SqliteTracker {
             FROM fix_attempts fa
             LEFT JOIN prs p ON p.attempt_id = fa.id
             LEFT JOIN claude_executions ce ON ce.attempt_id = fa.id
-            WHERE fa.status = 'merged' AND fa.merged_at >= ?1
+            WHERE fa.status = 'merged' AND fa.merged_at >= ?1 AND {}
             "#,
-        )?;
+            scope::source("fa.source", 2)
+        ))?;
 
-        let rows = stmt.query_map(params![since_iso], |row| {
+        let rows = stmt.query_map(params![since_iso, scope.excluded_source()], |row| {
             Ok((
                 row.get::<_, i64>(0)?, // id
                 row.get::<_, f64>(1)?, // total_lines
@@ -15319,7 +15343,7 @@ mod tests {
         tracker.record_attempt("sentry", "a2", "S1").unwrap();
         tracker.mark_failed("sentry", "a2", "build error").unwrap();
 
-        let summary = tracker.get_analytics_summary().unwrap();
+        let summary = tracker.get_analytics_summary(AttemptScope::All).unwrap();
         assert_eq!(summary.total_processed, 2);
         assert_eq!(summary.total_successful, 1);
         assert_eq!(summary.total_merged, 1);
@@ -15331,7 +15355,7 @@ mod tests {
     #[test]
     fn test_get_analytics_summary_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let summary = tracker.get_analytics_summary().unwrap();
+        let summary = tracker.get_analytics_summary(AttemptScope::All).unwrap();
         assert_eq!(summary.total_processed, 0);
         assert!((summary.success_rate - 0.0).abs() < f64::EPSILON);
     }
@@ -17708,7 +17732,7 @@ mod tests {
             .with_timezone(&Utc);
 
         let counts = tracker
-            .get_metric_counts_since(&["requests", "errors"], since)
+            .get_metric_counts_since(&["requests", "errors"], since, AttemptScope::All)
             .unwrap();
         assert_eq!(counts.get("requests"), Some(&2));
         assert_eq!(counts.get("errors"), Some(&1));
@@ -17718,7 +17742,9 @@ mod tests {
     fn test_get_metric_counts_since_empty_names() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let since = Utc::now();
-        let counts = tracker.get_metric_counts_since(&[], since).unwrap();
+        let counts = tracker
+            .get_metric_counts_since(&[], since, AttemptScope::All)
+            .unwrap();
         assert!(counts.is_empty());
     }
 
@@ -17754,7 +17780,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let counts = tracker
-            .get_metric_counts_since(&["old_count"], since)
+            .get_metric_counts_since(&["old_count"], since, AttemptScope::All)
             .unwrap();
         assert_eq!(counts.get("old_count"), Some(&1));
     }
@@ -17766,7 +17792,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let counts = tracker
-            .get_metric_counts_since(&["nonexistent"], since)
+            .get_metric_counts_since(&["nonexistent"], since, AttemptScope::All)
             .unwrap();
         assert!(counts.is_empty());
     }
@@ -17791,7 +17817,9 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let sums = tracker.get_metric_sums_since(&["cost_usd"], since).unwrap();
+        let sums = tracker
+            .get_metric_sums_since(&["cost_usd"], since, AttemptScope::All)
+            .unwrap();
         let total = sums.get("cost_usd").copied().unwrap_or(0.0);
         assert!((total - 36.0).abs() < 0.01);
     }
@@ -17800,7 +17828,9 @@ mod tests {
     fn test_get_metric_sums_since_empty_names() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let since = Utc::now();
-        let sums = tracker.get_metric_sums_since(&[], since).unwrap();
+        let sums = tracker
+            .get_metric_sums_since(&[], since, AttemptScope::All)
+            .unwrap();
         assert!(sums.is_empty());
     }
 
@@ -17824,7 +17854,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sums = tracker
-            .get_metric_sums_since(&["alpha", "beta"], since)
+            .get_metric_sums_since(&["alpha", "beta"], since, AttemptScope::All)
             .unwrap();
         assert!((sums.get("alpha").copied().unwrap_or(0.0) - 30.0).abs() < f64::EPSILON);
         assert!((sums.get("beta").copied().unwrap_or(0.0) - 5.0).abs() < f64::EPSILON);
@@ -17858,7 +17888,9 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let sums = tracker.get_metric_sums_since(&["cost"], since).unwrap();
+        let sums = tracker
+            .get_metric_sums_since(&["cost"], since, AttemptScope::All)
+            .unwrap();
         assert!((sums.get("cost").copied().unwrap_or(0.0) - 25.0).abs() < f64::EPSILON);
     }
 
@@ -17889,7 +17921,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sums = tracker
-            .get_metric_sums_by_source_since(&["cost", "latency"], since)
+            .get_metric_sums_by_source_since(&["cost", "latency"], since, AttemptScope::All)
             .unwrap();
 
         assert!(
@@ -17925,7 +17957,9 @@ mod tests {
     fn test_get_metric_sums_by_source_since_empty_names() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let since = Utc::now();
-        let sums = tracker.get_metric_sums_by_source_since(&[], since).unwrap();
+        let sums = tracker
+            .get_metric_sums_by_source_since(&[], since, AttemptScope::All)
+            .unwrap();
         assert!(sums.is_empty());
     }
 
@@ -17948,7 +17982,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sums = tracker
-            .get_metric_sums_by_source_since(&["no_src"], since)
+            .get_metric_sums_by_source_since(&["no_src"], since, AttemptScope::All)
             .unwrap();
         // source is NULL so the row is skipped by the `if let Some(source)` check
         assert!(sums.is_empty());
@@ -17983,7 +18017,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sums = tracker
-            .get_metric_sums_by_source_since(&["timed"], since)
+            .get_metric_sums_by_source_since(&["timed"], since, AttemptScope::All)
             .unwrap();
         let val = sums
             .get(&("timed".to_string(), "src".to_string()))
@@ -18191,7 +18225,7 @@ mod tests {
         let pr3 = make_pr_record("https://github.com/org/b/pull/1", "org/b", 1);
         tracker.upsert_pr(&pr3).unwrap();
 
-        let analytics = tracker.get_pr_analytics().unwrap();
+        let analytics = tracker.get_pr_analytics(AttemptScope::All).unwrap();
         assert_eq!(analytics.total, 3);
         assert_eq!(analytics.open, 1);
         assert_eq!(analytics.merged, 1);
@@ -18206,7 +18240,7 @@ mod tests {
     #[test]
     fn test_get_pr_analytics_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let analytics = tracker.get_pr_analytics().unwrap();
+        let analytics = tracker.get_pr_analytics(AttemptScope::All).unwrap();
         assert_eq!(analytics.total, 0);
         assert!(analytics.merge_rate.is_none());
         assert!(analytics.by_repo.is_empty());
@@ -18321,7 +18355,7 @@ mod tests {
     #[test]
     fn test_get_avg_time_to_pr_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let result = tracker.get_avg_time_to_pr().unwrap();
+        let result = tracker.get_avg_time_to_pr(AttemptScope::All).unwrap();
         assert!(result.is_none());
     }
 
@@ -18382,12 +18416,12 @@ mod tests {
         tracker.record_execution(&exec).unwrap();
 
         let count = tracker
-            .get_agent_spawn_count("2020-01-01T00:00:00")
+            .get_agent_spawn_count("2020-01-01T00:00:00", AttemptScope::All)
             .unwrap();
         assert_eq!(count, 1);
 
         let count_future = tracker
-            .get_agent_spawn_count("2099-01-01T00:00:00")
+            .get_agent_spawn_count("2099-01-01T00:00:00", AttemptScope::All)
             .unwrap();
         assert_eq!(count_future, 0);
     }
@@ -18405,7 +18439,7 @@ mod tests {
         tracker.record_execution(&exec).unwrap();
 
         let estimate = tracker
-            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "7d")
+            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "7d", AttemptScope::All)
             .unwrap();
         assert_eq!(estimate.cost_source, "duration_estimate");
         assert_eq!(estimate.period, "7d");
@@ -18426,7 +18460,7 @@ mod tests {
         tracker.record_execution(&exec).unwrap();
 
         let estimate = tracker
-            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "30d")
+            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "30d", AttemptScope::All)
             .unwrap();
         assert_eq!(estimate.cost_source, "api");
         assert!((estimate.total_cost - 1.50).abs() < f64::EPSILON);
@@ -18436,7 +18470,7 @@ mod tests {
     fn test_get_cost_estimate_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let estimate = tracker
-            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "7d")
+            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "7d", AttemptScope::All)
             .unwrap();
         assert_eq!(estimate.cost_source, "duration_estimate");
         assert!((estimate.total_cost - 0.0).abs() < f64::EPSILON);
@@ -18445,7 +18479,7 @@ mod tests {
     #[test]
     fn test_get_mttr_trend_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let trend = tracker.get_mttr_trend(4).unwrap();
+        let trend = tracker.get_mttr_trend(4, AttemptScope::All).unwrap();
         assert!(trend.is_empty());
     }
 
@@ -18465,7 +18499,7 @@ mod tests {
             .mark_success("linear", "2", "https://github.com/org/repo-a/pull/2")
             .unwrap();
 
-        let board = tracker.get_repo_leaderboard().unwrap();
+        let board = tracker.get_repo_leaderboard(AttemptScope::All).unwrap();
         // Should have entries for org/repo-a
         assert!(!board.is_empty());
         assert_eq!(board[0].repo, "org/repo-a");
@@ -18475,7 +18509,7 @@ mod tests {
     #[test]
     fn test_get_repo_leaderboard_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let board = tracker.get_repo_leaderboard().unwrap();
+        let board = tracker.get_repo_leaderboard(AttemptScope::All).unwrap();
         assert!(board.is_empty());
     }
 
@@ -18501,7 +18535,7 @@ mod tests {
         let e3 = AgentExecution::new().with_attempt_id(attempt.id);
         tracker.record_execution(&e3).unwrap();
 
-        let trend = tracker.get_commit_trend(30).unwrap();
+        let trend = tracker.get_commit_trend(30, AttemptScope::All).unwrap();
         assert_eq!(trend.len(), 1, "all executions are today => one bucket");
         assert_eq!(trend[0].commits, 1, "only the hash-advancing exec counts");
     }
@@ -18509,7 +18543,10 @@ mod tests {
     #[test]
     fn test_get_commit_trend_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        assert!(tracker.get_commit_trend(30).unwrap().is_empty());
+        assert!(tracker
+            .get_commit_trend(30, AttemptScope::All)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -18580,7 +18617,7 @@ mod tests {
     fn test_get_complexity_time_savings_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let savings = tracker
-            .get_complexity_time_savings("2020-01-01T00:00:00", 100.0, "30d")
+            .get_complexity_time_savings("2020-01-01T00:00:00", 100.0, "30d", AttemptScope::All)
             .unwrap();
         assert_eq!(savings.merged_count, 0);
         assert!((savings.hours_saved - 0.0).abs() < f64::EPSILON);
@@ -18659,8 +18696,260 @@ mod tests {
         assert_eq!(page3.len(), 1);
     }
 
+    const SCOPE_EPOCH: &str = "2000-01-01 00:00:00";
+
+    fn seed_scoped_fix(tracker: &SqliteTracker, source: &str, number: i64) {
+        let issue_id = format!("{source}-{number}");
+        let pr_url = format!("https://github.com/org/{source}/pull/{number}");
+        tracker
+            .record_attempt(source, &issue_id, &issue_id)
+            .unwrap();
+        tracker.mark_success(source, &issue_id, &pr_url).unwrap();
+        tracker.mark_merged(source, &issue_id).unwrap();
+        let attempt = tracker.get_attempt(source, &issue_id).unwrap().unwrap();
+
+        let mut execution = AgentExecution::new();
+        execution.attempt_id = Some(attempt.id);
+        execution.duration_secs = Some(120.0);
+        execution.total_cost_usd = Some(3.0);
+        execution.git_commit_before = Some("before".to_string());
+        execution.git_commit_after = Some("after".to_string());
+        tracker.record_execution(&execution).unwrap();
+
+        let mut pull_request = make_pr_record(&pr_url, &format!("org/{source}"), number);
+        pull_request.attempt_id = Some(attempt.id);
+        pull_request.status = "merged".to_string();
+        pull_request.time_to_merge_mins = Some(30);
+        tracker.upsert_pr(&pull_request).unwrap();
+
+        tracker
+            .record_activity(
+                &ActivityLogEntry::new("pr_merged", format!("Merged {issue_id}"))
+                    .with_source(source)
+                    .with_issue(&issue_id, &issue_id),
+            )
+            .unwrap();
+        for name in ["issues_fetched", "pr_created"] {
+            tracker
+                .record_metric(&ProcessingMetric::new(name, 2.0).with_source(source))
+                .unwrap();
+        }
+        tracker
+            .record_error_pattern(&ErrorPattern {
+                id: 0,
+                pattern_hash: format!("{source}-hash"),
+                error_type: Some(format!("{source}_error")),
+                error_message: None,
+                first_seen: Utc::now(),
+                last_seen: Utc::now(),
+                occurrence_count: number as i32,
+                sources: Some(vec![source.to_uppercase()]),
+                example_issue_ids: None,
+                resolution_hints: None,
+            })
+            .unwrap();
+        tracker
+            .store_embedding(&IssueEmbedding {
+                id: 0,
+                source: source.to_string(),
+                issue_id,
+                short_id: None,
+                title: None,
+                embedding: None,
+                embedding_model: None,
+                created_at: Utc::now(),
+                description: None,
+                url: None,
+                priority: None,
+                status: None,
+                labels: None,
+                updated_at: None,
+            })
+            .unwrap();
+    }
+
+    fn seed_unattributed_security_work(tracker: &SqliteTracker) {
+        seed_scoped_fix(tracker, "security", 9);
+        tracker
+            .record_metric(&ProcessingMetric::new("pr_status_merged", 1.0))
+            .unwrap();
+    }
+
+    fn scoped_aggregates(tracker: &SqliteTracker, scope: AttemptScope) -> serde_json::Value {
+        let since = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let names = ["issues_fetched", "pr_created", "pr_status_merged"];
+        let mut source_sums: Vec<_> = tracker
+            .get_metric_sums_by_source_since(&names, since, scope)
+            .unwrap()
+            .into_iter()
+            .collect();
+        source_sums.sort_by(|left, right| left.0.cmp(&right.0));
+        let mttr: Vec<(String, i64)> = tracker
+            .get_mttr_trend(8, scope)
+            .unwrap()
+            .into_iter()
+            .map(|point| (point.period_start, point.sample_count))
+            .collect();
+        let mut attempts_since: Vec<String> = tracker
+            .list_attempts_since(since, scope)
+            .unwrap()
+            .into_iter()
+            .map(|attempt| attempt.short_id)
+            .collect();
+        attempts_since.sort();
+        serde_json::json!({
+            "stats": tracker.get_scoped_stats(scope).unwrap(),
+            "summary": tracker.get_analytics_summary(scope).unwrap(),
+            "pull_requests": tracker.get_pr_analytics(scope).unwrap(),
+            "time_to_pr": tracker.get_avg_time_to_pr(scope).unwrap().is_some(),
+            "spawns": tracker.get_agent_spawn_count(SCOPE_EPOCH, scope).unwrap(),
+            "api_cost": tracker.get_cost_estimate(SCOPE_EPOCH, 0.0, "all", scope).unwrap(),
+            "mttr": mttr,
+            "leaderboard": tracker.get_repo_leaderboard(scope).unwrap(),
+            "commits": tracker.get_commit_trend(30, scope).unwrap(),
+            "savings": tracker
+                .get_complexity_time_savings(SCOPE_EPOCH, 150.0, "all", scope)
+                .unwrap(),
+            "activity": tracker.get_activity_type_counts_since(since, scope).unwrap(),
+            "metric_counts": tracker.get_metric_counts_since(&names, since, scope).unwrap(),
+            "metric_sums": tracker.get_metric_sums_since(&names, since, scope).unwrap(),
+            "source_sums": source_sums,
+            "attempts": tracker.count_attempts(None, None, scope).unwrap(),
+            "merged_attempts": tracker.count_attempts(Some("merged"), None, scope).unwrap(),
+            "attempts_since": attempts_since,
+            "issues": tracker.count_issues(None, scope).unwrap(),
+        })
+    }
+
     #[test]
-    fn list_attempts_excluding_source_pages_over_the_remaining_sources() {
+    fn scoped_aggregates_match_a_store_without_the_excluded_work() {
+        let other = SqliteTracker::in_memory().unwrap();
+        seed_scoped_fix(&other, "linear", 1);
+        let mixed = SqliteTracker::in_memory().unwrap();
+        seed_scoped_fix(&mixed, "linear", 1);
+        seed_unattributed_security_work(&mixed);
+
+        let expected = scoped_aggregates(&other, AttemptScope::All);
+        let scoped = scoped_aggregates(&mixed, AttemptScope::WithoutSecurity);
+        let everything = scoped_aggregates(&mixed, AttemptScope::All);
+        for (aggregate, value) in expected.as_object().unwrap() {
+            assert_eq!(
+                &scoped[aggregate], value,
+                "{aggregate} counted security work"
+            );
+            if aggregate != "time_to_pr" {
+                assert_ne!(
+                    &everything[aggregate], value,
+                    "{aggregate} left security work out of the unscoped read"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_pull_request_reads_exclude_security_attempts_without_an_issue_source() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("Security", "SEC-1", "SEC-1")
+            .unwrap();
+        let attempt = tracker.get_attempt("Security", "SEC-1").unwrap().unwrap();
+        let mut pull_request = make_pr_record("https://github.com/org/repo/pull/5", "org/repo", 5);
+        pull_request.attempt_id = Some(attempt.id);
+        tracker.upsert_pr(&pull_request).unwrap();
+        let mut unlinked = make_pr_record("https://github.com/org/repo/pull/6", "org/repo", 6);
+        unlinked.issue_source = Some("SECURITY".to_string());
+        tracker.upsert_pr(&unlinked).unwrap();
+
+        assert_eq!(
+            tracker
+                .get_pr_analytics(AttemptScope::WithoutSecurity)
+                .unwrap()
+                .total,
+            0
+        );
+        assert_eq!(
+            tracker.get_pr_analytics(AttemptScope::All).unwrap().total,
+            2
+        );
+    }
+
+    #[test]
+    fn scoped_executions_keep_executions_linked_to_no_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_execution(&AgentExecution::new()).unwrap();
+        assert_eq!(
+            tracker
+                .get_agent_spawn_count(SCOPE_EPOCH, AttemptScope::WithoutSecurity)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn scoped_metric_reads_drop_unattributed_rows_only_for_a_narrowed_scope() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_metric(&ProcessingMetric::new("pr_status_merged", 3.0))
+            .unwrap();
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let sums = |scope| {
+            tracker
+                .get_metric_sums_since(&["pr_status_merged"], since, scope)
+                .unwrap()
+        };
+        assert_eq!(sums(AttemptScope::All).get("pr_status_merged"), Some(&3.0));
+        assert!(sums(AttemptScope::WithoutSecurity).is_empty());
+    }
+
+    #[test]
+    fn scoped_plan_cost_amortizes_over_included_executions_only() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for source in ["linear", "security"] {
+            tracker.record_attempt(source, source, source).unwrap();
+            let attempt = tracker.get_attempt(source, source).unwrap().unwrap();
+            let mut execution = AgentExecution::new();
+            execution.attempt_id = Some(attempt.id);
+            execution.duration_secs = Some(120.0);
+            tracker.record_execution(&execution).unwrap();
+        }
+        let cost = |scope| {
+            tracker
+                .get_cost_estimate(SCOPE_EPOCH, 100.0, "all", scope)
+                .unwrap()
+                .total_cost
+        };
+        assert_eq!(cost(AttemptScope::WithoutSecurity), 100.0);
+        assert_eq!(cost(AttemptScope::All), 100.0);
+        let duration_cost = tracker
+            .get_cost_estimate(SCOPE_EPOCH, 0.0, "all", AttemptScope::WithoutSecurity)
+            .unwrap()
+            .total_cost;
+        assert!((duration_cost - 0.1).abs() < 1e-9, "{duration_cost}");
+    }
+
+    #[test]
+    fn scoped_stats_count_only_included_sources_in_any_case() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("SECURITY", "1", "S-1").unwrap();
+        tracker.record_attempt("linear", "2", "L-2").unwrap();
+        tracker.mark_failed("linear", "2", "boom").unwrap();
+
+        let stats = tracker
+            .get_scoped_stats(AttemptScope::WithoutSecurity)
+            .unwrap();
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.by_source.keys().collect::<Vec<_>>(), ["linear"]);
+        let all = tracker.get_stats().unwrap();
+        assert_eq!(all.total, 2);
+        assert_eq!(all.pending, 1);
+    }
+
+    #[test]
+    fn list_scoped_attempts_pages_over_the_included_sources() {
         let tracker = SqliteTracker::in_memory().unwrap();
         for index in 0..12 {
             let source = match index % 3 {
@@ -18675,26 +18964,26 @@ mod tests {
         tracker.mark_failed("linear", "2", "error").unwrap();
 
         let all = tracker
-            .list_attempts_excluding_source(None, "security", 100, 0)
+            .list_scoped_attempts(None, AttemptScope::WithoutSecurity, 100, 0)
             .unwrap();
         assert_eq!(all.len(), 4);
         assert!(all.iter().all(|attempt| attempt.source == "linear"));
         let second_page = tracker
-            .list_attempts_excluding_source(None, "security", 2, 2)
+            .list_scoped_attempts(None, AttemptScope::WithoutSecurity, 2, 2)
             .unwrap();
         let ids = |attempts: &[FixAttempt]| -> Vec<i64> {
             attempts.iter().map(|attempt| attempt.id).collect()
         };
         assert_eq!(ids(&second_page), ids(&all[2..4]));
         let failed = tracker
-            .list_attempts_excluding_source(Some("failed"), "security", 100, 0)
+            .list_scoped_attempts(Some("failed"), AttemptScope::WithoutSecurity, 100, 0)
             .unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].issue_id, "2");
     }
 
     #[test]
-    fn list_issues_excluding_source_pages_over_the_remaining_sources() {
+    fn list_scoped_issues_pages_over_the_included_sources() {
         let tracker = SqliteTracker::in_memory().unwrap();
         for (index, source) in ["security", "linear", "Security", "sentry", "linear"]
             .into_iter()
@@ -18721,12 +19010,12 @@ mod tests {
         }
 
         let all = tracker
-            .list_issues_excluding_source("security", 100, 0)
+            .list_scoped_issues(AttemptScope::WithoutSecurity, 100, 0)
             .unwrap();
         let ids: Vec<&str> = all.iter().map(|issue| issue.issue_id.as_str()).collect();
         assert_eq!(ids, ["1", "3", "4"]);
         let page = tracker
-            .list_issues_excluding_source("security", 1, 1)
+            .list_scoped_issues(AttemptScope::WithoutSecurity, 1, 1)
             .unwrap();
         assert_eq!(page[0].issue_id, "3");
     }
@@ -18737,7 +19026,9 @@ mod tests {
         tracker.record_attempt("linear", "1", "L-1").unwrap();
         tracker.record_attempt("sentry", "2", "S-2").unwrap();
 
-        let count = tracker.count_attempts(None, None).unwrap();
+        let count = tracker
+            .count_attempts(None, None, AttemptScope::All)
+            .unwrap();
         assert_eq!(count, 2);
     }
 
@@ -18748,8 +19039,18 @@ mod tests {
         tracker.record_attempt("linear", "2", "L-2").unwrap();
         tracker.mark_failed("linear", "2", "err").unwrap();
 
-        assert_eq!(tracker.count_attempts(Some("pending"), None).unwrap(), 1);
-        assert_eq!(tracker.count_attempts(Some("failed"), None).unwrap(), 1);
+        assert_eq!(
+            tracker
+                .count_attempts(Some("pending"), None, AttemptScope::All)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .count_attempts(Some("failed"), None, AttemptScope::All)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -18758,8 +19059,18 @@ mod tests {
         tracker.record_attempt("linear", "1", "L-1").unwrap();
         tracker.record_attempt("sentry", "2", "S-2").unwrap();
 
-        assert_eq!(tracker.count_attempts(None, Some("linear")).unwrap(), 1);
-        assert_eq!(tracker.count_attempts(None, Some("sentry")).unwrap(), 1);
+        assert_eq!(
+            tracker
+                .count_attempts(None, Some("linear"), AttemptScope::All)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .count_attempts(None, Some("sentry"), AttemptScope::All)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -18772,13 +19083,13 @@ mod tests {
 
         assert_eq!(
             tracker
-                .count_attempts(Some("pending"), Some("linear"))
+                .count_attempts(Some("pending"), Some("linear"), AttemptScope::All)
                 .unwrap(),
             1
         );
         assert_eq!(
             tracker
-                .count_attempts(Some("failed"), Some("sentry"))
+                .count_attempts(Some("failed"), Some("sentry"), AttemptScope::All)
                 .unwrap(),
             0
         );
@@ -18792,13 +19103,17 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let result = tracker.list_attempts_since(since).unwrap();
+        let result = tracker
+            .list_attempts_since(since, AttemptScope::All)
+            .unwrap();
         assert_eq!(result.len(), 1);
 
         let since_future = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let result_empty = tracker.list_attempts_since(since_future).unwrap();
+        let result_empty = tracker
+            .list_attempts_since(since_future, AttemptScope::All)
+            .unwrap();
         assert!(result_empty.is_empty());
     }
 
@@ -19221,7 +19536,7 @@ mod tests {
     #[test]
     fn test_count_issues_no_filter() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        assert_eq!(tracker.count_issues(None).unwrap(), 0);
+        assert_eq!(tracker.count_issues(None, AttemptScope::All).unwrap(), 0);
 
         let emb = IssueEmbedding {
             id: 0,
@@ -19240,7 +19555,7 @@ mod tests {
             updated_at: None,
         };
         tracker.store_embedding(&emb).unwrap();
-        assert_eq!(tracker.count_issues(None).unwrap(), 1);
+        assert_eq!(tracker.count_issues(None, AttemptScope::All).unwrap(), 1);
     }
 
     #[test]
@@ -19281,9 +19596,24 @@ mod tests {
         tracker.store_embedding(&emb1).unwrap();
         tracker.store_embedding(&emb2).unwrap();
 
-        assert_eq!(tracker.count_issues(Some("linear")).unwrap(), 1);
-        assert_eq!(tracker.count_issues(Some("sentry")).unwrap(), 1);
-        assert_eq!(tracker.count_issues(Some("other")).unwrap(), 0);
+        assert_eq!(
+            tracker
+                .count_issues(Some("linear"), AttemptScope::All)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .count_issues(Some("sentry"), AttemptScope::All)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .count_issues(Some("other"), AttemptScope::All)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -19561,7 +19891,9 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let counts = tracker.get_activity_type_counts_since(since).unwrap();
+        let counts = tracker
+            .get_activity_type_counts_since(since, AttemptScope::All)
+            .unwrap();
 
         assert_eq!(*counts.get("fix_started").unwrap(), 2);
         assert_eq!(*counts.get("pr_merged").unwrap(), 1);
@@ -19573,7 +19905,9 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let counts = tracker.get_activity_type_counts_since(since).unwrap();
+        let counts = tracker
+            .get_activity_type_counts_since(since, AttemptScope::All)
+            .unwrap();
         assert!(counts.is_empty());
     }
 
@@ -20872,7 +21206,7 @@ mod tests {
 
         // With max_plan_monthly_cost > 0 and no API costs
         let estimate = tracker
-            .get_cost_estimate("2020-01-01T00:00:00", 200.0, "30d")
+            .get_cost_estimate("2020-01-01T00:00:00", 200.0, "30d", AttemptScope::All)
             .unwrap();
         assert_eq!(estimate.cost_source, "plan_estimate");
         // total_cost should be > 0 since there's duration data
@@ -21624,7 +21958,7 @@ mod tests {
     #[test]
     fn test_count_issues_no_data() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let count = tracker.count_issues(None).unwrap();
+        let count = tracker.count_issues(None, AttemptScope::All).unwrap();
         assert_eq!(count, 0);
     }
 

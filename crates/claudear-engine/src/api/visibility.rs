@@ -1,36 +1,41 @@
 //! Keeps security-fix work out of the generic dashboard endpoints for
-//! everyone but admins.
+//! everyone but admins. Every endpoint decides what a user sees through the
+//! [`AttemptScope`] here: aggregates pass it to the store, and rows a store
+//! cannot scope are filtered with the same scope.
 
 use super::auth::AuthUser;
-use claudear_core::security::SECURITY_FIX_SOURCE;
-use claudear_core::types::{FixAttemptStats, ProcessingMetric};
-
-pub(super) fn hides_security(user: &AuthUser) -> bool {
-    !user.is_admin()
-}
+use claudear_core::types::ProcessingMetric;
+use claudear_storage::AttemptScope;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Visibility {
-    hides_security: bool,
+    scope: AttemptScope,
 }
 
 impl Visibility {
     pub(super) fn for_user(user: &AuthUser) -> Self {
-        Self {
-            hides_security: hides_security(user),
-        }
+        let scope = if user.is_admin() {
+            AttemptScope::All
+        } else {
+            AttemptScope::WithoutSecurity
+        };
+        Self { scope }
+    }
+
+    pub(super) fn scope(self) -> AttemptScope {
+        self.scope
     }
 
     pub(super) fn shows(self, source: &str) -> bool {
-        !(self.hides_security && source.eq_ignore_ascii_case(SECURITY_FIX_SOURCE))
+        self.scope.includes(source)
     }
 
     pub(super) fn shows_optional(self, source: Option<&str>) -> bool {
-        source.is_none_or(|source| self.shows(source))
+        self.scope.includes_optional(source)
     }
 
-    pub(super) fn shows_all<'a>(self, mut sources: impl Iterator<Item = &'a str>) -> bool {
-        sources.all(|source| self.shows(source))
+    pub(super) fn shows_all<'a>(self, sources: impl Iterator<Item = &'a str>) -> bool {
+        self.scope.includes_all(sources)
     }
 
     /// Whether a listing filtered to `source` is hidden as a whole.
@@ -38,49 +43,20 @@ impl Visibility {
         !self.shows_optional(source)
     }
 
-    /// Whether an unfiltered count includes rows of a hidden source that
-    /// must be subtracted.
-    pub(super) fn subtracts_hidden(self, source: Option<&str>) -> bool {
-        self.hides_security && source.is_none()
+    /// Whether raw per-table row counts, which no scope can narrow, are shown.
+    pub(super) fn shows_diagnostics(self) -> bool {
+        self.scope == AttemptScope::All
     }
 
-    pub(super) fn hidden_source(self) -> &'static str {
-        SECURITY_FIX_SOURCE
-    }
-
-    /// Removes the hidden source's bucket from attempt statistics, and its
-    /// attempts from the totals.
-    pub(super) fn scrub_stats(self, stats: &mut FixAttemptStats) {
-        if !self.hides_security {
-            return;
-        }
-        let Some(hidden) = stats.by_source.remove(SECURITY_FIX_SOURCE) else {
-            return;
-        };
-        let settled =
-            hidden.success + hidden.failed + hidden.merged + hidden.closed + hidden.cannot_fix;
-        stats.total = stats.total.saturating_sub(hidden.total);
-        stats.pending = stats
-            .pending
-            .saturating_sub(hidden.total.saturating_sub(settled));
-        stats.success = stats.success.saturating_sub(hidden.success);
-        stats.failed = stats.failed.saturating_sub(hidden.failed);
-        stats.merged = stats.merged.saturating_sub(hidden.merged);
-        stats.closed = stats.closed.saturating_sub(hidden.closed);
-        stats.cannot_fix = stats.cannot_fix.saturating_sub(hidden.cannot_fix);
-    }
-
-    /// The source an unfiltered listing must leave out in the store, so a
-    /// page costs the same at any offset.
-    pub(super) fn excluded_source(self, source: Option<&str>) -> Option<&'static str> {
-        self.subtracts_hidden(source).then_some(SECURITY_FIX_SOURCE)
+    pub(super) fn shows_metric(self, metric: &ProcessingMetric) -> bool {
+        self.scope.includes_metric(metric.source.as_deref())
     }
 
     pub(super) fn visible_metrics(
         self,
         mut metrics: Vec<ProcessingMetric>,
     ) -> Vec<ProcessingMetric> {
-        metrics.retain(|metric| self.shows_optional(metric.source.as_deref()));
+        metrics.retain(|metric| self.shows_metric(metric));
         metrics
     }
 
@@ -92,7 +68,7 @@ impl Visibility {
         visible: impl Fn(&T) -> bool,
         limit: usize,
     ) -> Result<Vec<T>, E> {
-        if !self.hides_security {
+        if self.scope == AttemptScope::All {
             return fetch(limit);
         }
         let mut requested = limit.max(1);
@@ -113,6 +89,7 @@ mod tests {
     use super::super::test_support::Harness;
     use super::*;
     use axum::http::StatusCode;
+    use claudear_core::security::SECURITY_FIX_SOURCE;
     use claudear_core::types::{
         ActivityLogEntry, AgentExecution, ErrorPattern, IssueEmbedding, PrRecord,
     };
@@ -153,18 +130,17 @@ mod tests {
         assert!(viewer.shows_optional(None));
         assert!(viewer.hides_filter(Some(SECURITY_FIX_SOURCE)));
         assert!(!viewer.hides_filter(None));
-        assert!(viewer.subtracts_hidden(None));
-        assert!(!viewer.subtracts_hidden(Some("linear")));
         assert!(!viewer.shows_all(["linear", SECURITY_FIX_SOURCE].into_iter()));
     }
 
     #[test]
-    fn only_unfiltered_non_admin_listings_exclude_the_hidden_source() {
-        let viewer = Visibility::for_user(&user("viewer"));
-        assert_eq!(viewer.excluded_source(None), Some(SECURITY_FIX_SOURCE));
-        assert_eq!(viewer.excluded_source(Some("linear")), None);
+    fn only_admins_read_every_attempt_and_the_diagnostics() {
         let admin = Visibility::for_user(&user("admin"));
-        assert_eq!(admin.excluded_source(None), None);
+        assert_eq!(admin.scope(), AttemptScope::All);
+        assert!(admin.shows_diagnostics());
+        let viewer = Visibility::for_user(&user("viewer"));
+        assert_eq!(viewer.scope(), AttemptScope::WithoutSecurity);
+        assert!(!viewer.shows_diagnostics());
     }
 
     #[test]
@@ -182,7 +158,7 @@ mod tests {
                 .map(|metric| metric.metric_value)
                 .collect()
         };
-        assert_eq!(values(Visibility::for_user(&user("viewer"))), [2.0, 3.0]);
+        assert_eq!(values(Visibility::for_user(&user("viewer"))), [2.0]);
         assert_eq!(
             values(Visibility::for_user(&user("admin"))),
             [1.0, 2.0, 3.0]
@@ -535,6 +511,229 @@ mod tests {
         assert!(admin["success_rate_by_source"]
             .get(SECURITY_FIX_SOURCE)
             .is_some());
+    }
+
+    const AGGREGATES: [&str; 13] = [
+        "/api/stats",
+        "/api/stats/overview",
+        "/api/attempts",
+        "/api/issues",
+        "/api/analytics/summary",
+        "/api/prs/analytics",
+        "/api/metrics?name=processing_time",
+        "/api/metrics?name=pr_status_merged",
+        "/api/telemetry/overview",
+        "/api/telemetry/timeseries",
+        "/api/telemetry/pipeline",
+        "/api/telemetry/latency",
+        "/api/telemetry/pipeline?period=day",
+    ];
+
+    fn seed_merged_fix(tracker: &dyn FixAttemptTracker, source: &str, number: i64) {
+        let issue_id = format!("{source}-{number}");
+        let pr_url = format!("https://github.com/org/{source}/pull/{number}");
+        tracker
+            .record_attempt(source, &issue_id, &issue_id)
+            .expect("attempt");
+        tracker
+            .mark_success(source, &issue_id, &pr_url)
+            .expect("success");
+        tracker.mark_merged(source, &issue_id).expect("merged");
+        let attempt = tracker
+            .get_attempt(source, &issue_id)
+            .expect("read")
+            .expect("attempt exists");
+
+        let mut execution = AgentExecution::new();
+        execution.attempt_id = Some(attempt.id);
+        execution.duration_secs = Some(90.0);
+        execution.total_cost_usd = Some(2.5);
+        execution.git_commit_before = Some("before".to_string());
+        execution.git_commit_after = Some("after".to_string());
+        tracker.record_execution(&execution).expect("execution");
+
+        let mut record = pull_request(number, source);
+        record.pr_url = pr_url;
+        record.scm_repo = format!("org/{source}");
+        record.attempt_id = Some(attempt.id);
+        record.issue_id = Some(issue_id.clone());
+        record.status = "merged".to_string();
+        record.time_to_first_review_mins = Some(10);
+        record.time_to_merge_mins = Some(45);
+        record.review_cycles = 2;
+        tracker.upsert_pr(&record).expect("pull request");
+
+        tracker
+            .record_activity(
+                &ActivityLogEntry::new("pr_merged", format!("Merged {issue_id}"))
+                    .with_source(source)
+                    .with_issue(&issue_id, &issue_id),
+            )
+            .expect("activity");
+        for (name, value) in [
+            ("processing_time", 75.0),
+            ("issues_fetched", 4.0),
+            ("batch_processed", 1.0),
+            ("pr_created", 1.0),
+        ] {
+            tracker
+                .record_metric(
+                    &ProcessingMetric::new(name, value)
+                        .with_source(source)
+                        .with_tags(serde_json::json!({ "status": "merged" })),
+                )
+                .expect("metric");
+        }
+        tracker
+            .record_error_pattern(&error_pattern(&format!("{source}-hash"), source))
+            .expect("error pattern");
+        tracker
+            .store_issue(&issue(source, &issue_id))
+            .expect("issue");
+    }
+
+    fn seed_security_fix(tracker: &dyn FixAttemptTracker) {
+        seed_merged_fix(tracker, SECURITY_FIX_SOURCE, 7);
+        for (name, value) in [
+            ("pr_status_merged", 1.0),
+            ("pending_attempts", 9.0),
+            ("total_attempts", 9.0),
+        ] {
+            tracker
+                .record_metric(&ProcessingMetric::new(name, value))
+                .expect("unattributed metric");
+        }
+    }
+
+    fn without_volatile_fields(mut value: Value) -> Value {
+        match &mut value {
+            Value::Object(fields) => {
+                fields.remove("generated_at");
+                fields.remove("uptime_secs");
+                if let Some(Value::Array(points)) = fields.get_mut("points") {
+                    points.retain(|point| point["total"].as_i64() != Some(0));
+                }
+                for field in fields.values_mut() {
+                    *field = without_volatile_fields(field.take());
+                }
+            }
+            Value::Array(items) => {
+                for item in items.iter_mut() {
+                    *item = without_volatile_fields(item.take());
+                }
+            }
+            _ => {}
+        }
+        value
+    }
+
+    async fn aggregates(harness: &Harness, session: &str) -> Vec<Value> {
+        let mut bodies = Vec::new();
+        for uri in AGGREGATES {
+            let (status, body) = harness.get(uri, Some(session)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            bodies.push(without_volatile_fields(body));
+        }
+        bodies
+    }
+
+    #[tokio::test]
+    async fn a_security_fix_changes_no_non_admin_aggregate() {
+        let harness = Harness::start();
+        seed_merged_fix(harness.tracker.as_ref(), OTHER_SOURCE, 1);
+        let viewer_before = aggregates(&harness, &harness.viewer).await;
+        let admin_before = aggregates(&harness, &harness.admin).await;
+
+        seed_security_fix(harness.tracker.as_ref());
+        let viewer_after = aggregates(&harness, &harness.viewer).await;
+        let admin_after = aggregates(&harness, &harness.admin).await;
+
+        for (index, uri) in AGGREGATES.iter().enumerate() {
+            assert_eq!(
+                viewer_before[index], viewer_after[index],
+                "{uri} changed for a non-admin when a security fix landed"
+            );
+            assert_ne!(
+                admin_before[index], admin_after[index],
+                "{uri} left the security fix out for an admin"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_admin_aggregates_still_count_other_work() {
+        let harness = Harness::start();
+        seed_merged_fix(harness.tracker.as_ref(), OTHER_SOURCE, 1);
+        seed_security_fix(harness.tracker.as_ref());
+
+        let (_, viewer) = harness
+            .get("/api/analytics/summary", Some(&harness.viewer))
+            .await;
+        let (_, admin) = harness
+            .get("/api/analytics/summary", Some(&harness.admin))
+            .await;
+        assert_eq!(viewer["total_processed"], 1);
+        assert_eq!(admin["total_processed"], 2);
+        assert_eq!(viewer["cost_estimate"]["total_cost"], 2.5);
+        assert_eq!(admin["cost_estimate"]["total_cost"], 5.0);
+        assert_eq!(viewer["repo_leaderboard"].as_array().map(Vec::len), Some(1));
+        assert_eq!(viewer["mttr_trend"][0]["sample_count"], 1);
+        assert_eq!(admin["mttr_trend"][0]["sample_count"], 2);
+        assert_eq!(viewer["commit_trend"][0]["commits"], 1);
+        assert_eq!(admin["commit_trend"][0]["commits"], 2);
+
+        let (_, viewer) = harness
+            .get("/api/prs/analytics", Some(&harness.viewer))
+            .await;
+        let (_, admin) = harness
+            .get("/api/prs/analytics", Some(&harness.admin))
+            .await;
+        assert_eq!(viewer["total"], 1);
+        assert_eq!(viewer["merged"], 1);
+        assert_eq!(admin["total"], 2);
+        assert_eq!(
+            viewer["by_repo"].as_object().map(|repos| repos.len()),
+            Some(1)
+        );
+
+        let (_, viewer) = harness
+            .get("/api/telemetry/overview", Some(&harness.viewer))
+            .await;
+        let (_, admin) = harness
+            .get("/api/telemetry/overview", Some(&harness.admin))
+            .await;
+        assert_eq!(viewer["agent_spawns_today"], 1);
+        assert_eq!(admin["agent_spawns_today"], 2);
+        assert_eq!(viewer["pr_analytics"]["total"], 1);
+        assert_eq!(viewer["activity_last_hour"]["pr_merged"], 1);
+        assert_eq!(admin["activity_last_hour"]["pr_merged"], 2);
+        assert_eq!(viewer["metric_counts_last_24h"]["pr_status_merged"], 0);
+        assert_eq!(admin["metric_counts_last_24h"]["pr_status_merged"], 1);
+        assert!(viewer["diagnostics"].is_null());
+        assert!(admin["diagnostics"].is_object());
+
+        let (_, viewer) = harness
+            .get("/api/telemetry/pipeline", Some(&harness.viewer))
+            .await;
+        let (_, admin) = harness
+            .get("/api/telemetry/pipeline", Some(&harness.admin))
+            .await;
+        assert_eq!(viewer["totals"]["fetched"], 4.0);
+        assert_eq!(admin["totals"]["fetched"], 8.0);
+        assert_eq!(viewer["totals"]["pr_status_merged"], 0.0);
+        assert_eq!(admin["totals"]["pr_status_merged"], 1.0);
+        assert!(viewer["poll_load"]["total_latest"].is_null());
+        assert_eq!(admin["poll_load"]["total_latest"], 9.0);
+
+        let (_, viewer) = harness
+            .get("/api/stats/overview", Some(&harness.viewer))
+            .await;
+        let (_, admin) = harness
+            .get("/api/stats/overview", Some(&harness.admin))
+            .await;
+        assert_eq!(viewer["agent_spawns_today"], 1);
+        assert_eq!(viewer["time_savings"]["merged_count"], 1);
+        assert_eq!(admin["time_savings"]["merged_count"], 2);
     }
 
     #[tokio::test]
