@@ -3,6 +3,9 @@
 //! Reports, for every config section, whether claudear is running with it
 //! configured and enabled, a hand-picked set of non-secret settings, and
 //! whether each secret is set. Secret values never leave the process.
+//!
+//! Every signed-in user can read this, so settings exclude filesystem paths,
+//! hosts, URLs and free-form queries; admins see those in the config API.
 
 use super::auth::AuthUser;
 use super::routes::ApiState;
@@ -237,13 +240,11 @@ fn jira(config: &Config) -> FeatureStatus {
     };
     feature
         .state(true, jira.enabled)
-        .setting("base_url", jira.base_url.clone())
         .setting("auth_mode", jira.auth_mode.clone())
         .setting("project_keys", jira.project_keys.clone())
         .setting("trigger_labels", jira.trigger_labels.clone())
         .setting("trigger_statuses", jira.trigger_statuses.clone())
         .setting("issue_types", jira.issue_types.clone())
-        .setting("custom_jql", jira.custom_jql.is_some())
         .setting("max_results", jira.max_results)
         .setting(
             "poll_interval_ms",
@@ -297,7 +298,6 @@ fn slack_source(config: &Config) -> FeatureStatus {
         .state(true, true)
         .setting("channel_id", slack.channel_id.clone())
         .setting("listen_channel_id", slack.listen_channel_id.clone())
-        .setting("workspace", slack.workspace.clone())
         .setting("app_id", slack.app_id.clone())
         .setting(
             "poll_interval_ms",
@@ -383,13 +383,6 @@ fn github(config: &Config) -> FeatureStatus {
     .setting("app.app_id", app.app_id)
     .setting("app.installation_id", app.installation_id)
     .setting("app.client_id", app.client_id.clone())
-    .setting("app.base_url", app.base_url.clone())
-    .setting(
-        "app.private_key_path",
-        app.private_key_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
-    )
     .secret("token", github.token.as_ref())
     .secret("webhook_secret", github.webhook_secret.as_ref())
     .secret("app.private_key", app.private_key.as_ref())
@@ -409,7 +402,6 @@ fn gitlab(config: &Config) -> FeatureStatus {
     };
     feature
         .state(true, config.is_gitlab_enabled())
-        .setting("base_url", gitlab.base_url.clone())
         .setting("groups", gitlab.groups.clone())
         .setting("trigger_labels", gitlab.trigger_labels.clone())
         .setting("trigger_states", gitlab.trigger_states.clone())
@@ -454,7 +446,6 @@ fn slack_notifier(config: &Config) -> FeatureStatus {
     .state(configured, true)
     .setting("user_id", slack.user_id.clone())
     .setting("channel_id", slack.channel_id.clone())
-    .setting("workspace", slack.workspace.clone())
     .secret("webhook_url", slack.webhook_url.as_ref())
     .secret("bot_token", slack.bot_token.as_ref())
 }
@@ -469,11 +460,9 @@ fn email(config: &Config) -> FeatureStatus {
         FeatureCategory::Notifier,
     )
     .state(configured, true)
-    .setting("smtp_host", email.smtp_host.clone())
     .setting("smtp_port", email.smtp_port)
     .setting("use_tls", email.use_tls)
     .setting("recipients", email.to_addresses.len())
-    .setting("imap_host", email.imap_host.clone())
     .setting("imap_port", email.imap_port)
     .setting("imap_use_tls", email.imap_use_tls)
     .setting("imap_folder", email.imap_folder.clone())
@@ -847,7 +836,6 @@ fn llm(config: &Config) -> FeatureStatus {
         FeatureCategory::Intelligence,
     )
     .state(true, llm.enabled)
-    .setting("model_path", llm.model_path.display().to_string())
     .setting("context_length", llm.context_length)
     .setting("gpu_layers", llm.gpu_layers)
     .setting("threads", llm.threads)
@@ -932,7 +920,6 @@ fn tls(config: &Config) -> FeatureStatus {
         FeatureCategory::Platform,
     )
     .state(!tls.domains.is_empty(), tls.enabled)
-    .setting("domains", tls.domains.clone())
     .setting("production", tls.production)
     .setting("https_port", tls.https_port)
     .setting("http_redirect_port", tls.http_redirect_port)
@@ -957,7 +944,6 @@ fn mcp_server(config: &Config) -> FeatureStatus {
         "require_cloudflare_access",
         server.require_cloudflare_access,
     )
-    .setting("allowed_origins", server.allowed_origins.clone())
 }
 
 #[cfg(test)]
@@ -1223,6 +1209,7 @@ mod tests {
             ("issues.helpscout", "app_id"),
             ("regression", "github_token"),
             ("notifiers.sms", "account_sid"),
+            ("notifiers.push", "user_key"),
         ] {
             let secret = |features: &[FeatureStatus]| {
                 feature(features, key)
@@ -1240,6 +1227,67 @@ mod tests {
                 assert!(!set, "{key} {name} should not be set by default");
             }
         }
+    }
+
+    const INTERNAL_SETTINGS: &[&str] = &[
+        "workspace",
+        "base_url",
+        "app.base_url",
+        "app.private_key_path",
+        "custom_jql",
+        "smtp_host",
+        "imap_host",
+        "model_path",
+        "domains",
+        "allowed_origins",
+    ];
+
+    fn internal(field: &str) -> String {
+        format!("INTERNAL-{field}")
+    }
+
+    fn config_with_internal_values() -> Config {
+        let mut config = populated_config();
+        config.workspace = PathBuf::from(internal("workspace"));
+        config.scm.github.app.base_url = Some(internal("github.app.base_url"));
+        config.scm.github.app.private_key_path = Some(PathBuf::from(internal("private_key_path")));
+        if let Some(gitlab) = config.scm.gitlab.as_mut() {
+            gitlab.base_url = internal("gitlab.base_url");
+        }
+        if let Some(jira) = config.issues.jira.as_mut() {
+            jira.base_url = internal("jira.base_url");
+            jira.custom_jql = Some(internal("jira.custom_jql"));
+        }
+        if let Some(slack) = config.issues.slack.as_mut() {
+            slack.workspace = Some(internal("issues.slack.workspace"));
+        }
+        config.notifiers.slack.workspace = Some(internal("notifiers.slack.workspace"));
+        config.notifiers.email.smtp_host = Some(internal("smtp_host"));
+        config.notifiers.email.imap_host = Some(internal("imap_host"));
+        config.llm.model_path = PathBuf::from(internal("model_path"));
+        config.tls.domains = vec![internal("tls.domains")];
+        config.mcp_server.allowed_origins = vec![internal("allowed_origins")];
+        config
+    }
+
+    #[test]
+    fn paths_hosts_and_queries_are_never_reported() {
+        let features = features(&config_with_internal_values());
+        for feature in &features {
+            for setting in &feature.settings {
+                assert!(
+                    !INTERNAL_SETTINGS.contains(&setting.name.as_str()),
+                    "{} reports internal setting {}",
+                    feature.key,
+                    setting.name
+                );
+            }
+        }
+        let body = serde_json::to_string(&FeaturesResponse { features }).unwrap();
+        assert!(
+            !body.contains("INTERNAL-"),
+            "feature status leaked an internal value: {body}"
+        );
     }
 
     #[test]

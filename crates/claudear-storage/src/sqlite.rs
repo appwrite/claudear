@@ -7965,7 +7965,8 @@ impl SqliteTracker {
                    created_at, updated_at
             FROM deploy_qa_tips
             WHERE (?1 IS NULL OR track = ?1)
-            ORDER BY COALESCE(published_at, created_at) DESC, id DESC
+            ORDER BY CAST(COALESCE(strftime('%s', published_at), strftime('%s', created_at)) AS INTEGER) DESC,
+                     id DESC
             LIMIT ?2
             "#,
         )?;
@@ -11535,6 +11536,42 @@ mod tests {
             .list_deploy_qa_tips(Some("missing"), 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn test_list_deploy_qa_tips_orders_unpublished_tips_by_created_at_epoch() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut published = DeployQaTip::new("cloud", "acme/cloud", "1.0.0");
+        published.published_at = Some("2026-03-01T08:00:00Z".into());
+        tracker.upsert_deploy_qa_tip(&published).unwrap();
+
+        let unpublished = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "acme/cloud", "1.1.0"))
+            .unwrap();
+        assert_eq!(unpublished.published_at, None);
+
+        let mut offset = DeployQaTip::new("cloud", "acme/cloud", "0.9.0");
+        offset.published_at = Some("2026-03-01T10:30:00+05:00".into());
+        tracker.upsert_deploy_qa_tip(&offset).unwrap();
+
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE deploy_qa_tips SET created_at = '2026-03-01 09:00:00' WHERE id = ?1",
+                params![unpublished.id],
+            )
+            .unwrap();
+
+        let tags: Vec<String> = tracker
+            .list_deploy_qa_tips(Some("cloud"), 10)
+            .unwrap()
+            .into_iter()
+            .map(|tip| tip.tag)
+            .collect();
+        assert_eq!(tags, ["1.1.0", "1.0.0", "0.9.0"]);
     }
 
     #[test]

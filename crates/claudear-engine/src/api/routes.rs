@@ -257,15 +257,11 @@ pub fn create_api_router_full(
         .with_state(state.clone())
         .nest_service("/avatars", ServeDir::new(avatars_dir));
 
-    // Merge chat routes if enabled
-    let api_routes = if let Some(chat_state) = chat_state {
-        api_routes.merge(super::chat::authenticated(
-            claudear_integrations::chat::create_chat_router(chat_state),
-            state,
-        ))
-    } else {
-        api_routes
-    };
+    let api_routes = super::chat::mount(
+        api_routes,
+        chat_state.map(claudear_integrations::chat::create_chat_router),
+        state,
+    );
 
     // If dashboard directory is provided, serve from filesystem (development override)
     if let Some(dashboard_path) = dashboard_dir {
