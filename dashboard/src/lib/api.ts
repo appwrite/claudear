@@ -178,7 +178,8 @@ export interface Identities {
 export interface UserIdentities {
   user_id: number
   name: string
-  email: string | null
+  login_email: string | null
+  person_key: string | null
   slug: string | null
   origin: IdentityOrigin
   status: UserStatus
@@ -1319,11 +1320,11 @@ export async function uploadAvatar(file: File): Promise<{ avatar_url: string }> 
 
 
 export async function fetchUsers(): Promise<UserRecord[]> {
-  return fetchJson(`${API_BASE}/users`)
+  return sendJson('GET', `${API_BASE}/users`)
 }
 
 export async function getUser(id: number): Promise<UserRecord> {
-  return fetchJson(`${API_BASE}/users/${id}`)
+  return sendJson('GET', `${API_BASE}/users/${id}`)
 }
 
 export async function createUser(data: {
@@ -1335,11 +1336,11 @@ export async function createUser(data: {
 export async function updateUser(id: number, data: {
   email?: string; password?: string; name?: string; role?: string
 }): Promise<UserRecord> {
-  return putJson(`${API_BASE}/users/${id}`, data)
+  return sendJson('PUT', `${API_BASE}/users/${id}`, data)
 }
 
 export async function deleteUser(id: number): Promise<void> {
-  return deleteRequest(`${API_BASE}/users/${id}`)
+  await sendJson<unknown>('DELETE', `${API_BASE}/users/${id}`)
 }
 
 export async function issueInvite(userId: number): Promise<UserInvite> {

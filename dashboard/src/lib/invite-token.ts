@@ -11,7 +11,8 @@ function isInviteHistoryState(state: unknown): state is InviteHistoryState {
 }
 
 export function isInvitePath(): boolean {
-  return window.location.pathname === INVITE_PATH
+  const { pathname } = window.location
+  return pathname === INVITE_PATH || pathname === `${INVITE_PATH}/`
 }
 
 /**
@@ -31,4 +32,8 @@ export function readInviteToken(): string | null {
   captureInviteToken()
   const state: unknown = window.history.state
   return isInviteHistoryState(state) ? state.inviteToken : null
+}
+
+export function clearInviteToken(): void {
+  window.history.replaceState(null, '', INVITE_PATH)
 }

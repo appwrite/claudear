@@ -131,6 +131,17 @@ function buildUpdate(
   return update
 }
 
+function revertPrompt(identities: UserIdentities, canEditSlug: boolean) {
+  const prompt = 'Revert to config? Identities saved in the console for this person will be removed.'
+  return keepsSlugOnRevert(identities, canEditSlug)
+    ? `${prompt} The person key "${identities.slug}" was set by an admin and is kept.`
+    : prompt
+}
+
+function keepsSlugOnRevert(identities: UserIdentities, canEditSlug: boolean) {
+  return !canEditSlug && identities.slug !== null
+}
+
 function groupViolations(violations: IdentityViolation[]) {
   const grouped = new Map<IdentityFieldName, string[]>()
   for (const violation of violations) {
@@ -142,7 +153,7 @@ function groupViolations(violations: IdentityViolation[]) {
 export function OriginBadge({ identities }: { identities: UserIdentities }) {
   const label = {
     console: 'Console',
-    config: identities.slug ? `From config (${identities.slug})` : 'From config',
+    config: identities.person_key ? `From config (${identities.person_key})` : 'From config',
     unset: 'Not set',
   }[identities.origin]
   return <Badge className={cn('font-medium', ORIGIN_BADGE_CLASSES[identities.origin])}>{label}</Badge>
@@ -232,10 +243,11 @@ function IdentityEditor({
   }
 
   const handleRevert = async () => {
-    if (!confirm('Revert to config? Identities saved in the console for this person will be removed.')) return
+    if (!confirm(revertPrompt(identities, canEditSlug))) return
+    const notice = keepsSlugOnRevert(identities, canEditSlug) ? 'Reverted to config; person key kept' : 'Reverted to config'
     setBusy(true)
     try {
-      await succeed(await resetUserIdentities(identities.user_id), 'Reverted to config')
+      await succeed(await resetUserIdentities(identities.user_id), notice)
     } catch (caught) {
       fail(caught, 'Failed to revert identities')
     } finally {
@@ -274,22 +286,36 @@ function IdentityEditor({
 
       {error && <div className="bg-destructive/10 text-destructive text-sm p-3 rounded-md">{error}</div>}
 
-      <div className="space-y-1 max-w-md">
-        <label htmlFor={`${formId}-slug`} className="text-sm font-medium">Person key</label>
-        <input
-          {...inputProps('slug')}
-          value={slug}
-          onChange={(event) => setSlug(event.target.value)}
-          readOnly={!canEditSlug}
-          placeholder={canEditSlug ? 'jake' : 'Assigned automatically'}
-        />
-        <p className="text-xs text-muted-foreground">
-          {canEditSlug
-            ? 'Links this person to a [users.<key>] config entry.'
-            : 'Only admins can change the person key.'}
-        </p>
-        {renderErrors('slug')}
-      </div>
+      {canEditSlug ? (
+        <div className="space-y-1 max-w-md">
+          <label htmlFor={`${formId}-slug`} className="text-sm font-medium">Person key</label>
+          <input
+            {...inputProps('slug')}
+            value={slug}
+            onChange={(event) => setSlug(event.target.value)}
+            placeholder="jake"
+          />
+          <p className="text-xs text-muted-foreground">
+            Links this person to a [users.&lt;key&gt;] config entry.
+            {identities.slug === null && identities.person_key !== null && (
+              <> Leave empty to keep the current key, <code className="font-mono">{identities.person_key}</code>.</>
+            )}
+          </p>
+          {renderErrors('slug')}
+        </div>
+      ) : (
+        <div className="space-y-1 max-w-md">
+          <label htmlFor={`${formId}-person-key`} className="text-sm font-medium">Person key</label>
+          <input
+            id={`${formId}-person-key`}
+            className={INPUT_CLASS}
+            value={identities.person_key ?? ''}
+            readOnly
+            placeholder="Assigned automatically"
+          />
+          <p className="text-xs text-muted-foreground">Only admins can change the person key.</p>
+        </div>
+      )}
 
       {GROUPS.map((group) => (
         <fieldset key={group.title} className="space-y-3">
