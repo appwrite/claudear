@@ -1,11 +1,15 @@
 //! `PUT /api/directory`: bulk create-or-update of console users and their identities.
 //!
-//! Entries are matched to users by login email (case-insensitive). An unknown email
-//! creates an invited user with an invite link; a known one gets a sparse update. Every
-//! entry is validated and conflict-checked before anything is written, and the whole
-//! batch is stored in one transaction, so a request either applies fully or not at all.
+//! Entries are matched to users by login email, compared and stored lowercased. An
+//! unknown email creates an invited user with an invite link; a known one gets a sparse
+//! update. Every entry is validated and conflict-checked before anything is written, and
+//! the whole batch is stored in one transaction, so a request either applies fully or not
+//! at all.
 
-use super::auth::{check_api_rate_limit, is_valid_login_email, AdminCaller, Role};
+use super::auth::{
+    check_api_rate_limit, is_valid_login_email, normalize_login_email, AdminCaller, Role,
+};
+use super::error::ApiError;
 use super::identities::{
     conflicts_by_plan, plan_update, IdentityPlan, UpdateIdentitiesRequest, UserIdentities,
 };
@@ -14,8 +18,6 @@ use super::routes::ApiState;
 use crate::registry;
 use axum::{
     extract::{rejection::JsonRejection, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
     Json,
 };
 use claudear_config::users::UserRegistry;
@@ -112,67 +114,12 @@ impl DirectoryViolation {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum DirectoryError {
-    RateLimited,
-    InvalidBody,
-    Internal,
-    Invalid(Vec<DirectoryViolation>),
-    Conflict(Vec<DirectoryViolation>),
-}
-
-impl DirectoryError {
-    fn storage(error: claudear_core::error::Error) -> Self {
-        tracing::error!(error = %error, "Directory storage operation failed");
-        Self::Internal
-    }
-}
-
-impl From<StatusCode> for DirectoryError {
-    fn from(_: StatusCode) -> Self {
-        Self::Internal
-    }
-}
-
-#[derive(Serialize)]
-struct ErrorBody {
-    error: &'static str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    violations: Vec<DirectoryViolation>,
-}
-
-impl IntoResponse for DirectoryError {
-    fn into_response(self) -> Response {
-        let (status, error, violations) = match self {
-            Self::RateLimited => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many requests",
-                Vec::new(),
-            ),
-            Self::InvalidBody => (StatusCode::BAD_REQUEST, "Invalid request body", Vec::new()),
-            Self::Internal => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error",
-                Vec::new(),
-            ),
-            Self::Invalid(violations) => (
-                StatusCode::BAD_REQUEST,
-                "Invalid directory entries",
-                violations,
-            ),
-            Self::Conflict(violations) => (
-                StatusCode::CONFLICT,
-                "Identities already belong to another person",
-                violations,
-            ),
-        };
-        (status, Json(ErrorBody { error, violations })).into_response()
-    }
-}
-
 /// A validated entry, ready to write.
 struct StagedEntry {
+    /// The normalized login email.
     email: String,
+    /// The email as the request gave it, which names the entry in violations.
+    requested_email: String,
     user: StagedUser,
     plan: Option<IdentityPlan>,
 }
@@ -194,19 +141,20 @@ pub(crate) async fn put_directory_handler(
     AdminCaller(admin): AdminCaller,
     State(state): State<ApiState>,
     body: Result<Json<DirectoryRequest>, JsonRejection>,
-) -> Result<Json<DirectoryResponse>, DirectoryError> {
+) -> Result<Json<DirectoryResponse>, ApiError> {
     if !check_api_rate_limit(admin.id) {
-        return Err(DirectoryError::RateLimited);
+        return Err(ApiError::rate_limited());
     }
-    let Json(request) = body.map_err(|_| DirectoryError::InvalidBody)?;
+    let Json(request) = body?;
 
+    let _writes = state.identity_writes.lock().await;
     registry::reload(&state.registry, state.tracker.as_ref());
     let users: HashMap<String, UserRow> = state
         .tracker
         .list_users()
-        .map_err(DirectoryError::storage)?
+        .map_err(ApiError::storage)?
         .into_iter()
-        .map(|user| (user.email.to_lowercase(), user))
+        .map(|user| (normalize_login_email(&user.email), user))
         .collect();
     let identities = identities_by_user(&state)?;
 
@@ -258,7 +206,7 @@ pub(crate) async fn put_directory_handler(
     let user_ids = state
         .tracker
         .save_directory(&writes)
-        .map_err(DirectoryError::storage)?;
+        .map_err(ApiError::user_write)?;
     registry::reload(&state.registry, state.tracker.as_ref());
 
     let identities = identities_by_user(&state)?;
@@ -267,8 +215,8 @@ pub(crate) async fn put_directory_handler(
         let user = state
             .tracker
             .get_user_by_id(user_id)
-            .map_err(DirectoryError::storage)?
-            .ok_or(DirectoryError::Internal)?;
+            .map_err(ApiError::storage)?
+            .ok_or_else(ApiError::internal)?;
         results.push(DirectoryResult {
             user_id,
             email: user.email.clone(),
@@ -286,11 +234,11 @@ pub(crate) async fn put_directory_handler(
     Ok(Json(DirectoryResponse { users: results }))
 }
 
-fn identities_by_user(state: &ApiState) -> Result<HashMap<i64, ConsoleIdentity>, DirectoryError> {
+fn identities_by_user(state: &ApiState) -> Result<HashMap<i64, ConsoleIdentity>, ApiError> {
     Ok(state
         .tracker
         .list_user_identities()
-        .map_err(DirectoryError::storage)?
+        .map_err(ApiError::storage)?
         .into_iter()
         .map(|entry| (entry.user_id, entry))
         .collect())
@@ -302,33 +250,34 @@ fn stage(
     users: &HashMap<String, UserRow>,
     identities: &HashMap<i64, ConsoleIdentity>,
     entries: Vec<DirectoryEntry>,
-) -> Result<Vec<StagedEntry>, DirectoryError> {
+) -> Result<Vec<StagedEntry>, ApiError> {
     let mut staged = Vec::with_capacity(entries.len());
     let mut violations = Vec::new();
     let mut seen = HashSet::new();
 
     for entry in entries {
-        let email = entry.email.trim().to_string();
+        let requested_email = entry.email.trim().to_string();
+        let email = normalize_login_email(&requested_email);
         let mut problems = Vec::new();
         if !is_valid_login_email(&email) {
             problems.push(DirectoryViolation::new(
-                &email,
+                &requested_email,
                 DirectoryField::Email,
                 "email must be a valid email address",
             ));
-        } else if !seen.insert(email.to_lowercase()) {
+        } else if !seen.insert(email.clone()) {
             problems.push(DirectoryViolation::new(
-                &email,
+                &requested_email,
                 DirectoryField::Email,
                 "email appears more than once in this request",
             ));
         }
 
-        let existing = users.get(&email.to_lowercase());
+        let existing = users.get(&email);
         let name = entry.name.as_deref().map(str::trim);
         if name == Some("") || (existing.is_none() && name.is_none()) {
             problems.push(DirectoryViolation::new(
-                &email,
+                &requested_email,
                 DirectoryField::Name,
                 "name is required for a new user and must not be empty",
             ));
@@ -337,7 +286,7 @@ fn stage(
             Some(Ok(role)) => Some(role),
             Some(Err(_)) => {
                 problems.push(DirectoryViolation::new(
-                    &email,
+                    &requested_email,
                     DirectoryField::Role,
                     "role must be admin or viewer",
                 ));
@@ -346,7 +295,7 @@ fn stage(
             None => {
                 if existing.is_none() {
                     problems.push(DirectoryViolation::new(
-                        &email,
+                        &requested_email,
                         DirectoryField::Role,
                         "role is required for a new user",
                     ));
@@ -363,15 +312,12 @@ fn stage(
                 login_email,
                 existing.map(|user| user.id),
                 update,
-                true,
             ) {
                 Ok(plan) => Some(plan),
                 Err(found) => {
-                    problems.extend(
-                        found
-                            .into_iter()
-                            .map(|violation| DirectoryViolation::identity(&email, violation)),
-                    );
+                    problems.extend(found.into_iter().map(|violation| {
+                        DirectoryViolation::identity(&requested_email, violation)
+                    }));
                     None
                 }
             },
@@ -391,7 +337,12 @@ fn stage(
             (None, _, _) => None,
         };
         match user {
-            Some(user) if problems.is_empty() => staged.push(StagedEntry { email, user, plan }),
+            Some(user) if problems.is_empty() => staged.push(StagedEntry {
+                email,
+                requested_email,
+                user,
+                plan,
+            }),
             _ => violations.append(&mut problems),
         }
     }
@@ -399,14 +350,19 @@ fn stage(
     if violations.is_empty() {
         Ok(staged)
     } else {
-        Err(DirectoryError::Invalid(violations))
+        Err(ApiError::invalid_directory(violations))
     }
 }
 
-fn check_conflicts(registry: &UserRegistry, staged: &[StagedEntry]) -> Result<(), DirectoryError> {
+fn check_conflicts(registry: &UserRegistry, staged: &[StagedEntry]) -> Result<(), ApiError> {
     let (emails, plans): (Vec<&str>, Vec<IdentityPlan>) = staged
         .iter()
-        .filter_map(|entry| entry.plan.clone().map(|plan| (entry.email.as_str(), plan)))
+        .filter_map(|entry| {
+            entry
+                .plan
+                .clone()
+                .map(|plan| (entry.requested_email.as_str(), plan))
+        })
         .unzip();
     let violations: Vec<DirectoryViolation> = conflicts_by_plan(registry, &plans)
         .into_iter()
@@ -420,17 +376,18 @@ fn check_conflicts(registry: &UserRegistry, staged: &[StagedEntry]) -> Result<()
     if violations.is_empty() {
         Ok(())
     } else {
-        Err(DirectoryError::Conflict(violations))
+        Err(ApiError::directory_conflict(violations))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::auth::IP_RATE_LIMIT_MAX_ATTEMPTS;
     use crate::api::tokens::hash_secret;
     use crate::api::{apply_dashboard_middleware, create_api_router_with_dashboard};
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use axum::Router;
     use claudear_config::config::{Config, UserConfig};
     use claudear_storage::{FixAttemptTracker, SqliteTracker};
@@ -592,11 +549,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"users": []}));
 
-        let (status, _) = put(&app, Some(&bearer(&app.viewer)), None, empty.clone()).await;
+        let (status, body) = put(&app, Some(&bearer(&app.viewer)), None, empty.clone()).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "Admin access required"}));
 
-        let (status, _) = put(&app, Some("Bearer cldr_unknown"), None, empty.clone()).await;
+        let (status, body) = put(&app, Some("Bearer cldr_unknown"), None, empty.clone()).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, json!({"error": "Invalid or expired token"}));
 
         let (status, _) = put(
             &app,
@@ -622,8 +581,9 @@ mod tests {
         let (status, _) = put(&app, None, Some(&app.viewer.session), empty.clone()).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
-        let (status, _) = put(&app, None, None, empty).await;
+        let (status, body) = put(&app, None, None, empty).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, json!({"error": "Not authenticated"}));
     }
 
     #[tokio::test]
@@ -825,5 +785,110 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "Invalid request body");
+    }
+
+    #[tokio::test]
+    async fn login_emails_match_case_insensitively_and_are_stored_lowercased() {
+        let app = test_app(false);
+        let before = user_count(&app);
+
+        let (status, body) = put(
+            &app,
+            Some(&bearer(&app.admin)),
+            None,
+            json!({"users": [{"email": " Directory-Case@Example.com ", "name": "Case",
+                              "role": "viewer"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = &body["users"][0];
+        assert_eq!(created["created"], true);
+        assert_eq!(created["email"], "directory-case@example.com");
+        assert_eq!(
+            created["identities"]["login_email"],
+            "directory-case@example.com"
+        );
+        let user_id = created["user_id"].as_i64().expect("user id");
+
+        let (status, body) = put(
+            &app,
+            Some(&bearer(&app.admin)),
+            None,
+            json!({"users": [{"email": "DIRECTORY-CASE@example.COM", "name": "Renamed"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["users"][0]["created"], false);
+        assert_eq!(body["users"][0]["user_id"], user_id);
+        assert_eq!(user_count(&app), before + 1);
+        let user = app
+            .tracker
+            .get_user_by_id(user_id)
+            .expect("lookup")
+            .expect("user exists");
+        assert_eq!(user.email, "directory-case@example.com");
+        assert_eq!(user.name, "Renamed");
+
+        let (status, body) = put(
+            &app,
+            Some(&bearer(&app.admin)),
+            None,
+            json!({"users": [
+                {"email": "Directory-Twin@Example.com", "name": "One", "role": "viewer"},
+                {"email": "directory-twin@example.com", "name": "Two", "role": "viewer"}
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["violations"][0]["email"], "directory-twin@example.com");
+        assert_eq!(body["violations"][0]["field"], "email");
+        assert_eq!(user_count(&app), before + 1);
+    }
+
+    #[tokio::test]
+    async fn failed_bearer_attempts_spend_the_client_ip_bucket() {
+        const PROBE_IP: &str = "198.51.100.71";
+        let app = test_app(false);
+        let attempt = |authorization: String, ip: &str| {
+            Request::builder()
+                .method("PUT")
+                .uri("/api/directory")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", ip)
+                .header("authorization", authorization)
+                .body(Body::from(json!({"users": []}).to_string()))
+                .expect("request")
+        };
+        let send = |request: Request<Body>| async {
+            let response = app.router.clone().oneshot(request).await.expect("response");
+            let status = response.status();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        };
+
+        for _ in 0..IP_RATE_LIMIT_MAX_ATTEMPTS {
+            let (status, body) = send(attempt("Bearer cldr_guess".to_string(), PROBE_IP)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body, json!({"error": "Invalid or expired token"}));
+        }
+
+        let (status, body) = send(attempt(bearer(&app.admin), PROBE_IP)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, json!({"error": "Too many requests"}));
+
+        let (status, _) = send(attempt(bearer(&app.admin), "198.51.100.72")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "other clients keep their own bucket"
+        );
     }
 }

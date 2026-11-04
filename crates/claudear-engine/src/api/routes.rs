@@ -42,6 +42,9 @@ pub struct ApiState {
     pub chat_service: Option<Arc<claudear_integrations::chat::ChatService>>,
     /// The shared person directory; identity writes reload it so edits apply at once.
     pub registry: UserRegistry,
+    /// Held across reload, plan, conflict check, save and reload by every user,
+    /// identity and directory write, so two writes never both pass the same check.
+    pub identity_writes: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Create the API router.
@@ -105,6 +108,7 @@ pub fn create_api_router_full(
         storage_dir: storage_dir.clone(),
         chat_service,
         registry,
+        identity_writes: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let api_routes = Router::new()
@@ -8612,7 +8616,7 @@ mod tests {
 
         fn assert_redacted(person: &Value) {
             assert_eq!(person["redacted"], true);
-            assert_eq!(person["email"], Value::Null);
+            assert_eq!(person["login_email"], Value::Null);
             for field in IdentityField::ALL
                 .into_iter()
                 .filter(|field| field.is_sensitive())
@@ -8654,14 +8658,15 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["user_id"], harness.viewer.id);
             assert_eq!(body["origin"], "console");
-            assert_eq!(body["slug"], console_key(harness.viewer.id));
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
+            assert_eq!(body["slug"], Value::Null);
             assert_eq!(body["redacted"], false);
 
             for token in [&harness.admin.token, &harness.viewer.token] {
                 let (status, read) = harness.send(auth_get(&uri, token)).await;
                 assert_eq!(status, StatusCode::OK);
                 assert_eq!(read["redacted"], false);
-                assert_eq!(read["email"], VIEWER_EMAIL);
+                assert_eq!(read["login_email"], VIEWER_EMAIL);
                 assert_eq!(read["identities"], body["identities"]);
                 assert_eq!(read["identities"]["github_usernames"], json!(["viewer-gh"]));
                 assert_eq!(read["identities"]["discord_id"], VIEWER_DISCORD_ID);
@@ -8691,9 +8696,10 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["status"], "active");
             assert_eq!(body["origin"], "console");
-            assert_eq!(body["slug"], console_key(harness.viewer.id));
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
+            assert_eq!(body["slug"], Value::Null);
             assert_eq!(body["redacted"], false);
-            assert_eq!(body["email"], VIEWER_EMAIL);
+            assert_eq!(body["login_email"], VIEWER_EMAIL);
             assert_eq!(body["name"], "Viewer");
             assert_eq!(body["identities"]["github_usernames"], json!(["Viewer-GH"]));
             assert_eq!(body["identities"]["telegram_chat_id"], TELEGRAM_CHAT_ID);
@@ -8706,6 +8712,7 @@ mod tests {
             let (status, body) = harness.send(auth_delete(&uri, &harness.viewer.token)).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["origin"], "unset");
+            assert_eq!(body["person_key"], Value::Null);
             assert_eq!(body["slug"], Value::Null);
             assert_eq!(body["identities"]["github_usernames"], json!([]));
             assert!(harness.stored_user_ids().is_empty());
@@ -8730,7 +8737,10 @@ mod tests {
                     ))
                     .await;
                 assert_eq!(status, StatusCode::FORBIDDEN);
-                assert_eq!(body, json!({"error": "Forbidden"}));
+                assert_eq!(
+                    body,
+                    json!({"error": "You can only change your own identities"})
+                );
             }
 
             let (status, _) = harness
@@ -8829,6 +8839,7 @@ mod tests {
                 "an admin links a console user to a config-only person by key"
             );
             assert_eq!(body["slug"], "ceo");
+            assert_eq!(body["person_key"], "ceo");
             assert_eq!(
                 harness.registry.origin("ceo"),
                 Some(IdentityOrigin::Console)
@@ -8844,6 +8855,7 @@ mod tests {
                 .await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["slug"], "viewer-key");
+            assert_eq!(body["person_key"], "viewer-key");
             assert_eq!(harness.registry.origin("ceo"), Some(IdentityOrigin::Config));
             assert_eq!(
                 harness.person("github", "chief-gh"),
@@ -8907,7 +8919,7 @@ mod tests {
                 .await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(own["redacted"], false);
-            assert_eq!(own["email"], VIEWER_EMAIL);
+            assert_eq!(own["login_email"], VIEWER_EMAIL);
             assert_eq!(own["identities"]["sms_number"], SMS_NUMBER);
             assert_eq!(own["identities"]["push_user_key"], PUSH_USER_KEY);
             assert_eq!(own["identities"]["email"], "notify-viewer-gh@example.com");
@@ -8920,7 +8932,7 @@ mod tests {
                 .await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(other["redacted"], false);
-            assert_eq!(other["email"], OTHER_EMAIL);
+            assert_eq!(other["login_email"], OTHER_EMAIL);
             assert_eq!(other["identities"]["telegram_chat_id"], TELEGRAM_CHAT_ID);
         }
 
@@ -8948,7 +8960,7 @@ mod tests {
             assert_redacted(find_person(&people, harness.admin.id));
             let own = find_person(&people, harness.viewer.id);
             assert_eq!(own["redacted"], false);
-            assert_eq!(own["email"], VIEWER_EMAIL);
+            assert_eq!(own["login_email"], VIEWER_EMAIL);
             assert_eq!(own["identities"]["sms_number"], SMS_NUMBER);
 
             let (status, people) = harness
@@ -8961,7 +8973,7 @@ mod tests {
                 .iter()
                 .all(|person| person["redacted"] == false));
             let other = find_person(&people, harness.other.id);
-            assert_eq!(other["email"], OTHER_EMAIL);
+            assert_eq!(other["login_email"], OTHER_EMAIL);
             assert_eq!(other["identities"]["sms_number"], SMS_NUMBER);
         }
 
@@ -9106,7 +9118,8 @@ mod tests {
             let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["origin"], "config");
-            assert_eq!(body["slug"], "jake");
+            assert_eq!(body["person_key"], "jake");
+            assert_eq!(body["slug"], Value::Null);
             assert_eq!(body["updated_at"], Value::Null);
             assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
             assert_eq!(body["identities"]["discord_id"], CONFIG_DISCORD_ID);
@@ -9124,6 +9137,7 @@ mod tests {
                 .await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], "jake");
             assert_eq!(body["slug"], "jake");
             assert!(body["updated_at"].is_string());
             assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
@@ -9147,8 +9161,12 @@ mod tests {
 
             let (status, body) = harness.send(auth_delete(&uri, &harness.viewer.token)).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(body["origin"], "config");
-            assert_eq!(body["slug"], "jake");
+            assert_eq!(
+                body["origin"], "config",
+                "the config link of the viewer's own login email is not a key to keep"
+            );
+            assert_eq!(body["person_key"], "jake");
+            assert_eq!(body["slug"], Value::Null);
             assert_eq!(body["updated_at"], Value::Null);
             assert_eq!(body["identities"]["slack_id"], Value::Null);
             assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
@@ -9173,6 +9191,7 @@ mod tests {
                 .await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["origin"], "unset");
+            assert_eq!(body["person_key"], Value::Null);
             assert_eq!(body["slug"], Value::Null);
             assert_eq!(body["identities"]["github_usernames"], json!([]));
         }
@@ -9238,13 +9257,13 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["status"], "active");
             assert_eq!(body["origin"], "console");
-            assert_eq!(body["slug"], console_key(harness.viewer.id));
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
             assert_eq!(body["identities"]["email"], "chief@example.com");
 
             let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["origin"], "console");
-            assert_eq!(body["slug"], console_key(harness.viewer.id));
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
 
             assert_eq!(
                 harness.person("github", "chief-gh"),
@@ -10072,13 +10091,14 @@ mod tests {
             let token = app.mint_bearer(id);
             let count = app.user_count();
 
-            let (status, _) = app
+            let (status, body) = app
                 .put_directory(
                     Caller::Bearer(&token),
                     json!({"users": [{"email": app.email("amy"), "name": "Amy", "role": "viewer"}]}),
                 )
                 .await;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body, json!({"error": "Invalid or expired token"}));
             assert_eq!(app.user_count(), count);
         }
 

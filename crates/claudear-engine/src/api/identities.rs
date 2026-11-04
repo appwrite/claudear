@@ -6,12 +6,11 @@
 //! different person is rejected, and every write reloads the shared registry.
 
 use super::auth::{check_api_rate_limit, AuthUser};
+use super::error::ApiError;
 use super::routes::ApiState;
 use crate::registry;
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
     Json,
 };
 use claudear_config::config::UserConfig;
@@ -95,7 +94,12 @@ fn replace<T>(target: &mut T, value: Option<T>) {
 pub(crate) struct UserIdentities {
     pub user_id: i64,
     pub name: String,
-    pub email: Option<String>,
+    /// The console login email; `None` when redacted.
+    pub login_email: Option<String>,
+    /// The key the registry knows this person by, possibly `console-<id>`; `None` when
+    /// the origin is unset.
+    pub person_key: Option<String>,
+    /// The slug stored on the console row, if any; never a `console-<id>` key.
     pub slug: Option<String>,
     pub origin: IdentityOrigin,
     pub status: UserStatus,
@@ -112,10 +116,11 @@ impl UserIdentities {
         user: &UserRow,
         entry: Option<&ConsoleIdentity>,
     ) -> Self {
-        let (origin, slug, identities, updated_at) = match entry {
+        let (origin, person_key, slug, identities, updated_at) = match entry {
             Some(entry) => (
                 IdentityOrigin::Console,
                 Some(registry.person_key(entry)),
+                entry.slug.clone(),
                 entry.identities.clone(),
                 Some(entry.updated_at.clone()),
             ),
@@ -123,16 +128,24 @@ impl UserIdentities {
                 Some((key, config)) => (
                     IdentityOrigin::Config,
                     Some(key),
+                    None,
                     Identities::from(&config),
                     None,
                 ),
-                None => (IdentityOrigin::Unset, None, Identities::default(), None),
+                None => (
+                    IdentityOrigin::Unset,
+                    None,
+                    None,
+                    Identities::default(),
+                    None,
+                ),
             },
         };
         Self {
             user_id: user.id,
             name: user.name.clone(),
-            email: Some(user.email.clone()),
+            login_email: Some(user.email.clone()),
+            person_key,
             slug,
             origin,
             status: user.status,
@@ -146,7 +159,7 @@ impl UserIdentities {
     /// email removed.
     pub(crate) fn redacted(self) -> Self {
         Self {
-            email: None,
+            login_email: None,
             redacted: true,
             identities: self.identities.redacted(),
             ..self
@@ -172,14 +185,13 @@ pub(crate) struct IdentityPlan {
 /// The base is the user's console row (`existing`), else the config entry matching their
 /// login email, in which case the slug defaults to that config key so the link becomes
 /// explicit. Values the update leaves alone are not re-validated, because config values
-/// were never validated.
+/// were never validated. Only admins may send `slug`; callers enforce that.
 pub(crate) fn plan_update(
     registry: &UserRegistry,
     existing: Option<&ConsoleIdentity>,
     login_email: &str,
     user_id: Option<i64>,
     update: UpdateIdentitiesRequest,
-    actor_is_admin: bool,
 ) -> Result<IdentityPlan, Vec<IdentityViolation>> {
     let user_id = user_id.or(existing.map(|entry| entry.user_id));
     let touched: Vec<IdentityField> = IdentityField::ALL
@@ -191,13 +203,6 @@ pub(crate) fn plan_update(
     let mut violations = Vec::new();
     let slug = match update.slug.as_deref().map(str::trim) {
         None => base_slug,
-        Some(_) if !actor_is_admin => {
-            violations.push(IdentityViolation::new(
-                IdentityField::Slug,
-                "only an admin can change the person key",
-            ));
-            base_slug
-        }
         Some("") => None,
         Some(slug) => {
             if let Err(violation) = validate_slug(slug) {
@@ -367,72 +372,16 @@ fn configured_person(registry: &UserRegistry, login_email: &str) -> Option<(Stri
         .filter(|(key, _)| registry.origin(key) == Some(IdentityOrigin::Config))
 }
 
-/// A failed identity request. Bodies are `{"error", "violations"?}` and never carry a
-/// stored value.
-#[derive(Debug)]
-pub(crate) enum IdentityError {
-    Forbidden,
-    NotFound,
-    RateLimited,
-    InvalidBody,
-    Storage,
-    Invalid(Vec<IdentityViolation>),
-    Conflict(Vec<IdentityViolation>),
-}
-
-impl IdentityError {
-    fn storage(error: claudear_core::error::Error) -> Self {
-        tracing::error!(error = %error, "Identity storage operation failed");
-        Self::Storage
-    }
-}
-
-#[derive(Serialize)]
-struct ErrorBody {
-    error: &'static str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    violations: Vec<IdentityViolation>,
-}
-
-impl IntoResponse for IdentityError {
-    fn into_response(self) -> Response {
-        let (status, error, violations) = match self {
-            Self::Forbidden => (StatusCode::FORBIDDEN, "Forbidden", Vec::new()),
-            Self::NotFound => (StatusCode::NOT_FOUND, "User not found", Vec::new()),
-            Self::RateLimited => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many requests",
-                Vec::new(),
-            ),
-            Self::InvalidBody => (StatusCode::BAD_REQUEST, "Invalid request body", Vec::new()),
-            Self::Storage => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error",
-                Vec::new(),
-            ),
-            Self::Invalid(violations) => {
-                (StatusCode::BAD_REQUEST, "Invalid identities", violations)
-            }
-            Self::Conflict(violations) => (
-                StatusCode::CONFLICT,
-                "Identities already belong to another person",
-                violations,
-            ),
-        };
-        (status, Json(ErrorBody { error, violations })).into_response()
-    }
-}
-
 /// GET /api/identities
 pub(crate) async fn list_identities_handler(
     actor: AuthUser,
     State(state): State<ApiState>,
-) -> Result<Json<Vec<UserIdentities>>, IdentityError> {
-    let users = state.tracker.list_users().map_err(IdentityError::storage)?;
+) -> Result<Json<Vec<UserIdentities>>, ApiError> {
+    let users = state.tracker.list_users().map_err(ApiError::storage)?;
     let mut entries: HashMap<i64, ConsoleIdentity> = state
         .tracker
         .list_user_identities()
-        .map_err(IdentityError::storage)?
+        .map_err(ApiError::storage)?
         .into_iter()
         .map(|entry| (entry.user_id, entry))
         .collect();
@@ -455,7 +404,7 @@ pub(crate) async fn get_user_identities_handler(
     actor: AuthUser,
     State(state): State<ApiState>,
     Path(user_id): Path<i64>,
-) -> Result<Json<UserIdentities>, IdentityError> {
+) -> Result<Json<UserIdentities>, ApiError> {
     let user = find_user(&state, user_id)?;
     let entry = console_entry(&state, user_id)?;
     Ok(Json(visible(
@@ -472,14 +421,17 @@ pub(crate) async fn update_user_identities_handler(
     State(state): State<ApiState>,
     Path(user_id): Path<i64>,
     body: Result<Json<UpdateIdentitiesRequest>, JsonRejection>,
-) -> Result<Json<UserIdentities>, IdentityError> {
+) -> Result<Json<UserIdentities>, ApiError> {
     authorize_write(&actor, user_id)?;
-    let Json(update) = body.map_err(|_| IdentityError::InvalidBody)?;
+    let Json(update) = body?;
     if update.slug.is_some() && !actor.is_admin() {
-        return Err(IdentityError::Forbidden);
+        return Err(ApiError::forbidden(
+            "Only an admin can change the person key",
+        ));
     }
     let user = find_user(&state, user_id)?;
 
+    let _writes = state.identity_writes.lock().await;
     registry::reload(&state.registry, state.tracker.as_ref());
     let existing = console_entry(&state, user_id)?;
     let plan = plan_update(
@@ -488,26 +440,14 @@ pub(crate) async fn update_user_identities_handler(
         &user.email,
         Some(user_id),
         update,
-        actor.is_admin(),
     )
-    .map_err(IdentityError::Invalid)?;
+    .map_err(ApiError::invalid_identities)?;
     let conflicts = find_conflicts(&state.registry, std::slice::from_ref(&plan));
     if !conflicts.is_empty() {
-        return Err(IdentityError::Conflict(conflicts));
+        return Err(ApiError::identity_conflict(conflicts));
     }
 
-    state
-        .tracker
-        .save_directory(&[DirectoryWrite {
-            user: DirectoryUser::Existing {
-                user_id,
-                name: None,
-                role: None,
-            },
-            identities: Some(plan.write),
-            invite: None,
-        }])
-        .map_err(IdentityError::storage)?;
+    save_identities(&state, user_id, plan.write)?;
     registry::reload(&state.registry, state.tracker.as_ref());
 
     let entry = console_entry(&state, user_id)?;
@@ -519,33 +459,79 @@ pub(crate) async fn update_user_identities_handler(
 }
 
 /// DELETE /api/users/{id}/identities — drop the console override so config applies again.
+///
+/// A non-admin cannot change their person key, so when dropping the row would change it
+/// (an admin set a slug other than the config key their login email matches), their
+/// reset clears the handles and targets but keeps the slug.
 pub(crate) async fn reset_user_identities_handler(
     actor: AuthUser,
     State(state): State<ApiState>,
     Path(user_id): Path<i64>,
-) -> Result<Json<UserIdentities>, IdentityError> {
+) -> Result<Json<UserIdentities>, ApiError> {
     authorize_write(&actor, user_id)?;
     let user = find_user(&state, user_id)?;
-    state
-        .tracker
-        .delete_user_identities(user_id)
-        .map_err(IdentityError::storage)?;
+
+    let _writes = state.identity_writes.lock().await;
     registry::reload(&state.registry, state.tracker.as_ref());
+    let configured_key = state
+        .registry
+        .configured_for_email(&user.email)
+        .map(|(key, _)| key);
+    let kept_slug = console_entry(&state, user_id)?
+        .and_then(|entry| entry.slug)
+        .filter(|slug| !actor.is_admin() && Some(slug) != configured_key.as_ref());
+    match kept_slug {
+        Some(slug) => save_identities(
+            &state,
+            user_id,
+            IdentityWrite {
+                slug: Some(slug),
+                identities: Identities::default(),
+            },
+        )?,
+        None => {
+            state
+                .tracker
+                .delete_user_identities(user_id)
+                .map_err(ApiError::storage)?;
+        }
+    }
+    registry::reload(&state.registry, state.tracker.as_ref());
+
+    let entry = console_entry(&state, user_id)?;
     Ok(Json(UserIdentities::effective(
         &state.registry,
         &user,
-        None,
+        entry.as_ref(),
     )))
 }
 
-fn authorize_write(actor: &AuthUser, user_id: i64) -> Result<(), IdentityError> {
+fn save_identities(state: &ApiState, user_id: i64, write: IdentityWrite) -> Result<(), ApiError> {
+    state
+        .tracker
+        .save_directory(&[DirectoryWrite {
+            user: DirectoryUser::Existing {
+                user_id,
+                name: None,
+                role: None,
+            },
+            identities: Some(write),
+            invite: None,
+        }])
+        .map_err(ApiError::storage)?;
+    Ok(())
+}
+
+fn authorize_write(actor: &AuthUser, user_id: i64) -> Result<(), ApiError> {
     if !check_api_rate_limit(actor.id) {
-        return Err(IdentityError::RateLimited);
+        return Err(ApiError::rate_limited());
     }
     if actor.is_admin() || actor.id == user_id {
         Ok(())
     } else {
-        Err(IdentityError::Forbidden)
+        Err(ApiError::forbidden(
+            "You can only change your own identities",
+        ))
     }
 }
 
@@ -563,19 +549,19 @@ fn visible(
     }
 }
 
-fn find_user(state: &ApiState, user_id: i64) -> Result<UserRow, IdentityError> {
+fn find_user(state: &ApiState, user_id: i64) -> Result<UserRow, ApiError> {
     state
         .tracker
         .get_user_by_id(user_id)
-        .map_err(IdentityError::storage)?
-        .ok_or(IdentityError::NotFound)
+        .map_err(ApiError::storage)?
+        .ok_or_else(ApiError::user_not_found)
 }
 
-fn console_entry(state: &ApiState, user_id: i64) -> Result<Option<ConsoleIdentity>, IdentityError> {
+fn console_entry(state: &ApiState, user_id: i64) -> Result<Option<ConsoleIdentity>, ApiError> {
     Ok(state
         .tracker
         .list_user_identities()
-        .map_err(IdentityError::storage)?
+        .map_err(ApiError::storage)?
         .into_iter()
         .find(|entry| entry.user_id == user_id))
 }
@@ -585,7 +571,8 @@ mod tests {
     use super::*;
     use crate::api::create_api_router_with_dashboard;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
+    use axum::response::Response;
     use axum::Router;
     use claudear_config::config::Config;
     use claudear_storage::{FixAttemptTracker, SqliteTracker};
@@ -681,7 +668,6 @@ mod tests {
             "amy@example.com",
             Some(5),
             update,
-            false,
         )
         .expect("valid update");
 
@@ -716,7 +702,6 @@ mod tests {
             "amy@example.com",
             Some(5),
             update,
-            true,
         )
         .expect("valid update");
 
@@ -732,7 +717,7 @@ mod tests {
             ..UpdateIdentitiesRequest::default()
         };
 
-        let plan = plan_update(&registry, None, "jake@EXAMPLE.com", Some(7), update, false)
+        let plan = plan_update(&registry, None, "jake@EXAMPLE.com", Some(7), update)
             .expect("valid update");
 
         assert_eq!(plan.write.slug.as_deref(), Some("jake"));
@@ -770,7 +755,6 @@ mod tests {
             "jake@example.com",
             Some(7),
             UpdateIdentitiesRequest::default(),
-            false,
         )
         .expect("valid update");
 
@@ -787,15 +771,8 @@ mod tests {
             ..UpdateIdentitiesRequest::default()
         };
 
-        let plan = plan_update(
-            &registry,
-            None,
-            "viewer@example.com",
-            Some(9),
-            update,
-            false,
-        )
-        .expect("valid update");
+        let plan = plan_update(&registry, None, "viewer@example.com", Some(9), update)
+            .expect("valid update");
 
         assert_eq!(plan.write.slug, None);
         assert_eq!(plan.person_key.as_deref(), Some("console-9"));
@@ -817,15 +794,8 @@ mod tests {
             github_usernames: Some(strings(&["legacy-gh"])),
             ..UpdateIdentitiesRequest::default()
         };
-        let plan = plan_update(
-            &registry,
-            None,
-            "legacy@example.com",
-            Some(3),
-            untouched,
-            false,
-        )
-        .expect("inherited config values are not re-validated");
+        let plan = plan_update(&registry, None, "legacy@example.com", Some(3), untouched)
+            .expect("inherited config values are not re-validated");
         assert_eq!(plan.write.identities.discord_id.as_deref(), Some("123"));
 
         let touched = UpdateIdentitiesRequest {
@@ -834,15 +804,8 @@ mod tests {
             sms_number: Some("12345".to_string()),
             ..UpdateIdentitiesRequest::default()
         };
-        let violations = plan_update(
-            &registry,
-            None,
-            "legacy@example.com",
-            Some(3),
-            touched,
-            false,
-        )
-        .expect_err("invalid values");
+        let violations = plan_update(&registry, None, "legacy@example.com", Some(3), touched)
+            .expect_err("invalid values");
         assert_eq!(
             fields(&violations),
             vec![
@@ -857,25 +820,17 @@ mod tests {
     }
 
     #[test]
-    fn slug_rules_and_admin_only() {
+    fn slug_rules() {
         let registry = UserRegistry::new(HashMap::new());
         for slug in ["console-1", "Jake", "-jake"] {
             let update = UpdateIdentitiesRequest {
                 slug: Some(slug.to_string()),
                 ..UpdateIdentitiesRequest::default()
             };
-            let violations = plan_update(&registry, None, "a@example.com", Some(2), update, true)
+            let violations = plan_update(&registry, None, "a@example.com", Some(2), update)
                 .expect_err("invalid slug");
             assert_eq!(fields(&violations), vec![IdentityField::Slug], "{slug}");
         }
-
-        let update = UpdateIdentitiesRequest {
-            slug: Some("jake".to_string()),
-            ..UpdateIdentitiesRequest::default()
-        };
-        let violations = plan_update(&registry, None, "a@example.com", Some(2), update, false)
-            .expect_err("viewer cannot set slug");
-        assert_eq!(fields(&violations), vec![IdentityField::Slug]);
     }
 
     #[test]
@@ -898,8 +853,8 @@ mod tests {
             sms_number: Some("+14155550199".to_string()),
             ..UpdateIdentitiesRequest::default()
         };
-        let plan = plan_update(&registry, None, "new@example.com", Some(8), update, false)
-            .expect("valid update");
+        let plan =
+            plan_update(&registry, None, "new@example.com", Some(8), update).expect("valid update");
 
         let violations = find_conflicts(&registry, &[plan]);
 
@@ -942,7 +897,6 @@ mod tests {
             "bee@example.com",
             Some(1),
             update,
-            true,
         )
         .expect("valid update");
 
@@ -966,7 +920,7 @@ mod tests {
             ..UpdateIdentitiesRequest::default()
         };
 
-        let plan = plan_update(&registry, None, "other@example.com", Some(2), update, true)
+        let plan = plan_update(&registry, None, "other@example.com", Some(2), update)
             .expect("valid update");
 
         assert_eq!(
@@ -979,15 +933,8 @@ mod tests {
             slug: Some("jake".to_string()),
             ..UpdateIdentitiesRequest::default()
         };
-        let plan = plan_update(
-            &registry,
-            Some(&own),
-            "jake@example.com",
-            Some(1),
-            update,
-            true,
-        )
-        .expect("valid update");
+        let plan = plan_update(&registry, Some(&own), "jake@example.com", Some(1), update)
+            .expect("valid update");
         assert!(find_conflicts(&registry, &[plan]).is_empty());
     }
 
@@ -1007,7 +954,6 @@ mod tests {
                 &format!("{user_id}@example.com"),
                 Some(user_id),
                 update,
-                true,
             )
             .expect("valid update")
         };
@@ -1039,28 +985,6 @@ mod tests {
             serde_json::from_slice(&bytes).expect("json body")
         };
         (status, body)
-    }
-
-    #[tokio::test]
-    async fn violations_map_to_400_and_conflicts_to_409() {
-        let violation = IdentityViolation::new(IdentityField::DiscordId, "bad");
-
-        let (status, body) =
-            response_json(IdentityError::Invalid(vec![violation.clone()]).into_response()).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body,
-            json!({"error": "Invalid identities", "violations": [{"field": "discord_id", "message": "bad"}]})
-        );
-
-        let (status, body) =
-            response_json(IdentityError::Conflict(vec![violation]).into_response()).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["violations"][0]["field"], "discord_id");
-
-        let (status, body) = response_json(IdentityError::Forbidden.into_response()).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body, json!({"error": "Forbidden"}));
     }
 
     struct Session {
@@ -1164,9 +1088,11 @@ mod tests {
             .find(|person| person["user_id"] == app.admin.id)
             .expect("admin listed");
         assert_eq!(admin["origin"], "config");
-        assert_eq!(admin["slug"], "jake");
+        assert_eq!(admin["person_key"], "jake");
+        assert_eq!(admin["slug"], Value::Null);
         assert_eq!(admin["redacted"], true);
-        assert_eq!(admin["email"], Value::Null);
+        assert_eq!(admin["login_email"], Value::Null);
+        assert!(admin.get("email").is_none());
         assert_eq!(admin["identities"]["sms_number"], Value::Null);
         assert_eq!(
             admin["identities"]["github_usernames"],
@@ -1177,7 +1103,7 @@ mod tests {
             .find(|person| person["user_id"] == app.viewer.id)
             .expect("viewer listed");
         assert_eq!(viewer["redacted"], false);
-        assert_eq!(viewer["email"], "viewer@example.com");
+        assert_eq!(viewer["login_email"], "viewer@example.com");
         assert_eq!(viewer["origin"], "unset");
         assert_eq!(viewer["status"], "active");
     }
@@ -1221,7 +1147,7 @@ mod tests {
         let app = test_app();
         let own = format!("/api/users/{}/identities", app.viewer.id);
 
-        let (status, _) = send(
+        let (status, body) = send(
             &app,
             request(
                 "PUT",
@@ -1232,8 +1158,12 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body,
+            json!({"error": "You can only change your own identities"})
+        );
 
-        let (status, _) = send(
+        let (status, body) = send(
             &app,
             request(
                 "PUT",
@@ -1244,6 +1174,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body,
+            json!({"error": "Only an admin can change the person key"})
+        );
 
         let (status, body) = send(
             &app,
@@ -1297,7 +1231,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["origin"], "console");
-        assert_eq!(body["slug"], format!("console-{}", app.viewer.id));
+        assert_eq!(body["person_key"], format!("console-{}", app.viewer.id));
+        assert_eq!(body["slug"], Value::Null);
         assert_eq!(body["status"], "active");
         assert_eq!(body["identities"]["github_usernames"], json!(["Viewer-GH"]));
         assert_eq!(
@@ -1331,7 +1266,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["origin"], "console");
-        assert_eq!(body["slug"], "jake");
+        assert_eq!(body["person_key"], "jake");
+        assert_eq!(body["slug"], "jake", "saving from config links the key");
         assert_eq!(
             body["identities"]["github_usernames"],
             json!(["jakebarnby"])
@@ -1352,9 +1288,132 @@ mod tests {
             send(&app, request("DELETE", &uri, Some(&app.admin.token), None)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["origin"], "config");
-        assert_eq!(body["slug"], "jake");
+        assert_eq!(body["person_key"], "jake");
+        assert_eq!(body["slug"], Value::Null);
         assert_eq!(body["identities"]["slack_id"], Value::Null);
         assert_eq!(app.registry.origin("jake"), Some(IdentityOrigin::Config));
         assert!(app.tracker.list_user_identities().expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_viewer_reset_keeps_the_person_key_an_admin_set() {
+        let app = test_app();
+        let uri = format!("/api/users/{}/identities", app.viewer.id);
+
+        let (status, body) = send(
+            &app,
+            request(
+                "PUT",
+                &uri,
+                Some(&app.admin.token),
+                Some(json!({"slug": "vera", "github_usernames": ["vera-gh"]})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["slug"], "vera");
+
+        let (status, body) =
+            send(&app, request("DELETE", &uri, Some(&app.viewer.token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["origin"], "console");
+        assert_eq!(body["slug"], "vera");
+        assert_eq!(body["person_key"], "vera");
+        assert_eq!(body["identities"]["github_usernames"], json!([]));
+        let stored = app.tracker.list_user_identities().expect("list");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].slug.as_deref(), Some("vera"));
+        assert!(stored[0].identities.is_empty());
+        assert_eq!(app.registry.origin("vera"), Some(IdentityOrigin::Console));
+        assert!(app.registry.resolve("github", "vera-gh").is_none());
+
+        let (status, body) =
+            send(&app, request("DELETE", &uri, Some(&app.admin.token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["origin"], "unset");
+        assert_eq!(body["slug"], Value::Null);
+        assert!(app.tracker.list_user_identities().expect("list").is_empty());
+        assert_eq!(app.registry.origin("vera"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_claims_of_one_handle_let_exactly_one_win() {
+        const CLAIMANTS: usize = 8;
+        const ROUNDS: usize = 10;
+        let app = test_app();
+        let claimants: Vec<Session> = (0..CLAIMANTS)
+            .map(|index| {
+                session(
+                    &app.tracker,
+                    &format!("claimant{index}@example.com"),
+                    "viewer",
+                )
+            })
+            .collect();
+
+        for round in 0..ROUNDS {
+            let handle = format!("contested-{round}");
+            let barrier = Arc::new(tokio::sync::Barrier::new(CLAIMANTS));
+            let tasks: Vec<_> = claimants
+                .iter()
+                .map(|claimant| {
+                    let router = app.router.clone();
+                    let barrier = barrier.clone();
+                    let claim = request(
+                        "PUT",
+                        &format!("/api/users/{}/identities", claimant.id),
+                        Some(&claimant.token),
+                        Some(json!({"github_usernames": [handle]})),
+                    );
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        router.oneshot(claim).await.expect("response").status()
+                    })
+                })
+                .collect();
+            let mut statuses = Vec::with_capacity(CLAIMANTS);
+            for task in tasks {
+                statuses.push(task.await.expect("claim task"));
+            }
+
+            let won = statuses
+                .iter()
+                .filter(|status| **status == StatusCode::OK)
+                .count();
+            let refused = statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CONFLICT)
+                .count();
+            assert_eq!(
+                (won, refused),
+                (1, CLAIMANTS - 1),
+                "round {round}: {statuses:?}"
+            );
+            let owners = app
+                .tracker
+                .list_user_identities()
+                .expect("list")
+                .into_iter()
+                .filter(|entry| entry.identities.github_usernames.contains(&handle))
+                .count();
+            assert_eq!(owners, 1, "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn extractor_rejections_are_json() {
+        let app = test_app();
+
+        let (status, body) = send(&app, request("GET", "/api/identities", None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, json!({"error": "Not authenticated"}));
+
+        let (status, body) = send(
+            &app,
+            request("GET", "/api/users", Some(&app.viewer.token), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "Admin access required"}));
     }
 }

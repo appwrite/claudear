@@ -8,13 +8,13 @@ use super::auth::{
     check_api_rate_limit, check_ip_rate_limit, extract_client_ip, hash_password, AdminUser,
     MessageResponse, PASSWORD_LENGTH,
 };
+use super::error::ApiError;
 use super::routes::ApiState;
 use super::tokens::hash_secret;
 use crate::registry;
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    http::HeaderMap,
     Json,
 };
 use claudear_config::config::Config;
@@ -92,62 +92,14 @@ pub(crate) fn invite_response(config: &Config, secret: &str, expires_at: &str) -
 
 /// A cost-12 bcrypt hash of random bytes nobody keeps, so an invited user cannot log in,
 /// yet a login attempt against them costs exactly as much as against a real account.
-pub(crate) async fn unusable_password_hash() -> Result<String, StatusCode> {
+pub(crate) async fn unusable_password_hash() -> Result<String, ApiError> {
     let unknowable = hex::encode(rand::random::<[u8; SECRET_BYTES]>());
     hash_password(unknowable).await
 }
 
-#[derive(Debug)]
-pub(crate) enum InviteError {
-    /// Any unusable token: unknown, expired, accepted, revoked or malformed.
-    Invalid,
-    UserNotFound,
-    NoOpenInvite,
-    AlreadyActive,
-    InvalidPassword,
-    InvalidBody,
-    RateLimited,
-    Internal,
-}
-
-impl InviteError {
-    fn storage(error: claudear_core::error::Error) -> Self {
-        tracing::error!(error = %error, "Invite storage operation failed");
-        Self::Internal
-    }
-}
-
-#[derive(Serialize)]
-struct ErrorBody {
-    error: &'static str,
-}
-
-impl IntoResponse for InviteError {
-    fn into_response(self) -> Response {
-        let (status, error) = match self {
-            Self::Invalid => (
-                StatusCode::NOT_FOUND,
-                "This invite link is invalid or has expired",
-            ),
-            Self::UserNotFound => (StatusCode::NOT_FOUND, "User not found"),
-            Self::NoOpenInvite => (StatusCode::NOT_FOUND, "User has no open invite"),
-            Self::AlreadyActive => (StatusCode::CONFLICT, "User is already active"),
-            Self::InvalidPassword => (
-                StatusCode::BAD_REQUEST,
-                "Password must be between 8 and 72 characters",
-            ),
-            Self::InvalidBody => (StatusCode::BAD_REQUEST, "Invalid request body"),
-            Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Too many requests"),
-            Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
-        };
-        (status, Json(ErrorBody { error })).into_response()
-    }
-}
-
-impl From<StatusCode> for InviteError {
-    fn from(_: StatusCode) -> Self {
-        Self::Internal
-    }
+/// Any unusable token: unknown, expired, accepted, revoked or malformed.
+fn invalid_invite() -> ApiError {
+    ApiError::not_found("This invite link is invalid or has expired")
 }
 
 #[derive(Deserialize)]
@@ -175,17 +127,17 @@ pub(crate) async fn issue_invite_handler(
     AdminUser(admin): AdminUser,
     State(state): State<ApiState>,
     Path(user_id): Path<i64>,
-) -> Result<Json<UserInvite>, InviteError> {
+) -> Result<Json<UserInvite>, ApiError> {
     if !check_api_rate_limit(admin.id) {
-        return Err(InviteError::RateLimited);
+        return Err(ApiError::rate_limited());
     }
     let user = state
         .tracker
         .get_user_by_id(user_id)
-        .map_err(InviteError::storage)?
-        .ok_or(InviteError::UserNotFound)?;
+        .map_err(ApiError::storage)?
+        .ok_or_else(ApiError::user_not_found)?;
     if user.status == UserStatus::Active {
-        return Err(InviteError::AlreadyActive);
+        return Err(ApiError::conflict("User is already active"));
     }
     let invite = NewInvite::generate(admin.id);
     state
@@ -196,7 +148,7 @@ pub(crate) async fn issue_invite_handler(
             &invite.write.expires_at,
             admin.id,
         )
-        .map_err(InviteError::storage)?;
+        .map_err(ApiError::storage)?;
     Ok(Json(invite.response(&state.config)))
 }
 
@@ -205,16 +157,16 @@ pub(crate) async fn revoke_invite_handler(
     AdminUser(admin): AdminUser,
     State(state): State<ApiState>,
     Path(user_id): Path<i64>,
-) -> Result<Json<MessageResponse>, InviteError> {
+) -> Result<Json<MessageResponse>, ApiError> {
     if !check_api_rate_limit(admin.id) {
-        return Err(InviteError::RateLimited);
+        return Err(ApiError::rate_limited());
     }
     let revoked = state
         .tracker
         .revoke_invite(user_id)
-        .map_err(InviteError::storage)?;
+        .map_err(ApiError::storage)?;
     if !revoked {
-        return Err(InviteError::NoOpenInvite);
+        return Err(ApiError::not_found("User has no open invite"));
     }
     Ok(Json(MessageResponse {
         message: "Invite revoked".to_string(),
@@ -226,15 +178,15 @@ pub(crate) async fn inspect_invite_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: Result<Json<InspectInviteRequest>, JsonRejection>,
-) -> Result<Json<InviteDetails>, InviteError> {
+) -> Result<Json<InviteDetails>, ApiError> {
     limit_by_ip(&headers)?;
-    let Json(request) = body.map_err(|_| InviteError::InvalidBody)?;
+    let Json(request) = body?;
     let token_hash = invite_hash(&request.token)?;
     let (invite, user) = state
         .tracker
         .find_open_invite(&token_hash)
-        .map_err(InviteError::storage)?
-        .ok_or(InviteError::Invalid)?;
+        .map_err(ApiError::storage)?
+        .ok_or_else(invalid_invite)?;
     Ok(Json(InviteDetails {
         name: user.name,
         email: user.email,
@@ -247,27 +199,28 @@ pub(crate) async fn accept_invite_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: Result<Json<AcceptInviteRequest>, JsonRejection>,
-) -> Result<Json<MessageResponse>, InviteError> {
+) -> Result<Json<MessageResponse>, ApiError> {
     limit_by_ip(&headers)?;
-    let Json(request) = body.map_err(|_| InviteError::InvalidBody)?;
+    let Json(request) = body?;
     if !PASSWORD_LENGTH.contains(&request.password.len()) {
-        return Err(InviteError::InvalidPassword);
+        return Err(ApiError::invalid_password());
     }
     let token_hash = invite_hash(&request.token)?;
     if state
         .tracker
         .find_open_invite(&token_hash)
-        .map_err(InviteError::storage)?
+        .map_err(ApiError::storage)?
         .is_none()
     {
-        return Err(InviteError::Invalid);
+        return Err(invalid_invite());
     }
     let password_hash = hash_password(request.password).await?;
+    let _writes = state.identity_writes.lock().await;
     state
         .tracker
         .accept_invite(&token_hash, &password_hash)
-        .map_err(InviteError::storage)?
-        .ok_or(InviteError::Invalid)?;
+        .map_err(ApiError::storage)?
+        .ok_or_else(invalid_invite)?;
     registry::reload(&state.registry, state.tracker.as_ref());
     Ok(Json(MessageResponse {
         message: "Invite accepted".to_string(),
@@ -275,21 +228,21 @@ pub(crate) async fn accept_invite_handler(
 }
 
 /// Invite endpoints draw from their own per-IP bucket so they never eat the login budget.
-fn limit_by_ip(headers: &HeaderMap) -> Result<(), InviteError> {
+fn limit_by_ip(headers: &HeaderMap) -> Result<(), ApiError> {
     let ip = extract_client_ip(headers);
     if check_ip_rate_limit(&format!("invite:{ip}")) {
         Ok(())
     } else {
-        Err(InviteError::RateLimited)
+        Err(ApiError::rate_limited())
     }
 }
 
-fn invite_hash(token: &str) -> Result<String, InviteError> {
+fn invite_hash(token: &str) -> Result<String, ApiError> {
     let token = token.trim();
     if token.starts_with(SECRET_PREFIX) {
         Ok(hash_secret(token))
     } else {
-        Err(InviteError::Invalid)
+        Err(invalid_invite())
     }
 }
 
@@ -298,7 +251,7 @@ mod tests {
     use super::*;
     use crate::api::create_api_router_with_dashboard;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use axum::Router;
     use claudear_config::users::UserRegistry;
     use claudear_storage::{FixAttemptTracker, SqliteTracker};
@@ -381,8 +334,11 @@ mod tests {
 
     #[test]
     fn invalid_tokens_all_share_one_generic_response() {
-        assert!(matches!(invite_hash("cldr_abc"), Err(InviteError::Invalid)));
-        assert!(matches!(invite_hash(""), Err(InviteError::Invalid)));
+        for token in ["cldr_abc", ""] {
+            let error = invite_hash(token).expect_err("invalid token");
+            assert_eq!(error.status(), invalid_invite().status());
+            assert_eq!(error.message(), invalid_invite().message());
+        }
         assert_eq!(
             invite_hash(" cldi_abc ").ok(),
             Some(hash_secret("cldi_abc"))
@@ -521,10 +477,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body["error"],
-            "Password must be between 8 and 72 characters"
-        );
+        assert_eq!(body["error"], "Password must be 8-72 bytes");
 
         let (status, body) = send(
             &app,
