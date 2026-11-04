@@ -3918,10 +3918,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------
-    // parse_pr_url tests
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_parse_pr_url_github() {
         let result = parse_pr_url("https://github.com/owner/repo/pull/42");
