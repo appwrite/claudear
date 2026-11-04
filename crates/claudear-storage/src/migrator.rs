@@ -87,9 +87,9 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/V14__fix_attempt_heartbeat.sql"),
     },
     Migration {
-        version: 15,
+        version: 18,
         name: "security_inbox",
-        sql: include_str!("../../../migrations/V15__security_inbox.sql"),
+        sql: include_str!("../../../migrations/V18__security_inbox.sql"),
     },
 ];
 
