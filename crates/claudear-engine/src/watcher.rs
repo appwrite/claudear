@@ -3,6 +3,7 @@
 use crate::heartbeat::{Heartbeat, Liveness};
 use crate::intent::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
+use crate::processing::{belongs_to_security_inbox, refuse_security_issue, SECURITY_REFUSAL};
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
 use crate::security::{
@@ -1777,7 +1778,7 @@ impl Watcher {
             self.lock_deferred_review_reruns().remove(pr_url);
         }
 
-        if self.config.learning.review_classification {
+        if self.config.learning.review_classification && attempt.source != SECURITY_FIX_SOURCE {
             if let Some(repo) = &attempt.scm_repo {
                 // Parse feedback as review comments for classification
                 let mock_comment = claudear_integrations::scm::ReviewComment {
@@ -2116,6 +2117,29 @@ impl Watcher {
         }
     }
 
+    /// The most recent merged attempt in `repository` a release cascade is
+    /// started from. Security fixes start no cascade, so a release whose
+    /// latest merge is a security fix cascades from the merge before it.
+    fn release_cascade_attempt(&self, repository: &str) -> Option<FixAttempt> {
+        let latest = self
+            .tracker
+            .get_most_recent_merged_attempt_for_repo(repository)
+            .ok()
+            .flatten()?;
+        if latest.source != SECURITY_FIX_SOURCE {
+            return Some(latest);
+        }
+        self.tracker
+            .get_attempts_by_status(FixAttemptStatus::Merged)
+            .ok()?
+            .into_iter()
+            .filter(|attempt| {
+                attempt.source != SECURITY_FIX_SOURCE
+                    && attempt.scm_repo.as_deref() == Some(repository)
+            })
+            .max_by_key(|attempt| attempt.merged_at)
+    }
+
     /// Trigger cascade processing for downstream repos after a PR is merged
     /// or a release is published.
     ///
@@ -2377,13 +2401,7 @@ impl Watcher {
                 seen.insert(upstream.to_string(), release.tag.clone());
             }
 
-            let merged_attempt = self
-                .tracker
-                .get_most_recent_merged_attempt_for_repo(upstream)
-                .ok()
-                .flatten();
-
-            let attempt = match merged_attempt {
+            let attempt = match self.release_cascade_attempt(upstream) {
                 Some(a) => a,
                 None => {
                     tracing::info!(
@@ -2769,7 +2787,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 Ok(issues) => {
                     let mut seeded = 0;
                     for issue in issues {
-                        if is_security_issue(&self.config, &issue) {
+                        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &issue) {
                             continue;
                         }
                         if !self.tracker.has_attempted(source.name(), &issue.id)? {
@@ -4813,7 +4831,7 @@ Create a PR with your changes.{custom_instructions}"#,
     ) -> IssueRun {
         use crate::processing::{ProcessingInput, ProcessingOutcome};
 
-        if is_security_issue(&self.config, &issue) {
+        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &issue) {
             tracing::warn!(
                 component = "security",
                 short_id = %issue.short_id,
@@ -5128,6 +5146,7 @@ Create a PR with your changes.{custom_instructions}"#,
         let (mut security, rest): (Vec<Issue>, Vec<Issue>) = issues
             .into_iter()
             .partition(|issue| is_security_issue(&self.config, issue));
+        let rest = self.without_held_security_conversations(rest);
         if security.is_empty() {
             return rest;
         }
@@ -5183,6 +5202,26 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
         rest
+    }
+
+    /// `issues` without the conversations the security inbox holds a report
+    /// for, which stay out of the generic pipeline after moving to another
+    /// mailbox.
+    fn without_held_security_conversations(&self, issues: Vec<Issue>) -> Vec<Issue> {
+        issues
+            .into_iter()
+            .filter(|issue| {
+                let held = belongs_to_security_inbox(&self.config, self.tracker.as_ref(), issue);
+                if held {
+                    tracing::info!(
+                        component = "security",
+                        short_id = %issue.short_id,
+                        "Leaving a conversation the security inbox holds a report for out of the generic pipeline"
+                    );
+                }
+                !held
+            })
+            .collect()
     }
 
     /// Spawn the routing of a security conversation once its source has a
@@ -5257,7 +5296,8 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Move every security report and vulnerability along its lifecycle,
-    /// then start the fixes still waiting for a first run.
+    /// then start the fixes still waiting for a first run that fit in the
+    /// free processing slots. The rest wait for a later poll.
     async fn advance_security_inbox(self: &Arc<Self>) {
         if self.dry_run {
             return;
@@ -5288,7 +5328,13 @@ Create a PR with your changes.{custom_instructions}"#,
                 return;
             }
         };
-        for request in requests {
+        let free = self
+            .config
+            .max_concurrent_for(SECURITY_FIX_SOURCE)
+            .max(1)
+            .saturating_sub(self.active_processing_for_source(SECURITY_FIX_SOURCE));
+        let waiting = requests.len();
+        for request in requests.into_iter().take(free) {
             let watcher = Arc::clone(self);
             let inbox = Arc::clone(&inbox);
             let handle = tokio::spawn(async move {
@@ -5297,6 +5343,14 @@ Create a PR with your changes.{custom_instructions}"#,
                     .await;
             });
             self.spawn_handles.lock().await.push(handle);
+        }
+        if waiting > free {
+            tracing::info!(
+                component = "security",
+                started = free,
+                waiting = waiting - free,
+                "Security fixes wait for a free processing slot"
+            );
         }
     }
 
@@ -6129,6 +6183,12 @@ Create a PR with your changes.{custom_instructions}"#,
             let run = self.process_security_issue(Arc::clone(source), issue).await;
             return trigger_result(run, source_name, issue_id);
         }
+        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &issue) {
+            return Err(claudear_core::error::Error::source(
+                source_name,
+                SECURITY_REFUSAL,
+            ));
+        }
         let match_result = MatchResult::matched(MANUAL_TRIGGER, MatchPriority::Urgent);
 
         if let Some(reason) = trigger_reason {
@@ -6216,6 +6276,16 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         let issue = source.get_issue(issue_id).await?;
+        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &issue) {
+            tracing::warn!(
+                component = "security",
+                source = source_name,
+                issue_id = issue_id,
+                %action,
+                "Refusing a manual action on a security issue"
+            );
+            return Ok(refuse_security_issue());
+        }
         let match_result = MatchResult::matched("Manual action", MatchPriority::Urgent);
         let resolution =
             resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
