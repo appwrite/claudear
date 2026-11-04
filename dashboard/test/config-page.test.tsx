@@ -303,10 +303,89 @@ describe("ConfigPage", () => {
     await renderConfigPage();
 
     expect(screen.getByText(/Restart required/)).toBeTruthy();
+    expect(screen.getByText(/Restart the claudear process serving this console \(and the daemon, if it runs separately\)/)).toBeTruthy();
     expect(
       screen.getByText("overridden at runtime (environment variable or instructions_file); the running value differs")
     ).toBeTruthy();
     expect(screen.getByText(/comments are removed and defaults written out/)).toBeTruthy();
+  });
+
+  test("the restart banner follows the save response", async () => {
+    const harness = createHarness("admin");
+    harness.replyToNextPut({
+      status: 200,
+      data: { ok: true, restart_required: false, revision: "rev-2", message: "Config saved." },
+    });
+    await renderConfigPage();
+
+    fireEvent.change(screen.getByLabelText("deploy_qa.tracks[0].name"), { target: { value: "cloud-2" } });
+    fireEvent.click(saveButton());
+
+    await waitFor(() => {
+      expect(screen.getByText("Config saved.")).toBeTruthy();
+    });
+    await waitFor(() => {
+      expect(harness.calls.filter((call) => call.url.endsWith("/api/config") && call.method === "GET").length).toBe(2);
+    });
+    expect(screen.queryByText(/Restart required/)).toBeNull();
+  });
+
+  test("the restart banner appears when the save response requires a restart", async () => {
+    createHarness("admin");
+    await renderConfigPage();
+    expect(screen.queryByText(/Restart required/)).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("deploy_qa.tracks[0].name"), { target: { value: "cloud-2" } });
+    fireEvent.click(saveButton());
+
+    await waitFor(() => {
+      expect(screen.getByText(/Restart required/)).toBeTruthy();
+    });
+  });
+
+  test("arrays and tables holding secret leaves are masked and read-only", async () => {
+    const content = [
+      TRACKS_CONFIG,
+      "[agent.providers.claude]",
+      'scopes = ["[REDACTED]", "[REDACTED]"]',
+      'extra = { nested = { token = "[REDACTED]" } }',
+      'labels = ["public"]',
+      "",
+    ].join("\n");
+    createHarness(
+      "admin",
+      configResponse({
+        content,
+        secret_paths: [
+          ...configResponse().secret_paths,
+          "agent.providers.claude.scopes[0]",
+          "agent.providers.claude.scopes[1]",
+          "agent.providers.claude.extra.nested.token",
+        ],
+      })
+    );
+    await renderConfigPage();
+
+    expect(document.body.innerHTML).not.toContain("[REDACTED]");
+    expect(screen.getAllByText("Secret value hidden").length).toBe(2);
+    expect(screen.queryByLabelText("agent.providers.claude.scopes")).toBeNull();
+    expect(screen.getByText("public")).toBeTruthy();
+  });
+
+  test("Add section offers only sections missing from the file", async () => {
+    createHarness(
+      "admin",
+      configResponse({
+        optional_sections: [
+          { key: "deploy_qa.tracks", template: '[[deploy_qa.tracks]]\nname = ""' },
+          { key: "scm.gitlab", template: '[scm.gitlab]\ntoken = ""' },
+        ],
+      })
+    );
+    await renderConfigPage();
+
+    const select = screen.getByLabelText("Add section") as HTMLSelectElement;
+    expect([...select.options].map((option) => option.value)).toEqual(["", "scm.gitlab"]);
   });
 
   test("Add section appends the template", async () => {

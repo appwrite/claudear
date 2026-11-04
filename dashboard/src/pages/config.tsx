@@ -397,11 +397,15 @@ function appendTemplate(content: string, template: string): string {
   return `${base}${base ? '\n\n' : ''}${template.trim()}\n`
 }
 
-function isArrayTemplate(template: string): boolean {
-  return template.trimStart().startsWith('[[')
-}
-
 type FieldChangeHandler = (field: ParsedField, value: string) => void
+
+function containsSecret(path: string, secretPaths: Set<string>): boolean {
+  if (secretPaths.has(path)) return true
+  for (const secretPath of secretPaths) {
+    if (secretPath.startsWith(`${path}[`) || secretPath.startsWith(`${path}.`)) return true
+  }
+  return false
+}
 
 const INPUT_CLASS = 'w-full px-3 py-1.5 text-sm border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary/30'
 
@@ -665,7 +669,7 @@ function SectionFormCard({
         {section.fields.length > 0 ? (
           <div className="space-y-3">
             {section.fields.map(field => {
-              const isSecret = secretPaths.has(field.path)
+              const isSecret = containsSecret(field.path, secretPaths)
               return (
                 <div key={field.path}>
                   <div className="flex items-center gap-2 mb-1 flex-wrap">
@@ -802,14 +806,13 @@ export default function ConfigPage() {
   const [saving, setSaving] = useState(false)
   const [saveResult, setSaveResult] = useState<SaveResult | null>(null)
   const [revisionConflict, setRevisionConflict] = useState(false)
-  const [savedThisSession, setSavedThisSession] = useState(false)
   const [mode, setMode] = useState<EditorMode>('sections')
 
   const savedContent = data?.content ?? ''
   const content = editContent ?? savedContent
   const hasUnsavedChanges = editContent !== null && editContent !== savedContent
   const writable = data?.writable ?? false
-  const restartRequired = (data?.restart_required ?? false) || savedThisSession
+  const restartRequired = data?.restart_required ?? false
 
   const sections = useMemo(() => parseDocument(content), [content])
   const savedFields = useMemo(() => buildFieldMap(parseDocument(savedContent)), [savedContent])
@@ -818,9 +821,7 @@ export default function ConfigPage() {
 
   const addableSections = useMemo(() => {
     const present = new Set(sections.map(section => section.key))
-    return (data?.optional_sections ?? []).filter(
-      section => isArrayTemplate(section.template) || !present.has(section.key),
-    )
+    return (data?.optional_sections ?? []).filter(section => !present.has(section.key))
   }, [data?.optional_sections, sections])
 
   useEffect(() => {
@@ -847,7 +848,10 @@ export default function ConfigPage() {
     try {
       const result = await saveConfig(editContent, data?.revision)
       setSaveResult({ ok: true, message: result.message })
-      setSavedThisSession(true)
+      await mutate(
+        current => current && { ...current, restart_required: result.restart_required },
+        { revalidate: false },
+      )
       await reloadFromServer()
     } catch (e: unknown) {
       if (e instanceof ApiError && e.code === REVISION_MISMATCH) setRevisionConflict(true)
@@ -855,7 +859,7 @@ export default function ConfigPage() {
     } finally {
       setSaving(false)
     }
-  }, [editContent, data?.revision, reloadFromServer])
+  }, [editContent, data?.revision, mutate, reloadFromServer])
 
   const handleDiscard = useCallback(() => {
     setEditContent(null)
@@ -892,7 +896,8 @@ export default function ConfigPage() {
       {restartRequired && (
         <div role="status" className="flex items-center gap-2 px-4 py-3 rounded-md text-sm bg-amber-50 border border-amber-200 text-amber-800">
           <RefreshCw className="h-4 w-4" />
-          Restart required: saved changes to claudear.toml apply after claudear restarts.
+          Restart required: saved changes to claudear.toml apply after claudear restarts. Restart the claudear
+          process serving this console (and the daemon, if it runs separately).
         </div>
       )}
 
