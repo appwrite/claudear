@@ -21761,6 +21761,12 @@ mod tests {
                 "a thread waiting on the connection lock got it only {} times across {batches} rebuild batches, so the rebuild held the lock across batches; batches indexed between its acquisitions: {advances:?}",
                 advances.len()
             );
+            let single_batch = advances.iter().filter(|&&advance| advance == 1).count();
+            assert!(
+                single_batch * 4 >= advances.len(),
+                "a waiting thread got the lock after a single rebuild batch only {single_batch} of {} times, so the rebuild holds the lock across batches; batches indexed between its acquisitions: {advances:?}",
+                advances.len()
+            );
         }
 
         #[cfg(unix)]
