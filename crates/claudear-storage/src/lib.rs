@@ -8,13 +8,15 @@ pub mod sqlite;
 pub mod tenant;
 pub mod types;
 #[cfg(feature = "sqlite")]
+pub(crate) mod vector_index;
+#[cfg(feature = "sqlite")]
 pub mod vectorlite;
 
 pub use analytics::{
     classify_error, compute_error_hash, AnalyticsService, TimePeriod, TrendAnalysis, TrendDirection,
 };
 #[cfg(feature = "sqlite")]
-pub use sqlite::SqliteTracker;
+pub use sqlite::{SqliteTracker, VectorIndexRebuilder};
 pub use types::{
     ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
     DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,

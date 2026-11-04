@@ -35,6 +35,9 @@ regex-lite = { workspace = true }
 # Async runtime (for watch channels)
 tokio = { workspace = true }
 
+# Synchronization
+parking_lot = { workspace = true }
+
 # Crypto (for error hashing)
 sha2 = { workspace = true }
 hex = { workspace = true }
@@ -44,3 +47,6 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
