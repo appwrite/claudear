@@ -1,13 +1,12 @@
 //! Authentication and user management handlers.
 
 use axum::{
-    extract::{FromRequestParts, Path, State},
+    extract::{rejection::JsonRejection, FromRequestParts, Path, State},
     http::{header, request::Parts, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     Json,
 };
 use claudear_core::identity::{Identities, UserStatus};
-use claudear_storage::{DirectoryUser, DirectoryWrite, UserRow};
+use claudear_storage::{DirectoryUser, DirectoryWrite, FixAttemptTracker, UserRow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -17,7 +16,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tower_cookies::{Cookie, Cookies};
 
-use super::identities::{find_conflicts, plan_update, IdentityError, UpdateIdentitiesRequest};
+use super::error::ApiError;
+use super::identities::{find_conflicts, plan_update, UpdateIdentitiesRequest};
 use super::invites::{unusable_password_hash, NewInvite, UserInvite};
 use super::routes::ApiState;
 use super::tokens::hash_secret;
@@ -82,7 +82,7 @@ const LOGIN_RATE_LIMIT_MAX_KEYS: usize = 10_000;
 
 /// Maximum number of login attempts per IP address within the rate limit window.
 /// More generous than per-email to avoid blocking legitimate users behind shared IPs.
-const IP_RATE_LIMIT_MAX_ATTEMPTS: usize = 100;
+pub(crate) const IP_RATE_LIMIT_MAX_ATTEMPTS: usize = 100;
 
 /// Duration of the IP rate limit window in seconds.
 const IP_RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
@@ -114,7 +114,7 @@ static API_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>
 /// Returns true if the attempt is within rate limits, false if it should be rejected.
 fn check_login_rate_limit(key: &str) -> bool {
     let mut limiter = match LOGIN_RATE_LIMITER.lock() {
-        Ok(l) => l,
+        Ok(limiter) => limiter,
         Err(poisoned) => {
             tracing::warn!("Login rate limiter mutex was poisoned, recovering");
             poisoned.into_inner()
@@ -127,7 +127,7 @@ fn check_login_rate_limit(key: &str) -> bool {
     let attempts = limiter.entry(key.to_string()).or_default();
 
     // Remove attempts outside the window
-    attempts.retain(|t| now.duration_since(*t) < window);
+    attempts.retain(|attempt| now.duration_since(*attempt) < window);
 
     if attempts.len() >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS {
         return false;
@@ -136,19 +136,23 @@ fn check_login_rate_limit(key: &str) -> bool {
     attempts.push(now);
 
     // Sweep expired entries from other keys to prevent unbounded memory growth
-    limiter.retain(|_, v| !v.is_empty() && v.iter().any(|t| now.duration_since(*t) < window));
+    limiter.retain(|_, attempts| {
+        attempts
+            .iter()
+            .any(|attempt| now.duration_since(*attempt) < window)
+    });
 
     // Cap total entries to prevent memory exhaustion from distributed attacks
     if limiter.len() > LOGIN_RATE_LIMIT_MAX_KEYS {
         // Find and remove entries with the oldest most-recent attempt
         let mut entries: Vec<(String, Instant)> = limiter
             .iter()
-            .filter_map(|(k, v)| v.last().map(|t| (k.clone(), *t)))
+            .filter_map(|(key, attempts)| attempts.last().map(|last| (key.clone(), *last)))
             .collect();
-        entries.sort_by_key(|(_, t)| *t);
+        entries.sort_by_key(|(_, last)| *last);
         let to_remove = limiter.len() - LOGIN_RATE_LIMIT_MAX_KEYS;
-        for (k, _) in entries.into_iter().take(to_remove) {
-            limiter.remove(&k);
+        for (key, _) in entries.into_iter().take(to_remove) {
+            limiter.remove(&key);
         }
     }
 
@@ -159,7 +163,7 @@ fn check_login_rate_limit(key: &str) -> bool {
 /// Returns true if the attempt is within rate limits, false if it should be rejected.
 pub(crate) fn check_ip_rate_limit(ip: &str) -> bool {
     let mut limiter = match IP_RATE_LIMITER.lock() {
-        Ok(l) => l,
+        Ok(limiter) => limiter,
         Err(poisoned) => {
             tracing::warn!("IP rate limiter mutex was poisoned, recovering");
             poisoned.into_inner()
@@ -172,7 +176,7 @@ pub(crate) fn check_ip_rate_limit(ip: &str) -> bool {
     let attempts = limiter.entry(ip.to_string()).or_default();
 
     // Remove attempts outside the window
-    attempts.retain(|t| now.duration_since(*t) < window);
+    attempts.retain(|attempt| now.duration_since(*attempt) < window);
 
     if attempts.len() >= IP_RATE_LIMIT_MAX_ATTEMPTS {
         return false;
@@ -181,22 +185,45 @@ pub(crate) fn check_ip_rate_limit(ip: &str) -> bool {
     attempts.push(now);
 
     // Sweep expired entries from other keys to prevent unbounded memory growth
-    limiter.retain(|_, v| !v.is_empty() && v.iter().any(|t| now.duration_since(*t) < window));
+    limiter.retain(|_, attempts| {
+        attempts
+            .iter()
+            .any(|attempt| now.duration_since(*attempt) < window)
+    });
 
     // Cap total entries to prevent memory exhaustion from distributed attacks
     if limiter.len() > LOGIN_RATE_LIMIT_MAX_KEYS {
         let mut entries: Vec<(String, Instant)> = limiter
             .iter()
-            .filter_map(|(k, v)| v.last().map(|t| (k.clone(), *t)))
+            .filter_map(|(key, attempts)| attempts.last().map(|last| (key.clone(), *last)))
             .collect();
-        entries.sort_by_key(|(_, t)| *t);
+        entries.sort_by_key(|(_, last)| *last);
         let to_remove = limiter.len() - LOGIN_RATE_LIMIT_MAX_KEYS;
-        for (k, _) in entries.into_iter().take(to_remove) {
-            limiter.remove(&k);
+        for (key, _) in entries.into_iter().take(to_remove) {
+            limiter.remove(&key);
         }
     }
 
     true
+}
+
+/// Whether the IP bucket `key` has no attempts left, without spending one.
+pub(crate) fn ip_rate_limit_exhausted(key: &str) -> bool {
+    let limiter = match IP_RATE_LIMITER.lock() {
+        Ok(limiter) => limiter,
+        Err(poisoned) => {
+            tracing::warn!("IP rate limiter mutex was poisoned, recovering");
+            poisoned.into_inner()
+        }
+    };
+    let window = std::time::Duration::from_secs(IP_RATE_LIMIT_WINDOW_SECS);
+    limiter.get(key).is_some_and(|attempts| {
+        attempts
+            .iter()
+            .filter(|attempt| attempt.elapsed() < window)
+            .count()
+            >= IP_RATE_LIMIT_MAX_ATTEMPTS
+    })
 }
 
 /// Reset the API rate limiter. Only for use in tests.
@@ -211,7 +238,7 @@ pub(crate) fn reset_api_rate_limiter() {
 pub(crate) fn check_api_rate_limit(user_id: i64) -> bool {
     let key = user_id.to_string();
     let mut limiter = match API_RATE_LIMITER.lock() {
-        Ok(l) => l,
+        Ok(limiter) => limiter,
         Err(poisoned) => {
             tracing::warn!("API rate limiter mutex was poisoned, recovering");
             poisoned.into_inner()
@@ -222,7 +249,7 @@ pub(crate) fn check_api_rate_limit(user_id: i64) -> bool {
     let window = std::time::Duration::from_secs(API_RATE_LIMIT_WINDOW_SECS);
 
     let attempts = limiter.entry(key).or_default();
-    attempts.retain(|t| now.duration_since(*t) < window);
+    attempts.retain(|attempt| now.duration_since(*attempt) < window);
 
     if attempts.len() >= API_RATE_LIMIT_MAX_REQUESTS {
         return false;
@@ -231,7 +258,11 @@ pub(crate) fn check_api_rate_limit(user_id: i64) -> bool {
     attempts.push(now);
 
     // Sweep expired entries
-    limiter.retain(|_, v| !v.is_empty() && v.iter().any(|t| now.duration_since(*t) < window));
+    limiter.retain(|_, attempts| {
+        attempts
+            .iter()
+            .any(|attempt| now.duration_since(*attempt) < window)
+    });
 
     true
 }
@@ -304,27 +335,26 @@ impl From<UserRow> for AuthUser {
 }
 
 impl FromRequestParts<ApiState> for AuthUser {
-    type Rejection = StatusCode;
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &ApiState,
     ) -> Result<Self, Self::Rejection> {
-        // Extract cookies from the request
         let cookies = Cookies::from_request_parts(parts, state)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| ApiError::internal())?;
 
         let token = cookies
             .get(SESSION_COOKIE)
             .map(|c| c.value().to_string())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .ok_or_else(ApiError::unauthenticated)?;
 
         let user = state
             .tracker
             .get_session_user(&token)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .map_err(ApiError::storage)?
+            .ok_or_else(ApiError::unauthenticated)?;
 
         // Refresh the idle session timeout on every authenticated request
         let _ = state.tracker.touch_session(&token);
@@ -340,7 +370,7 @@ impl FromRequestParts<ApiState> for AuthUser {
 pub struct AdminUser(pub AuthUser);
 
 impl FromRequestParts<ApiState> for AdminUser {
-    type Rejection = StatusCode;
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -348,7 +378,7 @@ impl FromRequestParts<ApiState> for AdminUser {
     ) -> Result<Self, Self::Rejection> {
         let user = AuthUser::from_request_parts(parts, state).await?;
         if !user.is_admin() {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(ApiError::admin_required());
         }
         Ok(AdminUser(user))
     }
@@ -356,12 +386,14 @@ impl FromRequestParts<ApiState> for AdminUser {
 
 /// An admin authenticated by `Authorization: Bearer <api token>` or, when that header
 /// is absent, by session. With the header present the cookie is never consulted, which
-/// is what makes the CSRF exemption for Bearer requests safe.
+/// is what makes the CSRF exemption for Bearer requests safe. Failed Bearer attempts
+/// spend the client IP's `bearer:` bucket; once it is empty every Bearer attempt from
+/// that IP is refused before the token is looked up.
 #[derive(Debug, Clone)]
 pub(crate) struct AdminCaller(pub AuthUser);
 
 impl FromRequestParts<ApiState> for AdminCaller {
-    type Rejection = StatusCode;
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -371,22 +403,32 @@ impl FromRequestParts<ApiState> for AdminCaller {
             let AdminUser(user) = AdminUser::from_request_parts(parts, state).await?;
             return Ok(Self(user));
         };
-        let token = authorization
+        let bucket = format!("bearer:{}", extract_client_ip(&parts.headers));
+        if ip_rate_limit_exhausted(&bucket) {
+            return Err(ApiError::rate_limited());
+        }
+        let user = authorization
             .to_str()
             .ok()
             .and_then(|value| value.strip_prefix(BEARER_PREFIX))
             .map(str::trim)
             .filter(|token| !token.is_empty())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-        let user = state
-            .tracker
-            .get_user_by_api_token_hash(&hash_secret(token))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map(AuthUser::from)
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .map(|token| {
+                state
+                    .tracker
+                    .get_user_by_api_token_hash(&hash_secret(token))
+            })
+            .transpose()
+            .map_err(ApiError::storage)?
+            .flatten()
+            .map(AuthUser::from);
+        let Some(user) = user else {
+            check_ip_rate_limit(&bucket);
+            return Err(ApiError::invalid_token());
+        };
         user.identify();
         if !user.is_admin() {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(ApiError::admin_required());
         }
         Ok(Self(user))
     }
@@ -495,6 +537,7 @@ pub async fn login_handler(
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
     let client_ip = extract_client_ip(&headers);
+    let email = normalize_login_email(&body.email);
 
     // Rate limit login attempts by IP to prevent distributed brute force across many emails
     if !check_ip_rate_limit(&client_ip) {
@@ -503,15 +546,14 @@ pub async fn login_handler(
     }
 
     // Rate limit login attempts by email to prevent brute force and bcrypt CPU exhaustion
-    if !check_login_rate_limit(&body.email) {
-        tracing::warn!(email = %body.email, ip = %client_ip, "Login rate limit exceeded");
+    if !check_login_rate_limit(&email) {
+        tracing::warn!(ip = %client_ip, "Login rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    // Look up user by email
     let user = state
         .tracker
-        .get_user_by_email(&body.email)
+        .get_user_by_email(&email)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Unknown, invited and wrong-password logins all run one cost-12 bcrypt verification
@@ -664,7 +706,11 @@ pub async fn update_profile_handler(
                 return Err(StatusCode::FORBIDDEN);
             }
 
-            Some(hash_password(new_pw.clone()).await?)
+            Some(
+                hash_password(new_pw.clone())
+                    .await
+                    .map_err(|error| error.status())?,
+            )
         }
         None => None,
     };
@@ -689,7 +735,9 @@ pub async fn update_profile_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(user_response(&state, updated)?))
+    Ok(Json(
+        user_response(&state, updated).map_err(|error| error.status())?,
+    ))
 }
 
 /// POST /api/auth/avatar
@@ -782,11 +830,16 @@ pub async fn upload_avatar_handler(
 }
 
 /// Hash a password with the default bcrypt cost, off the async runtime.
-pub(crate) async fn hash_password(password: String) -> Result<String, StatusCode> {
+pub(crate) async fn hash_password(password: String) -> Result<String, ApiError> {
     tokio::task::spawn_blocking(move || bcrypt::hash(password, bcrypt::DEFAULT_COST))
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| ApiError::internal())?
+        .map_err(|_| ApiError::internal())
+}
+
+/// Login emails are compared and stored trimmed and lowercased.
+pub(crate) fn normalize_login_email(email: &str) -> String {
+    email.trim().to_lowercase()
 }
 
 /// Whether `email` is usable as a login email (same rules as an identity email).
@@ -799,27 +852,60 @@ pub(crate) fn is_valid_login_email(email: &str) -> bool {
     .is_ok()
 }
 
-fn user_response(state: &ApiState, user: UserRow) -> Result<UserResponse, StatusCode> {
+fn validate_login_email(email: &str) -> Result<(), ApiError> {
+    if is_valid_login_email(email) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("Email must be a valid email address"))
+    }
+}
+
+fn validate_password(password: Option<&String>) -> Result<(), ApiError> {
+    if password.is_none_or(|password| PASSWORD_LENGTH.contains(&password.len())) {
+        Ok(())
+    } else {
+        Err(ApiError::invalid_password())
+    }
+}
+
+fn validate_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() {
+        Err(ApiError::bad_request("Name must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_role(role: &str) -> Result<Role, ApiError> {
+    Role::from_str(role).map_err(|_| ApiError::invalid_role())
+}
+
+fn user_response(state: &ApiState, user: UserRow) -> Result<UserResponse, ApiError> {
     let invite_expires_at = match user.status {
         UserStatus::Active => None,
         UserStatus::Invited => state
             .tracker
             .get_open_invite_for_user(user.id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(ApiError::storage)?
             .map(|invite| invite.expires_at),
     };
     Ok(UserResponse::new(user, invite_expires_at))
+}
+
+fn find_user(state: &ApiState, id: i64) -> Result<UserRow, ApiError> {
+    state
+        .tracker
+        .get_user_by_id(id)
+        .map_err(ApiError::storage)?
+        .ok_or_else(ApiError::user_not_found)
 }
 
 /// GET /api/users
 pub async fn list_users_handler(
     _admin: AdminUser,
     State(state): State<ApiState>,
-) -> Result<Json<Vec<UserResponse>>, StatusCode> {
-    let users = state
-        .tracker
-        .list_users()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+) -> Result<Json<Vec<UserResponse>>, ApiError> {
+    let users = state.tracker.list_users().map_err(ApiError::storage)?;
 
     let response = users
         .into_iter()
@@ -834,87 +920,28 @@ pub async fn get_user_handler(
     _admin: AdminUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
-) -> Result<Json<UserResponse>, StatusCode> {
-    let user = state
-        .tracker
-        .get_user_by_id(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
+) -> Result<Json<UserResponse>, ApiError> {
+    let user = find_user(&state, id)?;
     Ok(Json(user_response(&state, user)?))
-}
-
-/// A failed user creation: a bare status as before, or identity violations with a JSON body.
-#[derive(Debug)]
-pub(crate) enum CreateUserError {
-    Status(StatusCode),
-    Identity(IdentityError),
-}
-
-impl From<StatusCode> for CreateUserError {
-    fn from(status: StatusCode) -> Self {
-        Self::Status(status)
-    }
-}
-
-impl From<IdentityError> for CreateUserError {
-    fn from(error: IdentityError) -> Self {
-        Self::Identity(error)
-    }
-}
-
-impl IntoResponse for CreateUserError {
-    fn into_response(self) -> Response {
-        match self {
-            Self::Status(status) => status.into_response(),
-            Self::Identity(error) => error.into_response(),
-        }
-    }
 }
 
 /// POST /api/users
 pub(crate) async fn create_user_handler(
     AdminUser(admin): AdminUser,
     State(state): State<ApiState>,
-    Json(body): Json<CreateUserRequest>,
-) -> Result<(StatusCode, Json<CreatedUserResponse>), CreateUserError> {
+    body: Result<Json<CreateUserRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CreatedUserResponse>), ApiError> {
     if !check_api_rate_limit(admin.id) {
-        return Err(StatusCode::TOO_MANY_REQUESTS.into());
+        return Err(ApiError::rate_limited());
     }
+    let Json(body) = body?;
 
-    let role = Role::from_str(&body.role).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let email = body.email.trim();
+    let role = parse_role(&body.role)?;
+    let email = normalize_login_email(&body.email);
     let name = body.name.trim();
-    let password_is_valid = body
-        .password
-        .as_ref()
-        .is_none_or(|password| PASSWORD_LENGTH.contains(&password.len()));
-    if !is_valid_login_email(email) || name.is_empty() || !password_is_valid {
-        return Err(StatusCode::BAD_REQUEST.into());
-    }
-
-    if state
-        .tracker
-        .get_user_by_email(email)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .is_some()
-    {
-        return Err(StatusCode::CONFLICT.into());
-    }
-
-    let identities = match body.identities {
-        Some(update) => {
-            registry::reload(&state.registry, state.tracker.as_ref());
-            let plan = plan_update(&state.registry, None, email, None, update, true)
-                .map_err(IdentityError::Invalid)?;
-            let conflicts = find_conflicts(&state.registry, std::slice::from_ref(&plan));
-            if !conflicts.is_empty() {
-                return Err(IdentityError::Conflict(conflicts).into());
-            }
-            Some(plan.write)
-        }
-        None => None,
-    };
+    validate_login_email(&email)?;
+    validate_name(name)?;
+    validate_password(body.password.as_ref())?;
 
     let (password_hash, status, invite) = match body.password {
         Some(password) => (hash_password(password).await?, UserStatus::Active, None),
@@ -925,11 +952,35 @@ pub(crate) async fn create_user_handler(
         ),
     };
 
+    let _writes = state.identity_writes.lock().await;
+    if state
+        .tracker
+        .get_user_by_email(&email)
+        .map_err(ApiError::storage)?
+        .is_some()
+    {
+        return Err(ApiError::duplicate_email());
+    }
+
+    let identities = match body.identities {
+        Some(update) => {
+            registry::reload(&state.registry, state.tracker.as_ref());
+            let plan = plan_update(&state.registry, None, &email, None, update)
+                .map_err(ApiError::invalid_identities)?;
+            let conflicts = find_conflicts(&state.registry, std::slice::from_ref(&plan));
+            if !conflicts.is_empty() {
+                return Err(ApiError::identity_conflict(conflicts));
+            }
+            Some(plan.write)
+        }
+        None => None,
+    };
+
     let user_ids = state
         .tracker
         .save_directory(&[DirectoryWrite {
             user: DirectoryUser::New {
-                email: email.to_string(),
+                email,
                 name: name.to_string(),
                 role: role.as_str().to_string(),
                 password_hash,
@@ -938,21 +989,11 @@ pub(crate) async fn create_user_handler(
             identities,
             invite: invite.as_ref().map(|invite| invite.write.clone()),
         }])
-        .map_err(|error| {
-            tracing::error!(error = %error, "Failed to create user");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .map_err(ApiError::user_write)?;
     registry::reload(&state.registry, state.tracker.as_ref());
 
-    let user_id = user_ids
-        .first()
-        .copied()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    let user = state
-        .tracker
-        .get_user_by_id(user_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let user_id = user_ids.first().copied().ok_or_else(ApiError::internal)?;
+    let user = find_user(&state, user_id)?;
     let invite = invite.map(|invite| invite.response(&state.config));
     let invite_expires_at = invite.as_ref().map(|invite| invite.expires_at.clone());
 
@@ -965,6 +1006,38 @@ pub(crate) async fn create_user_handler(
     ))
 }
 
+/// The columns an admin update changes, with the activation of an invited user.
+struct UserUpdate<'a> {
+    email: Option<&'a str>,
+    password_hash: Option<&'a str>,
+    name: Option<&'a str>,
+    role: Option<Role>,
+    activation_hash: Option<&'a str>,
+}
+
+/// Write the column changes before the activation: the column write is the one a login
+/// email taken in the meantime can fail, and it must fail before the user is activated.
+fn apply_user_update(
+    tracker: &dyn FixAttemptTracker,
+    id: i64,
+    update: &UserUpdate<'_>,
+) -> Result<(), ApiError> {
+    tracker
+        .update_user(
+            id,
+            update.email,
+            update.password_hash,
+            update.name,
+            update.role.map(Role::as_str),
+            None,
+        )
+        .map_err(ApiError::user_write)?;
+    if let Some(hash) = update.activation_hash {
+        tracker.activate_user(id, hash).map_err(ApiError::storage)?;
+    }
+    Ok(())
+}
+
 /// PUT /api/users/{id}
 ///
 /// A password set on an invited user activates them and revokes their invite.
@@ -972,83 +1045,64 @@ pub async fn update_user_handler(
     AdminUser(admin): AdminUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
-    Json(body): Json<UpdateUserRequest>,
-) -> Result<Json<UserResponse>, StatusCode> {
+    body: Result<Json<UpdateUserRequest>, JsonRejection>,
+) -> Result<Json<UserResponse>, ApiError> {
     if !check_api_rate_limit(admin.id) {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        return Err(ApiError::rate_limited());
     }
+    let Json(body) = body?;
 
-    let role = body
-        .role
-        .as_deref()
-        .map(Role::from_str)
-        .transpose()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let email = body.email.as_deref().map(str::trim);
+    let role = body.role.as_deref().map(parse_role).transpose()?;
+    let email = body.email.as_deref().map(normalize_login_email);
     let name = body.name.as_deref().map(str::trim);
-    let password_is_valid = body
-        .password
-        .as_ref()
-        .is_none_or(|password| PASSWORD_LENGTH.contains(&password.len()));
-    if email.is_some_and(|email| !is_valid_login_email(email))
-        || name.is_some_and(str::is_empty)
-        || !password_is_valid
-    {
-        return Err(StatusCode::BAD_REQUEST);
+    if let Some(email) = &email {
+        validate_login_email(email)?;
     }
-
-    let user = state
-        .tracker
-        .get_user_by_id(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let email = email.filter(|email| *email != user.email);
-    if let Some(email) = email {
-        if state
-            .tracker
-            .get_user_by_email(email)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .is_some()
-        {
-            return Err(StatusCode::CONFLICT);
-        }
+    if let Some(name) = name {
+        validate_name(name)?;
     }
+    validate_password(body.password.as_ref())?;
 
-    let mut password_hash = match body.password {
+    let password_hash = match body.password {
         Some(password) => Some(hash_password(password).await?),
         None => None,
     };
-    if user.status == UserStatus::Invited {
-        if let Some(hash) = password_hash.take() {
-            state
-                .tracker
-                .activate_user(id, &hash)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let _writes = state.identity_writes.lock().await;
+    let user = find_user(&state, id)?;
+    let email = email.filter(|email| *email != user.email);
+    if let Some(email) = &email {
+        let holder = state
+            .tracker
+            .get_user_by_email(email)
+            .map_err(ApiError::storage)?;
+        if holder.is_some_and(|holder| holder.id != id) {
+            return Err(ApiError::duplicate_email());
         }
     }
 
-    state
-        .tracker
-        .update_user(
-            id,
-            email,
-            password_hash.as_deref(),
+    let activates = user.status == UserStatus::Invited && password_hash.is_some();
+    let (password_hash, activation_hash) = if activates {
+        (None, password_hash.as_deref())
+    } else {
+        (password_hash.as_deref(), None)
+    };
+    apply_user_update(
+        state.tracker.as_ref(),
+        id,
+        &UserUpdate {
+            email: email.as_deref(),
+            password_hash,
             name,
-            role.map(Role::as_str),
-            None,
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if email.is_some() {
+            role,
+            activation_hash,
+        },
+    )?;
+    if email.is_some() || activates {
         registry::reload(&state.registry, state.tracker.as_ref());
     }
 
-    let user = state
-        .tracker
-        .get_user_by_id(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
+    let user = find_user(&state, id)?;
     Ok(Json(user_response(&state, user)?))
 }
 
@@ -1057,26 +1111,22 @@ pub async fn delete_user_handler(
     AdminUser(admin): AdminUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
-) -> Result<Json<MessageResponse>, StatusCode> {
+) -> Result<Json<MessageResponse>, ApiError> {
     if !check_api_rate_limit(admin.id) {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        return Err(ApiError::rate_limited());
     }
 
-    // Can't delete yourself
     if admin.id == id {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::bad_request("You cannot delete yourself"));
     }
 
-    // Delete user sessions first
+    let _writes = state.identity_writes.lock().await;
     let _ = state.tracker.delete_user_sessions(id);
 
-    let deleted = state
-        .tracker
-        .delete_user(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let deleted = state.tracker.delete_user(id).map_err(ApiError::storage)?;
 
     if !deleted {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::user_not_found());
     }
     registry::reload(&state.registry, state.tracker.as_ref());
 
@@ -3076,7 +3126,7 @@ mod tests {
         use axum::http::Request;
         use claudear_config::config::{Config, UserConfig};
         use claudear_config::users::UserRegistry;
-        use claudear_storage::{FixAttemptTracker, SqliteTracker};
+        use claudear_storage::{FixAttemptTracker, SqliteTracker, UserStore};
         use http_body_util::BodyExt;
         use serde_json::{json, Value};
         use std::sync::Arc;
@@ -3319,6 +3369,186 @@ mod tests {
             .await;
             assert_eq!(pending.0, StatusCode::UNAUTHORIZED);
             assert_eq!(pending, wrong);
+        }
+
+        #[tokio::test]
+        async fn create_user_errors_are_json_and_emails_are_case_insensitive() {
+            let app = test_app();
+            let before = app.tracker.list_users().expect("list").len();
+
+            for (body, error) in [
+                (
+                    json!({"email": "writes-y@example.com", "name": "Y", "role": "owner"}),
+                    "Invalid role",
+                ),
+                (
+                    json!({"email": "writes-y@example.com", "name": "Y", "role": "viewer",
+                           "password": "short"}),
+                    "Password must be 8-72 bytes",
+                ),
+                (
+                    json!({"email": "not-an-email", "name": "Y", "role": "viewer"}),
+                    "Email must be a valid email address",
+                ),
+                (
+                    json!({"email": "writes-y@example.com", "name": " ", "role": "viewer"}),
+                    "Name must not be empty",
+                ),
+                (
+                    json!({"email": "writes-y@example.com"}),
+                    "Invalid request body",
+                ),
+            ] {
+                let (status, response) =
+                    send(&app, "POST", "/api/users", Some(&app.admin_token), body).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+                assert_eq!(json(&response), json!({"error": error}));
+            }
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/users",
+                Some(&app.admin_token),
+                json!({"email": " Writes-Amy@Example.com ", "name": "Amy", "role": "viewer",
+                       "password": "correct-horse"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(json(&body)["email"], "writes-amy@example.com");
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/users",
+                Some(&app.admin_token),
+                json!({"email": "writes-amy@example.com", "name": "Twin", "role": "viewer"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                json(&body),
+                json!({"error": "A user with this email already exists"})
+            );
+            assert_eq!(app.tracker.list_users().expect("list").len(), before + 1);
+
+            let (status, _) = send(
+                &app,
+                "POST",
+                "/api/auth/login",
+                None,
+                json!({"email": "WRITES-AMY@example.com", "password": "correct-horse"}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "login matches the email case-insensitively"
+            );
+        }
+
+        #[tokio::test]
+        async fn update_user_rejects_a_taken_email_in_any_case() {
+            let app = test_app();
+            let holder = app
+                .tracker
+                .create_user(
+                    "writes-holder@example.com",
+                    "unused-hash",
+                    "Holder",
+                    "viewer",
+                )
+                .expect("create holder");
+            let mover = app
+                .tracker
+                .create_user("writes-mover@example.com", "unused-hash", "Mover", "viewer")
+                .expect("create mover");
+
+            let (status, body) = send(
+                &app,
+                "PUT",
+                &format!("/api/users/{mover}"),
+                Some(&app.admin_token),
+                json!({"email": "Writes-Holder@Example.com"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                json(&body),
+                json!({"error": "A user with this email already exists"})
+            );
+
+            let (status, body) = send(
+                &app,
+                "PUT",
+                &format!("/api/users/{holder}"),
+                Some(&app.admin_token),
+                json!({"role": "owner"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(json(&body), json!({"error": "Invalid role"}));
+
+            let (status, body) = send(
+                &app,
+                "PUT",
+                "/api/users/999999",
+                Some(&app.admin_token),
+                json!({"name": "Nobody"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(json(&body), json!({"error": "User not found"}));
+        }
+
+        #[test]
+        fn a_taken_email_fails_the_update_before_the_invited_user_is_activated() {
+            let tracker = SqliteTracker::in_memory().expect("in-memory tracker");
+            tracker
+                .create_user("writes-taken@example.com", "unused-hash", "Taken", "viewer")
+                .expect("create holder");
+            let invited = tracker
+                .save_directory(&[DirectoryWrite {
+                    user: DirectoryUser::New {
+                        email: "writes-invited@example.com".to_string(),
+                        name: "Invited".to_string(),
+                        role: "viewer".to_string(),
+                        password_hash: "unused-hash".to_string(),
+                        status: UserStatus::Invited,
+                    },
+                    identities: None,
+                    invite: Some(claudear_storage::InviteWrite {
+                        token_hash: "invite-hash".to_string(),
+                        expires_at: "2099-12-31 23:59:59".to_string(),
+                        created_by: 1,
+                    }),
+                }])
+                .expect("create invited user")[0];
+
+            let error = apply_user_update(
+                &tracker,
+                invited,
+                &UserUpdate {
+                    email: Some("writes-taken@example.com"),
+                    password_hash: None,
+                    name: None,
+                    role: None,
+                    activation_hash: Some("new-hash"),
+                },
+            )
+            .expect_err("the email is taken");
+
+            assert_eq!(error.status(), StatusCode::CONFLICT);
+            let user = tracker
+                .get_user_by_id(invited)
+                .expect("lookup")
+                .expect("user exists");
+            assert_eq!(user.status, UserStatus::Invited);
+            assert_eq!(user.password_hash, "unused-hash");
+            assert!(tracker
+                .get_open_invite_for_user(invited)
+                .expect("lookup")
+                .is_some());
         }
     }
 }

@@ -5,6 +5,7 @@
 pub mod auth;
 mod directory;
 pub(crate) mod embedded;
+pub mod error;
 mod identities;
 mod invites;
 mod routes;
@@ -39,15 +40,7 @@ pub fn apply_dashboard_middleware(router: axum::Router, tls_enabled: bool) -> ax
     // In production behind a reverse proxy, the proxy should handle CORS.
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin, _| {
-            if let Ok(origin_str) = origin.to_str() {
-                // Allow localhost and 127.0.0.1 on any port (common dev/local setup)
-                origin_str.starts_with("http://localhost")
-                    || origin_str.starts_with("https://localhost")
-                    || origin_str.starts_with("http://127.0.0.1")
-                    || origin_str.starts_with("https://127.0.0.1")
-            } else {
-                false
-            }
+            origin.to_str().is_ok_and(is_local_origin)
         }))
         .allow_methods([
             http::Method::GET,
@@ -71,6 +64,24 @@ pub fn apply_dashboard_middleware(router: axum::Router, tls_enabled: bool) -> ax
         }))
         .layer(cors)
         .layer(CookieManagerLayer::new())
+}
+
+const LOCAL_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+
+/// Whether `origin` is `http(s)://` a loopback host on any port. The host must match
+/// exactly, so `http://localhost.attacker.com` is not local.
+fn is_local_origin(origin: &str) -> bool {
+    let Ok(uri) = origin.parse::<http::Uri>() else {
+        return false;
+    };
+    let scheme_is_web = matches!(uri.scheme_str(), Some("http" | "https"));
+    let bare_origin = uri.path_and_query().is_none_or(|path| path.as_str() == "/");
+    uri.authority().is_some_and(|authority| {
+        scheme_is_web
+            && bare_origin
+            && !authority.as_str().contains('@')
+            && LOCAL_HOSTS.contains(&authority.host())
+    })
 }
 
 /// API server configuration.
@@ -322,5 +333,65 @@ mod tests {
                 .map(|resolved| resolved.slug),
             Some("jake".to_string())
         );
+    }
+
+    #[test]
+    fn only_exact_loopback_hosts_are_local_origins() {
+        for origin in [
+            "http://localhost",
+            "http://localhost:5173",
+            "https://localhost:8443",
+            "http://127.0.0.1:3100",
+            "https://127.0.0.1",
+            "http://[::1]:3000",
+        ] {
+            assert!(is_local_origin(origin), "{origin} is local");
+        }
+        for origin in [
+            "http://localhost.attacker.com",
+            "https://127.0.0.1.attacker.com",
+            "http://localhostattacker.com",
+            "http://127.0.0.10",
+            "http://attacker.com",
+            "ftp://localhost",
+            "http://user@localhost",
+            "http://localhost/path",
+            "localhost:5173",
+            "null",
+            "",
+        ] {
+            assert!(!is_local_origin(origin), "{origin} is not local");
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_allows_credentials_only_for_loopback_origins() {
+        let router = apply_dashboard_middleware(
+            axum::Router::new().route("/api/ping", axum::routing::get(|| async { "pong" })),
+            false,
+        );
+        for (origin, allowed) in [
+            ("http://localhost:5173", true),
+            ("http://localhost.attacker.com", false),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("OPTIONS")
+                        .uri("/api/ping")
+                        .header("origin", origin)
+                        .header("access-control-request-method", "GET")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            let allowed_origin = response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok());
+            assert_eq!(allowed_origin, allowed.then_some(origin), "{origin}");
+        }
     }
 }
