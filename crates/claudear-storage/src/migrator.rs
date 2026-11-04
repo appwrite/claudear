@@ -90,6 +90,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "fix_attempt_heartbeat",
         sql: include_str!("../../../migrations/V14__fix_attempt_heartbeat.sql"),
     },
+    Migration {
+        version: 17,
+        name: "chat_session_owner",
+        sql: include_str!("../../../migrations/V17__chat_session_owner.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -257,6 +262,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_deploy_qa, 1);
+    }
+
+    #[test]
+    fn test_chat_sessions_record_their_owner() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let has_owner: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('chat_sessions') WHERE name = 'owner_user_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_owner, 1);
+
+        let owner_foreign_key: (String, String, String) = conn
+            .query_row(
+                "SELECT \"table\", \"to\", on_delete FROM pragma_foreign_key_list('chat_sessions') WHERE \"from\" = 'owner_user_id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            owner_foreign_key,
+            ("users".to_string(), "id".to_string(), "CASCADE".to_string())
+        );
+
+        let has_index: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_chat_sessions_owner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1);
+    }
+
+    #[test]
+    fn test_owner_migration_keeps_existing_sessions_ownerless() {
+        let conn = Connection::open_in_memory().unwrap();
+        let before_owner: Vec<Migration> = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 17)
+            .copied()
+            .collect();
+        apply(&conn, &before_owner).unwrap();
+        conn.execute("INSERT INTO chat_sessions (id) VALUES ('legacy')", [])
+            .unwrap();
+
+        run(&conn).unwrap();
+
+        let owner: Option<i64> = conn
+            .query_row(
+                "SELECT owner_user_id FROM chat_sessions WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, None);
     }
 
     #[test]

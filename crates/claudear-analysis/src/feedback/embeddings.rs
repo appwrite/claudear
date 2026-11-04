@@ -285,10 +285,28 @@ impl EmbeddingClient {
             .unwrap_or(0)
     }
 
+    /// A client with no model loaded, whose every embedding fails, for tests
+    /// that need an `EmbeddingClient` but never embed text successfully.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unloaded() -> Self {
+        Self {
+            pool: Vec::new(),
+            next: AtomicUsize::new(0),
+            dimension: 768,
+            model_name: "unloaded".to_string(),
+            sub_batch_override: 0,
+            gpu: false,
+        }
+    }
+
     /// Round-robin acquire a model instance from the pool.
-    fn acquire(&self) -> Arc<Mutex<TextEmbedding>> {
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
-        self.pool[idx].clone()
+    fn acquire(&self) -> Result<Arc<Mutex<TextEmbedding>>> {
+        let index = self
+            .next
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_rem(self.pool.len())
+            .ok_or_else(|| Error::Other("No embedding model is loaded".to_string()))?;
+        Ok(self.pool[index].clone())
     }
 
     /// Compute sub-batch size based on available system memory.
@@ -348,7 +366,7 @@ impl EmbeddingClient {
     /// Uses `spawn_blocking` because ONNX inference is CPU-bound and would
     /// otherwise block a tokio worker thread.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let model = self.acquire();
+        let model = self.acquire()?;
         let text = text.to_string();
 
         tokio::task::spawn_blocking(move || {
@@ -384,7 +402,7 @@ impl EmbeddingClient {
         let mut handles = Vec::new();
 
         for sub in texts.chunks(sub_batch) {
-            let model = self.acquire();
+            let model = self.acquire()?;
             let sub_owned: Vec<String> = sub.iter().map(|s| s.to_string()).collect();
 
             handles.push(tokio::task::spawn_blocking(move || {
@@ -487,6 +505,13 @@ mod tests {
         if let Err(e) = EmbeddingClient::warmup() {
             eprintln!("Embedding warmup failed (model may be unavailable): {e}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_unloaded_client_fails_to_embed_instead_of_panicking() {
+        let client = EmbeddingClient::unloaded();
+        assert!(client.embed("text").await.is_err());
+        assert!(client.embed_batch(&["text"]).await.is_err());
     }
 
     #[test]

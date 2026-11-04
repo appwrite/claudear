@@ -2009,9 +2009,19 @@ pub trait RegressionStore: Send + Sync {
 
 /// Chat sessions and messages (all defaulted).
 pub trait ChatStore: Send + Sync {
-    /// Create a new chat session.
-    fn create_chat_session(&self, _id: &str, _repo_id: Option<i64>) -> Result<()> {
+    /// Create a new chat session belonging to `owner_user_id`.
+    fn create_chat_session(
+        &self,
+        _id: &str,
+        _repo_id: Option<i64>,
+        _owner_user_id: Option<i64>,
+    ) -> Result<()> {
         Ok(())
+    }
+
+    /// A chat session, with its owner, without its messages.
+    fn get_chat_session(&self, _id: &str) -> Result<Option<claudear_core::types::ChatSession>> {
+        Ok(None)
     }
 
     /// Save a chat message to a session.
@@ -2034,8 +2044,11 @@ pub trait ChatStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// List all chat sessions.
-    fn list_chat_sessions(&self) -> Result<Vec<claudear_core::types::ChatSession>> {
+    /// List the chat sessions in `scope`, most recently updated first.
+    fn list_chat_sessions(
+        &self,
+        _scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Vec<claudear_core::types::ChatSession>> {
         Ok(Vec::new())
     }
 
@@ -3074,8 +3087,16 @@ mod tests {
         #[test]
         fn test_default_create_chat_session_succeeds() {
             let t = MockChat;
-            assert!(t.create_chat_session("session-1", None).is_ok());
-            assert!(t.create_chat_session("session-2", Some(42)).is_ok());
+            assert!(t.create_chat_session("session-1", None, None).is_ok());
+            assert!(t
+                .create_chat_session("session-2", Some(42), Some(7))
+                .is_ok());
+        }
+
+        #[test]
+        fn test_default_get_chat_session_returns_none() {
+            let t = MockChat;
+            assert!(t.get_chat_session("session-1").unwrap().is_none());
         }
 
         #[test]
@@ -3102,7 +3123,11 @@ mod tests {
         #[test]
         fn test_default_list_chat_sessions_returns_empty() {
             let t = MockChat;
-            assert!(t.list_chat_sessions().unwrap().is_empty());
+            let scope = claudear_core::types::ChatSessionScope {
+                owner_user_id: 1,
+                include_ownerless: true,
+            };
+            assert!(t.list_chat_sessions(&scope).unwrap().is_empty());
         }
 
         #[test]

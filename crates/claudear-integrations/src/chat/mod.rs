@@ -11,5 +11,5 @@ pub mod service;
 pub mod types;
 
 pub use routes::{create_chat_router, ChatState};
-pub use service::ChatService;
+pub use service::{ChatActor, ChatService, CHAT_SESSION_NOT_FOUND};
 pub use types::*;

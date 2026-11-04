@@ -3281,10 +3281,52 @@ pub struct ChatMessage {
 pub struct ChatSession {
     pub id: String,
     pub repo_id: Option<i64>,
+    /// The dashboard user the session belongs to; `None` for sessions created
+    /// before sessions had owners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
+}
+
+/// The signed-in dashboard user a chat request acts for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatViewer {
+    pub user_id: i64,
+    pub is_admin: bool,
+}
+
+/// Which chat sessions a listing returns: those owned by `owner_user_id`,
+/// plus the ownerless ones when `include_ownerless` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatSessionScope {
+    pub owner_user_id: i64,
+    pub include_ownerless: bool,
+}
+
+impl ChatViewer {
+    /// Only the owner reads an owned session; only admins read an ownerless one.
+    pub fn can_read(&self, session: &ChatSession) -> bool {
+        match session.owner_user_id {
+            Some(owner_user_id) => owner_user_id == self.user_id,
+            None => self.is_admin,
+        }
+    }
+
+    /// The owner, or any admin, may delete a session.
+    pub fn can_delete(&self, session: &ChatSession) -> bool {
+        self.is_admin || self.can_read(session)
+    }
+
+    /// The sessions this viewer may list: exactly those it may read.
+    pub fn scope(&self) -> ChatSessionScope {
+        ChatSessionScope {
+            owner_user_id: self.user_id,
+            include_ownerless: self.is_admin,
+        }
+    }
 }
 
 /// Alias for backward compatibility (was `PrReviewComment` in github.rs).
@@ -7122,5 +7164,82 @@ mod tests {
         let deser: AgentResult = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.confidence, 0);
         assert!(deser.confidence_reasoning.is_some());
+    }
+
+    fn chat_session(owner_user_id: Option<i64>) -> ChatSession {
+        ChatSession {
+            id: "session".to_string(),
+            repo_id: None,
+            owner_user_id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            messages: Vec::new(),
+        }
+    }
+
+    const OWNER: ChatViewer = ChatViewer {
+        user_id: 1,
+        is_admin: false,
+    };
+
+    const OTHER_VIEWER: ChatViewer = ChatViewer {
+        user_id: 2,
+        is_admin: false,
+    };
+
+    const ADMIN: ChatViewer = ChatViewer {
+        user_id: 3,
+        is_admin: true,
+    };
+
+    #[test]
+    fn only_the_owner_reads_an_owned_chat_session() {
+        let owned = chat_session(Some(OWNER.user_id));
+        assert!(OWNER.can_read(&owned));
+        assert!(!OTHER_VIEWER.can_read(&owned));
+        assert!(!ADMIN.can_read(&owned));
+    }
+
+    #[test]
+    fn the_owner_and_admins_delete_an_owned_chat_session() {
+        let owned = chat_session(Some(OWNER.user_id));
+        assert!(OWNER.can_delete(&owned));
+        assert!(ADMIN.can_delete(&owned));
+        assert!(!OTHER_VIEWER.can_delete(&owned));
+    }
+
+    #[test]
+    fn only_admins_read_or_delete_an_ownerless_chat_session() {
+        let ownerless = chat_session(None);
+        assert!(ADMIN.can_read(&ownerless));
+        assert!(ADMIN.can_delete(&ownerless));
+        assert!(!OWNER.can_read(&ownerless));
+        assert!(!OWNER.can_delete(&ownerless));
+    }
+
+    #[test]
+    fn a_viewer_lists_its_own_chat_sessions_and_admins_add_ownerless_ones() {
+        assert_eq!(
+            OWNER.scope(),
+            ChatSessionScope {
+                owner_user_id: OWNER.user_id,
+                include_ownerless: false,
+            }
+        );
+        assert_eq!(
+            ADMIN.scope(),
+            ChatSessionScope {
+                owner_user_id: ADMIN.user_id,
+                include_ownerless: true,
+            }
+        );
+    }
+
+    #[test]
+    fn an_ownerless_chat_session_omits_its_owner_when_serialized() {
+        let json = serde_json::to_value(chat_session(None)).unwrap();
+        assert!(json.get("owner_user_id").is_none());
+        let json = serde_json::to_value(chat_session(Some(7))).unwrap();
+        assert_eq!(json["owner_user_id"], 7);
     }
 }

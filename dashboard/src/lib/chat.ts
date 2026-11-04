@@ -21,6 +21,7 @@ export interface ChatSource {
 export interface ChatSession {
   id: string
   repo_id?: number
+  owner_user_id?: number
   created_at: string
   updated_at: string
   messages?: ChatMessage[]

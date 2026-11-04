@@ -7,10 +7,41 @@ use super::types::*;
 use claudear_analysis::repo::code_index::{format_code_search_context, CodeSearchService};
 use claudear_config::config::{ChatConfig, LlmModelConfig};
 use claudear_core::error::{Error, Result};
+use claudear_core::types::ChatViewer;
 use claudear_storage::FixAttemptTracker;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+
+/// The error a chat request gets for a session it may not read, whether or
+/// not the session exists.
+pub const CHAT_SESSION_NOT_FOUND: &str = "Chat session not found";
+
+/// Who a chat request acts for.
+#[derive(Debug, Clone, Copy)]
+pub enum ChatActor<'a> {
+    /// A signed-in dashboard user, who owns the sessions they create.
+    Viewer(&'a ChatViewer),
+    /// The local `claudear chat` operator, whose sessions have no owner and so
+    /// are visible in the dashboard only to admins.
+    Operator,
+}
+
+impl ChatActor<'_> {
+    fn owner_user_id(self) -> Option<i64> {
+        match self {
+            Self::Viewer(viewer) => Some(viewer.user_id),
+            Self::Operator => None,
+        }
+    }
+
+    fn can_continue(self, session: &ChatSession) -> bool {
+        match self {
+            Self::Viewer(viewer) => viewer.can_read(session),
+            Self::Operator => session.owner_user_id.is_none(),
+        }
+    }
+}
 
 /// Service that orchestrates RAG-powered code chat.
 ///
@@ -98,13 +129,14 @@ impl ChatService {
     /// Returns a list of token strings (for streaming to client) and the source references.
     pub async fn chat(
         &self,
+        actor: ChatActor<'_>,
         session_id: &str,
         message: &str,
         repo_id: Option<i64>,
         params_override: Option<&GenerationParamsOverride>,
     ) -> Result<(Vec<String>, Vec<ChatSource>)> {
         let prepared = self
-            .prepare_chat(session_id, message, repo_id, params_override)
+            .prepare_chat(actor, session_id, message, repo_id, params_override)
             .await?;
 
         let tokens = prepared
@@ -119,26 +151,28 @@ impl ChatService {
 
     /// Prepare a chat request: create session, save user message, RAG search, build prompt, load LLM.
     ///
+    /// A session that does not exist yet is created owned by `actor`; one
+    /// `actor` may not continue fails with [`CHAT_SESSION_NOT_FOUND`].
+    ///
     /// Returns a `PreparedChat` that the caller can use to drive generation (either
     /// via `complete_streaming` or `complete_streaming_channel`).
     pub async fn prepare_chat(
         &self,
+        actor: ChatActor<'_>,
         session_id: &str,
         message: &str,
         repo_id: Option<i64>,
         params_override: Option<&GenerationParamsOverride>,
     ) -> Result<PreparedChat> {
-        // 1. Ensure session exists
-        if self.tracker.get_chat_history(session_id, 1).is_err()
-            || self
-                .tracker
-                .get_chat_history(session_id, 1)
-                .map(|h| h.is_empty())
-                .unwrap_or(true)
-        {
-            let sessions = self.tracker.list_chat_sessions().unwrap_or_default();
-            if !sessions.iter().any(|s| s.id == session_id) {
-                self.tracker.create_chat_session(session_id, repo_id)?;
+        // 1. Ensure the session exists and belongs to the actor
+        match self.tracker.get_chat_session(session_id)? {
+            Some(session) if !actor.can_continue(&session) => {
+                return Err(Error::Other(CHAT_SESSION_NOT_FOUND.to_string()));
+            }
+            Some(_) => {}
+            None => {
+                self.tracker
+                    .create_chat_session(session_id, repo_id, actor.owner_user_id())?;
             }
         }
 
@@ -339,6 +373,37 @@ pub fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session(owner_user_id: Option<i64>) -> ChatSession {
+        ChatSession {
+            id: "session".to_string(),
+            repo_id: None,
+            owner_user_id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_viewer_continues_only_its_own_sessions_and_owns_new_ones() {
+        let viewer = ChatViewer {
+            user_id: 1,
+            is_admin: true,
+        };
+        let actor = ChatActor::Viewer(&viewer);
+        assert_eq!(actor.owner_user_id(), Some(1));
+        assert!(actor.can_continue(&session(Some(1))));
+        assert!(!actor.can_continue(&session(Some(2))));
+    }
+
+    #[test]
+    fn the_operator_continues_only_ownerless_sessions_and_owns_none() {
+        let actor = ChatActor::Operator;
+        assert_eq!(actor.owner_user_id(), None);
+        assert!(actor.can_continue(&session(None)));
+        assert!(!actor.can_continue(&session(Some(1))));
+    }
 
     #[test]
     fn test_expand_tilde() {

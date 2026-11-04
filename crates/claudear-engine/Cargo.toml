@@ -95,5 +95,7 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 abnegate-http = { workspace = true }
+claudear-analysis = { workspace = true, features = ["test-support"] }
 http-body-util = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = { workspace = true }

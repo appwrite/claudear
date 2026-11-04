@@ -3494,7 +3494,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         if let Some(q) = question {
             // One-shot mode
             let session_id = uuid::Uuid::new_v4().to_string();
-            match chat_service.chat(&session_id, q, repo_id, None).await {
+            match chat_service
+                .chat(
+                    claudear::chat::ChatActor::Operator,
+                    &session_id,
+                    q,
+                    repo_id,
+                    None,
+                )
+                .await
+            {
                 Ok((tokens, sources)) => {
                     // Print streaming tokens
                     for token in &tokens {
@@ -3573,7 +3582,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     _ => {}
                 }
 
-                match chat_service.chat(&session_id, input, repo_id, None).await {
+                match chat_service
+                    .chat(
+                        claudear::chat::ChatActor::Operator,
+                        &session_id,
+                        input,
+                        repo_id,
+                        None,
+                    )
+                    .await
+                {
                     Ok((tokens, sources)) => {
                         println!();
                         for token in &tokens {

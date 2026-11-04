@@ -1,5 +1,7 @@
 //! Chat wiring for the dashboard API: state construction and the session
-//! guard layered over the integrations chat router.
+//! guard layered over the integrations chat router. The guard hands the
+//! signed-in user to the chat handlers as a [`ChatViewer`], which they scope
+//! every session to; see `claudear_integrations::chat::routes` for the policy.
 
 use super::auth::AuthUser;
 use super::routes::ApiState;
@@ -13,6 +15,7 @@ use axum::{Json, Router};
 use claudear_analysis::feedback::EmbeddingClient;
 use claudear_analysis::repo::code_index::CodeSearchService;
 use claudear_config::config::Config;
+use claudear_core::types::ChatViewer;
 use claudear_integrations::chat::{ChatService, ChatState};
 use claudear_storage::FixAttemptTracker;
 use serde::Serialize;
@@ -81,15 +84,20 @@ pub(super) fn mount(routes: Router, chat: Option<Router>, state: ApiState) -> Ro
     }
 }
 
-/// Reject requests without a session, and cross-origin websocket upgrades.
+/// Reject requests without a session, and cross-origin websocket upgrades,
+/// and pass the signed-in user on to the chat handlers.
 async fn require_session(
-    _user: AuthUser,
-    request: Request,
+    user: AuthUser,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     if request.uri().path() == WEBSOCKET_PATH && !is_same_origin(&request) {
         return Err(StatusCode::FORBIDDEN);
     }
+    request.extensions_mut().insert(ChatViewer {
+        user_id: user.id,
+        is_admin: user.is_admin(),
+    });
     Ok(next.run(request).await)
 }
 
@@ -146,9 +154,15 @@ mod tests {
     use crate::api::{apply_dashboard_middleware, create_api_router_full};
     use axum::body::Body;
     use claudear_analysis::feedback::EmbeddingConfig;
+    use claudear_config::config::{ChatConfig, LlmModelConfig};
+    use claudear_integrations::chat::{create_chat_router, CHAT_SESSION_NOT_FOUND};
     use claudear_storage::SqliteTracker;
+    use futures::{SinkExt, StreamExt};
+    use serde_json::Value;
     use std::path::PathBuf;
     use std::time::Instant;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
     use tower::ServiceExt;
 
     const ROUTES: &[&str] = &[
@@ -604,5 +618,258 @@ mod tests {
                 "{route} with a session"
             );
         }
+    }
+
+    const CSRF_TOKEN: &str = "chat-test-csrf";
+
+    struct SignedIn {
+        id: i64,
+        cookie: String,
+    }
+
+    fn sign_in(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: &str) -> SignedIn {
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let id = tracker
+            .create_user(email, &password_hash, "Chat User", role)
+            .unwrap();
+        let token = tracker.create_session(id, "2099-12-31 23:59:59").unwrap();
+        SignedIn {
+            id,
+            cookie: format!("claudear_session={token}; claudear_csrf={CSRF_TOKEN}"),
+        }
+    }
+
+    fn chat_router(tracker: &Arc<dyn FixAttemptTracker>) -> Router {
+        let search = CodeSearchService::new(tracker.clone(), Arc::new(EmbeddingClient::unloaded()));
+        let chat_service = ChatService::new(
+            ChatConfig::default(),
+            LlmModelConfig::default(),
+            search,
+            tracker.clone(),
+        );
+        let chat = create_chat_router(ChatState {
+            chat_service: Arc::new(chat_service),
+            tracker: tracker.clone(),
+        });
+        apply_dashboard_middleware(mount(Router::new(), Some(chat), api_state(tracker)), false)
+    }
+
+    fn owned_session(tracker: &Arc<dyn FixAttemptTracker>, id: &str, owner: Option<i64>) {
+        tracker.create_chat_session(id, None, owner).unwrap();
+        tracker
+            .save_chat_message(id, "user", "private question", None)
+            .unwrap();
+    }
+
+    async fn send(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        viewer: &SignedIn,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("cookie", &viewer.cookie)
+                    .header("x-csrf-token", CSRF_TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    async fn listed_ids(router: &Router, viewer: &SignedIn) -> Vec<String> {
+        let (status, body) = send(router, "GET", "/api/chat/sessions", viewer).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut ids: Vec<String> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn the_owner_lists_and_reads_their_own_chat_session() {
+        let tracker = tracker();
+        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        owned_session(&tracker, "mine", Some(owner.id));
+        let router = chat_router(&tracker);
+
+        assert_eq!(listed_ids(&router, &owner).await, ["mine"]);
+        let (status, body) = send(&router, "GET", "/api/chat/sessions/mine", &owner).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["owner_user_id"], owner.id);
+        assert_eq!(body["messages"][0]["content"], "private question");
+    }
+
+    #[tokio::test]
+    async fn another_viewer_cannot_find_a_chat_session_they_do_not_own() {
+        let tracker = tracker();
+        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let other = sign_in(&tracker, "other@example.com", "viewer");
+        owned_session(&tracker, "mine", Some(owner.id));
+        let router = chat_router(&tracker);
+
+        assert!(listed_ids(&router, &other).await.is_empty());
+        let (status, body) = send(&router, "GET", "/api/chat/sessions/mine", &other).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.to_string().contains("private question"));
+        let (status, _) = send(&router, "DELETE", "/api/chat/sessions/mine", &other).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            send(&router, "GET", "/api/chat/sessions/missing", &other)
+                .await
+                .0,
+            StatusCode::NOT_FOUND,
+            "a missing session answers the same as another user's"
+        );
+
+        assert!(tracker.get_chat_session("mine").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_admin_deletes_another_users_chat_session() {
+        let tracker = tracker();
+        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let admin = sign_in(&tracker, "admin@example.com", "admin");
+        owned_session(&tracker, "mine", Some(owner.id));
+        let router = chat_router(&tracker);
+
+        let (status, _) = send(&router, "DELETE", "/api/chat/sessions/mine", &admin).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(tracker.get_chat_session("mine").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_admin_cannot_read_another_users_chat_history() {
+        let tracker = tracker();
+        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let admin = sign_in(&tracker, "admin@example.com", "admin");
+        owned_session(&tracker, "mine", Some(owner.id));
+        let router = chat_router(&tracker);
+
+        let (status, body) = send(&router, "GET", "/api/chat/sessions/mine", &admin).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.to_string().contains("private question"));
+        assert!(listed_ids(&router, &admin).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_ownerless_chat_session_is_visible_only_to_admins() {
+        let tracker = tracker();
+        let viewer = sign_in(&tracker, "viewer@example.com", "viewer");
+        let admin = sign_in(&tracker, "admin@example.com", "admin");
+        owned_session(&tracker, "legacy", None);
+        owned_session(&tracker, "admins-own", Some(admin.id));
+        let router = chat_router(&tracker);
+
+        assert!(listed_ids(&router, &viewer).await.is_empty());
+        let (status, _) = send(&router, "GET", "/api/chat/sessions/legacy", &viewer).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(&router, "DELETE", "/api/chat/sessions/legacy", &viewer).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        assert_eq!(listed_ids(&router, &admin).await, ["admins-own", "legacy"]);
+        let (status, body) = send(&router, "GET", "/api/chat/sessions/legacy", &admin).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["messages"][0]["content"], "private question");
+        let (status, _) = send(&router, "DELETE", "/api/chat/sessions/legacy", &admin).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(tracker.get_chat_session("legacy").unwrap().is_none());
+    }
+
+    async fn serve(router: Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        address
+    }
+
+    async fn chat_over_websocket(
+        address: std::net::SocketAddr,
+        viewer: &SignedIn,
+        session_id: Option<&str>,
+    ) -> Value {
+        let mut request = format!("ws://{address}{WEBSOCKET_PATH}")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("cookie", viewer.cookie.parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+        let mut message = serde_json::json!({ "type": "chat", "message": "hello" });
+        if let Some(session_id) = session_id {
+            message["session_id"] = Value::from(session_id);
+        }
+        socket
+            .send(Message::text(message.to_string()))
+            .await
+            .unwrap();
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("the server replies")
+            .expect("the socket stays open")
+            .unwrap();
+        serde_json::from_str(reply.to_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_websocket_attach_to_another_users_chat_session_is_rejected() {
+        let tracker = tracker();
+        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let other = sign_in(&tracker, "other@example.com", "viewer");
+        let admin = sign_in(&tracker, "admin@example.com", "admin");
+        owned_session(&tracker, "mine", Some(owner.id));
+        let address = serve(chat_router(&tracker)).await;
+
+        for intruder in [&other, &admin] {
+            let reply = chat_over_websocket(address, intruder, Some("mine")).await;
+            assert_eq!(reply["done"], true);
+            assert_eq!(reply["error"], CHAT_SESSION_NOT_FOUND);
+        }
+        assert_eq!(
+            tracker.get_chat_history("mine", 10).unwrap().len(),
+            1,
+            "a rejected attach saves nothing to the session"
+        );
+
+        let reply = chat_over_websocket(address, &owner, Some("mine")).await;
+        assert_ne!(reply["error"], CHAT_SESSION_NOT_FOUND);
+        assert_eq!(tracker.get_chat_history("mine", 10).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_websocket_creates_a_new_chat_session_owned_by_the_caller() {
+        let tracker = tracker();
+        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let address = serve(chat_router(&tracker)).await;
+
+        let reply = chat_over_websocket(address, &owner, None).await;
+        let session_id = reply["session_id"].as_str().unwrap();
+        let session = tracker.get_chat_session(session_id).unwrap().unwrap();
+        assert_eq!(session.owner_user_id, Some(owner.id));
+
+        let reply = chat_over_websocket(address, &owner, Some("named-by-client")).await;
+        assert_ne!(reply["error"], CHAT_SESSION_NOT_FOUND);
+        let session = tracker
+            .get_chat_session("named-by-client")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.owner_user_id, Some(owner.id));
     }
 }
