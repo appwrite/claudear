@@ -96,8 +96,8 @@ fn tag_version(filter: &DeployQaTagFilter, tag: &str) -> Option<Version> {
 }
 
 /// The newest tag matching `filter` and the one before it, by semantic
-/// version. `/tags` and `git/matching-refs` both list by name, which puts
-/// `1.2.99` above `1.2.141`.
+/// version. `git/matching-refs` lists by name, which puts `1.2.99` above
+/// `1.2.141`.
 ///
 /// When no matching tag is a semantic version, the first match in listing
 /// order is newest and has no predecessor.
@@ -299,7 +299,7 @@ impl<C: HttpClient> DeployQaTracker<C> {
                 .map(|release| ReleaseTip::from_release(repo, release)));
         }
 
-        let tags = self.client.get_tags(repo, PAGE_SIZE).await?;
+        let tags = self.client.get_tags_with_prefix(repo, "").await?;
         Ok(newest_tags(filter, tags).map(|(newest, previous)| {
             ReleaseTip::from_tag(repo, newest, previous.as_ref().map(|tag| tag.name.as_str()))
         }))
@@ -758,9 +758,9 @@ mod tests {
                 "[]",
             )
             .on(
-                "https://api.github.com/repos/appwrite/vibes/tags",
+                "https://api.github.com/repos/appwrite/vibes/git/matching-refs/tags/",
                 200,
-                r#"[{"name":"v0.4.0","commit":{"sha":"abc"}}]"#,
+                &references_json(&["v0.4.0"]),
             );
         let tracker = poller(http, store.clone(), config);
         let result = tracker.poll_once().await;
@@ -932,9 +932,9 @@ mod tests {
                 &body,
             )
             .on(
-                "https://api.github.com/repos/appwrite-labs/edge/tags",
+                "https://api.github.com/repos/appwrite-labs/edge/git/matching-refs/tags/",
                 200,
-                r#"[{"name":"1.0.0-db","commit":{"sha":"abc"}}]"#,
+                &references_json(&["1.0.0-db"]),
             );
         let tracker = poller(http, store.clone(), config);
 
@@ -1189,9 +1189,9 @@ mod tests {
                 "[]",
             )
             .on(
-                "https://api.github.com/repos/appwrite/vibes/tags",
+                "https://api.github.com/repos/appwrite/vibes/git/matching-refs/tags/",
                 200,
-                r#"[{"name":"v0.9.0"},{"name":"v0.10.0"},{"name":"v0.1.0"}]"#,
+                &references_json(&["v0.1.0", "v0.10.0", "v0.9.0"]),
             );
         let tracker = poller(http, store, config(vec![vibes.clone()], true));
 
@@ -1202,6 +1202,33 @@ mod tests {
             .body
             .as_deref()
             .is_some_and(|body| body.contains("compare/v0.9.0...v0.10.0")));
+    }
+
+    #[tokio::test]
+    async fn tags_fallback_reads_every_tag_not_just_the_first_page() {
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let vibes = track("vibes", "appwrite/vibes", DeployQaTagFilter::Any);
+        let names: Vec<String> = (0..40)
+            .map(|index| format!("archive-{index:02}"))
+            .chain(["v1.0.0".to_string(), "v2.0.0".to_string()])
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let http = MapMockHttp::new()
+            .on(
+                "https://api.github.com/repos/appwrite/vibes/releases",
+                200,
+                "[]",
+            )
+            .on(
+                "https://api.github.com/repos/appwrite/vibes/git/matching-refs/tags/",
+                200,
+                &references_json(&names),
+            );
+        let tracker = poller(http, store, config(vec![vibes.clone()], true));
+
+        let tip = tracker.poll_track(&vibes).await.unwrap().tip.unwrap();
+
+        assert_eq!(tip.tag, "v2.0.0");
     }
 
     #[test]

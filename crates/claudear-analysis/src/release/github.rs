@@ -269,31 +269,11 @@ impl<H: HttpClient> ReleaseClient<H> {
         Ok(response.json()?)
     }
 
-    /// List recent tags for a repository (fallback when Releases is empty).
-    pub async fn get_tags(&self, repo: &str, per_page: u32) -> Result<Vec<GitHubTag>> {
-        let url = format!(
-            "https://api.github.com/repos/{}/tags?per_page={}",
-            repo, per_page
-        );
-        let headers = self.build_headers();
-
-        let response = self.http.get(&url, headers).await?;
-
-        if !response.is_success() {
-            return Err(Error::Other(format!(
-                "GitHub API error ({}): {}",
-                response.status, response.body
-            )));
-        }
-
-        Ok(response.json()?)
-    }
-
-    /// Every tag whose name starts with `prefix`, in GitHub's (name) order.
+    /// Every tag whose name starts with `prefix` (all tags when it is empty),
+    /// in GitHub's (name) order.
     ///
     /// Reads `git/matching-refs`, which returns all matches in one response,
-    /// so a monorepo's other tags can never crowd an app's tags out of a page
-    /// the way they do in `/tags`.
+    /// so tags can never be crowded out of a page the way they are in `/tags`.
     pub async fn get_tags_with_prefix(&self, repo: &str, prefix: &str) -> Result<Vec<GitHubTag>> {
         let url = format!("https://api.github.com/repos/{repo}/git/matching-refs/tags/{prefix}");
         let headers = self.build_headers();
@@ -1029,15 +1009,6 @@ mod tests {
         assert_eq!(releases.len(), 2);
         assert_eq!(releases[0].tag_name, "v1.1.0");
         assert_eq!(releases[1].tag_name, "v1.0.0");
-    }
-
-    #[tokio::test]
-    async fn test_get_tags_success() {
-        let mock = MockHttpClient::new(200, r#"[{"name":"v1.0.0","commit":{"sha":"abc123"}}]"#);
-        let client = ReleaseClient::with_http_client("test-token", mock);
-        let tags = client.get_tags("org/repo", 10).await.unwrap();
-        assert_eq!(tags.len(), 1);
-        assert_eq!(tags[0].name, "v1.0.0");
     }
 
     #[tokio::test]
