@@ -1243,6 +1243,19 @@ async fn build_security_inbox(
     })))
 }
 
+/// Why a security inbox that is built without polling processes no report.
+const SECURITY_INBOX_NEEDS_POLLING: &str = "The security inbox only screens, assesses and replies to reports while polling, so reports wait until claudear runs with `start --poll`";
+
+/// Warn when `inbox` is built but never advanced, because only polling
+/// advances it. Returns whether it warned.
+fn warn_unless_security_inbox_advances(inbox: Option<&Arc<SecurityInbox>>, polling: bool) -> bool {
+    let idle = inbox.is_some() && !polling;
+    if idle {
+        tracing::warn!("{SECURITY_INBOX_NEEDS_POLLING}");
+    }
+    idle
+}
+
 /// The production deployment the security inbox tracks fixes into.
 fn deployment_topology(deployment: &SecurityDeploymentConfig) -> DeploymentTopology {
     DeploymentTopology {
@@ -3826,11 +3839,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             deps.inferrer.clone(),
         )
         .await;
-        if security_inbox.is_some() && !enable_polling {
-            tracing::warn!(
-                "The security inbox only processes reports while polling; start with --poll"
-            );
-        }
+        warn_unless_security_inbox_advances(security_inbox.as_ref(), enable_polling);
 
         let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: config.clone(),
@@ -4558,6 +4567,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 deps.inferrer.clone(),
             )
             .await;
+            warn_unless_security_inbox_advances(security_inbox.as_ref(), false);
 
             let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
@@ -5162,6 +5172,16 @@ mod tests {
             security_inbox_for(&security_inbox_config(true), &helpscout_sources(), false).await;
 
         assert!(inbox.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_security_inbox_built_without_polling_warns_that_it_never_advances() {
+        let inbox =
+            security_inbox_for(&security_inbox_config(true), &helpscout_sources(), true).await;
+
+        assert!(warn_unless_security_inbox_advances(inbox.as_ref(), false));
+        assert!(!warn_unless_security_inbox_advances(inbox.as_ref(), true));
+        assert!(!warn_unless_security_inbox_advances(None, false));
     }
 
     #[tokio::test]

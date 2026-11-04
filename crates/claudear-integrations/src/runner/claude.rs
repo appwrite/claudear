@@ -827,14 +827,16 @@ The PR title should include the issue ID: {}
 
     /// Build the per-invocation environment and derive a human-readable label
     /// from the optional issue. Shared by `execute` and `execute_with_attempt`
-    /// to avoid duplicating the env-var / label logic.
+    /// to avoid duplicating the env-var / label logic. A security fix's agent
+    /// gets no variable naming the fix, so the name cannot reach its pull
+    /// request.
     fn prepare_env_and_label<'a>(
         &self,
         issue: Option<&'a Issue>,
     ) -> (HashMap<String, String>, &'a str) {
         let mut env = self.base_env.clone();
 
-        if let Some(issue) = issue {
+        if let Some(issue) = issue.filter(|issue| issue.source != SECURITY_FIX_SOURCE) {
             let source_upper = issue.source.to_uppercase();
             env.insert(format!("{}_ISSUE_ID", source_upper), issue.id.clone());
             env.insert(
@@ -5397,14 +5399,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
         assert!(parsed["properties"]["blocking_question"].is_object());
     }
 
+    /// A security fix issue shaped like the security inbox's fix request.
     fn security_fix_issue() -> Issue {
-        let mut issue = Issue::new(
-            "SEC-7",
-            "SEC-7",
-            "Security fix SEC-7",
-            "",
-            SECURITY_FIX_SOURCE,
-        );
+        let mut issue = Issue::new("SEC-7", "SEC-7", "Hardening", "", SECURITY_FIX_SOURCE);
         issue.set_metadata("target_repo_name", "appwrite/appwrite");
         issue
     }
@@ -5412,6 +5409,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
     fn assert_neutral_security_prompt(prompt: &str) {
         assert!(prompt.contains("Harden the session revocation"), "{prompt}");
         assert!(!prompt.contains("SEC-"), "{prompt}");
+        assert!(!prompt.contains("Hardening"), "{prompt}");
         assert!(!prompt.contains("from security"), "{prompt}");
         assert!(!prompt.contains("PR title should include"), "{prompt}");
         assert!(!prompt.contains("issue ID"), "{prompt}");
@@ -5467,28 +5465,23 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
     }
 
     #[test]
-    fn a_security_fix_environment_names_only_the_neutral_fix() {
+    fn a_security_fix_environment_names_no_issue() {
         let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = security_fix_issue();
 
         let (environment, label) = runner.prepare_env_and_label(Some(&issue));
 
         assert_eq!(label, "SEC-7");
-        assert_eq!(
-            environment
-                .get("SECURITY_ISSUE_SHORT_ID")
-                .map(String::as_str),
-            Some("SEC-7")
-        );
-        assert_eq!(
-            environment.get("SECURITY_ISSUE_URL").map(String::as_str),
-            Some("")
-        );
-        assert!(
-            !environment.keys().any(|key| key.starts_with("HELPSCOUT_")),
-            "{:?}",
-            environment.keys().collect::<Vec<_>>()
-        );
+        let named = environment
+            .iter()
+            .filter(|(key, value)| {
+                key.starts_with("SECURITY_")
+                    || key.starts_with("HELPSCOUT_")
+                    || value.contains("SEC-")
+            })
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>();
+        assert!(named.is_empty(), "{named:?}");
     }
 
     #[test]

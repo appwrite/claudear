@@ -19,7 +19,7 @@ use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::security::SECURITY_FIX_SOURCE;
 use claudear_core::types::{
-    ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
+    ActionKind, ActivityLogEntry, AgentResult, AskRequest, ErrorPattern, Issue, ProcessingMetric,
     QaKnowledgeEntry, ReplyKind, RetrievalUsageRecord, TimelineEventStatus, TriageVerdict,
     VerifyResult,
 };
@@ -161,7 +161,14 @@ pub(crate) fn refuse_live_qa_action(action: ActionKind) -> ProcessingOutcome {
     }
 }
 
-const SECURITY_REFUSAL: &str = "security reports are handled by the security inbox";
+pub(crate) const SECURITY_REFUSAL: &str = "security reports are handled by the security inbox";
+
+/// Why a security fix stops before its agent runs when the fix prompt names
+/// the fix.
+const SECURITY_FIX_PROMPT_NOT_NEUTRAL: &str =
+    "The fix prompt names the security fix, so the fix agent was not run";
+
+const HELPSCOUT_SOURCE: &str = "helpscout";
 
 /// Why a security fix stops when its agent asks for human input.
 const SECURITY_FIX_NEEDS_HUMAN: &str =
@@ -169,9 +176,38 @@ const SECURITY_FIX_NEEDS_HUMAN: &str =
 
 /// The outcome of refusing a security conversation or security fix on a
 /// generic path: only the security inbox may act on them.
-fn refuse_security_issue() -> ProcessingOutcome {
+pub(crate) fn refuse_security_issue() -> ProcessingOutcome {
     ProcessingOutcome::CompletedNoPr {
         reason: SECURITY_REFUSAL.to_string(),
+    }
+}
+
+/// Whether `issue` belongs to the security inbox and must never reach a
+/// generic pipeline: a security issue, or a HelpScout conversation the
+/// inbox already holds a report for, even after it moved to another mailbox.
+/// A report lookup that fails counts as held.
+pub(crate) fn belongs_to_security_inbox(
+    config: &Config,
+    tracker: &dyn FixAttemptTracker,
+    issue: &Issue,
+) -> bool {
+    is_security_issue(config, issue) || has_security_report(tracker, issue)
+}
+
+fn has_security_report(tracker: &dyn FixAttemptTracker, issue: &Issue) -> bool {
+    if issue.source != HELPSCOUT_SOURCE {
+        return false;
+    }
+    match tracker.get_security_report_by_conversation(HELPSCOUT_SOURCE, &issue.id) {
+        Ok(report) => report.is_some(),
+        Err(error) => {
+            tracing::warn!(
+                short_id = %issue.short_id,
+                error = %error,
+                "Failed to check for a security report, so the conversation is held back"
+            );
+            true
+        }
     }
 }
 
@@ -179,6 +215,13 @@ fn refuse_security_issue() -> ProcessingOutcome {
 /// every generic side channel.
 fn is_security_fix(issue: &Issue) -> bool {
     issue.source == SECURITY_FIX_SOURCE
+}
+
+/// Whether the fix `prompt` for the security fix `issue` names it, so the
+/// name could reach the pull request.
+fn names_security_fix(issue: &Issue, prompt: &str) -> bool {
+    let short_id = issue.short_id.trim();
+    !short_id.is_empty() && prompt.contains(short_id)
 }
 
 /// `text` as it may be stored or notified for `issue`: scrubbed of secrets
@@ -666,17 +709,39 @@ fn build_verification_note(
     out
 }
 
-/// Prompt for the red phase: write a failing test only, no fix.
+/// Record the fix run's changelog and confidence on `issue` for the success
+/// notification. A security fix keeps only the confidence score: its
+/// changelog and reasoning are agent free text about the vulnerability.
+fn record_notification_details(issue: &mut Issue, result: &AgentResult) {
+    if result.confidence > 0 {
+        issue.set_metadata("confidence", result.confidence);
+    }
+    if is_security_fix(issue) {
+        return;
+    }
+    if let Some(ref changelog) = result.changelog {
+        issue.set_metadata("changelog", changelog.clone());
+    }
+    if let Some(ref reasoning) = result.confidence_reasoning {
+        issue.set_metadata("confidence_reasoning", reasoning.clone());
+    }
+}
+
+/// Prompt for the red phase: write a failing test only, no fix. A security
+/// fix names neither its source nor its id and title.
 fn build_failing_test_prompt(issue: &Issue, context: &str) -> String {
-    let source = if is_security_fix(issue) {
-        String::new()
+    let (source, heading) = if is_security_fix(issue) {
+        (String::new(), String::new())
     } else {
-        format!(" from {}", issue.source)
+        (
+            format!(" from {}", issue.source),
+            format!("Issue: {} - {}\n\n", issue.short_id, issue.title),
+        )
     };
     format!(
         "You are reproducing a bug{source} by writing a FAILING test. Do NOT fix it yet.\n\n\
          {context}\n\n\
-         Issue: {short_id} - {title}\n\n\
+         {heading}\
          Instructions:\n\
          1. Analyze the issue and locate the relevant code.\n\
          2. Add a single new test that reproduces the bug. It MUST fail against the current, \
@@ -686,8 +751,7 @@ fn build_failing_test_prompt(issue: &Issue, context: &str) -> String {
          Stop once the failing test is written.",
         source = source,
         context = context,
-        short_id = issue.short_id,
-        title = issue.title,
+        heading = heading,
     )
 }
 
@@ -824,7 +888,7 @@ impl IssueProcessor {
         input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
-        if is_security_issue(&self.config, &input.issue) {
+        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &input.issue) {
             tracing::warn!(
                 short_id = %input.issue.short_id,
                 source = %input.source_name,
@@ -1573,7 +1637,7 @@ impl IssueProcessor {
                         }
 
                         // Post evaluation comment on PR
-                        if self.config.evaluation.post_pr_comment {
+                        if self.posts_pull_request_comments(issue) {
                             let pr_url = match &result {
                                 Ok(ProcessingOutcome::Success { pr_url }) => Some(pr_url.as_str()),
                                 _ => None,
@@ -1928,6 +1992,13 @@ impl IssueProcessor {
                 resolution.repo_name(),
             );
 
+            if is_security_fix(issue) && names_security_fix(issue, &prompt) {
+                let error = SECURITY_FIX_PROMPT_NOT_NEUTRAL.to_string();
+                tracing::error!(short_id = %issue.short_id, "{error}");
+                self.mark_failed(source_name, issue, &error).ok();
+                return Ok(ProcessingOutcome::Failed { error });
+            }
+
             let mut run_result = self
                 .agent
                 .execute_with_attempt(&prompt, Some(issue), attempt_id, effective_project_dir)
@@ -2280,15 +2351,7 @@ impl IssueProcessor {
                 if existing_pr_branch.is_some() || review_feedback.is_some() {
                     issue.set_metadata("is_pr_update", true);
                 }
-                if let Some(ref changelog) = claude_result.changelog {
-                    issue.set_metadata("changelog", changelog.clone());
-                }
-                if claude_result.confidence > 0 {
-                    issue.set_metadata("confidence", claude_result.confidence);
-                }
-                if let Some(ref reasoning) = claude_result.confidence_reasoning {
-                    issue.set_metadata("confidence_reasoning", reasoning.clone());
-                }
+                record_notification_details(issue, &claude_result);
                 self.notifier.notify_success(issue, pr_url).await?;
                 if let Some(id) = attempt_id {
                     let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, true);
@@ -2337,10 +2400,7 @@ impl IssueProcessor {
                 }
 
                 // Post confidence comment on PR
-                if self.config.evaluation.post_pr_comment
-                    && claude_result.confidence > 0
-                    && !is_security_fix(issue)
-                {
+                if self.posts_pull_request_comments(issue) && claude_result.confidence > 0 {
                     if let Some((ref repo, pr_number)) = claudear_storage::parse_pr_url(pr_url) {
                         if let Some(ref gh) = self.github_client {
                             let mut comment =
@@ -2516,6 +2576,12 @@ impl IssueProcessor {
 
     /// The issue-embedding service for `issue`: none for a security fix, so
     /// its brief is never embedded, matched against or stored.
+    /// Whether evaluation and confidence comments are posted on `issue`'s
+    /// pull request. A security fix's pull request carries none.
+    fn posts_pull_request_comments(&self, issue: &Issue) -> bool {
+        self.config.evaluation.post_pr_comment && !is_security_fix(issue)
+    }
+
     fn embedding_service_for(&self, issue: &Issue) -> Option<&IssueEmbeddingService> {
         if is_security_fix(issue) {
             return None;
@@ -3071,7 +3137,7 @@ impl IssueProcessor {
         input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
-        if is_security_issue(&self.config, &input.issue) {
+        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &input.issue) {
             tracing::warn!(
                 short_id = %input.issue.short_id,
                 %action,

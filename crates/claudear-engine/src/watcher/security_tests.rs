@@ -9,11 +9,11 @@ use claudear_core::security::{
     security_fix_short_id, NewSecurityEvent, NewSecurityReport, NewSecurityVulnerability,
     SecurityEventKind, SecurityReportChanges, SecurityReportState, VulnerabilityState,
 };
-use claudear_core::types::{AgentResult, ReplyKind};
+use claudear_core::types::{AgentResult, IndexedRepo, ReplyKind, RepoIndex};
 use claudear_integrations::notifier::ConsoleNotifier;
 use claudear_integrations::runner::{ProviderCapabilities, SecuritySandbox};
 use claudear_integrations::scm::{CodeReview, PrInfo, RemoteRepo, ReviewComment};
-use claudear_storage::{AttemptTracker, SqliteTracker};
+use claudear_storage::{ActivityStore, AttemptTracker, SqliteTracker};
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 
@@ -22,6 +22,8 @@ const SUPPORT_MAILBOX: &str = "249877";
 const REPORT_BODY: &str =
     "The logout endpoint leaves the session token valid, so a stolen token keeps working.";
 const UNTAGGED_METADATA_KEY: &str = "untagged";
+const REVIEW_FEEDBACK: &str = "Always check the session token before trusting it";
+const SDK_REPOSITORY: &str = "appwrite/sdk";
 
 /// An agent whose security queries all fail, so every routed report is
 /// released, and whose fix runs all fail.
@@ -88,6 +90,53 @@ impl AgentRunner for Agent {
         self.queries.fetch_add(1, Ordering::SeqCst);
         Err(claudear_core::error::Error::runner(
             "the assessment agent is unavailable",
+        ))
+    }
+}
+
+/// A repository classifier that counts every classification it is asked for
+/// and classifies nothing.
+#[derive(Default)]
+struct Classifier {
+    classifications: AtomicUsize,
+}
+
+impl Classifier {
+    fn classifications(&self) -> usize {
+        self.classifications.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl AgentRunner for Classifier {
+    fn name(&self) -> &str {
+        "classifier"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
+
+    fn build_prompt_for_issue(&self, _: &Issue, context: &str, _: &Path) -> String {
+        context.to_string()
+    }
+
+    async fn execute_with_attempt(
+        &self,
+        _: &str,
+        _: Option<&Issue>,
+        _: Option<i64>,
+        _: &Path,
+    ) -> Result<AgentResult> {
+        Err(claudear_core::error::Error::runner(
+            "the classifier only classifies",
+        ))
+    }
+
+    async fn structured_query(&self, _: &str, _: &str, _: &Path) -> Result<serde_json::Value> {
+        self.classifications.fetch_add(1, Ordering::SeqCst);
+        Err(claudear_core::error::Error::runner(
+            "the classifier is unavailable",
         ))
     }
 }
@@ -266,6 +315,14 @@ fn report(conversation_id: &str) -> Issue {
     issue
 }
 
+/// The conversation of `report(conversation_id)` after it moved to the
+/// support mailbox.
+fn moved(conversation_id: &str) -> Issue {
+    let mut issue = report(conversation_id);
+    issue.set_metadata("mailbox_id", SUPPORT_MAILBOX);
+    issue
+}
+
 struct Fixture {
     tracker: Arc<SqliteTracker>,
     agent: Arc<Agent>,
@@ -356,14 +413,31 @@ impl Fixture {
             .unwrap()
     }
 
-    /// A vulnerability waiting for its first fix run, and its first report.
-    fn awaiting_fix(&self) -> (i64, i64) {
-        let report = self
-            .tracker
+    /// A watcher whose repository inference indexes one repository and asks
+    /// `classifier` to classify every issue.
+    fn classifying_watcher(&self, classifier: Arc<Classifier>) -> Arc<Watcher> {
+        let mut config = config();
+        config.llm.use_agent = true;
+        let mut index = RepoIndex::new();
+        index.add_repo(IndexedRepo::new(
+            "appwrite/appwrite",
+            std::env::temp_dir().join("appwrite"),
+        ));
+        let mut options = self.options(config, vec![self.helpscout.clone()]);
+        options.inferrer = Some(RepoInferrer::new(index));
+        options.repo_classification_agent = Some(classifier);
+        let watcher = Arc::new(Watcher::new(options));
+        watcher.set_security_inbox(self.inbox.clone());
+        watcher
+    }
+
+    /// Record the report of `conversation_id` as the security inbox does.
+    fn hold_report(&self, conversation_id: &str) -> claudear_core::security::SecurityReport {
+        self.tracker
             .upsert_security_report(&NewSecurityReport {
                 source: HELPSCOUT_SOURCE.to_string(),
-                conversation_id: "seeded".to_string(),
-                short_id: "HS-seeded".to_string(),
+                conversation_id: conversation_id.to_string(),
+                short_id: format!("HS-{conversation_id}"),
                 mailbox_id: SECURITY_MAILBOX.to_string(),
                 url: String::new(),
                 subject: "Session token survives logout".to_string(),
@@ -372,7 +446,18 @@ impl Fixture {
                 reported_at: Utc::now(),
                 customer_thread_count: 1,
             })
-            .unwrap();
+            .unwrap()
+    }
+
+    /// A vulnerability waiting for its first fix run, and its first report.
+    fn awaiting_fix(&self) -> (i64, i64) {
+        self.awaiting_fix_for("seeded")
+    }
+
+    /// A vulnerability first reported in `conversation_id` waiting for its
+    /// first fix run, and that report.
+    fn awaiting_fix_for(&self, conversation_id: &str) -> (i64, i64) {
+        let report = self.hold_report(conversation_id);
         let vulnerability = self
             .tracker
             .create_security_vulnerability(&NewSecurityVulnerability {
@@ -424,6 +509,21 @@ impl Fixture {
             .into_iter()
             .filter(|event| event.kind == SecurityEventKind::FixFailed)
             .count()
+    }
+
+    fn inference_records(&self) -> usize {
+        self.tracker.get_inference_history(100).unwrap().len()
+    }
+
+    /// A merged attempt of `source` for `pull_request`.
+    fn merged(&self, source: &str, issue_id: &str, pull_request: &str) {
+        self.tracker
+            .record_attempt(source, issue_id, issue_id)
+            .unwrap();
+        self.tracker
+            .mark_success(source, issue_id, pull_request)
+            .unwrap();
+        self.tracker.mark_merged(source, issue_id).unwrap();
     }
 
     fn fix_attempt(&self, vulnerability_id: i64) -> Option<FixAttempt> {
@@ -871,4 +971,295 @@ async fn a_generic_retry_of_a_security_conversation_records_nothing_about_it() {
         "a security conversation must leave no generic record: {mentions:?}"
     );
     assert_eq!(fixture.agent.queries(), 0);
+}
+
+fn assert_refused(outcome: crate::processing::ProcessingOutcome) {
+    match outcome {
+        crate::processing::ProcessingOutcome::CompletedNoPr { reason } => {
+            assert_eq!(reason, SECURITY_REFUSAL)
+        }
+        crate::processing::ProcessingOutcome::Failed { error } => {
+            panic!("expected the refusal, got Failed: {error}")
+        }
+        crate::processing::ProcessingOutcome::Success { pr_url } => {
+            panic!("expected the refusal, got Success: {pr_url}")
+        }
+        crate::processing::ProcessingOutcome::WrongRepo { .. } => {
+            panic!("expected the refusal, got WrongRepo")
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_action_on_a_security_conversation_reaches_no_repository_classifier() {
+    let fixture = Fixture::new();
+    fixture.helpscout.serve(vec![report("5001")]);
+    let classifier = Arc::new(Classifier::default());
+    let watcher = fixture.classifying_watcher(classifier.clone());
+
+    for action in [ActionKind::Verify, ActionKind::Reply, ActionKind::Resolve] {
+        assert_refused(
+            watcher
+                .run_action(action, HELPSCOUT_SOURCE, "5001")
+                .await
+                .unwrap(),
+        );
+    }
+
+    assert_eq!(classifier.classifications(), 0);
+    assert_eq!(fixture.inference_records(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_action_on_a_support_conversation_still_infers_its_repository() {
+    let fixture = Fixture::new();
+    let mut support = report("8812");
+    support.set_metadata("mailbox_id", SUPPORT_MAILBOX);
+    fixture.helpscout.serve(vec![support]);
+    let classifier = Arc::new(Classifier::default());
+    let watcher = fixture.classifying_watcher(classifier.clone());
+
+    watcher
+        .run_action(ActionKind::Verify, HELPSCOUT_SOURCE, "8812")
+        .await
+        .unwrap();
+
+    assert_eq!(classifier.classifications(), 1);
+    assert_eq!(fixture.inference_records(), 1);
+}
+
+#[tokio::test]
+async fn a_moved_conversation_the_inbox_holds_stays_out_of_the_poll_pipeline() {
+    let fixture = Fixture::new();
+    fixture.hold_report("5001");
+    fixture.helpscout.serve(vec![moved("5001")]);
+    let watcher = fixture.watcher();
+    watcher.set_running(true);
+
+    fixture.poll(&watcher).await;
+
+    assert!(fixture
+        .tracker
+        .get_attempt(HELPSCOUT_SOURCE, "5001")
+        .unwrap()
+        .is_none());
+    let mentions = fixture
+        .tracker
+        .get_recent_activities(100, None)
+        .unwrap()
+        .into_iter()
+        .filter(|activity| {
+            activity.issue_id.as_deref() == Some("5001")
+                || activity
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.to_string().contains("HS-5001"))
+        })
+        .map(|activity| activity.activity_type)
+        .collect::<Vec<_>>();
+    assert!(mentions.is_empty(), "{mentions:?}");
+    assert_eq!(fixture.agent.queries(), 0);
+}
+
+#[tokio::test]
+async fn a_manual_action_on_a_moved_conversation_the_inbox_holds_is_refused() {
+    let fixture = Fixture::new();
+    fixture.hold_report("5001");
+    fixture.helpscout.serve(vec![moved("5001")]);
+    let watcher = fixture.watcher();
+
+    for action in [ActionKind::Verify, ActionKind::Reply, ActionKind::Resolve] {
+        assert_refused(
+            watcher
+                .run_action(action, HELPSCOUT_SOURCE, "5001")
+                .await
+                .unwrap(),
+        );
+    }
+    assert!(fixture.helpscout.comments().is_empty());
+}
+
+#[tokio::test]
+async fn a_triggered_moved_conversation_the_inbox_holds_is_refused() {
+    let fixture = Fixture::new();
+    fixture.hold_report("5001");
+    fixture.helpscout.serve(vec![moved("5001")]);
+    let watcher = fixture.watcher();
+
+    let error = watcher
+        .trigger_issue(HELPSCOUT_SOURCE, "5001")
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains(SECURITY_REFUSAL), "{error}");
+    assert!(fixture
+        .tracker
+        .get_attempt(HELPSCOUT_SOURCE, "5001")
+        .unwrap()
+        .is_none());
+    assert_eq!(fixture.agent.queries(), 0);
+}
+
+#[tokio::test]
+async fn a_retried_moved_conversation_the_inbox_holds_is_skipped() {
+    let fixture = Fixture::new();
+    fixture.hold_report("5001");
+    fixture.helpscout.serve(vec![moved("5001")]);
+    fixture
+        .tracker
+        .record_attempt(HELPSCOUT_SOURCE, "5001", "HS-5001")
+        .unwrap();
+    fixture
+        .tracker
+        .mark_failed(HELPSCOUT_SOURCE, "5001", "an earlier failure")
+        .unwrap();
+    let attempt = fixture
+        .tracker
+        .get_attempt(HELPSCOUT_SOURCE, "5001")
+        .unwrap()
+        .unwrap();
+    let watcher = fixture.watcher();
+
+    let outcome = watcher.retry(&attempt, "Retry attempt 1").await;
+
+    match outcome {
+        RetryOutcome::Failed(error) => {
+            assert!(error.to_string().contains("was skipped"), "{error}")
+        }
+        outcome => panic!("expected a skipped retry, got {outcome:?}"),
+    }
+    let mentions = watcher
+        .tracker
+        .get_recent_activities(100)
+        .unwrap()
+        .into_iter()
+        .filter(|activity| activity.issue_id.as_deref() == Some("5001"))
+        .map(|activity| activity.activity_type)
+        .filter(|activity_type| activity_type != "retry_executed")
+        .collect::<Vec<_>>();
+    assert!(mentions.is_empty(), "{mentions:?}");
+}
+
+#[tokio::test]
+async fn seeding_skips_a_moved_conversation_the_inbox_holds() {
+    let fixture = Fixture::new();
+    fixture.hold_report("5001");
+    fixture.helpscout.serve(vec![moved("5001")]);
+    let watcher = fixture.watcher();
+
+    let seeded = watcher.seed().await.unwrap();
+
+    assert_eq!(seeded.total, 0);
+}
+
+#[tokio::test]
+async fn review_feedback_on_a_security_fix_is_not_learned() {
+    let mut config = config();
+    config.learning.review_classification = true;
+    let fixture = Fixture::with_config(config.clone());
+    let watcher = Arc::new(Watcher::new(
+        fixture.options(config, vec![fixture.helpscout.clone()]),
+    ));
+    watcher.set_security_inbox(fixture.inbox.clone());
+
+    for (source, issue_id, learned) in [
+        (SECURITY_FIX_SOURCE, "SEC-1", false),
+        ("linear", "LIN-1", true),
+    ] {
+        let repository = format!("appwrite/{issue_id}");
+        fixture
+            .tracker
+            .record_attempt(source, issue_id, issue_id)
+            .unwrap();
+        let mut attempt = fixture
+            .tracker
+            .get_attempt(source, issue_id)
+            .unwrap()
+            .unwrap();
+        attempt.scm_repo = Some(repository.clone());
+
+        let _ = watcher
+            .process_review_action(&attempt, REVIEW_FEEDBACK)
+            .await;
+
+        let patterns = fixture
+            .tracker
+            .get_review_patterns(&repository, 10)
+            .unwrap();
+        assert_eq!(!patterns.is_empty(), learned, "{source}: {patterns:?}");
+    }
+}
+
+#[tokio::test]
+async fn waiting_security_fixes_start_only_in_free_processing_slots() {
+    let fixture = Fixture::new();
+    let (first, _) = fixture.awaiting_fix_for("first");
+    let (second, _) = fixture.awaiting_fix_for("second");
+    let watcher = fixture.watcher();
+    let started = |fixture: &Fixture| {
+        [first, second]
+            .into_iter()
+            .filter(|vulnerability_id| fixture.fix_attempt(*vulnerability_id).is_some())
+            .count()
+    };
+
+    watcher.advance_security_inbox().await;
+    watcher.drain_spawned_tasks().await;
+    let after_one_advance = started(&fixture);
+    watcher.advance_security_inbox().await;
+    watcher.drain_spawned_tasks().await;
+
+    assert_eq!(after_one_advance, 1, "max_concurrent is one");
+    assert_eq!(
+        started(&fixture),
+        2,
+        "the waiting fix starts on the next advance"
+    );
+}
+
+#[tokio::test]
+async fn a_release_cascade_starts_from_the_last_merge_before_a_security_fix() {
+    let fixture = Fixture::new();
+    let watcher = fixture.watcher();
+    fixture.merged(
+        "linear",
+        "LIN-1",
+        &format!("https://github.com/{SDK_REPOSITORY}/pull/1"),
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    fixture.merged(
+        SECURITY_FIX_SOURCE,
+        "SEC-1",
+        &format!("https://github.com/{SDK_REPOSITORY}/pull/2"),
+    );
+    assert_eq!(
+        fixture
+            .tracker
+            .get_most_recent_merged_attempt_for_repo(SDK_REPOSITORY)
+            .unwrap()
+            .unwrap()
+            .source,
+        SECURITY_FIX_SOURCE,
+        "the security fix is the latest merge"
+    );
+
+    let attempt = watcher
+        .release_cascade_attempt(SDK_REPOSITORY)
+        .expect("the release cascades");
+
+    assert_eq!(attempt.source, "linear");
+    assert_eq!(attempt.issue_id, "LIN-1");
+}
+
+#[tokio::test]
+async fn a_release_whose_only_merge_is_a_security_fix_starts_no_cascade() {
+    let fixture = Fixture::new();
+    let watcher = fixture.watcher();
+    fixture.merged(
+        SECURITY_FIX_SOURCE,
+        "SEC-1",
+        &format!("https://github.com/{SDK_REPOSITORY}/pull/2"),
+    );
+
+    assert!(watcher.release_cascade_attempt(SDK_REPOSITORY).is_none());
 }
