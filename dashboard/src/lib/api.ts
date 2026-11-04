@@ -128,14 +128,95 @@ export interface LoginResponse {
   user: AuthUser
 }
 
+export type UserStatus = 'active' | 'invited'
+
 export interface UserRecord {
   id: number
   email: string
   name: string
   role: string
   avatar_url: string | null
+  status: UserStatus
+  invite_expires_at: string | null
   created_at: string
   updated_at: string
+}
+
+export interface UserInvite {
+  invite_link: string
+  invite_url: string | null
+  expires_at: string
+}
+
+export interface CreatedUser extends UserRecord {
+  invite: UserInvite | null
+}
+
+export interface InviteDetails {
+  name: string
+  email: string
+  expires_at: string
+}
+
+export type IdentityOrigin = 'console' | 'config' | 'unset'
+
+export interface Identities {
+  linear_names: string[]
+  github_usernames: string[]
+  sentry_usernames: string[]
+  jira_usernames: string[]
+  gitlab_usernames: string[]
+  discord_id: string | null
+  slack_id: string | null
+  email: string | null
+  push_user_key: string | null
+  sms_number: string | null
+  whatsapp_number: string | null
+  telegram_chat_id: string | null
+}
+
+export interface UserIdentities {
+  user_id: number
+  name: string
+  email: string | null
+  slug: string | null
+  origin: IdentityOrigin
+  status: UserStatus
+  redacted: boolean
+  identities: Identities
+  updated_at: string | null
+}
+
+export type IdentityFieldName = 'slug' | keyof Identities
+
+export interface IdentityViolation {
+  field: IdentityFieldName
+  message: string
+  email?: string
+}
+
+export type IdentitiesUpdate = { slug?: string } & {
+  [K in keyof Identities]?: Identities[K] extends string[] ? string[] : string
+}
+
+export const SENSITIVE_IDENTITY_FIELDS: ReadonlyArray<keyof Identities> = [
+  'email',
+  'push_user_key',
+  'sms_number',
+  'whatsapp_number',
+  'telegram_chat_id',
+]
+
+export class ApiError extends Error {
+  readonly status: number
+  readonly violations: IdentityViolation[]
+
+  constructor(message: string, status: number, violations: IdentityViolation[] = []) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.violations = violations
+  }
 }
 
 
@@ -765,6 +846,51 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
   return res.json()
 }
 
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE'
+
+interface ErrorBody {
+  error?: unknown
+  violations?: unknown
+}
+
+async function readErrorBody(res: Response): Promise<ErrorBody> {
+  try {
+    const body: unknown = await res.json()
+    return body !== null && typeof body === 'object' ? (body as ErrorBody) : {}
+  } catch {
+    return {}
+  }
+}
+
+async function sendJson<T>(method: HttpMethod, url: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {}
+  if (method !== 'GET') {
+    Sentry.addBreadcrumb({ category: 'api', message: `${method} ${url}`, level: 'info' })
+    headers['x-csrf-token'] = getCsrfToken()
+  }
+  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  if (res.status === 401) {
+    onUnauthorized?.()
+    throw new ApiError('Unauthorized', res.status)
+  }
+  if (!res.ok) {
+    const { error, violations } = await readErrorBody(res)
+    const message = typeof error === 'string' && error ? error : `Request to ${url} failed: ${res.status}`
+    const apiError = new ApiError(message, res.status, Array.isArray(violations) ? (violations as IdentityViolation[]) : [])
+    if (res.status >= 500) {
+      Sentry.captureException(apiError, { tags: { 'api.url': url, 'api.method': method, 'api.status': String(res.status) } })
+    }
+    throw apiError
+  }
+  if (res.status === 204) return undefined as T
+  return res.json()
+}
+
 async function deleteRequest(url: string): Promise<void> {
   Sentry.addBreadcrumb({ category: 'api', message: `DELETE ${url}`, level: 'info' })
   const res = await fetch(url, {
@@ -782,7 +908,6 @@ async function deleteRequest(url: string): Promise<void> {
   }
 }
 
-// Existing
 export async function fetchOverview(): Promise<Overview> {
   return fetchJson(`${API_BASE}/stats/overview`);
 }
@@ -829,7 +954,6 @@ export async function getSources(): Promise<SourcesResponse> {
   return fetchJson(`${API_BASE}/sources`);
 }
 
-// New fetchers
 
 export async function fetchActivity(params?: {
   limit?: number;
@@ -1203,9 +1327,9 @@ export async function getUser(id: number): Promise<UserRecord> {
 }
 
 export async function createUser(data: {
-  email: string; password: string; name: string; role: string
-}): Promise<UserRecord> {
-  return postJson(`${API_BASE}/users`, data)
+  email: string; name: string; role: string; password?: string; identities?: IdentitiesUpdate
+}): Promise<CreatedUser> {
+  return sendJson('POST', `${API_BASE}/users`, data)
 }
 
 export async function updateUser(id: number, data: {
@@ -1218,7 +1342,41 @@ export async function deleteUser(id: number): Promise<void> {
   return deleteRequest(`${API_BASE}/users/${id}`)
 }
 
-// --- Personal access tokens -------------------------------------------------
+export async function issueInvite(userId: number): Promise<UserInvite> {
+  return sendJson('POST', `${API_BASE}/users/${userId}/invite`)
+}
+
+export async function revokeInvite(userId: number): Promise<void> {
+  await sendJson<unknown>('DELETE', `${API_BASE}/users/${userId}/invite`)
+}
+
+export async function inspectInvite(token: string): Promise<InviteDetails> {
+  return sendJson('POST', `${API_BASE}/auth/invite/inspect`, { token })
+}
+
+export async function acceptInvite(token: string, password: string): Promise<void> {
+  await sendJson<unknown>('POST', `${API_BASE}/auth/invite/accept`, { token, password })
+}
+
+export function inviteAbsoluteUrl(invite: UserInvite): string {
+  return invite.invite_url ?? window.location.origin + invite.invite_link
+}
+
+export async function fetchIdentities(): Promise<UserIdentities[]> {
+  return sendJson('GET', `${API_BASE}/identities`)
+}
+
+export async function fetchUserIdentities(userId: number): Promise<UserIdentities> {
+  return sendJson('GET', `${API_BASE}/users/${userId}/identities`)
+}
+
+export async function updateUserIdentities(userId: number, update: IdentitiesUpdate): Promise<UserIdentities> {
+  return sendJson('PUT', `${API_BASE}/users/${userId}/identities`, update)
+}
+
+export async function resetUserIdentities(userId: number): Promise<UserIdentities> {
+  return sendJson('DELETE', `${API_BASE}/users/${userId}/identities`)
+}
 
 /** A personal access token (never includes the secret after creation). */
 export interface ApiToken {
