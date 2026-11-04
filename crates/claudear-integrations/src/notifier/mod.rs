@@ -49,7 +49,7 @@ pub mod ask_orchestrator;
 mod console;
 mod discord;
 mod email;
-mod html;
+pub(crate) mod html;
 mod push;
 mod slack;
 mod sms;

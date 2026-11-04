@@ -6,6 +6,7 @@
 use super::ConversationStatus;
 use super::IssueSource;
 use super::ReporterReply;
+use crate::notifier::html;
 use abnegate_http::HttpClient;
 use abnegate_http::HttpResponse;
 use abnegate_http::ReqwestHttpClient;
@@ -15,6 +16,8 @@ use claudear_config::config::MailboxProfile;
 use claudear_config::config::ReplyAs;
 use claudear_config::config::ATTACHMENTS_METADATA_KEY;
 use claudear_config::config::CUSTOMER_THREAD_COUNT_METADATA_KEY;
+use claudear_config::config::HELPSCOUT_SOURCE;
+use claudear_config::config::MAILBOX_ID_METADATA_KEY;
 use claudear_config::config::MAILBOX_PROFILE_METADATA_KEY;
 use claudear_core::error::Error;
 use claudear_core::error::Result;
@@ -204,7 +207,7 @@ impl<H: HttpClient> HelpScoutSource<H> {
             .await?;
         if !response.is_success() {
             return Err(Error::source(
-                "helpscout",
+                HELPSCOUT_SOURCE,
                 format!(
                     "token request failed ({}): {}",
                     response.status, response.body
@@ -276,7 +279,7 @@ impl<H: HttpClient> HelpScoutSource<H> {
             let response = self.api_get(&path).await?;
             if !response.is_success() {
                 return Err(Error::source(
-                    "helpscout",
+                    HELPSCOUT_SOURCE,
                     format!(
                         "list conversations failed ({}): {}",
                         response.status, response.body
@@ -314,11 +317,11 @@ impl<H: HttpClient> HelpScoutSource<H> {
             .api_get(&format!("/v2/conversations/{issue_id}"))
             .await?;
         if response.is_not_found() {
-            return Err(Error::issue_not_found("helpscout", issue_id));
+            return Err(Error::issue_not_found(HELPSCOUT_SOURCE, issue_id));
         }
         if !response.is_success() {
             return Err(Error::source(
-                "helpscout",
+                HELPSCOUT_SOURCE,
                 format!(
                     "get conversation failed ({}): {}",
                     response.status, response.body
@@ -336,7 +339,7 @@ impl<H: HttpClient> HelpScoutSource<H> {
             Ok(conversation) => conversation,
             Err(error) => {
                 tracing::warn!(
-                    source = "helpscout",
+                    source = HELPSCOUT_SOURCE,
                     issue_id = %issue_id,
                     error = %error,
                     "Conversation lookup failed; posting the comment as a note"
@@ -358,7 +361,10 @@ impl<H: HttpClient> HelpScoutSource<H> {
                 .customer_id()
                 .map(|id| Some(id.to_string()))
                 .ok_or_else(|| {
-                    Error::source("helpscout", "conversation has no customer id for reply")
+                    Error::source(
+                        HELPSCOUT_SOURCE,
+                        "conversation has no customer id for reply",
+                    )
                 }),
         }
     }
@@ -382,7 +388,7 @@ impl<H: HttpClient> HelpScoutSource<H> {
             Ok(())
         } else {
             Err(Error::source(
-                "helpscout",
+                HELPSCOUT_SOURCE,
                 format!("{action} failed ({}): {}", response.status, response.body),
             ))
         }
@@ -402,7 +408,7 @@ impl<H: HttpClient> HelpScoutSource<H> {
             .unwrap_or_else(|| format!("Conversation {number}"));
         let url = format!("https://secure.helpscout.net/conversation/{}", c.id);
 
-        let mut issue = Issue::new(c.id.to_string(), short_id, title, url, "helpscout");
+        let mut issue = Issue::new(c.id.to_string(), short_id, title, url, HELPSCOUT_SOURCE);
 
         // Capture timestamps so consumers (e.g. the MCP list tool) can order
         // conversations globally; `updated_at` falls back to `created_at`.
@@ -448,7 +454,7 @@ impl<H: HttpClient> HelpScoutSource<H> {
             u32::try_from(customer_threads.len()).unwrap_or(u32::MAX),
         );
         if let Some(mailbox_id) = mailbox_id {
-            issue.set_metadata("mailbox_id", mailbox_id);
+            issue.set_metadata(MAILBOX_ID_METADATA_KEY, mailbox_id);
         }
         issue.set_metadata("tags", &tags);
         // `labels` is the key the pipeline reads to populate FixAttempt.issue_labels
@@ -554,6 +560,12 @@ const SKIPPED_TAGS: &[&str] = &["script", "style", "head"];
 /// Convert an HTML thread body to plain text: tags are dropped (block tags
 /// become line or paragraph breaks, script/style contents vanish), entities are
 /// decoded and blank lines are collapsed.
+/// `text` as HelpScout thread HTML: markup characters escaped so reporter- or
+/// agent-derived text renders literally, and line breaks kept as `<br>`.
+fn plain_text_html(text: &str) -> String {
+    html::escape(&text.replace("\r\n", "\n")).replace('\n', "<br>")
+}
+
 fn html_to_text(html: &str) -> String {
     let mut text = String::with_capacity(html.len());
     let mut rest = html;
@@ -783,7 +795,7 @@ fn format_helpscout_context(issue: &Issue) -> String {
 #[async_trait]
 impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
     fn name(&self) -> &str {
-        "helpscout"
+        HELPSCOUT_SOURCE
     }
 
     fn display_name(&self) -> &str {
@@ -802,15 +814,17 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
         Ok(issues
             .into_iter()
             .filter(|issue| {
-                !self
-                    .config
-                    .treats_as_security(issue.get_metadata::<String>("mailbox_id").as_deref())
+                !self.config.treats_as_security(
+                    issue
+                        .get_metadata::<String>(MAILBOX_ID_METADATA_KEY)
+                        .as_deref(),
+                )
             })
             .collect())
     }
 
     fn matches_criteria(&self, issue: &Issue) -> MatchResult {
-        let mailbox_id: Option<String> = issue.get_metadata("mailbox_id");
+        let mailbox_id: Option<String> = issue.get_metadata(MAILBOX_ID_METADATA_KEY);
         let trigger_tags = match mailbox_id.as_deref() {
             Some(mailbox) => self.config.trigger_tags_for(mailbox),
             None if self.config.has_security_mailbox() => {
@@ -861,7 +875,10 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
                     // A customer-facing reply requires the customer id.
                     let issue = self.get_issue(issue_id).await?;
                     Some(issue.get_metadata::<String>("customer_id").ok_or_else(|| {
-                        Error::source("helpscout", "conversation has no customer id for reply")
+                        Error::source(
+                            HELPSCOUT_SOURCE,
+                            "conversation has no customer id for reply",
+                        )
                     })?)
                 }
             }
@@ -894,7 +911,7 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
             Ok(())
         } else {
             Err(Error::source(
-                "helpscout",
+                HELPSCOUT_SOURCE,
                 format!("post reply failed ({}): {}", response.status, response.body),
             ))
         }
@@ -918,9 +935,9 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
         let Some(mailbox_id) = conversation.mailbox_id.map(|id| id.to_string()) else {
             return ReporterReply::Rejected("conversation has no mailbox id".to_string());
         };
-        if self.config.reply_as_for(&mailbox_id) != ReplyAs::Reply {
+        if !self.config.is_security_mailbox(&mailbox_id) {
             return ReporterReply::Rejected(format!(
-                "mailbox {mailbox_id} does not send customer replies"
+                "mailbox {mailbox_id} is not a security mailbox"
             ));
         }
         let Some(customer_id) = conversation.customer_id() else {
@@ -932,7 +949,7 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
         };
 
         let mut payload = serde_json::json!({
-            "text": body,
+            "text": plain_text_html(body),
             "customer": { "id": customer_id },
         });
         if let Some(status) = status {
@@ -971,7 +988,7 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
     async fn mark_spam(&self, issue_id: &str) -> Result<()> {
         if !is_conversation_id(issue_id) {
             return Err(Error::source(
-                "helpscout",
+                HELPSCOUT_SOURCE,
                 format!("invalid conversation id '{issue_id}'"),
             ));
         }
@@ -1495,7 +1512,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&replies[0].body).unwrap();
         assert_eq!(
             body,
-            serde_json::json!({"text": "Hi,\n\nThanks.", "customer": {"id": 99}, "status": "closed"})
+            serde_json::json!({"text": "Hi,<br><br>Thanks.", "customer": {"id": 99}, "status": "closed"})
         );
         assert!(source.http.requests_to("POST", "/notes").is_empty());
     }
@@ -1612,7 +1629,7 @@ mod tests {
             (
                 "42",
                 conversation_body(SUPPORT_MAILBOX, Some(99)),
-                "does not send",
+                "not a security mailbox",
             ),
             (
                 "42",
@@ -1659,6 +1676,68 @@ mod tests {
             ReporterReply::Rejected(_)
         ));
         assert!(source.http.requests_to("POST", "/reply").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reply_to_reporter_rejects_a_support_mailbox_that_sends_replies() {
+        let mut config = security_config();
+        config.reply_as = ReplyAs::Reply;
+        config.mailboxes.push(HelpScoutMailboxConfig {
+            id: SUPPORT_MAILBOX.to_string(),
+            profile: MailboxProfile::Support,
+            reply_as: Some(ReplyAs::Reply),
+            trigger_tags: None,
+            trigger_status: None,
+        });
+        assert_eq!(config.reply_as_for(SUPPORT_MAILBOX), ReplyAs::Reply);
+        let mock = MockHttpClient::new(vec![
+            ("/v2/oauth2/token", 200, TOKEN_BODY),
+            ("/reply", 201, ""),
+        ])
+        .on(
+            "GET",
+            "/v2/conversations/42",
+            200,
+            &conversation_body(SUPPORT_MAILBOX, Some(99)),
+        );
+        let source = HelpScoutSource::with_http_client(config, mock);
+
+        let outcome = source.reply_to_reporter("42", "x", None).await;
+
+        assert!(
+            matches!(&outcome, ReporterReply::Rejected(reason) if reason.contains("not a security mailbox")),
+            "{outcome:?}"
+        );
+        assert!(source.http.requests_to("POST", "/reply").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reply_to_reporter_escapes_markup_and_keeps_line_breaks() {
+        let mock = MockHttpClient::new(vec![("/v2/oauth2/token", 200, TOKEN_BODY)])
+            .on(
+                "GET",
+                "/v2/conversations/42",
+                200,
+                &conversation_body(SECURITY_MAILBOX, Some(99)),
+            )
+            .on("POST", "/reply", 201, "");
+        let source = HelpScoutSource::with_http_client(security_config(), mock);
+
+        let outcome = source
+            .reply_to_reporter(
+                "42",
+                "Hi,\r\n\nThe <img src=x onerror=alert(1)> & \"token\" isn't valid.",
+                None,
+            )
+            .await;
+
+        assert_eq!(outcome, ReporterReply::Sent);
+        let body: serde_json::Value =
+            serde_json::from_str(&source.http.requests_to("POST", "/reply")[0].body).unwrap();
+        assert_eq!(
+            body["text"],
+            "Hi,<br><br>The &lt;img src=x onerror=alert(1)&gt; &amp; &quot;token&quot; isn't valid."
+        );
     }
 
     #[tokio::test]
