@@ -874,8 +874,11 @@ github_search_repos = []
 # bot posts. Required env for a live host (not used in CI):
 #   CLAUDEAR_GITHUB_TOKEN          - GitHub token for release/tag polling;
 #                                    required (or scm.github.token) whenever
-#                                    deploy_qa is enabled with tracks
-#   CLAUDEAR_DISCORD_BOT_TOKEN     - bot that can reply / create threads
+#                                    deploy_qa is enabled with tracks; needs
+#                                    Actions read on private repos to link a
+#                                    bare tag's deploy run
+#   CLAUDEAR_DISCORD_BOT_TOKEN     - bot that can post, read history, reply
+#                                    and create threads (it announces bare tags)
 #   QA credentials the playbook's checks need (e.g. a throwaway QA project's
 #   API key) - set in the daemon or provider env, which every agent run
 #   inherits, so scope them to the QA project, and don't name them CLAUDEAR_*,
@@ -923,6 +926,8 @@ tag_filter = "suffix:-db"
 
 # The console deploys from apps/console/<version> tags in the appwrite
 # monorepo, which carry no GitHub release; the repo's releases are the server's.
+# GitHub's release feed never posts a bare tag, so Claudear announces it in
+# discord_channel_id itself and replies with the QA outcome under that.
 [[deploy_qa.tracks]]
 name = "console"
 repo = "appwrite/appwrite"
