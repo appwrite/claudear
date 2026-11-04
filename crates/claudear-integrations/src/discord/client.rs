@@ -268,13 +268,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         let response = self.http.get(&url).await?;
 
         if !response.is_success() {
-            return Err(Error::notifier(
-                "discord",
-                format!(
-                    "Failed to list channel messages ({}): {}",
-                    response.status, response.body
-                ),
-            ));
+            return Err(list_channel_messages_failure(&response));
         }
 
         Ok(response.json()?)
@@ -296,13 +290,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         let response = self.http.get(&url).await?;
 
         if !response.is_success() {
-            return Err(Error::notifier(
-                "discord",
-                format!(
-                    "Failed to list channel messages ({}): {}",
-                    response.status, response.body
-                ),
-            ));
+            return Err(list_channel_messages_failure(&response));
         }
 
         // Discord returns messages newest-first; reverse to get chronological order
@@ -327,13 +315,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         let response = self.http.get(&url).await?;
 
         if !response.is_success() {
-            return Err(Error::notifier(
-                "discord",
-                format!(
-                    "Failed to list channel messages ({}): {}",
-                    response.status, response.body
-                ),
-            ));
+            return Err(list_channel_messages_failure(&response));
         }
 
         // Discord returns messages newest-first; reverse to get chronological order
@@ -544,6 +526,21 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         }
 
         Ok(all)
+    }
+}
+
+/// The error for a failed message listing. Discord answers 403 (`50001
+/// Missing Access`, `50013 Missing Permissions`) when the bot lacks View
+/// Channel or Read Message History on the channel.
+fn list_channel_messages_failure(response: &HttpResponse) -> Error {
+    let message = format!(
+        "Failed to list channel messages ({}): {}",
+        response.status, response.body
+    );
+    if response.status == 403 {
+        Error::forbidden("discord", message)
+    } else {
+        Error::notifier("discord", message)
     }
 }
 
@@ -854,6 +851,58 @@ mod tests {
         let messages = client.list_channel_messages("123", 10).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, "999");
+    }
+
+    #[tokio::test]
+    async fn test_list_channel_messages_without_access_is_forbidden() {
+        let mock = MockDiscordClient::new();
+        let url = "https://discord.com/api/v10/channels/123/messages";
+        mock.mock_get(
+            format!("{url}?limit=100"),
+            403,
+            r#"{"message": "Missing Access", "code": 50001}"#,
+        );
+        mock.mock_get(
+            format!("{url}?after=1&limit=100"),
+            403,
+            r#"{"message": "Missing Permissions", "code": 50013}"#,
+        );
+        mock.mock_get(
+            format!("{url}?before=1&limit=100"),
+            403,
+            r#"{"message": "Missing Access", "code": 50001}"#,
+        );
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+
+        let results = [
+            client.list_channel_messages("123", 100).await,
+            client.list_channel_messages_after("123", "1", 100).await,
+            client.list_channel_messages_before("123", "1", 100).await,
+        ];
+
+        for result in results {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::Forbidden { .. }),
+                "a 403 must be typed as forbidden: {error}"
+            );
+            assert!(error.to_string().contains("Missing"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_channel_messages_server_error_is_not_forbidden() {
+        let mock = MockDiscordClient::new();
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/messages?limit=100",
+            503,
+            "upstream connect error",
+        );
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+
+        let error = client.list_channel_messages("123", 100).await.unwrap_err();
+
+        assert!(matches!(error, Error::Notifier { .. }), "{error}");
     }
 
     #[tokio::test]
