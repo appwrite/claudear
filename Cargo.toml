@@ -115,6 +115,9 @@ libc = "0.2"
 # Parallel iteration
 rayon = "1"
 
+# Synchronization
+parking_lot = "0.12"
+
 # File system utilities
 walkdir = "2"
 dirs = "7"

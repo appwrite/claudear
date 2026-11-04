@@ -104,6 +104,7 @@ jobs:
     name: Test (${{ matrix.crate }})
     needs: [compile]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -166,7 +167,7 @@ jobs:
       # the prebuilt .so from the vectorlite-py wheel and point the loader at it
       # so the semantic-search tests exercise real, populated results.
       - name: Install vectorlite extension
-        if: matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
+        if: matrix.crate == 'claudear-storage' || matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
         run: |
           python3 -m pip install -q vectorlite-py
           # vectorlite_path() returns the path without a file extension, but the
