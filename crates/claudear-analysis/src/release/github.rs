@@ -50,89 +50,6 @@ pub struct GitHubTag {
     /// Lightweight commit pointer.
     #[serde(default)]
     pub commit: Option<GitHubTagCommit>,
-    /// SHA of the annotated tag object, when the tag is annotated.
-    #[serde(default)]
-    pub annotation: Option<String>,
-}
-
-/// An annotated tag object from `GET /repos/{owner}/{repo}/git/tags/{sha}`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GitHubAnnotatedTag {
-    /// Who created the tag. Git records a name and email, never a login.
-    #[serde(default)]
-    pub tagger: Option<GitIdentity>,
-    /// The object the tag points at, normally a commit.
-    pub object: GitHubTaggedObject,
-}
-
-/// The object an annotated tag points at.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GitHubTaggedObject {
-    /// Object SHA.
-    pub sha: String,
-    /// Object type (`commit`, or `tag` for a tag of a tag).
-    #[serde(rename = "type")]
-    pub kind: String,
-}
-
-/// A git author, committer or tagger as git records it.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GitIdentity {
-    /// Name.
-    #[serde(default)]
-    pub name: Option<String>,
-    /// Email.
-    #[serde(default)]
-    pub email: Option<String>,
-}
-
-/// A commit from `GET /repos/{owner}/{repo}/commits/{sha}`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GitHubCommit {
-    /// The GitHub account of the commit's author, when its email maps to one.
-    #[serde(default)]
-    pub author: Option<ReleaseAuthor>,
-    /// The GitHub account of the commit's committer, when its email maps to one.
-    #[serde(default)]
-    pub committer: Option<ReleaseAuthor>,
-    /// The commit's git identities.
-    pub commit: GitHubCommitDetail,
-}
-
-/// The git identities on a [`GitHubCommit`].
-#[derive(Debug, Clone, Deserialize)]
-pub struct GitHubCommitDetail {
-    /// Author identity.
-    #[serde(default)]
-    pub author: Option<GitIdentity>,
-    /// Committer identity.
-    #[serde(default)]
-    pub committer: Option<GitIdentity>,
-}
-
-/// A GitHub Actions workflow run.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GitHubWorkflowRun {
-    /// Workflow name (e.g. `Console / Production`).
-    #[serde(default)]
-    pub name: Option<String>,
-    /// Run number within its workflow.
-    #[serde(default)]
-    pub run_number: Option<u64>,
-    /// Commit the run built.
-    #[serde(default)]
-    pub head_sha: Option<String>,
-    /// Run page URL.
-    pub html_url: String,
-    /// Account whose push started the run.
-    #[serde(default)]
-    pub actor: Option<ReleaseAuthor>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GitHubWorkflowRuns {
-    #[serde(default)]
-    workflow_runs: Vec<GitHubWorkflowRun>,
 }
 
 /// Commit pointer on a GitHub tag.
@@ -375,69 +292,16 @@ impl<H: HttpClient> ReleaseClient<H> {
             .into_iter()
             .filter_map(|reference| {
                 let name = reference.name.strip_prefix(TAG_REFERENCE_NAMESPACE)?;
-                let (commit, annotation) = if reference.object.kind == COMMIT_OBJECT_KIND {
-                    let commit = GitHubTagCommit {
+                let commit =
+                    (reference.object.kind == COMMIT_OBJECT_KIND).then_some(GitHubTagCommit {
                         sha: Some(reference.object.sha),
-                    };
-                    (Some(commit), None)
-                } else {
-                    (None, Some(reference.object.sha))
-                };
+                    });
                 Some(GitHubTag {
                     name: name.to_string(),
                     commit,
-                    annotation,
                 })
             })
             .collect())
-    }
-
-    /// The annotated tag object `sha`, or `None` when it does not exist.
-    pub async fn get_annotated_tag(
-        &self,
-        repo: &str,
-        sha: &str,
-    ) -> Result<Option<GitHubAnnotatedTag>> {
-        let url = format!("https://api.github.com/repos/{repo}/git/tags/{sha}");
-        self.get_optional(&url).await
-    }
-
-    /// The commit `sha`, or `None` when it does not exist.
-    pub async fn get_commit(&self, repo: &str, sha: &str) -> Result<Option<GitHubCommit>> {
-        let url = format!("https://api.github.com/repos/{repo}/commits/{sha}");
-        self.get_optional(&url).await
-    }
-
-    /// Workflow runs a push of `reference` (a branch or tag name) started,
-    /// newest first.
-    pub async fn get_push_workflow_runs(
-        &self,
-        repo: &str,
-        reference: &str,
-    ) -> Result<Vec<GitHubWorkflowRun>> {
-        let url = format!(
-            "https://api.github.com/repos/{repo}/actions/runs?event=push&branch={}&per_page=10",
-            urlencoding::encode(reference)
-        );
-        Ok(self
-            .get_optional::<GitHubWorkflowRuns>(&url)
-            .await?
-            .map(|runs| runs.workflow_runs)
-            .unwrap_or_default())
-    }
-
-    async fn get_optional<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<Option<T>> {
-        let response = self.http.get(url, self.build_headers()).await?;
-        if response.is_not_found() {
-            return Ok(None);
-        }
-        if !response.is_success() {
-            return Err(Error::Other(format!(
-                "GitHub API error ({}): {}",
-                response.status, response.body
-            )));
-        }
-        Ok(Some(response.json()?))
     }
 
     /// Get a specific release by tag.
@@ -1177,8 +1041,6 @@ mod tests {
             tags[1].commit.is_none(),
             "an annotated tag's object is a tag, not the commit"
         );
-        assert_eq!(tags[1].annotation.as_deref(), Some("40384e6"));
-        assert_eq!(tags[0].annotation, None);
     }
 
     #[tokio::test]

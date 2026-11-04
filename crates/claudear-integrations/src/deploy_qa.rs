@@ -2,17 +2,12 @@
 //!
 //! All verified or unverified: reply under the automated release announcement
 //! (no @). FAIL: post in the announcement's thread and `@` the mapped releaser.
-//! GitHub's release feed never announces a bare tag, so Claudear announces it
-//! itself ([`DeployQaAnnouncer`]) and the outcome replies under that. A tip
-//! whose announcement cannot be found gets a post of its own in the channel
-//! instead, with the same `@` rule.
+//! A tip nothing announced, such as a bare monorepo tag, gets a post of its own
+//! in the channel instead, with the same `@` rule.
 
-use async_trait::async_trait;
 use claudear_analysis::deploy_qa::{
-    classify_deploy_qa_verdict, DeployQaAnnouncement, DeployQaAnnouncer, DeployQaVerdict,
-    GitHubDiscordMap, ANNOUNCEMENT_FOOTER, DEPLOY_QA_SOURCE,
+    classify_deploy_qa_verdict, DeployQaVerdict, GitHubDiscordMap, DEPLOY_QA_SOURCE,
 };
-use claudear_config::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::secret::Redactor;
 use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
@@ -26,10 +21,6 @@ use crate::discord::{
 const COLOR_VERIFIED: u32 = 0x2ecc71;
 const COLOR_UNVERIFIED: u32 = 0xffbf00;
 const COLOR_FAIL: u32 = 0xe74c3c;
-const COLOR_ANNOUNCEMENT: u32 = 0x24292f;
-
-/// [`UserRegistry::resolve`] source whose usernames are GitHub logins.
-const GITHUB_USER_SOURCE: &str = "github";
 
 const TITLE_VERIFIED: &str = "All PRs verified";
 const TITLE_UNVERIFIED: &str = "Not fully verified";
@@ -51,7 +42,6 @@ pub struct DeployQaDiscord<H: DiscordHttpClient = ReqwestDiscordClient> {
     client: DiscordClient<H>,
     channel_id: String,
     map: GitHubDiscordMap,
-    users: UserRegistry,
     redactor: Redactor,
 }
 
@@ -67,7 +57,6 @@ impl DeployQaDiscord<ReqwestDiscordClient> {
             client: DiscordClient::new(bot_token)?,
             channel_id: channel_id.into(),
             map,
-            users: UserRegistry::default(),
             redactor,
         })
     }
@@ -85,90 +74,8 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
             client,
             channel_id: channel_id.into(),
             map,
-            users: UserRegistry::default(),
             redactor,
         }
-    }
-
-    /// Also resolve releasers through `[users]`, for GitHub logins the
-    /// GitHub↔Discord map does not name.
-    pub fn with_users(mut self, users: UserRegistry) -> Self {
-        self.users = users;
-        self
-    }
-
-    /// Discord mention for a GitHub login: the GitHub↔Discord map first, then
-    /// a `[users]` entry listing the login in `github_usernames`.
-    pub fn mention_for_login(&self, login: &str) -> Option<String> {
-        self.map.mention_for(login).or_else(|| {
-            self.users
-                .resolve(GITHUB_USER_SOURCE, login)
-                .and_then(|user| user.discord_id)
-                .map(|discord_id| format!("<@{discord_id}>"))
-        })
-    }
-
-    /// Claudear's own announcement for `announcement`'s tag among the
-    /// channel's recent messages.
-    async fn find_announcement(
-        &self,
-        announcement: &DeployQaAnnouncement,
-    ) -> Result<Option<String>> {
-        let messages = self
-            .client
-            .list_channel_messages(&self.channel_id, RELEASE_SEARCH_PAGE_SIZE)
-            .await?;
-        Ok(messages
-            .into_iter()
-            .find(|message| {
-                is_automated(message)
-                    && message.embeds.iter().any(|embed| {
-                        embed
-                            .footer
-                            .as_ref()
-                            .is_some_and(|footer| footer.text == ANNOUNCEMENT_FOOTER)
-                            && embed
-                                .url
-                                .as_deref()
-                                .is_some_and(|url| same_url(url, &announcement.tag_url))
-                    })
-            })
-            .map(|message| message.id))
-    }
-
-    fn announcement_embed(&self, announcement: &DeployQaAnnouncement) -> MessageEmbed {
-        let releaser = match announcement.releaser_login.as_deref() {
-            Some(login) => match self.mention_for_login(login) {
-                Some(mention) => format!("{mention} (`{login}`)"),
-                None => format!("`{login}`"),
-            },
-            None => "unknown".to_string(),
-        };
-        let mut embed = MessageEmbed::new()
-            .title(format!(
-                "[{}] New {} release: {}",
-                announcement.repo, announcement.track, announcement.tag
-            ))
-            .url(&announcement.tag_url)
-            .color(COLOR_ANNOUNCEMENT)
-            .field("Version", format!("`{}`", announcement.version), true)
-            .field("Released by", releaser, true);
-        if let (Some(previous), Some(compare_url)) = (
-            announcement.previous_tag.as_deref(),
-            announcement.compare_url(),
-        ) {
-            embed = embed.field(
-                "Changes",
-                format!("[{previous}...{}]({compare_url})", announcement.tag),
-                false,
-            );
-        }
-        if let Some(run) = announcement.deploy_run.as_ref() {
-            embed = embed.field("Deploy", format!("[{}]({})", run.name, run.url), false);
-        }
-        embed
-            .footer(ANNOUNCEMENT_FOOTER)
-            .timestamp(chrono::Utc::now().to_rfc3339())
     }
 
     /// Find the automated `#releases` announcement for `tip`.
@@ -358,30 +265,15 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
             );
             return None;
         };
-        let mention = self.mention_for_login(login);
+        let mention = self.map.mention_for(login);
         if mention.is_none() {
             tracing::warn!(
                 login,
                 tag = %tip.tag,
-                "deploy_qa: releaser is in neither the GitHub↔Discord map nor [users]; posting FAIL without @releaser"
+                "deploy_qa: releaser is not in the GitHub↔Discord map; posting FAIL without @releaser"
             );
         }
         mention
-    }
-}
-
-#[async_trait]
-impl<H: DiscordHttpClient> DeployQaAnnouncer for DeployQaDiscord<H> {
-    async fn announce(&self, announcement: &DeployQaAnnouncement) -> Result<String> {
-        if let Some(message_id) = self.find_announcement(announcement).await? {
-            return Ok(message_id);
-        }
-        let embed = self.announcement_embed(announcement);
-        let sent = self
-            .client
-            .send_message(&self.channel_id, CreateMessageParams::with_embed("", embed))
-            .await?;
-        Ok(sent.id)
     }
 }
 
@@ -1605,234 +1497,6 @@ mod tests {
         assert!(
             truncated.ends_with(&footer),
             "a cut report must keep its tail, where the verdict footer is"
-        );
-    }
-
-    const ANNOUNCEMENT_MESSAGE: &str = "7777";
-    const REGISTRY_LOGIN: &str = "atharvadeosthale";
-    const REGISTRY_DISCORD_ID: &str = "822500146658017292";
-
-    fn console_announcement(releaser: Option<&str>) -> DeployQaAnnouncement {
-        DeployQaAnnouncement {
-            track: "console".into(),
-            repo: CONSOLE_REPO.into(),
-            tag: CONSOLE_TAG.into(),
-            version: "1.2.141".into(),
-            tag_url: release_url(CONSOLE_REPO, CONSOLE_TAG),
-            previous_tag: Some("apps/console/1.2.140".into()),
-            deploy_run: Some(claudear_analysis::deploy_qa::DeployRun {
-                name: "Console / Production #312".into(),
-                url: "https://github.com/appwrite/appwrite/actions/runs/41684208512".into(),
-            }),
-            releaser_login: releaser.map(str::to_string),
-        }
-    }
-
-    fn registry() -> UserRegistry {
-        let user = claudear_config::config::UserConfig {
-            github_usernames: vec![REGISTRY_LOGIN.to_string()],
-            discord_id: Some(REGISTRY_DISCORD_ID.to_string()),
-            ..Default::default()
-        };
-        UserRegistry::new(std::collections::HashMap::from([(
-            "atharva".to_string(),
-            user,
-        )]))
-    }
-
-    fn field<'a>(request: &'a Request, name: &str) -> &'a str {
-        request.body["embeds"][0]["fields"]
-            .as_array()
-            .and_then(|fields| fields.iter().find(|field| field["name"] == name))
-            .and_then(|field| field["value"].as_str())
-            .unwrap_or_default()
-    }
-
-    /// Claudear's own announcement, as Discord lists it back.
-    fn posted_announcement(id: &str, tag_url: &str) -> Value {
-        json!({
-            "id": id,
-            "channel_id": CHANNEL,
-            "content": "",
-            "timestamp": "2026-11-03T17:30:00Z",
-            "author": { "id": "800", "username": "Claudear", "bot": true },
-            "embeds": [{
-                "title": format!("[{CONSOLE_REPO}] New console release: {CONSOLE_TAG}"),
-                "url": tag_url,
-                "footer": { "text": ANNOUNCEMENT_FOOTER }
-            }]
-        })
-    }
-
-    #[tokio::test]
-    async fn announcement_names_the_tag_version_changes_deploy_and_releaser() {
-        let (discord, requests) = reporter(Vec::new(), false);
-
-        let id = discord
-            .announce(&console_announcement(Some(RELEASER)))
-            .await
-            .unwrap();
-
-        let posted = posts(&requests);
-        assert_eq!(posted.len(), 1, "{posted:?}");
-        let post = &posted[0];
-        assert_eq!(id, format!("sent-in-{CHANNEL}"));
-        assert!(post.is_post_to(&format!("/channels/{CHANNEL}/messages")));
-        assert!(post.body["message_reference"].is_null());
-        let embed = &post.body["embeds"][0];
-        assert_eq!(
-            embed["title"],
-            "[appwrite/appwrite] New console release: apps/console/1.2.141"
-        );
-        assert_eq!(embed["url"], release_url(CONSOLE_REPO, CONSOLE_TAG));
-        assert_eq!(embed["footer"]["text"], ANNOUNCEMENT_FOOTER);
-        assert_eq!(field(post, "Version"), "`1.2.141`");
-        assert_eq!(
-            field(post, "Released by"),
-            format!("<@{RELEASER_DISCORD_ID}> (`{RELEASER}`)")
-        );
-        assert_eq!(
-            field(post, "Changes"),
-            "[apps/console/1.2.140...apps/console/1.2.141](https://github.com/appwrite/appwrite/compare/apps/console/1.2.140...apps/console/1.2.141)"
-        );
-        assert_eq!(
-            field(post, "Deploy"),
-            "[Console / Production #312](https://github.com/appwrite/appwrite/actions/runs/41684208512)"
-        );
-        assert_eq!(
-            post.body["content"], "",
-            "an announcement shows the releaser without pinging them"
-        );
-    }
-
-    #[tokio::test]
-    async fn announcement_resolves_releasers_through_users_then_falls_back_to_the_login() {
-        let (discord, requests) = reporter(Vec::new(), false);
-        let discord = discord.with_users(registry());
-
-        discord
-            .announce(&console_announcement(Some(REGISTRY_LOGIN)))
-            .await
-            .unwrap();
-        discord
-            .announce(&console_announcement(Some("unmapped-person")))
-            .await
-            .unwrap();
-        discord.announce(&console_announcement(None)).await.unwrap();
-
-        let posted = posts(&requests);
-        assert_eq!(
-            field(&posted[0], "Released by"),
-            format!("<@{REGISTRY_DISCORD_ID}> (`{REGISTRY_LOGIN}`)")
-        );
-        assert_eq!(field(&posted[1], "Released by"), "`unmapped-person`");
-        assert_eq!(field(&posted[2], "Released by"), "unknown");
-    }
-
-    #[tokio::test]
-    async fn announcement_already_in_the_channel_is_reused_not_reposted() {
-        let tag_url = release_url(CONSOLE_REPO, CONSOLE_TAG);
-        let (discord, requests) = reporter(
-            vec![
-                posted_announcement("6000", &release_url(CONSOLE_REPO, "apps/console/1.2.140")),
-                posted_announcement(ANNOUNCEMENT_MESSAGE, &tag_url),
-            ],
-            false,
-        );
-
-        let id = discord
-            .announce(&console_announcement(Some(RELEASER)))
-            .await
-            .unwrap();
-
-        assert_eq!(id, ANNOUNCEMENT_MESSAGE);
-        assert!(posts(&requests).is_empty(), "{:?}", posts(&requests));
-    }
-
-    fn announced_console_tip() -> DeployQaTip {
-        let mut tip = console_tip();
-        tip.discord_message_id = Some(ANNOUNCEMENT_MESSAGE.to_string());
-        tip
-    }
-
-    #[tokio::test]
-    async fn console_outcome_replies_under_its_stored_announcement() {
-        let store = MemoryStore::new(announced_console_tip());
-        let (discord, requests) = reporter(Vec::new(), false);
-
-        report(
-            &store,
-            &discord,
-            &verdict_report("LIVE PASS", VERDICT_ALL_VERIFIED),
-        )
-        .await;
-
-        let posted = posts(&requests);
-        assert_eq!(posted.len(), 1, "{posted:?}");
-        assert_eq!(
-            posted[0].body["message_reference"]["message_id"], ANNOUNCEMENT_MESSAGE,
-            "the outcome replies under Claudear's announcement like a release's"
-        );
-        assert!(
-            requests
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|request| request.method != "GET"),
-            "a stored announcement needs no channel search"
-        );
-    }
-
-    #[tokio::test]
-    async fn console_fail_threads_under_the_announcement_and_mentions_the_releaser() {
-        let mut tip = announced_console_tip();
-        tip.author_login = Some(REGISTRY_LOGIN.to_string());
-        let store = MemoryStore::new(tip);
-        let (discord, requests) = reporter(Vec::new(), false);
-        let discord = discord.with_users(registry());
-
-        report(&store, &discord, &verdict_report("LIVE FAIL", VERDICT_FAIL)).await;
-
-        let posted = posts(&requests);
-        assert_eq!(posted.len(), 2, "{posted:?}");
-        assert!(posted[0].is_post_to(&format!(
-            "/channels/{CHANNEL}/messages/{ANNOUNCEMENT_MESSAGE}/threads"
-        )));
-        let content = posted[1].body["content"].as_str().unwrap_or_default();
-        assert!(
-            content.contains(&format!("<@{REGISTRY_DISCORD_ID}>")),
-            "a releaser known only to [users] is still pinged: {content}"
-        );
-        assert_eq!(
-            store.tip().discord_thread_id.as_deref(),
-            Some(CREATED_THREAD)
-        );
-    }
-
-    #[tokio::test]
-    async fn outcome_finds_the_announcement_when_its_id_was_never_stored() {
-        let tag_url = release_url(CONSOLE_REPO, CONSOLE_TAG);
-        let store = MemoryStore::new(console_tip());
-        let (discord, requests) = reporter(
-            vec![posted_announcement(ANNOUNCEMENT_MESSAGE, &tag_url)],
-            false,
-        );
-
-        report(
-            &store,
-            &discord,
-            &verdict_report("LIVE PASS", VERDICT_ALL_VERIFIED),
-        )
-        .await;
-
-        let posted = posts(&requests);
-        assert_eq!(
-            posted[0].body["message_reference"]["message_id"],
-            ANNOUNCEMENT_MESSAGE
-        );
-        assert_eq!(
-            store.tip().discord_message_id.as_deref(),
-            Some(ANNOUNCEMENT_MESSAGE)
         );
     }
 }

@@ -1683,16 +1683,6 @@ fn start_deploy_qa_monitoring(
                 return None;
             }
         };
-    let poller = match claudear::build_deploy_qa_discord(config) {
-        Some(discord) => poller.with_announcer(Arc::new(discord)),
-        None => {
-            tracing::info!(
-                component = "deploy_qa",
-                "Deploy QA Discord unset; bare tags will not be announced"
-            );
-            poller
-        }
-    };
 
     let stale_after = config.deploy_qa.stale_run_after();
     let interval_ms = config.deploy_qa.effective_poll_interval_ms();

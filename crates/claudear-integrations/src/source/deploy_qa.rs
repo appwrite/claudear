@@ -67,7 +67,6 @@ impl DeployQaSource {
                 format!("https://github.com/{}/releases/tag/{}", tip.repo, tip.tag)
             }),
             author_login: tip.author_login.clone(),
-            bare_tag: None,
         };
         let mut issue = build_deploy_qa_issue(&track, &release, &self.playbook);
         issue.id = tip.issue_id.clone();
