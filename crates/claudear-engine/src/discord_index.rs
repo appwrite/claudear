@@ -1,11 +1,11 @@
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Duration, Utc};
 
 use claudear_analysis::knowledgebase::{DiscordIndexer, DiscordMessageInput};
 use claudear_config::DiscordKnowledgebaseConfig;
-use claudear_core::error::Result;
+use claudear_core::error::{Error, Result};
 use claudear_core::types::{DiscordChannelKind, DiscordIndexStats};
 use claudear_integrations::discord::{
     DiscordChannel, DiscordClient, DiscordMessage, DiscordThread,
@@ -20,6 +20,26 @@ struct IndexTarget {
     id: String,
     name: String,
     is_thread: bool,
+    parent_id: Option<String>,
+}
+
+/// Channels Discord refused the bot access to, by id, with their names. Kept
+/// across runs so the list is logged when it changes, not on every reindex.
+#[derive(Debug, Default)]
+struct UnreadableChannels {
+    reported: BTreeMap<String, String>,
+}
+
+impl UnreadableChannels {
+    /// Replace the reported channels with `current`, returning whether they
+    /// changed.
+    fn update(&mut self, current: BTreeMap<String, String>) -> bool {
+        if self.reported == current {
+            return false;
+        }
+        self.reported = current;
+        true
+    }
 }
 
 /// Fetches Discord content and drives the analysis `DiscordIndexer`.
@@ -28,6 +48,7 @@ pub struct DiscordIndexOrchestrator {
     guild_id: String,
     indexer: Arc<DiscordIndexer>,
     tracker: Arc<dyn FixAttemptTracker>,
+    unreadable: Mutex<UnreadableChannels>,
 }
 
 impl DiscordIndexOrchestrator {
@@ -42,6 +63,7 @@ impl DiscordIndexOrchestrator {
             guild_id: guild_id.into(),
             indexer,
             tracker,
+            unreadable: Mutex::default(),
         })
     }
 
@@ -109,6 +131,7 @@ impl DiscordIndexOrchestrator {
                 id: channel.id.clone(),
                 name: channel.name.clone().unwrap_or_default(),
                 is_thread: false,
+                parent_id: channel.parent_id.clone(),
             });
         }
 
@@ -142,6 +165,7 @@ impl DiscordIndexOrchestrator {
                     id: thread.id.clone(),
                     name: thread.name.clone(),
                     is_thread: true,
+                    parent_id: thread.parent_id.clone(),
                 });
             }
         }
@@ -154,8 +178,17 @@ impl DiscordIndexOrchestrator {
             "Registered Discord channels/threads; starting backfill"
         );
 
-        // backfill messages for every registered target
+        let mut unreadable: BTreeMap<String, String> = BTreeMap::new();
         for target in &targets {
+            let in_unreadable_channel = target.is_thread
+                && target
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|parent| unreadable.contains_key(parent));
+            if in_unreadable_channel {
+                stats.threads_skipped += 1;
+                continue;
+            }
             match self
                 .index_one(&target.id, &target.name, target.is_thread, cfg)
                 .await
@@ -166,6 +199,14 @@ impl DiscordIndexOrchestrator {
                         stats.threads_processed += 1;
                     } else {
                         stats.channels_processed += 1;
+                    }
+                }
+                Err(Error::Forbidden { .. }) => {
+                    unreadable.insert(target.id.clone(), target.name.clone());
+                    if target.is_thread {
+                        stats.threads_skipped += 1;
+                    } else {
+                        stats.channels_skipped += 1;
                     }
                 }
                 Err(e) => {
@@ -180,8 +221,34 @@ impl DiscordIndexOrchestrator {
             }
         }
 
+        self.report_unreadable(unreadable);
         tracing::info!(guild = %self.guild_id, %stats, "Discord knowledgebase indexing complete");
         Ok(stats)
+    }
+
+    /// Log the channels the bot cannot read once each time the set changes.
+    fn report_unreadable(&self, current: BTreeMap<String, String>) {
+        let channels: Vec<String> = current
+            .iter()
+            .map(|(id, name)| format!("{name} ({id})"))
+            .collect();
+        let changed = self
+            .unreadable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .update(current);
+        if !changed {
+            return;
+        }
+        if channels.is_empty() {
+            tracing::info!(guild = %self.guild_id, "The bot can read every selected Discord channel");
+        } else {
+            tracing::info!(
+                guild = %self.guild_id,
+                ?channels,
+                "Skipping Discord channels the bot cannot read; grant it View Channel and Read Message History on them to index them"
+            );
+        }
     }
 
     /// Index one channel/thread. Dispatches on persisted backfill state: until
@@ -503,6 +570,37 @@ mod tests {
             embeds: vec![],
             mentions: vec![],
         }
+    }
+
+    fn unreadable(channels: &[(&str, &str)]) -> BTreeMap<String, String> {
+        channels
+            .iter()
+            .map(|(id, name)| (id.to_string(), name.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_unreadable_channels_change_only_when_the_set_changes() {
+        let mut channels = UnreadableChannels::default();
+        let analytics = unreadable(&[("1557774392254144522", "analytics")]);
+
+        assert!(
+            !channels.update(BTreeMap::new()),
+            "none unreadable from the start"
+        );
+        assert!(
+            channels.update(analytics.clone()),
+            "a newly unreadable channel"
+        );
+        assert!(
+            !channels.update(analytics.clone()),
+            "the same channel on reindex"
+        );
+        assert!(channels.update(unreadable(&[
+            ("1557774392254144522", "analytics"),
+            ("1562734129857044490", "security"),
+        ])));
+        assert!(channels.update(BTreeMap::new()), "access granted");
     }
 
     #[test]
