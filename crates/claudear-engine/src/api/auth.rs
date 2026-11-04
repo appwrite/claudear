@@ -5,7 +5,7 @@ use axum::{
     http::{header, request::Parts, HeaderMap, StatusCode},
     Json,
 };
-use claudear_core::identity::{Identities, UserStatus};
+use claudear_core::identity::{normalize_login_email, Identities, UserStatus};
 use claudear_storage::{DirectoryUser, DirectoryWrite, FixAttemptTracker, UserRow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -835,11 +835,6 @@ pub(crate) async fn hash_password(password: String) -> Result<String, ApiError> 
         .await
         .map_err(|_| ApiError::internal())?
         .map_err(|_| ApiError::internal())
-}
-
-/// Login emails are compared and stored trimmed and lowercased.
-pub(crate) fn normalize_login_email(email: &str) -> String {
-    email.trim().to_lowercase()
 }
 
 /// Whether `email` is usable as a login email (same rules as an identity email).

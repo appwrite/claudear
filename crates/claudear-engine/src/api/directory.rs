@@ -6,9 +6,7 @@
 //! the whole batch is stored in one transaction, so a request either applies fully or not
 //! at all.
 
-use super::auth::{
-    check_api_rate_limit, is_valid_login_email, normalize_login_email, AdminCaller, Role,
-};
+use super::auth::{check_api_rate_limit, is_valid_login_email, AdminCaller, Role};
 use super::error::ApiError;
 use super::identities::{
     conflicts_by_plan, plan_update, IdentityPlan, UpdateIdentitiesRequest, UserIdentities,
@@ -21,7 +19,9 @@ use axum::{
     Json,
 };
 use claudear_config::users::UserRegistry;
-use claudear_core::identity::{ConsoleIdentity, IdentityField, IdentityViolation, UserStatus};
+use claudear_core::identity::{
+    normalize_login_email, ConsoleIdentity, IdentityField, IdentityViolation, UserStatus,
+};
 use claudear_storage::{DirectoryUser, DirectoryWrite, UserRow};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
