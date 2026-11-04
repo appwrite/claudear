@@ -287,6 +287,73 @@ mod tests {
             .collect()
     }
 
+    fn foreign_keys(connection: &Connection, table: &str) -> Vec<(String, String)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT \"from\", \"table\" FROM pragma_foreign_key_list(?1) ORDER BY \"from\"",
+            )
+            .unwrap();
+        statement
+            .query_map([table], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_security_inbox_foreign_keys() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+        let pairs = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(column, table)| (column.to_string(), table.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            foreign_keys(&connection, "security_vulnerabilities"),
+            pairs(&[
+                ("first_report_id", "security_reports"),
+                ("fix_attempt_id", "fix_attempts")
+            ])
+        );
+        assert_eq!(
+            foreign_keys(&connection, "security_reports"),
+            pairs(&[("vulnerability_id", "security_vulnerabilities")])
+        );
+        assert_eq!(
+            foreign_keys(&connection, "security_replies"),
+            pairs(&[("report_id", "security_reports")])
+        );
+        assert_eq!(
+            foreign_keys(&connection, "security_awards"),
+            pairs(&[
+                ("report_id", "security_reports"),
+                ("vulnerability_id", "security_vulnerabilities")
+            ])
+        );
+    }
+
+    #[test]
+    fn test_security_replies_allow_one_fix_live_reply_per_report() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO security_reports (source, conversation_id, short_id, mailbox_id, url, subject, reported_at, state, created_at, updated_at)
+                 VALUES ('helpscout', '1', 'HS-1', '249891', '', '', '2026-11-04T00:00:00Z', 'tracking', '2026-11-04T00:00:00Z', '2026-11-04T00:00:00Z');
+                 INSERT INTO security_replies (report_id, kind, status, claimed_at) VALUES (1, 'confirmed', 'sent', '2026-11-04T00:00:00Z');
+                 INSERT INTO security_replies (report_id, kind, status, claimed_at) VALUES (1, 'fix_live', 'sent', '2026-11-04T00:00:00Z');",
+            )
+            .unwrap();
+        assert!(connection
+            .execute(
+                "INSERT INTO security_replies (report_id, kind, status, claimed_at) VALUES (1, 'fix_live_rewarded', 'sending', '2026-11-04T00:00:00Z')",
+                [],
+            )
+            .is_err());
+    }
+
     #[test]
     fn test_security_inbox_schema() {
         let connection = Connection::open_in_memory().unwrap();

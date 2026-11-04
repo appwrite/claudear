@@ -19,9 +19,24 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub(crate) const NO_TOOLS_TIMEOUT: Duration = Duration::from_secs(120);
+const NO_TOOLS_QUERIES_PER_REPORT: u32 = 3;
+const PHASE_A_RUNS_PER_REPORT: u32 = 2;
+const REPOSITORY_SYNC_ALLOWANCE: Duration = Duration::from_secs(10 * 60);
 const NO_FIX_CHOICE: &str = "none";
+const MERGED_AT_DETAIL_KEY: &str = "merged_at";
+const FIXED_BY_COMMIT_DETAIL_KEY: &str = "fixed_by_commit";
 
-/// The scrubbed, internal description of a vulnerability.
+/// The longest one assessment can legitimately hold a report in `Assessing`:
+/// both Phase A runs, screening, the history check, the duplicate judge and
+/// the repository syncs.
+pub(crate) fn assessment_deadline(assessment_timeout: Duration) -> Duration {
+    assessment_timeout
+        .saturating_mul(PHASE_A_RUNS_PER_REPORT)
+        .saturating_add(NO_TOOLS_TIMEOUT.saturating_mul(NO_TOOLS_QUERIES_PER_REPORT))
+        .saturating_add(history::WORST_CASE_DURATION)
+        .saturating_add(REPOSITORY_SYNC_ALLOWANCE)
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Assessment {
     pub title: String,
@@ -71,21 +86,55 @@ impl Assessment {
     }
 }
 
-/// A fix that landed on the default branch after the report arrived.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergedFix {
     pub commit: String,
     pub merged_at: DateTime<Utc>,
 }
 
+impl MergedFix {
+    pub(crate) fn record(&self, detail: &mut Value) {
+        detail[FIXED_BY_COMMIT_DETAIL_KEY] = self.commit.clone().into();
+        detail[MERGED_AT_DETAIL_KEY] = self.merged_at.to_rfc3339().into();
+    }
+
+    pub(crate) fn from_detail(detail: &Value) -> Option<Self> {
+        let commit = detail.get(FIXED_BY_COMMIT_DETAIL_KEY)?.as_str()?;
+        history::validate_sha(commit).ok()?;
+        let merged_at = DateTime::parse_from_rfc3339(detail.get(MERGED_AT_DETAIL_KEY)?.as_str()?)
+            .ok()?
+            .with_timezone(&Utc);
+        Some(Self {
+            commit: commit.to_string(),
+            merged_at,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Verdict {
-    Valid { merged: Option<MergedFix> },
+    Valid,
+    /// The report does not reproduce because a fix landed after it arrived:
+    /// it may be valid, but only an admin can confirm that.
+    FixedAfterReport(MergedFix),
     NotReproducible,
-    AlreadyFixed { commit: String, fixed_on: NaiveDate },
+    AlreadyFixed {
+        commit: String,
+        fixed_on: NaiveDate,
+    },
     NotVulnerability,
     OutOfScope,
     NeedsHuman(ReviewReason),
+}
+
+impl Verdict {
+    pub(crate) fn review_reason(&self) -> Option<ReviewReason> {
+        match self {
+            Self::NeedsHuman(reason) => Some(*reason),
+            Self::FixedAfterReport(_) => Some(ReviewReason::FixFoundInHistory),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -191,7 +240,7 @@ impl SecurityInbox {
         }
         let assessment = phase.assessment();
         let verdict = match phase.outcome {
-            AgentOutcome::Valid => Verdict::Valid { merged: None },
+            AgentOutcome::Valid => Verdict::Valid,
             AgentOutcome::NotVulnerability => Verdict::NotVulnerability,
             AgentOutcome::OutOfScope => Verdict::OutOfScope,
             AgentOutcome::NeedsHuman => Verdict::NeedsHuman(ReviewReason::AssessmentInconclusive),
@@ -333,19 +382,17 @@ impl SecurityInbox {
                 "chosen fix is not on the default branch".to_string(),
             ));
         }
-        let (commit, committed_at) = history.commit_date(&choice.fixed_by_commit).await?;
-        Ok(if committed_at < report.reported_at {
+        let (commit, landed_at) = history.landed_at(&choice.fixed_by_commit).await?;
+        Ok(if landed_at < report.reported_at {
             Verdict::AlreadyFixed {
                 commit,
-                fixed_on: committed_at.date_naive(),
+                fixed_on: landed_at.date_naive(),
             }
         } else {
-            Verdict::Valid {
-                merged: Some(MergedFix {
-                    commit,
-                    merged_at: committed_at,
-                }),
-            }
+            Verdict::FixedAfterReport(MergedFix {
+                commit,
+                merged_at: landed_at,
+            })
         })
     }
 
@@ -363,5 +410,35 @@ impl SecurityInbox {
         let mut seen = HashSet::new();
         commits.retain(|commit| seen.insert(commit.sha.clone()));
         Ok(commits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_deadline_covers_every_step_of_one_assessment() {
+        let timeout = Duration::from_secs(900);
+        let deadline = assessment_deadline(timeout);
+        assert!(deadline > timeout.saturating_mul(2) + NO_TOOLS_TIMEOUT.saturating_mul(3));
+        assert!(deadline >= timeout.saturating_mul(2) + history::WORST_CASE_DURATION);
+        assert_eq!(assessment_deadline(Duration::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn a_merged_fix_round_trips_through_event_detail() {
+        let merged = MergedFix {
+            commit: "a".repeat(40),
+            merged_at: DateTime::parse_from_rfc3339("2026-11-06T09:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let mut detail = json!({ "reason": "fix_found_in_history" });
+        merged.record(&mut detail);
+        assert_eq!(MergedFix::from_detail(&detail), Some(merged));
+        detail[FIXED_BY_COMMIT_DETAIL_KEY] = "--output".into();
+        assert_eq!(MergedFix::from_detail(&detail), None);
+        assert_eq!(MergedFix::from_detail(&json!({})), None);
     }
 }

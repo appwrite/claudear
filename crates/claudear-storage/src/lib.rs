@@ -30,9 +30,10 @@ use chrono::{DateTime, Utc};
 use claudear_core::error::{Error, Result};
 use claudear_core::security::{
     AwardStatus, DeliveryStatus, NewSecurityAward, NewSecurityEvent, NewSecurityReport,
-    NewSecurityVulnerability, SecurityAward, SecurityEvent, SecurityEventKind, SecurityReply,
-    SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportFilter,
-    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityChanges, VulnerabilityState,
+    NewSecurityVulnerability, ReportTransition, SecurityAward, SecurityEvent, SecurityEventKind,
+    SecurityReply, SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportFilter,
+    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityCandidate,
+    SecurityVulnerabilityChanges, VulnerabilityState,
 };
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, DeployQaTip, DeployQaTipStatus,
@@ -2047,7 +2048,7 @@ pub trait SecurityReportStore: Send + Sync {
         Ok(None)
     }
 
-    /// Reports in `Assessing` whose latest event is `AdminConfirmed`, with that event.
+    /// Reports in `Registering`, each with its latest `AdminConfirmed` event.
     fn list_admin_confirmed_reports(&self) -> Result<Vec<(SecurityReport, SecurityEvent)>> {
         Ok(Vec::new())
     }
@@ -2074,6 +2075,21 @@ pub trait SecurityReportStore: Send + Sync {
         Ok(None)
     }
 
+    fn find_security_vulnerability_by_first_report(
+        &self,
+        _report_id: i64,
+    ) -> Result<Option<SecurityVulnerability>> {
+        Ok(None)
+    }
+
+    /// Deduplication fields of the newest `limit` vulnerabilities, newest first.
+    fn list_security_vulnerability_candidates(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<SecurityVulnerabilityCandidate>> {
+        Ok(Vec::new())
+    }
+
     /// Oldest first, optionally only those in `state`.
     fn list_security_vulnerabilities(
         &self,
@@ -2096,7 +2112,8 @@ pub trait SecurityReportStore: Send + Sync {
     }
 
     /// Make `report_id` the first reporter while `expected_first_report_id`
-    /// still is, `reported_at` is strictly earlier, and no award exists.
+    /// still is, `reported_at` is earlier (or the same second with a lower
+    /// report id), and no award exists.
     fn replace_first_reporter(
         &self,
         _vulnerability_id: i64,
@@ -2107,21 +2124,32 @@ pub trait SecurityReportStore: Send + Sync {
         Ok(false)
     }
 
-    /// Claim a reply for sending: true for a new claim or a re-claim of a
-    /// `Failed` reply; false while one is sending, sent or unconfirmed.
-    fn claim_security_reply(&self, _report_id: i64, _kind: SecurityReplyKind) -> Result<bool> {
+    /// Claim a reply for sending, recording `event` in the same transaction:
+    /// true for a new claim or a re-claim of a `Failed` reply (counting the
+    /// attempt and keeping its last error); false while one is sending, sent
+    /// or unconfirmed, or when the report already has the other fix-live kind.
+    fn claim_security_reply(
+        &self,
+        _report_id: i64,
+        _kind: SecurityReplyKind,
+        _event: &NewSecurityEvent,
+    ) -> Result<bool> {
         Ok(false)
     }
 
-    /// Finish a claimed reply as `Sent`, `Failed` or `Unconfirmed`.
+    /// Finish a claimed reply as `Sent`, `Failed` or `Unconfirmed`, recording
+    /// `event` and applying `transition` to the report in the same
+    /// transaction. Returns whether the report moved.
     fn complete_security_reply(
         &self,
         _report_id: i64,
         _kind: SecurityReplyKind,
         _status: DeliveryStatus,
         _error: Option<&str>,
-    ) -> Result<()> {
-        Ok(())
+        _event: &NewSecurityEvent,
+        _transition: Option<ReportTransition>,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Resolve an `Unconfirmed` reply after an admin checked the mailbox.
@@ -2139,8 +2167,13 @@ pub trait SecurityReportStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Ids of reports with at least one `Unconfirmed` reply, ascending.
+    fn list_reports_with_unconfirmed_replies(&self) -> Result<Vec<i64>> {
+        Ok(Vec::new())
+    }
+
     /// Prepare the vulnerability's only award, and only for its current
-    /// first reporter.
+    /// first reporter, addressed to that report's reporter email.
     fn prepare_security_award(
         &self,
         _vulnerability_id: i64,
@@ -3345,10 +3378,22 @@ mod tests {
             assert!(store.list_admin_confirmed_reports().unwrap().is_empty());
             assert!(store.get_security_vulnerability(1).unwrap().is_none());
             assert!(store
+                .find_security_vulnerability_by_first_report(1)
+                .unwrap()
+                .is_none());
+            assert!(store
+                .list_security_vulnerability_candidates(10)
+                .unwrap()
+                .is_empty());
+            assert!(store
                 .list_security_vulnerabilities(None)
                 .unwrap()
                 .is_empty());
             assert!(store.list_security_replies(1).unwrap().is_empty());
+            assert!(store
+                .list_reports_with_unconfirmed_replies()
+                .unwrap()
+                .is_empty());
             assert!(store.get_security_award(1).unwrap().is_none());
             assert!(store.list_security_awards(None).unwrap().is_empty());
         }
@@ -3385,21 +3430,22 @@ mod tests {
             assert!(store.record_security_event(Some(1), None, &event).is_ok());
             assert!(!store.replace_first_reporter(1, 1, 2, Utc::now()).unwrap());
             assert!(!store
-                .claim_security_reply(1, SecurityReplyKind::Confirmed)
+                .claim_security_reply(1, SecurityReplyKind::Confirmed, &event)
                 .unwrap());
-            assert!(store
+            assert!(!store
                 .complete_security_reply(
                     1,
                     SecurityReplyKind::Confirmed,
                     DeliveryStatus::Sent,
-                    None
+                    None,
+                    &event,
+                    None,
                 )
-                .is_ok());
+                .unwrap());
             assert!(!store
                 .confirm_security_reply(1, SecurityReplyKind::Confirmed, true, "admin")
                 .unwrap());
             let award = NewSecurityAward {
-                recipient_email: None,
                 campaign: "SecurityResearchers".to_string(),
                 credits: 100,
             };

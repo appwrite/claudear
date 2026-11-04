@@ -555,10 +555,41 @@ impl Harness {
         SecurityTemplates::default()
     }
 
+    fn attempt(&self, vulnerability_id: i64) -> i64 {
+        let short_id = format!("SEC-{vulnerability_id}");
+        self.tracker
+            .record_attempt_with_labels(SECURITY_FIX_SOURCE, &short_id, &short_id, &[])
+            .unwrap();
+        self.tracker
+            .get_attempt(SECURITY_FIX_SOURCE, &short_id)
+            .unwrap()
+            .expect("attempt stored")
+            .id
+    }
+
+    fn confirm(&self, report_id: i64, detail: Value) {
+        assert!(self
+            .tracker
+            .transition_security_report(
+                report_id,
+                SecurityReportState::NeedsHuman,
+                SecurityReportState::Registering,
+                &SecurityReportChanges::default(),
+                &NewSecurityEvent::new(SecurityEventKind::AdminConfirmed)
+                    .with_actor("admin@example.com")
+                    .with_detail(detail),
+            )
+            .unwrap());
+    }
+
+    fn timeline(&self, report_id: i64) -> Vec<claudear_core::security::SecurityEvent> {
+        self.tracker.list_security_timeline(report_id).unwrap()
+    }
+
     /// Link a merged fix and deploy it, then advance once.
     async fn ship(&self, vulnerability_id: i64) -> SecurityAdvanceSummary {
         self.inbox
-            .link_fix(vulnerability_id, Some(1), PULL_REQUEST)
+            .link_fix(vulnerability_id, None, PULL_REQUEST)
             .unwrap();
         self.deployment.merge();
         self.deployment.set_status(Ok(LiveStatus::Live {
@@ -931,7 +962,7 @@ async fn a_fix_on_the_default_branch_before_the_report_replies_already_fixed() {
 }
 
 #[tokio::test]
-async fn a_fix_landed_after_the_report_is_valid_and_already_merged() {
+async fn a_fix_landed_after_the_report_waits_for_an_admin_and_promises_nothing() {
     let harness = Harness::new();
     let fix =
         harness
@@ -950,8 +981,36 @@ async fn a_fix_landed_after_the_report_is_valid_and_already_merged() {
     assert!(matches!(route, SecurityRoute::Done { .. }), "{route:?}");
 
     let report = harness.report("1");
+    assert_eq!(report.state, SecurityReportState::NeedsHuman);
+    assert_eq!(report.outcome, None);
+    assert_eq!(report.fixed_by_commit.as_deref(), Some(fix.as_str()));
+    assert!(harness.source.replies().is_empty());
+    assert!(harness
+        .tracker
+        .list_security_vulnerabilities(None)
+        .unwrap()
+        .is_empty());
+    assert_eq!(harness.pings_containing("fix_found_in_history"), 1);
+    harness.inbox.advance().await;
+    assert!(harness.source.replies().is_empty());
+    assert!(harness
+        .tracker
+        .list_security_awards(None)
+        .unwrap()
+        .is_empty());
+
+    harness.confirm(
+        report.id,
+        json!({
+            "title": "Session tokens survive logout",
+            "summary": "Logout does not revoke the session token.",
+            "repository": REPOSITORY,
+            "severity": "high",
+        }),
+    );
+    harness.inbox.advance().await;
+    let report = harness.report("1");
     assert_eq!(report.state, SecurityReportState::Tracking);
-    assert_eq!(report.outcome, Some(SecurityOutcome::Valid));
     let vulnerability = harness.vulnerability(report.vulnerability_id.unwrap());
     assert_eq!(vulnerability.state, VulnerabilityState::Merged);
     assert_eq!(vulnerability.merge_commit.as_deref(), Some(fix.as_str()));
@@ -960,11 +1019,97 @@ async fn a_fix_landed_after_the_report_is_valid_and_already_merged() {
         Some(Utc.with_ymd_and_hms(2026, 11, 6, 9, 0, 0).unwrap())
     );
     assert!(harness.inbox.pending_fix_requests().unwrap().is_empty());
-    assert_eq!(harness.source.replies().len(), 1);
     assert_eq!(
         harness.source.replies()[0].body,
         harness.templates().confirmed
     );
+
+    harness.deployment.set_status(Ok(LiveStatus::Live {
+        versions: vec!["1.53.30".to_string()],
+    }));
+    harness.inbox.advance().await;
+    assert_eq!(
+        harness.source.replies().last().unwrap().body,
+        harness.templates().fix_live_rewarded,
+        "an admin confirmation makes the reporter eligible"
+    );
+    assert!(harness
+        .tracker
+        .get_security_award(vulnerability.id)
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn a_branch_fix_merged_after_the_report_is_not_already_fixed() {
+    let harness = Harness::new();
+    let fix = harness.repository.commit_merged(
+        "harden logout",
+        "revokeSession",
+        "2026-11-01T09:00:00Z",
+        "2026-11-06T09:00:00Z",
+    );
+    let mut assessment = assessment_response("not_reproducible");
+    assessment["history_terms"] = json!(["revokeSession"]);
+    harness.agent.respond(Query::Assessment, assessment);
+    harness.agent.respond(
+        Query::History,
+        json!({"fixed_by_commit": fix, "reason": "revocation added"}),
+    );
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+
+    let report = harness.report("1");
+    assert_eq!(report.state, SecurityReportState::NeedsHuman);
+    assert_ne!(report.outcome, Some(SecurityOutcome::AlreadyFixed));
+    assert!(harness.source.replies().is_empty());
+    let needs_human = harness.timeline(report.id).pop().unwrap();
+    assert_eq!(needs_human.detail["reason"], json!("fix_found_in_history"));
+    assert_eq!(needs_human.detail["fixed_by_commit"], json!(fix));
+    assert_eq!(
+        needs_human.detail["merged_at"],
+        json!("2026-11-06T09:00:00+00:00")
+    );
+}
+
+#[tokio::test]
+async fn an_agent_only_vulnerability_made_live_without_a_fix_gets_no_reward() {
+    let harness = Harness::new();
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    let vulnerability_id = harness.report("1").vulnerability_id.unwrap();
+    for (from, to) in [
+        (
+            VulnerabilityState::AwaitingFix,
+            VulnerabilityState::NeedsHuman,
+        ),
+        (VulnerabilityState::NeedsHuman, VulnerabilityState::Live),
+    ] {
+        assert!(harness
+            .tracker
+            .transition_security_vulnerability(
+                vulnerability_id,
+                from,
+                to,
+                &Default::default(),
+                &NewSecurityEvent::new(SecurityEventKind::Overridden),
+            )
+            .unwrap());
+    }
+    let summary = harness.inbox.advance().await;
+    assert_eq!(summary.awards_prepared, 0);
+    assert!(harness
+        .tracker
+        .get_security_award(vulnerability_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        harness.source.replies().last().unwrap().body,
+        harness.templates().fix_live
+    );
+    assert_eq!(harness.report("1").state, SecurityReportState::Resolved);
 }
 
 #[tokio::test]
@@ -1220,8 +1365,10 @@ async fn routing_twice_and_advancing_three_times_replies_once_per_kind() {
 }
 
 #[tokio::test]
-async fn a_rejected_reply_is_sent_again_on_the_next_advance() {
-    let harness = Harness::new();
+async fn a_rejected_reply_is_sent_again_once_its_backoff_passed() {
+    let harness = Harness::build(test_config(), |inbox| {
+        inbox.with_reply_retry_backoff(Duration::ZERO)
+    });
     harness
         .agent
         .respond(Query::Assessment, assessment_response("not_reproducible"));
@@ -1247,6 +1394,120 @@ async fn a_rejected_reply_is_sent_again_on_the_next_advance() {
     assert_eq!(harness.report("1").state, SecurityReportState::Closed);
     harness.inbox.advance().await;
     assert_eq!(harness.source.replies().len(), 2);
+
+    let replies = harness.tracker.list_security_replies(report.id).unwrap();
+    assert_eq!(replies[0].attempts, 2);
+    let edges: Vec<(SecurityEventKind, Option<String>, Option<String>)> = harness
+        .timeline(report.id)
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                SecurityEventKind::ReplyClaimed
+                    | SecurityEventKind::ReplyFailed
+                    | SecurityEventKind::ReplySent
+            )
+        })
+        .map(|event| (event.kind, event.from_state, event.to_state))
+        .collect();
+    let edge =
+        |kind, from: Option<&str>, to: &str| (kind, from.map(str::to_string), Some(to.to_string()));
+    assert_eq!(
+        edges,
+        vec![
+            edge(SecurityEventKind::ReplyClaimed, None, "sending"),
+            edge(SecurityEventKind::ReplyFailed, Some("sending"), "failed"),
+            edge(SecurityEventKind::ReplyClaimed, Some("failed"), "sending"),
+            edge(SecurityEventKind::ReplySent, Some("replying"), "closed"),
+        ],
+        "every reply status change is recorded with its event"
+    );
+    let reclaimed = harness
+        .timeline(report.id)
+        .into_iter()
+        .filter(|event| event.kind == SecurityEventKind::ReplyClaimed)
+        .nth(1)
+        .unwrap();
+    assert_eq!(reclaimed.detail["attempt"], json!(2));
+    assert_eq!(
+        reclaimed.detail["previous_error"],
+        json!("422 unprocessable")
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_reply_is_not_resent_before_its_backoff() {
+    let harness = Harness::new();
+    harness
+        .agent
+        .respond(Query::Assessment, assessment_response("not_reproducible"));
+    harness
+        .source
+        .queue(ReporterReply::Rejected("422 unprocessable".to_string()));
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    for _ in 0..3 {
+        harness.inbox.advance().await;
+    }
+    assert_eq!(harness.source.replies().len(), 1);
+    assert_eq!(harness.report("1").state, SecurityReportState::Replying);
+}
+
+#[tokio::test]
+async fn repeated_rejections_hand_the_report_to_an_admin_once() {
+    let harness = Harness::build(test_config(), |inbox| {
+        inbox.with_reply_retry_backoff(Duration::ZERO)
+    });
+    harness
+        .agent
+        .respond(Query::Assessment, assessment_response("not_reproducible"));
+    for _ in 0..5 {
+        harness
+            .source
+            .queue(ReporterReply::Rejected("422 unprocessable".to_string()));
+    }
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    for _ in 0..5 {
+        harness.inbox.advance().await;
+    }
+
+    let report = harness.report("1");
+    assert_eq!(report.state, SecurityReportState::NeedsHuman);
+    assert_eq!(harness.source.replies().len(), 3);
+    assert_eq!(harness.pings_containing("reply_failed"), 1);
+    let replies = harness.tracker.list_security_replies(report.id).unwrap();
+    assert_eq!(replies[0].attempts, 3);
+    assert_eq!(replies[0].status, DeliveryStatus::Failed);
+    let escalation = harness.timeline(report.id).pop().unwrap();
+    assert_eq!(escalation.kind, SecurityEventKind::ReplyFailed);
+    assert_eq!(escalation.from_state.as_deref(), Some("replying"));
+    assert_eq!(escalation.to_state.as_deref(), Some("needs_human"));
+    assert_eq!(escalation.detail["reason"], json!("reply_failed"));
+}
+
+#[tokio::test]
+async fn a_confirmation_that_keeps_failing_takes_a_tracking_report_to_an_admin() {
+    let harness = Harness::build(test_config(), |inbox| {
+        inbox.with_reply_retry_backoff(Duration::ZERO)
+    });
+    for _ in 0..3 {
+        harness
+            .source
+            .queue(ReporterReply::Rejected("400 bad request".to_string()));
+    }
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    assert_eq!(harness.report("1").state, SecurityReportState::Tracking);
+    for _ in 0..3 {
+        harness.inbox.advance().await;
+    }
+    assert_eq!(harness.report("1").state, SecurityReportState::NeedsHuman);
+    assert_eq!(harness.source.replies().len(), 3);
+    assert_eq!(harness.pings_containing("reply_failed"), 1);
 }
 
 #[tokio::test]
@@ -1338,7 +1599,11 @@ async fn a_reply_left_sending_by_a_crash_becomes_unconfirmed_without_a_resend() 
     }
     assert!(harness
         .tracker
-        .claim_security_reply(report.id, SecurityReplyKind::NotReproducible)
+        .claim_security_reply(
+            report.id,
+            SecurityReplyKind::NotReproducible,
+            &NewSecurityEvent::new(SecurityEventKind::ReplyClaimed),
+        )
         .unwrap());
 
     harness.inbox.advance().await;
@@ -1463,7 +1728,7 @@ async fn a_fix_request_carries_no_report_text_or_reporter_reference() {
     let short_id = format!("SEC-{}", request.vulnerability_id);
     assert_eq!(request.issue.id, short_id);
     assert_eq!(request.issue.short_id, short_id);
-    assert_eq!(request.issue.title, format!("Security fix {short_id}"));
+    assert_eq!(request.issue.title, "Hardening");
     assert_eq!(request.issue.source, SECURITY_FIX_SOURCE);
     assert!(request.issue.url.is_empty());
     assert!(request.issue.description.is_none());
@@ -1488,9 +1753,11 @@ async fn a_fix_request_carries_no_report_text_or_reporter_reference() {
         assert!(!everything.contains(forbidden), "{forbidden} leaked");
     }
     assert!(!everything.to_lowercase().contains("helpscout"));
-    assert!(request.context.starts_with(&format!(
-        "# Security fix {short_id}\nRepository: {REPOSITORY}\n"
-    )));
+    assert!(request
+        .context
+        .starts_with(&format!("Repository: {REPOSITORY}\n")));
+    assert!(!request.context.contains("SEC-"));
+    assert!(!request.issue.title.contains("SEC-"));
     assert!(request.context.contains("<<<UNTRUSTED assessment "));
     assert!(request.context.contains("Write a failing test"));
     assert!(request.context.contains("neutral title"));
@@ -1565,13 +1832,14 @@ async fn a_pending_deployment_stays_merged_and_going_live_replies_once_per_repor
         .route(&report_issue("1", REPORT_BODY, reported(0)))
         .await;
     let vulnerability_id = harness.report("1").vulnerability_id.unwrap();
+    let attempt_id = harness.attempt(vulnerability_id);
     harness
         .inbox
-        .link_fix(vulnerability_id, Some(7), PULL_REQUEST)
+        .link_fix(vulnerability_id, Some(attempt_id), PULL_REQUEST)
         .unwrap();
     let fixing = harness.vulnerability(vulnerability_id);
     assert_eq!(fixing.state, VulnerabilityState::Fixing);
-    assert_eq!(fixing.fix_attempt_id, Some(7));
+    assert_eq!(fixing.fix_attempt_id, Some(attempt_id));
     assert_eq!(fixing.pull_request_url.as_deref(), Some(PULL_REQUEST));
     harness.inbox.advance().await;
     assert_eq!(
@@ -1616,7 +1884,7 @@ async fn a_merged_package_fix_pings_for_a_cloud_bump() {
     let vulnerability_id = harness.report("1").vulnerability_id.unwrap();
     harness
         .inbox
-        .link_fix(vulnerability_id, Some(1), PULL_REQUEST)
+        .link_fix(vulnerability_id, None, PULL_REQUEST)
         .unwrap();
     harness.deployment.merge();
     harness.inbox.advance().await;
@@ -1638,7 +1906,7 @@ async fn a_closed_pull_request_goes_to_needs_human() {
     let vulnerability_id = harness.report("1").vulnerability_id.unwrap();
     harness
         .inbox
-        .link_fix(vulnerability_id, Some(1), PULL_REQUEST)
+        .link_fix(vulnerability_id, None, PULL_REQUEST)
         .unwrap();
     *harness.deployment.pull_request.lock().unwrap() = Ok(Some(PullRequestState {
         merged: false,
@@ -1664,7 +1932,7 @@ async fn an_untracked_repository_goes_to_needs_human() {
     let vulnerability_id = harness.report("1").vulnerability_id.unwrap();
     harness
         .inbox
-        .link_fix(vulnerability_id, Some(1), PULL_REQUEST)
+        .link_fix(vulnerability_id, None, PULL_REQUEST)
         .unwrap();
     harness.deployment.merge();
     harness.deployment.set_status(Ok(LiveStatus::Untracked));
@@ -1686,7 +1954,7 @@ async fn deployment_errors_are_recorded_and_pinged_at_most_once_a_day() {
     let vulnerability_id = harness.report("1").vulnerability_id.unwrap();
     harness
         .inbox
-        .link_fix(vulnerability_id, Some(1), PULL_REQUEST)
+        .link_fix(vulnerability_id, None, PULL_REQUEST)
         .unwrap();
     harness.deployment.merge();
     harness
@@ -1720,7 +1988,7 @@ async fn a_cannot_fix_attempt_moves_the_vulnerability_to_needs_human() {
     let short_id = format!("SEC-{vulnerability_id}");
     harness
         .inbox
-        .link_fix(vulnerability_id, Some(1), PULL_REQUEST)
+        .link_fix(vulnerability_id, None, PULL_REQUEST)
         .unwrap();
     harness
         .tracker
@@ -1956,23 +2224,15 @@ async fn an_admin_confirmed_report_registers_a_vulnerability_and_replies_once() 
         .await;
     let report = harness.report("1");
     assert_eq!(report.state, SecurityReportState::NeedsHuman);
-    assert!(harness
-        .tracker
-        .transition_security_report(
-            report.id,
-            SecurityReportState::NeedsHuman,
-            SecurityReportState::Assessing,
-            &SecurityReportChanges::default(),
-            &NewSecurityEvent::new(SecurityEventKind::AdminConfirmed)
-                .with_actor("admin@example.com")
-                .with_detail(json!({
-                    "title": format!("Session fixation via {HOST}"),
-                    "summary": "Sessions survive logout.",
-                    "repository": REPOSITORY,
-                    "severity": "critical",
-                })),
-        )
-        .unwrap());
+    harness.confirm(
+        report.id,
+        json!({
+            "title": format!("Session fixation via {HOST}"),
+            "summary": "Sessions survive logout.",
+            "repository": REPOSITORY,
+            "severity": "critical",
+        }),
+    );
 
     harness.inbox.advance().await;
     harness.inbox.advance().await;
@@ -2060,11 +2320,9 @@ async fn an_admin_spam_override_runs_the_spam_action_once() {
 
 #[tokio::test]
 async fn a_stale_assessment_is_released_by_advance() {
-    let config = SecurityInboxConfig {
-        assessment_timeout_secs: 1,
-        ..test_config()
-    };
-    let harness = Harness::build(config, |inbox| inbox);
+    let harness = Harness::build(test_config(), |inbox| {
+        inbox.with_stale_assessment_after(Duration::from_secs(1))
+    });
     let stored = harness
         .tracker
         .upsert_security_report(&NewSecurityReport {
@@ -2090,7 +2348,7 @@ async fn a_stale_assessment_is_released_by_advance() {
             &NewSecurityEvent::new(SecurityEventKind::AssessmentStarted),
         )
         .unwrap());
-    tokio::time::sleep(Duration::from_millis(3100)).await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
     let summary = harness.inbox.advance().await;
     assert_eq!(summary.released, 1);
     let released = harness.report("1");
@@ -2113,4 +2371,202 @@ async fn security_fix_context_never_posts_to_the_reporter() {
     );
     assert_eq!(context.build_issue_context(&issue).await.unwrap(), "brief");
     assert!(context.post_reply("SEC-1", "hello").await.is_err());
+}
+
+#[tokio::test]
+async fn link_fix_accepts_only_a_pull_request_in_the_vulnerability_repository() {
+    let harness = Harness::new();
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    let vulnerability_id = harness.report("1").vulnerability_id.unwrap();
+    for url in [
+        "https://evil.example/github.com/appwrite/appwrite/pull/1",
+        "https://github.com/attacker/repo/pull/1",
+        "https://github.com/appwrite/appwrite/pull/1?x=1",
+        "https://user@github.com/appwrite/appwrite/pull/1",
+        "not a url",
+    ] {
+        assert!(
+            harness.inbox.link_fix(vulnerability_id, None, url).is_err(),
+            "{url}"
+        );
+    }
+    assert_eq!(
+        harness.vulnerability(vulnerability_id).state,
+        VulnerabilityState::AwaitingFix
+    );
+    assert!(harness.inbox.link_fix(999, None, PULL_REQUEST).is_err());
+
+    harness
+        .inbox
+        .link_fix(vulnerability_id, None, PULL_REQUEST)
+        .unwrap();
+    let linked = harness.vulnerability(vulnerability_id);
+    assert_eq!(linked.state, VulnerabilityState::Fixing);
+    assert_eq!(linked.pull_request_url.as_deref(), Some(PULL_REQUEST));
+}
+
+#[tokio::test]
+async fn advance_links_a_fix_whose_pull_request_was_never_recorded() {
+    let harness = Harness::new();
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    let vulnerability_id = harness.report("1").vulnerability_id.unwrap();
+    let attempt_id = harness.attempt(vulnerability_id);
+    harness.inbox.advance().await;
+    assert_eq!(
+        harness.vulnerability(vulnerability_id).state,
+        VulnerabilityState::AwaitingFix,
+        "an attempt without a pull request is still running"
+    );
+
+    let short_id = format!("SEC-{vulnerability_id}");
+    harness
+        .tracker
+        .mark_success(SECURITY_FIX_SOURCE, &short_id, PULL_REQUEST)
+        .unwrap();
+    harness.inbox.advance().await;
+    let linked = harness.vulnerability(vulnerability_id);
+    assert_eq!(linked.state, VulnerabilityState::Fixing);
+    assert_eq!(linked.pull_request_url.as_deref(), Some(PULL_REQUEST));
+    assert_eq!(linked.fix_attempt_id, Some(attempt_id));
+}
+
+#[tokio::test]
+async fn an_unlinkable_recorded_pull_request_goes_to_needs_human() {
+    let harness = Harness::new();
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    let vulnerability_id = harness.report("1").vulnerability_id.unwrap();
+    harness.attempt(vulnerability_id);
+    let short_id = format!("SEC-{vulnerability_id}");
+    harness
+        .tracker
+        .mark_success(
+            SECURITY_FIX_SOURCE,
+            &short_id,
+            "https://github.com/attacker/repo/pull/1",
+        )
+        .unwrap();
+    let summary = harness.inbox.advance().await;
+    assert_eq!(summary.needs_human, 1);
+    harness.inbox.advance().await;
+    assert_eq!(
+        harness.vulnerability(vulnerability_id).state,
+        VulnerabilityState::NeedsHuman
+    );
+    assert_eq!(harness.pings_containing("invalid_pull_request"), 1);
+}
+
+#[tokio::test]
+async fn a_merged_pull_request_without_a_merge_commit_goes_to_needs_human() {
+    let harness = Harness::new();
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    let vulnerability_id = harness.report("1").vulnerability_id.unwrap();
+    harness
+        .inbox
+        .link_fix(vulnerability_id, None, PULL_REQUEST)
+        .unwrap();
+    *harness.deployment.pull_request.lock().unwrap() = Ok(Some(PullRequestState {
+        merged: true,
+        closed: true,
+        merge_commit_sha: None,
+        merged_at: Some(reported(30)),
+    }));
+    harness.inbox.advance().await;
+    harness.inbox.advance().await;
+    assert_eq!(
+        harness.vulnerability(vulnerability_id).state,
+        VulnerabilityState::NeedsHuman
+    );
+    assert_eq!(harness.pings_containing("missing_merge_commit"), 1);
+    assert_eq!(harness.pings_containing("untracked_repository"), 0);
+}
+
+#[tokio::test]
+async fn vulnerabilities_without_an_embedding_stay_duplicate_candidates() {
+    let harness = Harness::new();
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    let unembedded = harness.report("1").vulnerability_id.unwrap();
+    assert!(harness.vulnerability(unembedded).embedding.is_empty());
+
+    let harness = Harness {
+        inbox: SecurityInbox::new(SecurityInboxDependencies {
+            config: test_config(),
+            tracker: harness.tracker.clone(),
+            agent: harness.agent.clone(),
+            embedding_client: None,
+            notifier: harness.notifier.clone(),
+            source: harness.source.clone(),
+            deployment: Some(harness.deployment.clone()),
+            inferrer: None,
+        })
+        .with_embedder(Arc::new(VocabularyEmbedder)),
+        ..harness
+    };
+    harness.agent.queue(
+        Query::Duplicate,
+        Ok(json!({"duplicate_of": unembedded.to_string(), "reason": "same"})),
+    );
+    harness
+        .route(&report_issue("2", REPORT_BODY, reported(5)))
+        .await;
+
+    let judged = harness.agent.calls_of(Query::Duplicate);
+    assert_eq!(judged.len(), 1);
+    let schema: Value = serde_json::from_str(&judged[0].schema).unwrap();
+    assert_eq!(
+        schema["properties"]["duplicate_of"]["enum"],
+        json!([unembedded.to_string(), "none"])
+    );
+    let duplicate = harness.report("2");
+    assert_eq!(duplicate.outcome, Some(SecurityOutcome::Duplicate));
+    assert_eq!(duplicate.vulnerability_id, Some(unembedded));
+}
+
+#[tokio::test]
+async fn a_same_second_report_with_the_lower_id_stays_first() {
+    let harness = Harness::new();
+    let earlier_id = harness
+        .tracker
+        .upsert_security_report(&NewSecurityReport {
+            source: "helpscout".to_string(),
+            conversation_id: "1".to_string(),
+            short_id: "HS-1".to_string(),
+            mailbox_id: "249891".to_string(),
+            url: String::new(),
+            subject: SUBJECT.to_string(),
+            reporter_email: None,
+            reporter_customer_id: None,
+            reported_at: reported(0),
+            customer_thread_count: 1,
+        })
+        .unwrap();
+    harness
+        .route(&report_issue("2", REPORT_BODY, reported(0)))
+        .await;
+    let later_id = harness.report("2");
+    let vulnerability_id = later_id.vulnerability_id.unwrap();
+    assert!(earlier_id.id < later_id.id);
+
+    harness.agent.queue(
+        Query::Duplicate,
+        Ok(json!({"duplicate_of": vulnerability_id.to_string(), "reason": "same"})),
+    );
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    assert_eq!(
+        harness.vulnerability(vulnerability_id).first_report_id,
+        earlier_id.id,
+        "a same-second tie goes to the report stored first"
+    );
+    assert_eq!(harness.report("1").state, SecurityReportState::Tracking);
 }

@@ -4,9 +4,10 @@ use chrono::{DateTime, NaiveDate, SecondsFormat, TimeDelta, Utc};
 use claudear_core::error::{Error, Result};
 use claudear_core::security::{
     AwardStatus, DeliveryStatus, NewSecurityAward, NewSecurityEvent, NewSecurityReport,
-    NewSecurityVulnerability, SecurityAward, SecurityEvent, SecurityEventKind, SecurityReply,
-    SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportFilter,
-    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityChanges, VulnerabilityState,
+    NewSecurityVulnerability, ReportTransition, SecurityAward, SecurityEvent, SecurityEventKind,
+    SecurityReply, SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportFilter,
+    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityCandidate,
+    SecurityVulnerabilityChanges, VulnerabilityState,
 };
 use rusqlite::types::{Type, Value};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
@@ -84,6 +85,7 @@ const REPLY_COLUMNS: &[&str] = &[
     "kind",
     "status",
     "error",
+    "attempts",
     "claimed_at",
     "completed_at",
 ];
@@ -258,8 +260,9 @@ fn row_to_reply(row: &Row<'_>) -> rusqlite::Result<SecurityReply> {
         kind: parse_enum(row, 2)?,
         status: parse_enum(row, 3)?,
         error: row.get(4)?,
-        claimed_at: parse_time(row, 5)?,
-        completed_at: parse_optional_time(row, 6)?,
+        attempts: row.get(5)?,
+        claimed_at: parse_time(row, 6)?,
+        completed_at: parse_optional_time(row, 7)?,
     })
 }
 
@@ -382,6 +385,65 @@ fn insert_event(
         ],
     )?;
     Ok(())
+}
+
+fn move_report(
+    connection: &Connection,
+    id: i64,
+    transition: ReportTransition,
+    changes: &SecurityReportChanges,
+    updated_at: &str,
+) -> Result<bool> {
+    if !transition.is_allowed() {
+        return Ok(false);
+    }
+    let mut assignments = vec![
+        ("state", text(transition.to.as_str())),
+        ("updated_at", text(updated_at)),
+    ];
+    assignments.extend(report_assignments(changes));
+    update_in_state(
+        connection,
+        REPORTS,
+        id,
+        transition.from.as_str(),
+        assignments,
+    )
+}
+
+fn query_reply(
+    connection: &Connection,
+    report_id: i64,
+    kind: SecurityReplyKind,
+) -> Result<Option<SecurityReply>> {
+    let sql = format!(
+        "SELECT {} FROM security_replies WHERE security_replies.report_id = ?1 AND security_replies.kind = ?2",
+        select_list(REPLY_COLUMNS, "security_replies")
+    );
+    Ok(connection
+        .query_row(&sql, params![report_id, kind.as_str()], row_to_reply)
+        .optional()?)
+}
+
+fn has_other_fix_live_reply(
+    connection: &Connection,
+    report_id: i64,
+    kind: SecurityReplyKind,
+) -> Result<bool> {
+    if !kind.is_fix_live() {
+        return Ok(false);
+    }
+    let siblings: Vec<&str> = SecurityReplyKind::ALL
+        .iter()
+        .filter(|other| other.is_fix_live() && **other != kind)
+        .map(|other| other.as_str())
+        .collect();
+    let placeholders = vec!["?"; siblings.len()].join(", ");
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM security_replies WHERE report_id = ? AND kind IN ({placeholders}))"
+    );
+    let values = std::iter::once(Value::Integer(report_id)).chain(siblings.into_iter().map(text));
+    Ok(connection.query_row(&sql, params_from_iter(values), |row| row.get(0))?)
 }
 
 fn query_report(connection: &Connection, id: i64) -> Result<Option<SecurityReport>> {
@@ -555,18 +617,14 @@ impl SqliteTracker {
         changes: &SecurityReportChanges,
         event: &NewSecurityEvent,
     ) -> Result<bool> {
-        if !expected.can_transition_to(next) {
+        let transition = ReportTransition::new(expected, next);
+        if !transition.is_allowed() {
             return Ok(false);
         }
         let mut connection = self.acquire_lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated_at = now();
-        let mut assignments = vec![
-            ("state", text(next.as_str())),
-            ("updated_at", text(&updated_at)),
-        ];
-        assignments.extend(report_assignments(changes));
-        if !update_in_state(&transaction, REPORTS, id, expected.as_str(), assignments)? {
+        if !move_report(&transaction, id, transition, changes, &updated_at)? {
             return Ok(false);
         }
         insert_event(
@@ -737,10 +795,10 @@ impl SqliteTracker {
             SELECT {}, {} FROM security_reports
             JOIN security_events
               ON security_events.id = (
-                  SELECT MAX(latest.id) FROM security_events AS latest
-                  WHERE latest.report_id = security_reports.id
+                  SELECT MAX(confirmation.id) FROM security_events AS confirmation
+                  WHERE confirmation.report_id = security_reports.id AND confirmation.kind = ?2
               )
-            WHERE security_reports.state = ?1 AND security_events.kind = ?2
+            WHERE security_reports.state = ?1
             ORDER BY security_events.id ASC
             "#,
             select_list(REPORT_COLUMNS, "security_reports"),
@@ -750,7 +808,7 @@ impl SqliteTracker {
         let confirmed = statement
             .query_map(
                 params![
-                    SecurityReportState::Assessing.as_str(),
+                    SecurityReportState::Registering.as_str(),
                     SecurityEventKind::AdminConfirmed.as_str()
                 ],
                 |row| {
@@ -851,6 +909,52 @@ impl SqliteTracker {
         query_vulnerability(&connection, id)
     }
 
+    pub fn find_security_vulnerability_by_first_report(
+        &self,
+        report_id: i64,
+    ) -> Result<Option<SecurityVulnerability>> {
+        let connection = self.acquire_lock()?;
+        let sql = format!(
+            "SELECT {} FROM security_vulnerabilities WHERE security_vulnerabilities.first_report_id = ?1 ORDER BY security_vulnerabilities.id LIMIT 1",
+            select_list(VULNERABILITY_COLUMNS, "security_vulnerabilities")
+        );
+        Ok(connection
+            .query_row(&sql, params![report_id], row_to_vulnerability)
+            .optional()?)
+    }
+
+    pub fn list_security_vulnerability_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SecurityVulnerabilityCandidate>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, title, summary, embedding FROM security_vulnerabilities
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let candidates = statement
+            .query_map(params![limit], |row| {
+                let embedding: Option<Vec<u8>> = row.get(3)?;
+                Ok(SecurityVulnerabilityCandidate {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    summary: row.get(2)?,
+                    embedding: match embedding {
+                        None => Vec::new(),
+                        Some(blob) => embedding_from_blob(&blob).ok_or_else(|| {
+                            conversion_error(3, "malformed embedding blob".to_string())
+                        })?,
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(candidates)
+    }
+
     pub fn list_security_vulnerabilities(
         &self,
         state: Option<VulnerabilityState>,
@@ -934,7 +1038,8 @@ impl SqliteTracker {
             r#"
             UPDATE security_vulnerabilities
             SET first_report_id = ?1, first_reported_at = ?2, updated_at = ?3
-            WHERE id = ?4 AND first_report_id = ?5 AND first_reported_at > ?2
+            WHERE id = ?4 AND first_report_id = ?5
+              AND (first_reported_at > ?2 OR (first_reported_at = ?2 AND first_report_id > ?1))
               AND NOT EXISTS (SELECT 1 FROM security_awards WHERE vulnerability_id = ?4)
             "#,
             params![
@@ -964,28 +1069,61 @@ impl SqliteTracker {
         Ok(true)
     }
 
-    pub fn claim_security_reply(&self, report_id: i64, kind: SecurityReplyKind) -> Result<bool> {
-        let connection = self.acquire_lock()?;
-        let claimed = connection.execute(
-            r#"
-            INSERT INTO security_replies (report_id, kind, status, claimed_at)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(report_id, kind) DO UPDATE SET
-                status = excluded.status,
-                error = NULL,
-                claimed_at = excluded.claimed_at,
-                completed_at = NULL
-            WHERE security_replies.status = ?5
-            "#,
-            params![
-                report_id,
-                kind.as_str(),
-                DeliveryStatus::Sending.as_str(),
-                now(),
-                DeliveryStatus::Failed.as_str()
-            ],
+    pub fn claim_security_reply(
+        &self,
+        report_id: i64,
+        kind: SecurityReplyKind,
+        event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if has_other_fix_live_reply(&transaction, report_id, kind)? {
+            return Ok(false);
+        }
+        let previous = query_reply(&transaction, report_id, kind)?.map(|reply| reply.status);
+        let claimed_at = now();
+        let sending = DeliveryStatus::Sending.as_str();
+        match previous {
+            None => {
+                transaction.execute(
+                    r#"
+                    INSERT INTO security_replies (report_id, kind, status, attempts, claimed_at)
+                    VALUES (?1, ?2, ?3, 1, ?4)
+                    "#,
+                    params![report_id, kind.as_str(), sending, claimed_at],
+                )?;
+            }
+            Some(DeliveryStatus::Failed) => {
+                transaction.execute(
+                    r#"
+                    UPDATE security_replies
+                    SET status = ?1, attempts = attempts + 1, claimed_at = ?2, completed_at = NULL
+                    WHERE report_id = ?3 AND kind = ?4 AND status = ?5
+                    "#,
+                    params![
+                        sending,
+                        claimed_at,
+                        report_id,
+                        kind.as_str(),
+                        DeliveryStatus::Failed.as_str()
+                    ],
+                )?;
+            }
+            Some(_) => return Ok(false),
+        }
+        insert_event(
+            &transaction,
+            EventRow {
+                report_id: Some(report_id),
+                from_state: previous.map(DeliveryStatus::as_str),
+                to_state: Some(sending),
+                ..EventRow::default()
+            },
+            event,
+            &claimed_at,
         )?;
-        Ok(claimed > 0)
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn complete_security_reply(
@@ -994,14 +1132,19 @@ impl SqliteTracker {
         kind: SecurityReplyKind,
         status: DeliveryStatus,
         error: Option<&str>,
-    ) -> Result<()> {
+        event: &NewSecurityEvent,
+        transition: Option<ReportTransition>,
+    ) -> Result<bool> {
         if !status.is_completion() {
             return Err(Error::storage(format!(
                 "a reply cannot complete as {status}"
             )));
         }
-        let connection = self.acquire_lock()?;
-        let completed = connection.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let completed_at = now();
+        let sending = DeliveryStatus::Sending.as_str();
+        let completed = transaction.execute(
             r#"
             UPDATE security_replies SET status = ?1, error = ?2, completed_at = ?3
             WHERE report_id = ?4 AND kind = ?5 AND status = ?6
@@ -1009,10 +1152,10 @@ impl SqliteTracker {
             params![
                 status.as_str(),
                 error,
-                now(),
+                completed_at,
                 report_id,
                 kind.as_str(),
-                DeliveryStatus::Sending.as_str()
+                sending
             ],
         )?;
         if completed == 0 {
@@ -1020,7 +1163,46 @@ impl SqliteTracker {
                 "no {kind} reply is being sent for security report {report_id}"
             )));
         }
-        Ok(())
+        let moved = match transition {
+            Some(transition) => move_report(
+                &transaction,
+                report_id,
+                transition,
+                &SecurityReportChanges::default(),
+                &completed_at,
+            )?,
+            None => false,
+        };
+        let row = match transition {
+            Some(transition) if moved => EventRow {
+                report_id: Some(report_id),
+                from_state: Some(transition.from.as_str()),
+                to_state: Some(transition.to.as_str()),
+                ..EventRow::default()
+            },
+            _ => EventRow {
+                report_id: Some(report_id),
+                from_state: Some(sending),
+                to_state: Some(status.as_str()),
+                ..EventRow::default()
+            },
+        };
+        insert_event(&transaction, row, event, &completed_at)?;
+        transaction.commit()?;
+        Ok(moved)
+    }
+
+    pub fn list_reports_with_unconfirmed_replies(&self) -> Result<Vec<i64>> {
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT report_id FROM security_replies WHERE status = ?1 ORDER BY report_id",
+        )?;
+        let ids = statement
+            .query_map(params![DeliveryStatus::Unconfirmed.as_str()], |row| {
+                row.get(0)
+            })?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
     }
 
     pub fn confirm_security_reply(
@@ -1102,14 +1284,16 @@ impl SqliteTracker {
                 vulnerability_id, report_id, recipient_email, campaign, credits, status,
                 prepared_at, updated_at
             )
-            SELECT id, ?2, ?3, ?4, ?5, ?6, ?7, ?7 FROM security_vulnerabilities
-            WHERE id = ?1 AND first_report_id = ?2
+            SELECT security_vulnerabilities.id, security_reports.id, security_reports.reporter_email,
+                   ?3, ?4, ?5, ?6, ?6
+            FROM security_vulnerabilities
+            JOIN security_reports ON security_reports.id = security_vulnerabilities.first_report_id
+            WHERE security_vulnerabilities.id = ?1 AND security_vulnerabilities.first_report_id = ?2
             ON CONFLICT(vulnerability_id) DO NOTHING
             "#,
             params![
                 vulnerability_id,
                 report_id,
-                award.recipient_email,
                 award.campaign,
                 award.credits,
                 status.as_str(),
@@ -1262,7 +1446,6 @@ mod tests {
 
     fn new_award() -> NewSecurityAward {
         NewSecurityAward {
-            recipient_email: Some("researcher@example.com".to_string()),
             campaign: "SecurityResearchers".to_string(),
             credits: 100,
         }
@@ -1270,6 +1453,29 @@ mod tests {
 
     fn event(kind: SecurityEventKind) -> NewSecurityEvent {
         NewSecurityEvent::new(kind)
+    }
+
+    fn claim(tracker: &SqliteTracker, report_id: i64, kind: SecurityReplyKind) -> bool {
+        tracker
+            .claim_security_reply(report_id, kind, &event(SecurityEventKind::ReplyClaimed))
+            .unwrap()
+    }
+
+    fn complete(
+        tracker: &SqliteTracker,
+        report_id: i64,
+        kind: SecurityReplyKind,
+        status: DeliveryStatus,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        tracker.complete_security_reply(
+            report_id,
+            kind,
+            status,
+            error,
+            &event(SecurityEventKind::ReplySent),
+            None,
+        )
     }
 
     fn event_count(tracker: &SqliteTracker) -> i64 {
@@ -1451,17 +1657,15 @@ mod tests {
         tracker
             .prepare_security_award(vulnerability.id, report.id, &new_award())
             .unwrap();
-        assert!(tracker
-            .claim_security_reply(report.id, SecurityReplyKind::Confirmed)
-            .unwrap());
-        tracker
-            .complete_security_reply(
-                report.id,
-                SecurityReplyKind::Confirmed,
-                DeliveryStatus::Sent,
-                None,
-            )
-            .unwrap();
+        assert!(claim(&tracker, report.id, SecurityReplyKind::Confirmed));
+        complete(
+            &tracker,
+            report.id,
+            SecurityReplyKind::Confirmed,
+            DeliveryStatus::Sent,
+            None,
+        )
+        .unwrap();
 
         let pattern = regex_lite::Regex::new(RFC3339_SECONDS).unwrap();
         let connection = tracker.acquire_lock().unwrap();
@@ -2010,8 +2214,35 @@ mod tests {
         assert_eq!(last.detail, json!({ "attempt": 2 }));
     }
 
+    fn confirm(tracker: &SqliteTracker, report_id: i64, title: &str) {
+        for (from, to, kind) in [
+            (
+                SecurityReportState::Received,
+                SecurityReportState::NeedsHuman,
+                SecurityEventKind::NeedsHuman,
+            ),
+            (
+                SecurityReportState::NeedsHuman,
+                SecurityReportState::Registering,
+                SecurityEventKind::AdminConfirmed,
+            ),
+        ] {
+            assert!(tracker
+                .transition_security_report(
+                    report_id,
+                    from,
+                    to,
+                    &SecurityReportChanges::default(),
+                    &event(kind)
+                        .with_actor("admin@example.com")
+                        .with_detail(json!({ "title": title })),
+                )
+                .unwrap());
+        }
+    }
+
     #[test]
-    fn admin_confirmed_reports_are_those_whose_latest_event_is_the_confirmation() {
+    fn admin_confirmed_reports_are_registering_reports_with_their_confirmation() {
         let tracker = tracker();
         let confirmed = tracker
             .upsert_security_report(&new_report("1", reported_at(0)))
@@ -2019,56 +2250,83 @@ mod tests {
         let assessing = tracker
             .upsert_security_report(&new_report("2", reported_at(1)))
             .unwrap();
-        let superseded = tracker
+        let followed_up = tracker
             .upsert_security_report(&new_report("3", reported_at(2)))
             .unwrap();
-        for report in [&confirmed, &superseded] {
-            assert!(tracker
-                .transition_security_report(
-                    report.id,
-                    SecurityReportState::Received,
-                    SecurityReportState::NeedsHuman,
-                    &SecurityReportChanges::default(),
-                    &event(SecurityEventKind::NeedsHuman),
-                )
-                .unwrap());
-            assert!(tracker
-                .transition_security_report(
-                    report.id,
-                    SecurityReportState::NeedsHuman,
-                    SecurityReportState::Assessing,
-                    &SecurityReportChanges::default(),
-                    &event(SecurityEventKind::AdminConfirmed)
-                        .with_actor("admin@example.com")
-                        .with_detail(json!({ "title": "Session fixation" })),
-                )
-                .unwrap());
-        }
+        confirm(&tracker, confirmed.id, "Session fixation");
+        confirm(&tracker, followed_up.id, "Token leak");
         assess(&tracker, assessing.id);
         tracker
             .record_security_event(
-                Some(superseded.id),
+                Some(assessing.id),
                 None,
-                &event(SecurityEventKind::AssessmentFailed),
+                &event(SecurityEventKind::AdminConfirmed),
             )
             .unwrap();
+        assert!(tracker
+            .record_security_follow_up(followed_up.id, 1, 2)
+            .unwrap());
 
         let listed = tracker.list_admin_confirmed_reports().unwrap();
-        assert_eq!(listed.len(), 1);
+        let ids: Vec<i64> = listed.iter().map(|(report, _)| report.id).collect();
+        assert_eq!(
+            ids,
+            vec![confirmed.id, followed_up.id],
+            "a later event does not hide the confirmation, and only registering reports count"
+        );
         let (report, confirmation) = &listed[0];
-        assert_eq!(report.id, confirmed.id);
-        assert_eq!(report.state, SecurityReportState::Assessing);
+        assert_eq!(report.state, SecurityReportState::Registering);
         assert_eq!(confirmation.kind, SecurityEventKind::AdminConfirmed);
         assert_eq!(confirmation.actor.as_deref(), Some("admin@example.com"));
         assert_eq!(confirmation.detail, json!({ "title": "Session fixation" }));
         assert_eq!(confirmation.from_state.as_deref(), Some("needs_human"));
+        assert_eq!(listed[1].1.detail, json!({ "title": "Token leak" }));
 
         let vulnerability = tracker
             .create_security_vulnerability(&new_vulnerability(report))
             .unwrap();
+        assert!(tracker
+            .transition_security_report(
+                confirmed.id,
+                SecurityReportState::Registering,
+                SecurityReportState::Tracking,
+                &SecurityReportChanges {
+                    vulnerability_id: Some(vulnerability.id),
+                    ..SecurityReportChanges::default()
+                },
+                &event(SecurityEventKind::Assessed),
+            )
+            .unwrap());
         assert_eq!(tracker.list_admin_confirmed_reports().unwrap().len(), 1);
-        track(&tracker, confirmed.id, vulnerability.id);
-        assert!(tracker.list_admin_confirmed_reports().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_stale_sweep_never_touches_an_admin_confirmed_report() {
+        let tracker = tracker();
+        let report = tracker
+            .upsert_security_report(&new_report("1", reported_at(0)))
+            .unwrap();
+        confirm(&tracker, report.id, "Session fixation");
+        execute(
+            &tracker,
+            "UPDATE security_reports SET updated_at = ?1 WHERE id = ?2",
+            params![timestamp(Utc::now() - TimeDelta::days(2)), report.id],
+        );
+        assert_eq!(
+            tracker
+                .release_stale_security_assessments(Duration::from_secs(60))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            tracker
+                .get_security_report(report.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            SecurityReportState::Registering
+        );
+        assert_eq!(tracker.list_admin_confirmed_reports().unwrap().len(), 1);
     }
 
     #[test]
@@ -2213,13 +2471,18 @@ mod tests {
             .unwrap());
         assert_eq!(event_count(&tracker), before);
 
+        crate::AttemptTracker::record_attempt(&tracker, "security", "SEC-1", "SEC-1").unwrap();
+        let attempt_id = crate::AttemptTracker::get_attempt(&tracker, "security", "SEC-1")
+            .unwrap()
+            .unwrap()
+            .id;
         assert!(tracker
             .transition_security_vulnerability(
                 vulnerability.id,
                 VulnerabilityState::AwaitingFix,
                 VulnerabilityState::Fixing,
                 &SecurityVulnerabilityChanges {
-                    fix_attempt_id: Some(7),
+                    fix_attempt_id: Some(attempt_id),
                     pull_request_url: Some(
                         "https://github.com/appwrite/appwrite/pull/1".to_string()
                     ),
@@ -2247,7 +2510,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, VulnerabilityState::Merged);
-        assert_eq!(stored.fix_attempt_id, Some(7));
+        assert_eq!(stored.fix_attempt_id, Some(attempt_id));
         assert_eq!(
             stored.pull_request_url.as_deref(),
             Some("https://github.com/appwrite/appwrite/pull/1")
@@ -2333,6 +2596,17 @@ mod tests {
         assert!(!tracker
             .replace_first_reporter(vulnerability.id, current.id, current.id, reported_at(1))
             .unwrap());
+        let same_second_later_id = tracker
+            .upsert_security_report(&new_report("4", reported_at(10)))
+            .unwrap();
+        assert!(!tracker
+            .replace_first_reporter(
+                vulnerability.id,
+                current.id,
+                same_second_later_id.id,
+                reported_at(10)
+            )
+            .unwrap());
 
         assert!(tracker
             .replace_first_reporter(vulnerability.id, current.id, earlier.id, reported_at(5))
@@ -2369,6 +2643,97 @@ mod tests {
     }
 
     #[test]
+    fn a_same_second_report_with_an_earlier_id_replaces_the_first_reporter() {
+        let tracker = tracker();
+        let earlier_id = tracker
+            .upsert_security_report(&new_report("1", reported_at(10)))
+            .unwrap();
+        let later_id = tracker
+            .upsert_security_report(&new_report("2", reported_at(10)))
+            .unwrap();
+        let vulnerability = tracker
+            .create_security_vulnerability(&new_vulnerability(&later_id))
+            .unwrap();
+        assert!(tracker
+            .replace_first_reporter(
+                vulnerability.id,
+                later_id.id,
+                earlier_id.id,
+                reported_at(10)
+            )
+            .unwrap());
+        assert_eq!(
+            tracker
+                .get_security_vulnerability(vulnerability.id)
+                .unwrap()
+                .unwrap()
+                .first_report_id,
+            earlier_id.id
+        );
+    }
+
+    #[test]
+    fn vulnerability_lookups_by_first_report_and_dedup_candidates() {
+        let tracker = tracker();
+        let first = tracker
+            .upsert_security_report(&new_report("1", reported_at(0)))
+            .unwrap();
+        let second = tracker
+            .upsert_security_report(&new_report("2", reported_at(1)))
+            .unwrap();
+        let older = tracker
+            .create_security_vulnerability(&new_vulnerability(&first))
+            .unwrap();
+        let newer = tracker
+            .create_security_vulnerability(&NewSecurityVulnerability {
+                title: "Token leak".to_string(),
+                embedding: Vec::new(),
+                ..new_vulnerability(&second)
+            })
+            .unwrap();
+
+        assert_eq!(
+            tracker
+                .find_security_vulnerability_by_first_report(first.id)
+                .unwrap()
+                .map(|vulnerability| vulnerability.id),
+            Some(older.id)
+        );
+        assert_eq!(
+            tracker
+                .find_security_vulnerability_by_first_report(999)
+                .unwrap(),
+            None
+        );
+
+        let candidates = tracker.list_security_vulnerability_candidates(10).unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                SecurityVulnerabilityCandidate {
+                    id: newer.id,
+                    title: "Token leak".to_string(),
+                    summary: newer.summary.clone(),
+                    embedding: Vec::new(),
+                },
+                SecurityVulnerabilityCandidate {
+                    id: older.id,
+                    title: older.title.clone(),
+                    summary: older.summary.clone(),
+                    embedding: vec![0.25, -0.5, 1.0],
+                },
+            ]
+        );
+        let bounded: Vec<i64> = tracker
+            .list_security_vulnerability_candidates(1)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect();
+        assert_eq!(bounded, vec![newer.id]);
+    }
+
+    #[test]
     fn reply_claims_are_exclusive_and_only_failed_replies_are_reclaimed() {
         let tracker = tracker();
         let report = tracker
@@ -2376,48 +2741,318 @@ mod tests {
             .unwrap();
         let kind = SecurityReplyKind::Confirmed;
 
-        assert!(tracker.claim_security_reply(report.id, kind).unwrap());
-        assert!(!tracker.claim_security_reply(report.id, kind).unwrap());
-        assert!(tracker
-            .claim_security_reply(report.id, SecurityReplyKind::FixLive)
-            .unwrap());
+        assert!(claim(&tracker, report.id, kind));
+        assert!(!claim(&tracker, report.id, kind));
+        assert!(claim(&tracker, report.id, SecurityReplyKind::FixLive));
 
-        tracker
-            .complete_security_reply(report.id, kind, DeliveryStatus::Failed, Some("422"))
-            .unwrap();
+        complete(
+            &tracker,
+            report.id,
+            kind,
+            DeliveryStatus::Failed,
+            Some("422"),
+        )
+        .unwrap();
         let failed = tracker.list_security_replies(report.id).unwrap();
         assert_eq!(failed[0].status, DeliveryStatus::Failed);
         assert_eq!(failed[0].error.as_deref(), Some("422"));
         assert!(failed[0].completed_at.is_some());
 
-        assert!(tracker.claim_security_reply(report.id, kind).unwrap());
+        assert_eq!(failed[0].attempts, 1);
+
+        assert!(claim(&tracker, report.id, kind));
         let reclaimed = &tracker.list_security_replies(report.id).unwrap()[0];
         assert_eq!(reclaimed.status, DeliveryStatus::Sending);
-        assert_eq!(reclaimed.error, None);
+        assert_eq!(
+            reclaimed.error.as_deref(),
+            Some("422"),
+            "a reclaim keeps the last error"
+        );
+        assert_eq!(reclaimed.attempts, 2);
         assert_eq!(reclaimed.completed_at, None);
 
-        tracker
-            .complete_security_reply(report.id, kind, DeliveryStatus::Unconfirmed, Some("503"))
-            .unwrap();
-        assert!(!tracker.claim_security_reply(report.id, kind).unwrap());
+        complete(
+            &tracker,
+            report.id,
+            kind,
+            DeliveryStatus::Unconfirmed,
+            Some("503"),
+        )
+        .unwrap();
+        assert!(!claim(&tracker, report.id, kind));
 
-        tracker
-            .complete_security_reply(
-                report.id,
-                SecurityReplyKind::FixLive,
-                DeliveryStatus::Sent,
-                None,
-            )
-            .unwrap();
-        assert!(!tracker
-            .claim_security_reply(report.id, SecurityReplyKind::FixLive)
-            .unwrap());
+        complete(
+            &tracker,
+            report.id,
+            SecurityReplyKind::FixLive,
+            DeliveryStatus::Sent,
+            None,
+        )
+        .unwrap();
+        assert!(!claim(&tracker, report.id, SecurityReplyKind::FixLive));
 
         let replies = tracker.list_security_replies(report.id).unwrap();
         assert_eq!(replies.len(), 2);
         assert_eq!(replies[0].kind, kind);
         assert_eq!(replies[0].status, DeliveryStatus::Unconfirmed);
+        assert_eq!(replies[0].error.as_deref(), Some("503"));
         assert_eq!(replies[1].status, DeliveryStatus::Sent);
+    }
+
+    #[test]
+    fn claims_and_completions_record_their_event_in_the_same_write() {
+        let tracker = tracker();
+        let report = tracker
+            .upsert_security_report(&new_report("1", reported_at(0)))
+            .unwrap();
+        let kind = SecurityReplyKind::NotReproducible;
+        assert!(tracker
+            .claim_security_reply(
+                report.id,
+                kind,
+                &event(SecurityEventKind::ReplyClaimed).with_detail(json!({ "kind": kind })),
+            )
+            .unwrap());
+        assert!(!tracker
+            .complete_security_reply(
+                report.id,
+                kind,
+                DeliveryStatus::Failed,
+                Some("422"),
+                &event(SecurityEventKind::ReplyFailed),
+                None,
+            )
+            .unwrap());
+        assert!(tracker
+            .claim_security_reply(report.id, kind, &event(SecurityEventKind::ReplyClaimed))
+            .unwrap());
+
+        let timeline = tracker.list_security_timeline(report.id).unwrap();
+        let edges: Vec<(SecurityEventKind, Option<&str>, Option<&str>)> = timeline
+            .iter()
+            .skip(1)
+            .map(|event| {
+                (
+                    event.kind,
+                    event.from_state.as_deref(),
+                    event.to_state.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            edges,
+            vec![
+                (SecurityEventKind::ReplyClaimed, None, Some("sending")),
+                (
+                    SecurityEventKind::ReplyFailed,
+                    Some("sending"),
+                    Some("failed")
+                ),
+                (
+                    SecurityEventKind::ReplyClaimed,
+                    Some("failed"),
+                    Some("sending")
+                ),
+            ]
+        );
+        assert_eq!(timeline[1].detail, json!({ "kind": "not_reproducible" }));
+
+        let refused = event_count(&tracker);
+        assert!(!tracker
+            .claim_security_reply(report.id, kind, &event(SecurityEventKind::ReplyClaimed))
+            .unwrap());
+        assert!(complete(
+            &tracker,
+            report.id,
+            SecurityReplyKind::Duplicate,
+            DeliveryStatus::Sent,
+            None
+        )
+        .is_err());
+        assert_eq!(
+            event_count(&tracker),
+            refused,
+            "a refused write records nothing"
+        );
+    }
+
+    #[test]
+    fn a_sent_completion_moves_the_report_in_the_same_write() {
+        let tracker = tracker();
+        let report = tracker
+            .upsert_security_report(&new_report("1", reported_at(0)))
+            .unwrap();
+        assess(&tracker, report.id);
+        assert!(tracker
+            .transition_security_report(
+                report.id,
+                SecurityReportState::Assessing,
+                SecurityReportState::Replying,
+                &SecurityReportChanges::default(),
+                &event(SecurityEventKind::Assessed),
+            )
+            .unwrap());
+        let kind = SecurityReplyKind::NotReproducible;
+        let closing =
+            ReportTransition::new(SecurityReportState::Replying, SecurityReportState::Closed);
+
+        assert!(claim(&tracker, report.id, kind));
+        assert!(tracker
+            .complete_security_reply(
+                report.id,
+                kind,
+                DeliveryStatus::Sent,
+                None,
+                &event(SecurityEventKind::ReplySent),
+                Some(closing),
+            )
+            .unwrap());
+        assert_eq!(
+            tracker
+                .get_security_report(report.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            SecurityReportState::Closed
+        );
+        let sent = tracker
+            .list_security_timeline(report.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(sent.kind, SecurityEventKind::ReplySent);
+        assert_eq!(sent.from_state.as_deref(), Some("replying"));
+        assert_eq!(sent.to_state.as_deref(), Some("closed"));
+
+        let other = tracker
+            .upsert_security_report(&new_report("2", reported_at(1)))
+            .unwrap();
+        assert!(claim(&tracker, other.id, kind));
+        assert!(
+            !tracker
+                .complete_security_reply(
+                    other.id,
+                    kind,
+                    DeliveryStatus::Sent,
+                    None,
+                    &event(SecurityEventKind::ReplySent),
+                    Some(closing),
+                )
+                .unwrap(),
+            "a report outside the transition's state does not move"
+        );
+        assert_eq!(
+            tracker.list_security_replies(other.id).unwrap()[0].status,
+            DeliveryStatus::Sent
+        );
+        let sent = tracker
+            .list_security_timeline(other.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(sent.from_state.as_deref(), Some("sending"));
+        assert_eq!(sent.to_state.as_deref(), Some("sent"));
+    }
+
+    #[test]
+    fn a_report_gets_only_one_fix_live_reply() {
+        let tracker = tracker();
+        let report = tracker
+            .upsert_security_report(&new_report("1", reported_at(0)))
+            .unwrap();
+        assert!(claim(&tracker, report.id, SecurityReplyKind::FixLive));
+        assert!(!claim(
+            &tracker,
+            report.id,
+            SecurityReplyKind::FixLiveRewarded
+        ));
+        complete(
+            &tracker,
+            report.id,
+            SecurityReplyKind::FixLive,
+            DeliveryStatus::Failed,
+            Some("422"),
+        )
+        .unwrap();
+        assert!(
+            !claim(&tracker, report.id, SecurityReplyKind::FixLiveRewarded),
+            "a failed fix-live reply still blocks the other kind"
+        );
+        assert!(claim(&tracker, report.id, SecurityReplyKind::FixLive));
+        assert!(claim(&tracker, report.id, SecurityReplyKind::Confirmed));
+        let kinds: Vec<SecurityReplyKind> = tracker
+            .list_security_replies(report.id)
+            .unwrap()
+            .into_iter()
+            .map(|reply| reply.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![SecurityReplyKind::FixLive, SecurityReplyKind::Confirmed]
+        );
+    }
+
+    #[test]
+    fn reports_with_unconfirmed_replies_are_listed_once() {
+        let tracker = tracker();
+        let mut ids = Vec::new();
+        for conversation in ["1", "2", "3"] {
+            ids.push(
+                tracker
+                    .upsert_security_report(&new_report(conversation, reported_at(0)))
+                    .unwrap()
+                    .id,
+            );
+        }
+        for kind in [SecurityReplyKind::Confirmed, SecurityReplyKind::FixLive] {
+            assert!(claim(&tracker, ids[2], kind));
+            complete(&tracker, ids[2], kind, DeliveryStatus::Unconfirmed, None).unwrap();
+        }
+        assert!(claim(&tracker, ids[0], SecurityReplyKind::Duplicate));
+        complete(
+            &tracker,
+            ids[0],
+            SecurityReplyKind::Duplicate,
+            DeliveryStatus::Sent,
+            None,
+        )
+        .unwrap();
+        assert!(claim(&tracker, ids[1], SecurityReplyKind::Duplicate));
+        complete(
+            &tracker,
+            ids[1],
+            SecurityReplyKind::Duplicate,
+            DeliveryStatus::Unconfirmed,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tracker.list_reports_with_unconfirmed_replies().unwrap(),
+            vec![ids[1], ids[2]]
+        );
+    }
+
+    #[test]
+    fn replies_and_awards_must_reference_stored_rows() {
+        let tracker = tracker();
+        assert!(tracker
+            .claim_security_reply(
+                999,
+                SecurityReplyKind::Confirmed,
+                &event(SecurityEventKind::ReplyClaimed)
+            )
+            .is_err());
+        let report = tracker
+            .upsert_security_report(&new_report("1", reported_at(0)))
+            .unwrap();
+        assert!(tracker
+            .create_security_vulnerability(&NewSecurityVulnerability {
+                first_report_id: 999,
+                ..new_vulnerability(&report)
+            })
+            .is_err());
+        assert_eq!(event_count(&tracker), 1);
     }
 
     #[test]
@@ -2428,19 +3063,11 @@ mod tests {
             .unwrap();
         let kind = SecurityReplyKind::Duplicate;
 
-        assert!(tracker
-            .complete_security_reply(report.id, kind, DeliveryStatus::Sent, None)
-            .is_err());
-        assert!(tracker.claim_security_reply(report.id, kind).unwrap());
-        assert!(tracker
-            .complete_security_reply(report.id, kind, DeliveryStatus::Sending, None)
-            .is_err());
-        tracker
-            .complete_security_reply(report.id, kind, DeliveryStatus::Sent, None)
-            .unwrap();
-        assert!(tracker
-            .complete_security_reply(report.id, kind, DeliveryStatus::Failed, None)
-            .is_err());
+        assert!(complete(&tracker, report.id, kind, DeliveryStatus::Sent, None).is_err());
+        assert!(claim(&tracker, report.id, kind));
+        assert!(complete(&tracker, report.id, kind, DeliveryStatus::Sending, None).is_err());
+        complete(&tracker, report.id, kind, DeliveryStatus::Sent, None).unwrap();
+        assert!(complete(&tracker, report.id, kind, DeliveryStatus::Failed, None).is_err());
         assert_eq!(
             tracker.list_security_replies(report.id).unwrap()[0].status,
             DeliveryStatus::Sent
@@ -2456,13 +3083,11 @@ mod tests {
         let delivered = SecurityReplyKind::Confirmed;
         let lost = SecurityReplyKind::FixLiveRewarded;
         for kind in [delivered, lost] {
-            assert!(tracker.claim_security_reply(report.id, kind).unwrap());
+            assert!(claim(&tracker, report.id, kind));
             assert!(!tracker
                 .confirm_security_reply(report.id, kind, true, "admin@example.com")
                 .unwrap());
-            tracker
-                .complete_security_reply(report.id, kind, DeliveryStatus::Unconfirmed, None)
-                .unwrap();
+            complete(&tracker, report.id, kind, DeliveryStatus::Unconfirmed, None).unwrap();
         }
 
         assert!(tracker
@@ -2471,7 +3096,7 @@ mod tests {
         assert!(!tracker
             .confirm_security_reply(report.id, delivered, false, "admin@example.com")
             .unwrap());
-        assert!(!tracker.claim_security_reply(report.id, delivered).unwrap());
+        assert!(!claim(&tracker, report.id, delivered));
 
         assert!(tracker
             .confirm_security_reply(report.id, lost, false, "admin@example.com")
@@ -2481,7 +3106,7 @@ mod tests {
         assert_eq!(replies[0].error, None);
         assert_eq!(replies[1].status, DeliveryStatus::Failed);
         assert_eq!(replies[1].error.as_deref(), Some(NOT_DELIVERED_ERROR));
-        assert!(tracker.claim_security_reply(report.id, lost).unwrap());
+        assert!(claim(&tracker, report.id, lost));
 
         let confirmations: Vec<SecurityEvent> = tracker
             .list_security_timeline(report.id)
@@ -2558,6 +3183,44 @@ mod tests {
         assert_eq!(prepared.to_state.as_deref(), Some("prepared"));
         assert_eq!(prepared.detail["report_id"], json!(first.id));
         assert!(prepared.detail.get("recipient_email").is_none());
+    }
+
+    #[test]
+    fn award_recipient_is_the_current_first_reporter_email() {
+        let tracker = tracker();
+        let first = tracker
+            .upsert_security_report(&NewSecurityReport {
+                reporter_email: Some("first@example.com".to_string()),
+                ..new_report("1", reported_at(5))
+            })
+            .unwrap();
+        let earlier = tracker
+            .upsert_security_report(&NewSecurityReport {
+                reporter_email: Some("earlier@example.com".to_string()),
+                ..new_report("2", reported_at(1))
+            })
+            .unwrap();
+        let vulnerability = tracker
+            .create_security_vulnerability(&new_vulnerability(&first))
+            .unwrap();
+        assert!(tracker
+            .replace_first_reporter(vulnerability.id, first.id, earlier.id, reported_at(1))
+            .unwrap());
+        assert!(!tracker
+            .prepare_security_award(vulnerability.id, first.id, &new_award())
+            .unwrap());
+        assert!(tracker
+            .prepare_security_award(vulnerability.id, earlier.id, &new_award())
+            .unwrap());
+        let award = tracker
+            .get_security_award(vulnerability.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(award.report_id, earlier.id);
+        assert_eq!(
+            award.recipient_email.as_deref(),
+            Some("earlier@example.com")
+        );
     }
 
     #[test]
@@ -2727,8 +3390,12 @@ mod tests {
             )
             .unwrap());
         assert!(store
-            .claim_security_reply(report.id, SecurityReplyKind::Confirmed)
+            .claim_security_reply(
+                report.id,
+                SecurityReplyKind::Confirmed,
+                &event(SecurityEventKind::ReplyClaimed),
+            )
             .unwrap());
-        assert_eq!(store.list_security_timeline(report.id).unwrap().len(), 2);
+        assert_eq!(store.list_security_timeline(report.id).unwrap().len(), 3);
     }
 }

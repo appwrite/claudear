@@ -21,6 +21,10 @@ const PATH_LOG_LIMIT: &str = "40";
 const TERM_LOG_LIMIT: &str = "20";
 const LOG_FORMAT: &str = "--format=%H%x09%cI%x09%s";
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const QUERIES_PER_CHECK: u64 = MAX_TERMS as u64 + 4;
+pub(crate) const WORST_CASE_DURATION: Duration =
+    Duration::from_secs(GIT_TIMEOUT.as_secs() * QUERIES_PER_CHECK);
+const LANDING_FORMAT: &str = "--format=%H%x00%cI%x00%P";
 const ENVIRONMENT_ALLOWLIST: &[&str] = &["PATH", "HOME"];
 
 static SHA: LazyLock<Regex> =
@@ -44,8 +48,6 @@ pub(crate) fn validate_branch(branch: &str) -> Result<()> {
     }
 }
 
-/// Keep at most ten agent-supplied paths that are relative, plain and
-/// resolve inside `project_dir`.
 pub(crate) fn validate_paths(project_dir: &Path, paths: &[String]) -> Vec<String> {
     paths
         .iter()
@@ -91,7 +93,6 @@ fn resolves_inside(project_dir: &Path, candidate: &Path) -> bool {
     }
 }
 
-/// Keep at most five agent-supplied search terms of 3 to 100 plain characters.
 pub(crate) fn validate_terms(terms: &[String]) -> Vec<String> {
     terms
         .iter()
@@ -170,7 +171,6 @@ impl History {
         Ok(parse_log(&output.stdout))
     }
 
-    /// The full sha and committer date of `sha`.
     pub(crate) async fn commit_date(&self, sha: &str) -> Result<(String, DateTime<Utc>)> {
         validate_sha(sha)?;
         let arguments = [
@@ -185,13 +185,46 @@ impl History {
             .split_once('\0')
             .ok_or_else(|| Error::git(format!("unexpected git show output for {sha}")))?;
         validate_sha(full)?;
-        let committed_at = DateTime::parse_from_rfc3339(date.trim())
-            .map_err(|error| Error::git(format!("unparseable commit date for {sha}: {error}")))?
-            .with_timezone(&Utc);
-        Ok((full.to_string(), committed_at))
+        Ok((full.to_string(), parse_date(date, sha)?))
     }
 
-    /// Whether `sha` is reachable from the default branch.
+    /// When `sha` became reachable from the default branch: the committer
+    /// date of the first-parent merge that brought it in, or its own date when
+    /// it sits on the first-parent chain itself. Returns the full sha too.
+    pub(crate) async fn landed_at(&self, sha: &str) -> Result<(String, DateTime<Utc>)> {
+        let (full, committed_at) = self.commit_date(sha).await?;
+        let arguments = [
+            "log".to_string(),
+            "--no-color".to_string(),
+            "--ancestry-path".to_string(),
+            "--first-parent".to_string(),
+            LANDING_FORMAT.to_string(),
+            format!("{full}..{}", self.remote_branch),
+        ];
+        let output = self.run(&arguments).await?;
+        if !output.status.success() {
+            return Err(Error::git(format!(
+                "git log failed for {full}: {}",
+                capped(&String::from_utf8_lossy(&output.stderr))
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let Some(oldest) = stdout.lines().rev().find(|line| !line.trim().is_empty()) else {
+            return Ok((full, committed_at));
+        };
+        let mut fields = oldest.split('\0');
+        let (Some(merge), Some(date), Some(parents)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Error::git(format!("unexpected git log output for {full}")));
+        };
+        validate_sha(merge)?;
+        if parents.split_whitespace().next() == Some(full.as_str()) {
+            return Ok((full, committed_at));
+        }
+        Ok((full, parse_date(date, merge)?))
+    }
+
     pub(crate) async fn is_ancestor(&self, sha: &str) -> Result<bool> {
         validate_sha(sha)?;
         let arguments = [
@@ -252,6 +285,12 @@ impl History {
 
 struct GitOutput {
     stdout: String,
+}
+
+fn parse_date(date: &str, sha: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(date.trim())
+        .map_err(|error| Error::git(format!("unparseable commit date for {sha}: {error}")))?
+        .with_timezone(&Utc))
 }
 
 fn capped(text: &str) -> String {
@@ -373,6 +412,37 @@ pub(crate) mod tests {
             git(&work, &["commit", "-am", message], Some(date));
             git(&work, &["push", "origin", "main"], None);
             git(&work, &["rev-parse", "HEAD"], None)
+        }
+
+        /// Commit a change to `src/auth.php` on a branch at `committed`, then
+        /// merge it into origin's main with a merge commit at `merged`.
+        /// Returns the branch commit's full sha.
+        pub(crate) fn commit_merged(
+            &self,
+            message: &str,
+            marker: &str,
+            committed: &str,
+            merged: &str,
+        ) -> String {
+            let work = self.work();
+            git(&work, &["checkout", "-b", "fix-branch"], None);
+            let path = work.join("src/auth.php");
+            let mut contents = std::fs::read_to_string(&path).unwrap();
+            contents.push_str(&format!("// {marker}\n"));
+            std::fs::write(&path, contents).unwrap();
+            git(&work, &["commit", "-am", message], Some(committed));
+            let sha = git(&work, &["rev-parse", "HEAD"], None);
+            git(&work, &["checkout", "main"], None);
+            std::fs::write(work.join("unrelated.txt"), "mainline\n").unwrap();
+            git(&work, &["add", "."], None);
+            git(&work, &["commit", "-m", "mainline change"], Some(committed));
+            git(
+                &work,
+                &["merge", "--no-ff", "-m", "merge fix branch", "fix-branch"],
+                Some(merged),
+            );
+            git(&work, &["push", "origin", "main"], None);
+            sha
         }
 
         /// Commit on a side branch that never reaches main.
@@ -508,5 +578,44 @@ pub(crate) mod tests {
         assert!(!history.is_ancestor(&side).await.unwrap());
         assert!(history.is_ancestor("-").await.is_err());
         assert!(history.commit_date("--output").await.is_err());
+        assert!(history.landed_at("--output").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_first_parent_commit_lands_at_its_own_date() {
+        let repository = Repository::new();
+        let fixed = repository.commit_fix("harden", "first", "2026-03-01T12:00:00Z");
+        repository.commit_fix("later", "second", "2026-03-05T12:00:00Z");
+        repository.fetch();
+        let history = History::new(&repository.clone, "main").unwrap();
+
+        let (full, landed) = history.landed_at(&fixed[..10]).await.unwrap();
+        assert_eq!(full, fixed);
+        assert_eq!(landed.to_rfc3339(), "2026-03-01T12:00:00+00:00");
+
+        let tip = repository.commit_fix("tip", "third", "2026-03-09T12:00:00Z");
+        repository.fetch();
+        let (_, landed) = history.landed_at(&tip).await.unwrap();
+        assert_eq!(landed.to_rfc3339(), "2026-03-09T12:00:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn a_branch_commit_lands_when_its_merge_reaches_the_default_branch() {
+        let repository = Repository::new();
+        let fixed = repository.commit_merged(
+            "harden session validation",
+            "validateSessionToken",
+            "2026-03-01T12:00:00Z",
+            "2026-03-20T12:00:00Z",
+        );
+        repository.commit_fix("later", "after", "2026-03-25T12:00:00Z");
+        repository.fetch();
+        let history = History::new(&repository.clone, "main").unwrap();
+
+        let (_, committed) = history.commit_date(&fixed).await.unwrap();
+        assert_eq!(committed.to_rfc3339(), "2026-03-01T12:00:00+00:00");
+        let (full, landed) = history.landed_at(&fixed).await.unwrap();
+        assert_eq!(full, fixed);
+        assert_eq!(landed.to_rfc3339(), "2026-03-20T12:00:00+00:00");
     }
 }
