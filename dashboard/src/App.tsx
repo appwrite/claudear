@@ -11,9 +11,11 @@ import AnalyticsPage from './pages/analytics'
 import ErrorsPage from './pages/errors'
 import FeedbackPage from './pages/feedback'
 import RegressionsPage from './pages/regressions'
+import DeployQaPage from './pages/deploy-qa'
 import ExperimentsPage from './pages/experiments'
 import ReposPage from './pages/repos'
 import ChannelsPage from './pages/channels'
+import IntegrationsPage from './pages/integrations'
 import InferencePage from './pages/inference'
 import ActivityPage from './pages/activity'
 import UsersPage from './pages/users'
@@ -53,9 +55,11 @@ const routes: Record<string, () => JSX.Element | null> = {
   '/errors': ErrorsPage,
   '/feedback': FeedbackPage,
   '/regressions': RegressionsPage,
+  '/deploy-qa': DeployQaPage,
   '/experiments': ExperimentsPage,
   '/repos': ReposPage,
   '/channels': ChannelsPage,
+  '/integrations': IntegrationsPage,
   '/learning': LearningPage,
   '/chat': ChatPage,
   '/models': ModelsPage,

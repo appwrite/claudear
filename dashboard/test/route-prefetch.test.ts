@@ -128,6 +128,9 @@ function mockPrefetchPayload(requestUrl: string): unknown {
     return { period: "hour", buckets: [], summary: { p50_ms: null, p95_ms: null, p99_ms: null } };
   }
   if (requestUrl.includes("/api/users")) return [];
+  if (requestUrl.includes("/api/deploy-qa/tips")) return { tips: [] };
+  if (requestUrl.endsWith("/api/deploy-qa")) return { enabled: false, tracks: [] };
+  if (requestUrl.endsWith("/api/features")) return { features: [] };
   return { ok: true };
 }
 
@@ -182,6 +185,8 @@ describe("prefetchRouteData", () => {
     prefetchRouteData!("/errors");
     prefetchRouteData!("/feedback");
     prefetchRouteData!("/regressions");
+    prefetchRouteData!("/deploy-qa");
+    prefetchRouteData!("/integrations");
     prefetchRouteData!("/experiments");
     prefetchRouteData!("/learning");
     prefetchRouteData!("/repos");
@@ -220,6 +225,9 @@ describe("prefetchRouteData", () => {
     expect(calls.some((call) => call.url.includes("/api/inference/history?limit=50"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/activity?limit=200"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/config"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/api/deploy-qa"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/api/deploy-qa/tips"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/api/features"))).toBe(true);
 
     const prsCalls = calls.filter((call) => call.url.includes("/api/prs?"));
     expect(prsCalls.length).toBe(4);
@@ -266,5 +274,14 @@ describe("prefetchRouteData", () => {
 
     expect(calls.filter((call) => call.url.includes("/api/config")).length).toBe(1);
     expect(calls.filter((call) => call.url.includes("/api/users")).length).toBe(1);
+  });
+
+  test("preloads deploy qa status and tips for a viewer without touching the admin config", async () => {
+    prefetchRouteData!("/deploy-qa", "viewer");
+    await flushAsync();
+
+    expect(calls.filter((call) => call.url.endsWith("/api/deploy-qa")).length).toBe(1);
+    expect(calls.filter((call) => call.url.endsWith("/api/deploy-qa/tips")).length).toBe(1);
+    expect(calls.some((call) => call.url.includes("/api/deploy-qa/config"))).toBe(false);
   });
 });

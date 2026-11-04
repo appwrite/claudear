@@ -4,11 +4,14 @@ import {
   fetchAnalyticsSummary,
   fetchAttempts,
   fetchConfig,
+  fetchDeployQaStatus,
+  fetchDeployQaTips,
   fetchDependencies,
   fetchDiscordChannels,
   fetchDiscordChannelStats,
   fetchErrors,
   fetchExperiments,
+  fetchFeatures,
   fetchFeedback,
   fetchInferenceHistory,
   fetchInferenceStats,
@@ -78,6 +81,10 @@ const routePrefetchers: Record<string, () => void> = {
       queuePreload(['regressions', status], () => fetchRegressions(status))
     }
   },
+  '/deploy-qa': () => {
+    queuePreload('deploy-qa-status', fetchDeployQaStatus)
+    queuePreload(['deploy-qa-tips', ''], () => fetchDeployQaTips(''))
+  },
   '/experiments': () => {
     queuePreload('experiments', fetchExperiments)
   },
@@ -89,6 +96,9 @@ const routePrefetchers: Record<string, () => void> = {
   '/channels': () => {
     queuePreload('discord-channels', fetchDiscordChannels)
     queuePreload('discord-channel-stats', fetchDiscordChannelStats)
+  },
+  '/integrations': () => {
+    queuePreload('features', fetchFeatures)
   },
   '/learning': () => {
     queuePreload('repos', fetchRepos)
