@@ -5,6 +5,7 @@
 //! - `tracing::warn!` on error, then propagates the `Err`
 
 use crate::notifier::Notifier;
+use crate::reports::RepetitiveDigest;
 use crate::reports::Report;
 use crate::runner::{AgentRunner, ProviderCapabilities};
 use crate::scm::{
@@ -279,6 +280,19 @@ impl Notifier for InstrumentedNotifier {
             }
             Err(e) => {
                 tracing::warn!(component = self.inner.name(), error = %e, "Failed to notify report");
+                Err(e)
+            }
+        }
+    }
+
+    async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
+        match self.inner.notify_repetitive_digest(digest).await {
+            Ok(v) => {
+                tracing::info!(component = self.inner.name(), "Notified repetitive digest");
+                Ok(v)
+            }
+            Err(e) => {
+                tracing::warn!(component = self.inner.name(), error = %e, "Failed to notify repetitive digest");
                 Err(e)
             }
         }
@@ -563,5 +577,74 @@ impl AgentRunner for InstrumentedRunner {
         self.inner
             .structured_query(prompt, json_schema, project_dir)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records which trait method was called, so a wrapper falling back to a
+    /// default (which routes through `notify_status`) shows up as "status".
+    #[derive(Default)]
+    struct Recorder {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl Recorder {
+        fn record(&self, call: &'static str) -> Result<()> {
+            self.calls.lock().unwrap().push(call);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Notifier for Recorder {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        async fn notify_start(&self, _issue: &Issue) -> Result<()> {
+            self.record("start")
+        }
+        async fn notify_success(&self, _issue: &Issue, _pr_url: &str) -> Result<()> {
+            self.record("success")
+        }
+        async fn notify_completed(&self, _issue: &Issue) -> Result<()> {
+            self.record("completed")
+        }
+        async fn notify_failed(&self, _issue: &Issue, _error: &str) -> Result<()> {
+            self.record("failed")
+        }
+        async fn notify_status(&self, _message: &str) -> Result<()> {
+            self.record("status")
+        }
+        async fn notify_urgent_issues(&self, _issues: &[Issue]) -> Result<()> {
+            self.record("urgent")
+        }
+        async fn notify_repetitive_digest(&self, _digest: &RepetitiveDigest) -> Result<()> {
+            self.record("repetitive_digest")
+        }
+    }
+
+    #[tokio::test]
+    async fn instrumented_notifier_forwards_mention_capable_digests() {
+        let recorder = Arc::new(Recorder::default());
+        let notifier = InstrumentedNotifier::wrap(Arc::clone(&recorder) as Arc<dyn Notifier>);
+
+        notifier
+            .notify_repetitive_digest(&RepetitiveDigest {
+                period: "week".to_string(),
+                from: Utc::now(),
+                to: Utc::now(),
+                entries: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(*recorder.calls.lock().unwrap(), vec!["repetitive_digest"]);
     }
 }
