@@ -188,14 +188,14 @@ describe("prefetchRouteData", () => {
     prefetchRouteData!("/inference");
     prefetchRouteData!("/activity");
     prefetchRouteData!("/telemetry");
-    prefetchRouteData!("/config");
-    prefetchRouteData!("/users");
+    prefetchRouteData!("/config", "admin");
+    prefetchRouteData!("/users", "admin");
     prefetchRouteData!("/does-not-exist");
 
     await flushAsync();
 
     const initialUserCalls = calls.filter((call) => call.url.includes("/api/users")).length;
-    prefetchRouteData!("/users");
+    prefetchRouteData!("/users", "admin");
     prefetchRouteData!("/");
     prefetchRouteData!("/does-not-exist");
     await flushAsync();
@@ -246,5 +246,25 @@ describe("prefetchRouteData", () => {
     expect(telemetryLatencyCalls.length).toBe(4);
     expect(telemetryTimeseriesCalls.some((call) => call.url.includes("period=hour"))).toBe(true);
     expect(telemetryTimeseriesCalls.some((call) => call.url.includes("bucket_minutes=360"))).toBe(true);
+  });
+
+  test("skips admin-only routes for viewers and anonymous users, then prefetches once an admin hovers", async () => {
+    prefetchRouteData!("/config", "viewer");
+    prefetchRouteData!("/users", "viewer");
+    prefetchRouteData!("/config");
+    prefetchRouteData!("/users");
+    prefetchRouteData!("/", "viewer");
+    await flushAsync();
+
+    expect(calls.some((call) => call.url.includes("/api/config"))).toBe(false);
+    expect(calls.some((call) => call.url.includes("/api/users"))).toBe(false);
+    expect(calls.some((call) => call.url.includes("/api/stats/overview"))).toBe(true);
+
+    prefetchRouteData!("/config", "admin");
+    prefetchRouteData!("/users", "admin");
+    await flushAsync();
+
+    expect(calls.filter((call) => call.url.includes("/api/config")).length).toBe(1);
+    expect(calls.filter((call) => call.url.includes("/api/users")).length).toBe(1);
   });
 });

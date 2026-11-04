@@ -71,7 +71,7 @@ export function Sidebar() {
   const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'))
 
   const handlePrefetch = (nextPath: string) => {
-    prefetchRouteData(nextPath)
+    prefetchRouteData(nextPath, user?.role)
   }
 
   useEffect(() => {

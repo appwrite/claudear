@@ -122,9 +122,13 @@ const routePrefetchers: Record<string, () => void> = {
   },
 }
 
-export function prefetchRouteData(path: string) {
+const adminRole = 'admin'
+const adminRoutes = new Set<string>(['/config', '/users'])
+
+export function prefetchRouteData(path: string, role?: string) {
   const prefetch = routePrefetchers[path]
   if (!prefetch || prefetchedRoutes.has(path)) return
+  if (adminRoutes.has(path) && role !== adminRole) return
 
   prefetchedRoutes.add(path)
   prefetch()
