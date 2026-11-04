@@ -3,24 +3,22 @@ import { useAuth } from '../lib/auth'
 import { uploadAvatar } from '../lib/api'
 import { getInitials } from '../lib/formatters'
 import { PageHeader } from '../components/layout/page-header'
+import { IdentityForm } from '../components/users/identity-form'
 import { Camera, Check, Loader2 } from 'lucide-react'
 
 export default function SettingsPage() {
   const { user, updateProfile, refreshUser } = useAuth()
 
-  // Avatar state
   const fileRef = useRef<HTMLInputElement>(null)
   const [avatarLoading, setAvatarLoading] = useState(false)
   const [avatarError, setAvatarError] = useState('')
   const [avatarSuccess, setAvatarSuccess] = useState(false)
 
-  // Name state
   const [name, setName] = useState(user?.name ?? '')
   const [nameLoading, setNameLoading] = useState(false)
   const [nameError, setNameError] = useState('')
   const [nameSuccess, setNameSuccess] = useState(false)
 
-  // Password state
   const [currentPassword, setCurrentPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
@@ -100,7 +98,6 @@ export default function SettingsPage() {
     <div className="space-y-6">
       <PageHeader title="Settings" description="Manage your profile and account settings" />
 
-      {/* Profile Picture */}
       <div className="border rounded-lg p-6 bg-card">
         <h3 className="font-medium mb-4">Profile Picture</h3>
         <div className="flex items-center gap-6">
@@ -144,7 +141,6 @@ export default function SettingsPage() {
         </div>
       </div>
 
-      {/* Display Name */}
       <div className="border rounded-lg p-6 bg-card">
         <h3 className="font-medium mb-4">Display Name</h3>
         <form onSubmit={handleNameSave} className="flex items-end gap-4 max-w-md">
@@ -169,7 +165,6 @@ export default function SettingsPage() {
         {nameError && <p className="text-destructive text-sm mt-2">{nameError}</p>}
       </div>
 
-      {/* Change Password */}
       <div className="border rounded-lg p-6 bg-card">
         <h3 className="font-medium mb-4">Change Password</h3>
         <form onSubmit={handlePasswordSave} className="space-y-4 max-w-md">
@@ -216,6 +211,14 @@ export default function SettingsPage() {
             {pwLoading ? 'Changing...' : 'Change Password'}
           </button>
         </form>
+      </div>
+
+      <div className="border rounded-lg p-6 bg-card">
+        <h3 className="font-medium mb-1">My Identities</h3>
+        <p className="text-sm text-muted-foreground mb-4">
+          The handles Claudear uses to recognise you across trackers and to reach you in chat.
+        </p>
+        <IdentityForm userId={user.id} canEditSlug={user.role === 'admin'} />
       </div>
     </div>
   )
