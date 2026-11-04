@@ -14,6 +14,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use claudear_config::config::Config;
+use claudear_config::users::UserRegistry;
 use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, RegressionWatchStatus};
 use claudear_storage::FixAttemptTracker;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,8 @@ pub struct ApiState {
     pub storage_dir: PathBuf,
     /// Chat service for model browsing/downloading (None if chat is disabled).
     pub chat_service: Option<Arc<claudear_integrations::chat::ChatService>>,
+    /// The shared person directory; identity writes reload it so edits apply at once.
+    pub registry: UserRegistry,
 }
 
 /// Create the API router.
@@ -48,7 +51,8 @@ pub fn create_api_router(
     config_path: PathBuf,
     indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
 ) -> Router {
-    create_api_router_with_dashboard(config, tracker, config_path, indexing_rx, None)
+    let registry = UserRegistry::new(config.users.clone());
+    create_api_router_with_dashboard(config, tracker, config_path, indexing_rx, None, registry)
 }
 
 /// Create the API router with optional dashboard static file serving.
@@ -58,6 +62,7 @@ pub fn create_api_router_with_dashboard(
     config_path: PathBuf,
     indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
     dashboard_dir: Option<PathBuf>,
+    registry: UserRegistry,
 ) -> Router {
     create_api_router_full(
         config,
@@ -66,6 +71,7 @@ pub fn create_api_router_with_dashboard(
         indexing_rx,
         dashboard_dir,
         None,
+        registry,
     )
 }
 
@@ -77,8 +83,10 @@ pub fn create_api_router_full(
     indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
     dashboard_dir: Option<PathBuf>,
     chat_state: Option<claudear_integrations::chat::ChatState>,
+    registry: UserRegistry,
 ) -> Router {
     let storage_dir = config.storage_dir.clone();
+    crate::registry::reload(&registry, tracker.as_ref());
 
     // Ensure avatar upload directory exists
     let avatars_dir = storage_dir.join("avatars");
@@ -96,6 +104,7 @@ pub fn create_api_router_full(
         indexing_rx,
         storage_dir: storage_dir.clone(),
         chat_service,
+        registry,
     };
 
     let api_routes = Router::new()
@@ -203,6 +212,16 @@ pub fn create_api_router_full(
             axum::routing::get(get_user_handler)
                 .put(update_user_handler)
                 .delete(delete_user_handler),
+        )
+        .route(
+            "/api/identities",
+            axum::routing::get(super::identities::list_identities_handler),
+        )
+        .route(
+            "/api/users/{id}/identities",
+            axum::routing::get(super::identities::get_user_identities_handler)
+                .put(super::identities::update_user_identities_handler)
+                .delete(super::identities::reset_user_identities_handler),
         )
         // Personal access token routes (for the MCP server and other clients)
         .route(

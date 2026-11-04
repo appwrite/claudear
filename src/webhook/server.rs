@@ -406,6 +406,7 @@ impl WebhookServer {
                 config_path,
                 indexing_rx,
                 None,
+                state.user_registry.clone(),
             );
             // Apply the dashboard middleware (cookies, CSRF, CORS, security
             // headers) to the dashboard routes only — not the webhook routes,
