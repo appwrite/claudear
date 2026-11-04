@@ -1,6 +1,7 @@
 //! API route handlers for the dashboard.
 
 use super::auth::*;
+use super::rate_limit::RateLimiters;
 use crate::retry::RetryManager;
 use axum::{
     extract::{
@@ -14,6 +15,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use claudear_config::config::Config;
+use claudear_config::users::UserRegistry;
 use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, RegressionWatchStatus};
 use claudear_storage::FixAttemptTracker;
 use serde::{Deserialize, Serialize};
@@ -39,6 +41,12 @@ pub struct ApiState {
     pub storage_dir: PathBuf,
     /// Chat service for model browsing/downloading (None if chat is disabled).
     pub chat_service: Option<Arc<claudear_integrations::chat::ChatService>>,
+    /// The shared person directory; identity writes reload it so edits apply at once.
+    pub registry: UserRegistry,
+    /// Held across reload, plan, conflict check, save and reload by every user,
+    /// identity and directory write, so two writes never both pass the same check.
+    pub identity_writes: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) limiters: Arc<RateLimiters>,
 }
 
 /// Create the API router.
@@ -48,7 +56,8 @@ pub fn create_api_router(
     config_path: PathBuf,
     indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
 ) -> Router {
-    create_api_router_with_dashboard(config, tracker, config_path, indexing_rx, None)
+    let registry = UserRegistry::new(config.users.clone());
+    create_api_router_with_dashboard(config, tracker, config_path, indexing_rx, None, registry)
 }
 
 /// Create the API router with optional dashboard static file serving.
@@ -58,6 +67,7 @@ pub fn create_api_router_with_dashboard(
     config_path: PathBuf,
     indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
     dashboard_dir: Option<PathBuf>,
+    registry: UserRegistry,
 ) -> Router {
     create_api_router_full(
         config,
@@ -66,6 +76,7 @@ pub fn create_api_router_with_dashboard(
         indexing_rx,
         dashboard_dir,
         None,
+        registry,
     )
 }
 
@@ -77,8 +88,10 @@ pub fn create_api_router_full(
     indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
     dashboard_dir: Option<PathBuf>,
     chat_state: Option<claudear_integrations::chat::ChatState>,
+    registry: UserRegistry,
 ) -> Router {
     let storage_dir = config.storage_dir.clone();
+    crate::registry::reload(&registry, tracker.as_ref());
 
     // Ensure avatar upload directory exists
     let avatars_dir = storage_dir.join("avatars");
@@ -96,6 +109,9 @@ pub fn create_api_router_full(
         indexing_rx,
         storage_dir: storage_dir.clone(),
         chat_service,
+        registry,
+        identity_writes: Arc::new(tokio::sync::Mutex::new(())),
+        limiters: Arc::new(RateLimiters::default()),
     };
 
     let api_routes = Router::new()
@@ -180,6 +196,14 @@ pub fn create_api_router_full(
             axum::routing::put(update_profile_handler),
         )
         .route(
+            "/api/auth/invite/inspect",
+            axum::routing::post(super::invites::inspect_invite_handler),
+        )
+        .route(
+            "/api/auth/invite/accept",
+            axum::routing::post(super::invites::accept_invite_handler),
+        )
+        .route(
             "/api/auth/avatar",
             axum::routing::post(upload_avatar_handler)
                 .layer(axum::extract::DefaultBodyLimit::max(6 * 1024 * 1024)),
@@ -203,6 +227,25 @@ pub fn create_api_router_full(
             axum::routing::get(get_user_handler)
                 .put(update_user_handler)
                 .delete(delete_user_handler),
+        )
+        .route(
+            "/api/users/{id}/invite",
+            axum::routing::post(super::invites::issue_invite_handler)
+                .delete(super::invites::revoke_invite_handler),
+        )
+        .route(
+            "/api/directory",
+            axum::routing::put(super::directory::put_directory_handler),
+        )
+        .route(
+            "/api/identities",
+            axum::routing::get(super::identities::list_identities_handler),
+        )
+        .route(
+            "/api/users/{id}/identities",
+            axum::routing::get(super::identities::get_user_identities_handler)
+                .put(super::identities::update_user_identities_handler)
+                .delete(super::identities::reset_user_identities_handler),
         )
         // Personal access token routes (for the MCP server and other clients)
         .route(
@@ -2670,7 +2713,7 @@ async fn put_config_handler(
     State(state): State<ApiState>,
     Json(body): Json<ConfigUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !check_api_rate_limit(_user.0.id) {
+    if !state.limiters.api.allow(&_user.0.id) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({ "error": "Rate limit exceeded" })),
@@ -2822,7 +2865,7 @@ async fn put_global_instruction_handler(
     State(state): State<ApiState>,
     Json(body): Json<InstructionUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !check_api_rate_limit(_user.0.id) {
+    if !state.limiters.api.allow(&_user.0.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     state
@@ -2869,7 +2912,7 @@ async fn put_repo_instruction_handler(
     Path(repo): Path<String>,
     Json(body): Json<InstructionUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !check_api_rate_limit(_user.0.id) {
+    if !state.limiters.api.allow(&_user.0.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     state
@@ -3038,6 +3081,7 @@ mod tests {
         LearningConfig, NotifiersConfig, PrDistributionConfig, PrioritisationConfig,
         RegressionConfig, RetryConfig, ScmConfig,
     };
+    use claudear_core::identity::Role;
     use claudear_core::secret::SecretValue;
     use claudear_storage::{IndexingProgress, SqliteTracker};
     use http_body_util::BodyExt;
@@ -3106,7 +3150,7 @@ mod tests {
         // Create a test user and session
         let password_hash = bcrypt::hash("testpass", 4).unwrap(); // cost=4 for speed
         tracker
-            .create_user("test@example.com", &password_hash, "Test User", "admin")
+            .create_user("test@example.com", &password_hash, "Test User", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4178,7 +4222,7 @@ mod tests {
         // Use a nonexistent config path to test the error case
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4207,7 +4251,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4240,7 +4284,7 @@ mod tests {
         let config = test_config();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4290,7 +4334,7 @@ mod tests {
         let config = test_config();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6102,7 +6146,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6145,7 +6189,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6182,7 +6226,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6890,7 +6934,7 @@ mod tests {
         // Test that "events" is also a valid stream
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -7022,7 +7066,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -7486,7 +7530,7 @@ mod tests {
         let config = test_config();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@test.com", &password_hash, "Test", "admin")
+            .create_user("test@test.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         // Create a session that already expired
         let token = tracker.create_session(1, "2020-01-01 00:00:00").unwrap();
@@ -7896,7 +7940,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -7999,7 +8043,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8038,7 +8082,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8220,7 +8264,7 @@ mod tests {
                 "todelete@example.com",
                 &bcrypt::hash("pass", 4).unwrap(),
                 "Delete Me",
-                "viewer",
+                Role::Viewer,
             )
             .unwrap();
 
@@ -8241,7 +8285,7 @@ mod tests {
         let config = test_config();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8339,5 +8383,1948 @@ mod tests {
         assert_eq!(summary.samples, 0);
         assert!(summary.avg_secs.is_none());
         assert!(summary.max_secs.is_none());
+    }
+
+    mod identity_authorization {
+        use super::{auth_get, auth_put_json, create_test_tracker, test_config, Role};
+        use crate::api::create_api_router_with_dashboard;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::Router;
+        use claudear_config::config::{Config, UserConfig};
+        use claudear_config::users::UserRegistry;
+        use claudear_core::identity::{Identities, IdentityField, IdentityOrigin};
+        use claudear_storage::{DirectoryUser, DirectoryWrite, FixAttemptTracker, IdentityWrite};
+        use http_body_util::BodyExt;
+        use serde_json::{json, Value};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+        use tower_cookies::CookieManagerLayer;
+
+        const ADMIN_EMAIL: &str = "identity-admin@example.com";
+        const VIEWER_EMAIL: &str = "identity-viewer@example.com";
+        const OTHER_EMAIL: &str = "identity-other@example.com";
+        const VIEWER_DISCORD_ID: &str = "452316113016193041";
+        const OTHER_DISCORD_ID: &str = "452316113016193042";
+        const CONFIG_DISCORD_ID: &str = "452316113016193043";
+        const SLACK_ID: &str = "U0123456789";
+        const SMS_NUMBER: &str = "+14155550123";
+        const PUSH_USER_KEY: &str = "abcdefghij0123456789ABCDEFGHIJ";
+        const TELEGRAM_CHAT_ID: &str = "-1001234567";
+        const CONFLICT_MESSAGE: &str = "already belongs to another person";
+
+        struct Account {
+            id: i64,
+            token: String,
+        }
+
+        struct Harness {
+            router: Router,
+            tracker: Arc<dyn FixAttemptTracker>,
+            registry: UserRegistry,
+            admin: Account,
+            viewer: Account,
+            other: Account,
+        }
+
+        impl Harness {
+            fn new(users: HashMap<String, UserConfig>) -> Self {
+                let tracker = create_test_tracker();
+                let admin = account(&tracker, ADMIN_EMAIL, "Admin", Role::Admin);
+                let viewer = account(&tracker, VIEWER_EMAIL, "Viewer", Role::Viewer);
+                let other = account(&tracker, OTHER_EMAIL, "Other", Role::Viewer);
+                let config = Config {
+                    users,
+                    ..test_config()
+                };
+                let registry = UserRegistry::new(config.users.clone());
+                let router = create_api_router_with_dashboard(
+                    config,
+                    tracker.clone(),
+                    PathBuf::from("claudear.toml"),
+                    tracker.subscribe_indexing_progress(),
+                    None,
+                    registry.clone(),
+                )
+                .layer(CookieManagerLayer::new());
+                Self {
+                    router,
+                    tracker,
+                    registry,
+                    admin,
+                    viewer,
+                    other,
+                }
+            }
+
+            async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
+                let response = self
+                    .router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("response");
+                let status = response.status();
+                let bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                let body = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).expect("json body")
+                };
+                (status, body)
+            }
+
+            /// Store a console row directly, bypassing the API and its write limiter.
+            fn seed(&self, user_id: i64, slug: Option<&str>, identities: Identities) {
+                self.tracker
+                    .save_directory(&[DirectoryWrite {
+                        user: DirectoryUser::Existing {
+                            user_id,
+                            name: None,
+                            role: None,
+                        },
+                        identities: Some(IdentityWrite {
+                            slug: slug.map(str::to_string),
+                            identities,
+                        }),
+                        invite: None,
+                    }])
+                    .expect("seed identities");
+                crate::registry::reload(&self.registry, self.tracker.as_ref());
+            }
+
+            fn person(&self, source: &str, handle: &str) -> Option<String> {
+                self.registry
+                    .resolve(source, handle)
+                    .map(|person| person.slug)
+            }
+
+            fn stored_user_ids(&self) -> Vec<i64> {
+                self.tracker
+                    .list_user_identities()
+                    .expect("list identities")
+                    .into_iter()
+                    .map(|entry| entry.user_id)
+                    .collect()
+            }
+        }
+
+        fn account(
+            tracker: &Arc<dyn FixAttemptTracker>,
+            email: &str,
+            name: &str,
+            role: Role,
+        ) -> Account {
+            let id = tracker
+                .create_user(email, "unused-hash", name, role)
+                .expect("create user");
+            let token = tracker
+                .create_session(id, "2099-12-31 23:59:59")
+                .expect("create session");
+            Account { id, token }
+        }
+
+        fn identities_uri(user_id: i64) -> String {
+            format!("/api/users/{user_id}/identities")
+        }
+
+        fn console_key(user_id: i64) -> String {
+            format!("console-{user_id}")
+        }
+
+        fn auth_delete(uri: &str, token: &str) -> Request<Body> {
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("cookie", format!("claudear_session={token}"))
+                .body(Body::empty())
+                .expect("request")
+        }
+
+        fn anonymous(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
+            let builder = Request::builder().method(method).uri(uri);
+            match body {
+                Some(body) => builder
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string())),
+                None => builder.body(Body::empty()),
+            }
+            .expect("request")
+        }
+
+        fn sensitive_identities(github: &str, discord_id: &str) -> Identities {
+            Identities {
+                github_usernames: vec![github.to_string()],
+                discord_id: Some(discord_id.to_string()),
+                email: Some(format!("notify-{github}@example.com")),
+                push_user_key: Some(PUSH_USER_KEY.to_string()),
+                sms_number: Some(SMS_NUMBER.to_string()),
+                whatsapp_number: Some(SMS_NUMBER.to_string()),
+                telegram_chat_id: Some(TELEGRAM_CHAT_ID.to_string()),
+                ..Identities::default()
+            }
+        }
+
+        fn chief_config() -> HashMap<String, UserConfig> {
+            HashMap::from([(
+                "ceo".to_string(),
+                UserConfig {
+                    github_usernames: vec!["chief-gh".to_string()],
+                    discord_id: Some(CONFIG_DISCORD_ID.to_string()),
+                    email: Some("chief@example.com".to_string()),
+                    ..UserConfig::default()
+                },
+            )])
+        }
+
+        fn violation_fields(body: &Value) -> Vec<String> {
+            let mut fields: Vec<String> = body["violations"]
+                .as_array()
+                .expect("violations")
+                .iter()
+                .map(|violation| violation["field"].as_str().expect("field").to_string())
+                .collect();
+            fields.sort();
+            fields
+        }
+
+        fn assert_redacted(person: &Value) {
+            assert_eq!(person["redacted"], true);
+            assert_eq!(person["login_email"], Value::Null);
+            for field in IdentityField::ALL
+                .into_iter()
+                .filter(|field| field.is_sensitive())
+            {
+                assert_eq!(
+                    person["identities"][field.as_str()],
+                    Value::Null,
+                    "{} must be redacted",
+                    field.as_str()
+                );
+            }
+        }
+
+        fn find_person(people: &Value, user_id: i64) -> &Value {
+            people
+                .as_array()
+                .expect("array")
+                .iter()
+                .find(|person| person["user_id"] == user_id)
+                .expect("person listed")
+        }
+
+        #[tokio::test]
+        async fn admin_writes_another_users_identities_and_reads_them_back() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({
+                        "github_usernames": ["viewer-gh"],
+                        "discord_id": VIEWER_DISCORD_ID,
+                        "sms_number": SMS_NUMBER,
+                    }),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["user_id"], harness.viewer.id);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["redacted"], false);
+
+            for token in [&harness.admin.token, &harness.viewer.token] {
+                let (status, read) = harness.send(auth_get(&uri, token)).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(read["redacted"], false);
+                assert_eq!(read["login_email"], VIEWER_EMAIL);
+                assert_eq!(read["identities"], body["identities"]);
+                assert_eq!(read["identities"]["github_usernames"], json!(["viewer-gh"]));
+                assert_eq!(read["identities"]["discord_id"], VIEWER_DISCORD_ID);
+                assert_eq!(read["identities"]["sms_number"], SMS_NUMBER);
+            }
+            assert_eq!(
+                harness.person("github", "viewer-gh"),
+                Some(console_key(harness.viewer.id))
+            );
+        }
+
+        #[tokio::test]
+        async fn viewer_writes_and_resets_their_own_identities() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({
+                        "github_usernames": ["@Viewer-GH"],
+                        "telegram_chat_id": TELEGRAM_CHAT_ID,
+                    }),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "active");
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["redacted"], false);
+            assert_eq!(body["login_email"], VIEWER_EMAIL);
+            assert_eq!(body["name"], "Viewer");
+            assert_eq!(body["identities"]["github_usernames"], json!(["Viewer-GH"]));
+            assert_eq!(body["identities"]["telegram_chat_id"], TELEGRAM_CHAT_ID);
+            assert!(body["updated_at"].is_string());
+            assert_eq!(
+                harness.person("github", "viewer-gh"),
+                Some(console_key(harness.viewer.id))
+            );
+
+            let (status, body) = harness.send(auth_delete(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "unset");
+            assert_eq!(body["person_key"], Value::Null);
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!([]));
+            assert!(harness.stored_user_ids().is_empty());
+            assert_eq!(harness.person("github", "viewer-gh"), None);
+        }
+
+        #[tokio::test]
+        async fn viewer_cannot_write_or_reset_another_users_identities() {
+            let harness = Harness::new(HashMap::new());
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("other-gh", OTHER_DISCORD_ID),
+            );
+
+            for target in [harness.other.id, harness.admin.id] {
+                let (status, body) = harness
+                    .send(auth_put_json(
+                        &identities_uri(target),
+                        &harness.viewer.token,
+                        json!({"github_usernames": ["sneaky-gh"]}),
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(
+                    body,
+                    json!({"error": "You can only change your own identities"})
+                );
+            }
+
+            let (status, _) = harness
+                .send(auth_delete(
+                    &identities_uri(harness.other.id),
+                    &harness.viewer.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+
+            let (status, _) = harness
+                .send(auth_put_json(
+                    &identities_uri(999_999_999),
+                    &harness.viewer.token,
+                    json!({"github_usernames": ["sneaky-gh"]}),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a viewer must not learn whether another user id exists"
+            );
+
+            let (status, _) = harness
+                .send(auth_put_json(
+                    &identities_uri(999_999_999),
+                    &harness.admin.token,
+                    json!({"github_usernames": ["sneaky-gh"]}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            assert_eq!(harness.stored_user_ids(), vec![harness.other.id]);
+            assert_eq!(harness.person("github", "sneaky-gh"), None);
+            assert_eq!(
+                harness.person("github", "other-gh"),
+                Some(console_key(harness.other.id))
+            );
+        }
+
+        #[tokio::test]
+        async fn only_an_admin_sets_the_person_key() {
+            let harness = Harness::new(chief_config());
+            harness.seed(harness.other.id, Some("other-key"), Identities::default());
+            let uri = identities_uri(harness.viewer.id);
+
+            for body in [
+                json!({"slug": "viewer-key"}),
+                json!({"slug": ""}),
+                json!({"slug": "viewer-key", "github_usernames": ["viewer-gh"]}),
+            ] {
+                let (status, _) = harness
+                    .send(auth_put_json(&uri, &harness.viewer.token, body))
+                    .await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+            }
+            assert_eq!(harness.stored_user_ids(), vec![harness.other.id]);
+            assert_eq!(harness.person("github", "viewer-gh"), None);
+
+            for slug in ["Bad Slug", "console-7"] {
+                let (status, body) = harness
+                    .send(auth_put_json(
+                        &uri,
+                        &harness.admin.token,
+                        json!({"slug": slug}),
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "slug {slug:?}");
+                assert_eq!(violation_fields(&body), vec!["slug"]);
+            }
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({"slug": "other-key"}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(violation_fields(&body), vec!["slug"]);
+            assert_eq!(
+                harness.registry.origin("other-key"),
+                Some(IdentityOrigin::Console)
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({"slug": "ceo"}),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "an admin links a console user to a config-only person by key"
+            );
+            assert_eq!(body["slug"], "ceo");
+            assert_eq!(body["person_key"], "ceo");
+            assert_eq!(
+                harness.registry.origin("ceo"),
+                Some(IdentityOrigin::Console)
+            );
+            assert_eq!(harness.person("github", "chief-gh"), None);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({"slug": "viewer-key"}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["slug"], "viewer-key");
+            assert_eq!(body["person_key"], "viewer-key");
+            assert_eq!(harness.registry.origin("ceo"), Some(IdentityOrigin::Config));
+            assert_eq!(
+                harness.person("github", "chief-gh"),
+                Some("ceo".to_string())
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"discord_id": VIEWER_DISCORD_ID}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["slug"], "viewer-key");
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("viewer-key")
+                    .and_then(|person| person.discord_id),
+                Some(VIEWER_DISCORD_ID.to_string())
+            );
+            assert!(harness
+                .registry
+                .get_by_slug(&console_key(harness.viewer.id))
+                .is_some());
+        }
+
+        #[tokio::test]
+        async fn viewer_reads_other_people_redacted_and_themselves_in_full() {
+            let harness = Harness::new(HashMap::new());
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("other-gh", OTHER_DISCORD_ID),
+            );
+            harness.seed(
+                harness.viewer.id,
+                None,
+                sensitive_identities("viewer-gh", VIEWER_DISCORD_ID),
+            );
+
+            let (status, other) = harness
+                .send(auth_get(
+                    &identities_uri(harness.other.id),
+                    &harness.viewer.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_redacted(&other);
+            assert_eq!(other["name"], "Other");
+            assert_eq!(other["origin"], "console");
+            assert_eq!(other["identities"]["github_usernames"], json!(["other-gh"]));
+            assert_eq!(other["identities"]["discord_id"], OTHER_DISCORD_ID);
+
+            let (status, own) = harness
+                .send(auth_get(
+                    &identities_uri(harness.viewer.id),
+                    &harness.viewer.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(own["redacted"], false);
+            assert_eq!(own["login_email"], VIEWER_EMAIL);
+            assert_eq!(own["identities"]["sms_number"], SMS_NUMBER);
+            assert_eq!(own["identities"]["push_user_key"], PUSH_USER_KEY);
+            assert_eq!(own["identities"]["email"], "notify-viewer-gh@example.com");
+
+            let (status, other) = harness
+                .send(auth_get(
+                    &identities_uri(harness.other.id),
+                    &harness.admin.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(other["redacted"], false);
+            assert_eq!(other["login_email"], OTHER_EMAIL);
+            assert_eq!(other["identities"]["telegram_chat_id"], TELEGRAM_CHAT_ID);
+        }
+
+        #[tokio::test]
+        async fn identity_list_redacts_only_other_people_for_a_viewer() {
+            let harness = Harness::new(HashMap::from([(
+                "chief".to_string(),
+                UserConfig {
+                    github_usernames: vec!["chief-gh".to_string()],
+                    email: Some(ADMIN_EMAIL.to_string()),
+                    ..UserConfig::default()
+                },
+            )]));
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("other-gh", OTHER_DISCORD_ID),
+            );
+            harness.seed(
+                harness.viewer.id,
+                None,
+                sensitive_identities("viewer-gh", VIEWER_DISCORD_ID),
+            );
+            let newcomer = account(
+                &harness.tracker,
+                "identity-newcomer@example.com",
+                "Newcomer",
+                Role::Viewer,
+            );
+
+            let (status, people) = harness
+                .send(auth_get("/api/identities", &harness.viewer.token))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(people.as_array().expect("array").len(), 4);
+            let other = find_person(&people, harness.other.id);
+            assert_redacted(other);
+            assert_eq!(other["identities"]["github_usernames"], json!(["other-gh"]));
+            let admin = find_person(&people, harness.admin.id);
+            assert_redacted(admin);
+            assert_eq!(admin["origin"], "config");
+            assert_eq!(admin["person_key"], "chief");
+            assert_eq!(admin["slug"], Value::Null);
+            assert!(admin.get("email").is_none(), "no login email field leaks");
+            assert_eq!(admin["identities"]["github_usernames"], json!(["chief-gh"]));
+            let newcomer = find_person(&people, newcomer.id);
+            assert_eq!(newcomer["origin"], "unset");
+            assert_eq!(newcomer["person_key"], Value::Null);
+            assert_eq!(newcomer["status"], "active");
+            let own = find_person(&people, harness.viewer.id);
+            assert_eq!(own["redacted"], false);
+            assert_eq!(own["login_email"], VIEWER_EMAIL);
+            assert_eq!(own["identities"]["sms_number"], SMS_NUMBER);
+
+            let (status, people) = harness
+                .send(auth_get("/api/identities", &harness.admin.token))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(people
+                .as_array()
+                .expect("array")
+                .iter()
+                .all(|person| person["redacted"] == false));
+            let other = find_person(&people, harness.other.id);
+            assert_eq!(other["login_email"], OTHER_EMAIL);
+            assert_eq!(other["identities"]["sms_number"], SMS_NUMBER);
+        }
+
+        #[tokio::test]
+        async fn invalid_values_are_rejected_per_field_without_echoing_them() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            for (field, value, body) in [
+                ("discord_id", "123", json!({"discord_id": "123"})),
+                ("sms_number", "12345678", json!({"sms_number": "12345678"})),
+                (
+                    "github_usernames",
+                    "-bad-",
+                    json!({"github_usernames": ["-bad-"]}),
+                ),
+                ("email", "not-an-email", json!({"email": "not-an-email"})),
+            ] {
+                let (status, response) = harness
+                    .send(auth_put_json(&uri, &harness.viewer.token, body))
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+                assert_eq!(response["error"], "Invalid identities");
+                assert_eq!(violation_fields(&response), vec![field]);
+                let message = response["violations"][0]["message"]
+                    .as_str()
+                    .expect("message");
+                if field != "github_usernames" {
+                    assert!(
+                        !message.contains(value),
+                        "{field} violation must not echo the value"
+                    );
+                }
+            }
+
+            let (status, response) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({
+                        "discord_id": "123",
+                        "sms_number": "12345678",
+                        "github_usernames": ["-bad-"],
+                        "email": "not-an-email",
+                    }),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                violation_fields(&response),
+                vec!["discord_id", "email", "github_usernames", "sms_number"]
+            );
+
+            assert!(harness.stored_user_ids().is_empty());
+            assert_eq!(harness.person("github", "-bad-"), None);
+        }
+
+        #[tokio::test]
+        async fn handles_owned_by_another_person_conflict_for_every_role() {
+            let harness = Harness::new(chief_config());
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("taken-gh", OTHER_DISCORD_ID),
+            );
+            let uri = identities_uri(harness.viewer.id);
+
+            for (token, body, field) in [
+                (
+                    &harness.viewer.token,
+                    json!({"github_usernames": ["Taken-GH"]}),
+                    "github_usernames",
+                ),
+                (
+                    &harness.viewer.token,
+                    json!({"github_usernames": ["chief-gh"]}),
+                    "github_usernames",
+                ),
+                (
+                    &harness.viewer.token,
+                    json!({"discord_id": OTHER_DISCORD_ID}),
+                    "discord_id",
+                ),
+                (
+                    &harness.admin.token,
+                    json!({"github_usernames": ["chief-gh"]}),
+                    "github_usernames",
+                ),
+            ] {
+                let (status, response) = harness.send(auth_put_json(&uri, token, body)).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{field}");
+                assert_eq!(violation_fields(&response), vec![field]);
+                let message = response["violations"][0]["message"]
+                    .as_str()
+                    .expect("message");
+                assert!(message.contains(CONFLICT_MESSAGE), "{message}");
+                assert!(!message.contains("ceo"), "{message}");
+                assert!(
+                    !message.contains(&console_key(harness.other.id)),
+                    "{message}"
+                );
+                assert!(!message.contains("Other"), "{message}");
+            }
+            assert_eq!(harness.stored_user_ids(), vec![harness.other.id]);
+            assert_eq!(
+                harness.person("github", "chief-gh"),
+                Some("ceo".to_string())
+            );
+            assert_eq!(
+                harness.person("github", "taken-gh"),
+                Some(console_key(harness.other.id))
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"sms_number": SMS_NUMBER, "email": "notify-taken-gh@example.com"}),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "notification targets may be shared between people"
+            );
+            assert_eq!(body["identities"]["sms_number"], SMS_NUMBER);
+        }
+
+        #[tokio::test]
+        async fn config_person_becomes_console_on_save_and_reverts_on_reset() {
+            let harness = Harness::new(HashMap::from([(
+                "jake".to_string(),
+                UserConfig {
+                    github_usernames: vec!["jake-gh".to_string()],
+                    discord_id: Some(CONFIG_DISCORD_ID.to_string()),
+                    email: Some("Identity-Viewer@Example.com".to_string()),
+                    ..UserConfig::default()
+                },
+            )]));
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "config");
+            assert_eq!(body["person_key"], "jake");
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["updated_at"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
+            assert_eq!(body["identities"]["discord_id"], CONFIG_DISCORD_ID);
+            assert_eq!(
+                harness.registry.origin("jake"),
+                Some(IdentityOrigin::Config)
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"slack_id": SLACK_ID}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], "jake");
+            assert_eq!(body["slug"], "jake");
+            assert!(body["updated_at"].is_string());
+            assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
+            assert_eq!(body["identities"]["discord_id"], CONFIG_DISCORD_ID);
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+            assert_eq!(
+                harness.registry.origin("jake"),
+                Some(IdentityOrigin::Console)
+            );
+            assert_eq!(
+                harness.person("github", "jake-gh"),
+                Some("jake".to_string())
+            );
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("jake")
+                    .and_then(|person| person.slack_id),
+                Some(SLACK_ID.to_string())
+            );
+
+            let (status, body) = harness.send(auth_delete(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body["origin"], "config",
+                "the config link of the viewer's own login email is not a key to keep"
+            );
+            assert_eq!(body["person_key"], "jake");
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["updated_at"], Value::Null);
+            assert_eq!(body["identities"]["slack_id"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
+            assert_eq!(
+                harness.registry.origin("jake"),
+                Some(IdentityOrigin::Config)
+            );
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("jake")
+                    .and_then(|person| person.slack_id),
+                None
+            );
+            assert!(harness.stored_user_ids().is_empty());
+
+            let (status, body) = harness
+                .send(auth_get(
+                    &identities_uri(harness.other.id),
+                    &harness.admin.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "unset");
+            assert_eq!(body["person_key"], Value::Null);
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn sparse_updates_keep_earlier_fields() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            for body in [
+                json!({"github_usernames": ["viewer-gh"], "slack_id": SLACK_ID}),
+                json!({"discord_id": VIEWER_DISCORD_ID}),
+            ] {
+                let (status, _) = harness
+                    .send(auth_put_json(&uri, &harness.viewer.token, body))
+                    .await;
+                assert_eq!(status, StatusCode::OK);
+            }
+            let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["identities"]["github_usernames"], json!(["viewer-gh"]));
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+            assert_eq!(body["identities"]["discord_id"], VIEWER_DISCORD_ID);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"discord_id": ""}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["identities"]["discord_id"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!(["viewer-gh"]));
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"github_usernames": []}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["identities"]["github_usernames"], json!([]));
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+            assert_eq!(harness.person("github", "viewer-gh"), None);
+        }
+
+        #[tokio::test]
+        async fn identity_email_never_links_a_viewer_to_a_config_person() {
+            let harness = Harness::new(chief_config());
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"email": "chief@example.com", "github_usernames": ["viewer-gh"]}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "active");
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
+            assert_eq!(body["identities"]["email"], "chief@example.com");
+
+            let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
+
+            assert_eq!(
+                harness.person("github", "chief-gh"),
+                Some("ceo".to_string())
+            );
+            assert_eq!(harness.registry.origin("ceo"), Some(IdentityOrigin::Config));
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("ceo")
+                    .and_then(|person| person.discord_id),
+                Some(CONFIG_DISCORD_ID.to_string())
+            );
+            assert_eq!(
+                harness.person("github", "viewer-gh"),
+                Some(console_key(harness.viewer.id))
+            );
+        }
+
+        #[tokio::test]
+        async fn identity_endpoints_require_a_session() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+            let update = json!({"github_usernames": ["anonymous-gh"]});
+
+            for request in [
+                anonymous("GET", "/api/identities", None),
+                anonymous("GET", &uri, None),
+                anonymous("PUT", &uri, Some(update.clone())),
+                anonymous("DELETE", &uri, None),
+                auth_get(&uri, "not-a-session"),
+                auth_put_json(&uri, "not-a-session", update.clone()),
+                auth_delete(&uri, "not-a-session"),
+            ] {
+                let (status, _) = harness.send(request).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+            }
+            assert!(harness.stored_user_ids().is_empty());
+            assert_eq!(harness.person("github", "anonymous-gh"), None);
+        }
+    }
+
+    mod invite_directory {
+        use super::*;
+        use crate::api::apply_dashboard_middleware;
+        use axum::body::Bytes;
+        use axum::http::Method;
+        use claudear_core::identity::{Identities, UserStatus};
+        use claudear_storage::{DirectoryUser, DirectoryWrite, IdentityWrite, InviteWrite};
+        use serde_json::{json, Value};
+
+        const PASSWORD: &str = "correct horse battery";
+        const INVALID_INVITE: &str = "This invite link is invalid or has expired";
+        const PUBLIC_URL: &str = "https://claudear.example.com/";
+        const DISCORD_ID: &str = "452316113016193024";
+        const SLACK_ID: &str = "U0123456789";
+        const LINK_PREFIX: &str = "/invite#cldi_";
+        const SECRET_HEX_LENGTH: usize = 64;
+
+        struct Account {
+            id: i64,
+            session: String,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Caller<'a> {
+            Anonymous,
+            Session(&'a str),
+            Bearer(&'a str),
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Csrf {
+            Sent,
+            Omitted,
+        }
+
+        struct TestApp {
+            router: Router,
+            tracker: Arc<dyn FixAttemptTracker>,
+            registry: UserRegistry,
+            admin: Account,
+            viewer: Account,
+            csrf: String,
+        }
+
+        impl TestApp {
+            async fn new() -> Self {
+                Self::build(None).await
+            }
+
+            async fn with_public_url(public_url: &str) -> Self {
+                Self::build(Some(public_url.to_string())).await
+            }
+
+            async fn build(public_url: Option<String>) -> Self {
+                let tracker = create_test_tracker();
+                let admin = account(&tracker, "admin@invite.test", Role::Admin);
+                let viewer = account(&tracker, "viewer@invite.test", Role::Viewer);
+
+                let mut config = test_config();
+                config.storage_dir = std::env::temp_dir().join("claudear-invite-directory-tests");
+                config.dashboard.public_url = public_url;
+                let registry = UserRegistry::new(config.users.clone());
+                let router = apply_dashboard_middleware(
+                    create_api_router_with_dashboard(
+                        config,
+                        tracker.clone(),
+                        PathBuf::from("claudear.toml"),
+                        test_indexing_rx(&tracker),
+                        None,
+                        registry.clone(),
+                    ),
+                    false,
+                );
+                let csrf = fetch_csrf(&router).await;
+
+                Self {
+                    router,
+                    tracker,
+                    registry,
+                    admin,
+                    viewer,
+                    csrf,
+                }
+            }
+
+            fn email(&self, name: &str) -> String {
+                format!("{name}@invite.test")
+            }
+
+            fn request(
+                &self,
+                method: Method,
+                uri: &str,
+                caller: Caller<'_>,
+                csrf: Csrf,
+                body: Option<Value>,
+            ) -> Request<Body> {
+                let mut cookies = Vec::new();
+                let mut builder = Request::builder().method(method).uri(uri);
+                match caller {
+                    Caller::Anonymous => {}
+                    Caller::Session(session) => cookies.push(format!("claudear_session={session}")),
+                    Caller::Bearer(token) => {
+                        builder = builder.header("authorization", format!("Bearer {token}"));
+                    }
+                }
+                if csrf == Csrf::Sent {
+                    cookies.push(format!("claudear_csrf={}", self.csrf));
+                    builder = builder.header("x-csrf-token", &self.csrf);
+                }
+                if !cookies.is_empty() {
+                    builder = builder.header("cookie", cookies.join("; "));
+                }
+                match body {
+                    Some(body) => builder
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string())),
+                    None => builder.body(Body::empty()),
+                }
+                .expect("request")
+            }
+
+            async fn send_bytes(&self, request: Request<Body>) -> (StatusCode, Bytes) {
+                let response = self
+                    .router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("response");
+                let status = response.status();
+                let bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                (status, bytes)
+            }
+
+            async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
+                let (status, bytes) = self.send_bytes(request).await;
+                let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                (status, body)
+            }
+
+            async fn call(
+                &self,
+                method: Method,
+                uri: &str,
+                caller: Caller<'_>,
+                body: Option<Value>,
+            ) -> (StatusCode, Value) {
+                self.send(self.request(method, uri, caller, Csrf::Sent, body))
+                    .await
+            }
+
+            async fn as_admin(
+                &self,
+                method: Method,
+                uri: &str,
+                body: Option<Value>,
+            ) -> (StatusCode, Value) {
+                self.call(method, uri, Caller::Session(&self.admin.session), body)
+                    .await
+            }
+
+            async fn put_directory(&self, caller: Caller<'_>, body: Value) -> (StatusCode, Value) {
+                self.send(self.request(
+                    Method::PUT,
+                    "/api/directory",
+                    caller,
+                    Csrf::Omitted,
+                    Some(body),
+                ))
+                .await
+            }
+
+            /// Admin `POST /api/users` without a password; returns the new user's id, the
+            /// invite secret and the response body.
+            async fn create_invited_user(
+                &self,
+                name: &str,
+                identities: Option<Value>,
+            ) -> (i64, String, Value) {
+                let mut request =
+                    json!({"email": self.email(name), "name": name, "role": "viewer"});
+                if let Some(identities) = identities {
+                    request["identities"] = identities;
+                }
+                let (status, body) = self
+                    .as_admin(Method::POST, "/api/users", Some(request))
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "create invited user: {body}");
+                let id = body["id"].as_i64().expect("user id");
+                (id, secret_of(&body["invite"]), body)
+            }
+
+            async fn inspect(&self, token: &str) -> (StatusCode, Value) {
+                self.call(
+                    Method::POST,
+                    "/api/auth/invite/inspect",
+                    Caller::Anonymous,
+                    Some(json!({"token": token})),
+                )
+                .await
+            }
+
+            async fn accept(&self, token: &str, password: &str) -> (StatusCode, Value) {
+                self.call(
+                    Method::POST,
+                    "/api/auth/invite/accept",
+                    Caller::Anonymous,
+                    Some(json!({"token": token, "password": password})),
+                )
+                .await
+            }
+
+            async fn login(&self, email: &str, password: &str) -> (StatusCode, Bytes) {
+                self.send_bytes(self.request(
+                    Method::POST,
+                    "/api/auth/login",
+                    Caller::Anonymous,
+                    Csrf::Omitted,
+                    Some(json!({"email": email, "password": password})),
+                ))
+                .await
+            }
+
+            /// Store an invited user directly, bypassing the HTTP API, with an invite for
+            /// `secret` that expires at `expires_at`.
+            fn seed_invited(
+                &self,
+                email: &str,
+                role: Role,
+                password_hash: &str,
+                secret: &str,
+                expires_at: &str,
+            ) -> i64 {
+                let ids = self
+                    .tracker
+                    .save_directory(&[DirectoryWrite {
+                        user: DirectoryUser::New {
+                            email: email.to_string(),
+                            name: "Seeded".to_string(),
+                            role,
+                            password_hash: password_hash.to_string(),
+                            status: UserStatus::Invited,
+                        },
+                        identities: None,
+                        invite: Some(InviteWrite {
+                            token_hash: sha256_hex(secret),
+                            expires_at: expires_at.to_string(),
+                            created_by: self.admin.id,
+                        }),
+                    }])
+                    .expect("seed invited user");
+                ids[0]
+            }
+
+            /// Store console identities for an existing user and reload the registry.
+            fn seed_identities(&self, user_id: i64, identities: Identities) {
+                self.tracker
+                    .save_directory(&[DirectoryWrite {
+                        user: DirectoryUser::Existing {
+                            user_id,
+                            name: None,
+                            role: None,
+                        },
+                        identities: Some(IdentityWrite {
+                            slug: None,
+                            identities,
+                        }),
+                        invite: None,
+                    }])
+                    .expect("seed identities");
+                assert!(crate::registry::reload(
+                    &self.registry,
+                    self.tracker.as_ref()
+                ));
+            }
+
+            /// Mint an API token for `user_id` the way `POST /api/tokens` does.
+            fn mint_bearer(&self, user_id: i64) -> String {
+                let secret = format!("cldr_{}", hex::encode(rand::random::<[u8; 24]>()));
+                self.tracker
+                    .create_api_token(
+                        user_id,
+                        "directory load",
+                        &sha256_hex(&secret),
+                        &secret[.."cldr_".len() + 8],
+                        None,
+                    )
+                    .expect("create api token");
+                secret
+            }
+
+            fn user_count(&self) -> i64 {
+                self.tracker.count_users().expect("count users")
+            }
+
+            fn status_of(&self, user_id: i64) -> UserStatus {
+                self.tracker
+                    .get_user_by_id(user_id)
+                    .expect("get user")
+                    .expect("user exists")
+                    .status
+            }
+        }
+
+        fn account(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: Role) -> Account {
+            let id = tracker
+                .create_user(email, "unused-hash", email, role)
+                .expect("create user");
+            let session = tracker
+                .create_session(id, "2099-12-31 23:59:59")
+                .expect("create session");
+            Account { id, session }
+        }
+
+        /// Read the CSRF cookie the middleware issues on a plain `GET`, as the SPA does.
+        async fn fetch_csrf(router: &Router) -> String {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/health")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .find_map(|cookie| cookie.strip_prefix("claudear_csrf="))
+                .and_then(|cookie| cookie.split(';').next())
+                .map(str::to_string)
+                .expect("claudear_csrf cookie")
+        }
+
+        fn sha256_hex(secret: &str) -> String {
+            hex::encode(Sha256::digest(secret.as_bytes()))
+        }
+
+        fn invite_secret() -> String {
+            format!("cldi_{}", hex::encode(rand::random::<[u8; 32]>()))
+        }
+
+        fn timestamp(offset: Duration) -> String {
+            (Utc::now() + offset)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        }
+
+        fn password_hash(password: &str) -> String {
+            bcrypt::hash(password, 4).expect("bcrypt hash")
+        }
+
+        /// The secret from a `UserInvite`, asserting the link shape on the way.
+        fn secret_of(invite: &Value) -> String {
+            let link = invite["invite_link"].as_str().expect("invite_link");
+            assert!(link.starts_with(LINK_PREFIX), "invite link shape: {link}");
+            let secret = link.trim_start_matches("/invite#").to_string();
+            assert_eq!(secret.len(), "cldi_".len() + SECRET_HEX_LENGTH);
+            secret
+        }
+
+        fn invalid_invite() -> Value {
+            json!({"error": INVALID_INVITE})
+        }
+
+        #[tokio::test]
+        async fn post_users_without_a_password_creates_an_invited_user() {
+            let app = TestApp::new().await;
+
+            let (id, _, body) = app.create_invited_user("amy", None).await;
+            assert_eq!(body["status"], "invited");
+            assert_eq!(body["email"], app.email("amy"));
+            assert!(body["invite"]["invite_url"].is_null());
+            assert_eq!(body["invite_expires_at"], body["invite"]["expires_at"]);
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+
+            let (status, user) = app
+                .as_admin(Method::GET, &format!("/api/users/{id}"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(user["status"], "invited");
+            assert_eq!(user["invite_expires_at"], body["invite"]["expires_at"]);
+
+            let (status, active) = app
+                .as_admin(
+                    Method::POST,
+                    "/api/users",
+                    Some(json!({
+                        "email": app.email("bob"),
+                        "name": "Bob",
+                        "role": "viewer",
+                        "password": PASSWORD,
+                    })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{active}");
+            assert_eq!(active["status"], "active");
+            assert!(active["invite"].is_null());
+            assert!(active["invite_expires_at"].is_null());
+
+            let (status, users) = app.as_admin(Method::GET, "/api/users", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let expiry_of = |user_id: &Value| {
+                users
+                    .as_array()
+                    .expect("users")
+                    .iter()
+                    .find(|user| &user["id"] == user_id)
+                    .map(|user| user["invite_expires_at"].clone())
+                    .expect("user listed")
+            };
+            assert_eq!(expiry_of(&json!(id)), body["invite"]["expires_at"]);
+            assert!(expiry_of(&active["id"]).is_null());
+            assert!(expiry_of(&json!(app.admin.id)).is_null());
+        }
+
+        #[tokio::test]
+        async fn public_url_makes_the_invite_link_absolute() {
+            let app = TestApp::with_public_url(PUBLIC_URL).await;
+
+            let (_, _, body) = app.create_invited_user("amy", None).await;
+            let link = body["invite"]["invite_link"].as_str().expect("invite_link");
+            assert_eq!(
+                body["invite"]["invite_url"],
+                format!("{}{link}", PUBLIC_URL.trim_end_matches('/'))
+            );
+        }
+
+        #[tokio::test]
+        async fn post_users_identities_for_an_invited_user_are_live_in_the_registry() {
+            let app = TestApp::new().await;
+
+            let (id, _, _) = app
+                .create_invited_user("amy", Some(json!({"github_usernames": ["amy"]})))
+                .await;
+
+            let person = app.registry.resolve("github", "amy").expect("amy resolves");
+            let people = app.registry.users();
+            assert!(people.contains_key(&person.slug));
+            assert_eq!(
+                people[&person.slug].github_usernames,
+                vec!["amy".to_string()]
+            );
+
+            let (status, identities) = app
+                .as_admin(Method::GET, &format!("/api/users/{id}/identities"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(identities["status"], "invited");
+            assert_eq!(identities["identities"]["github_usernames"], json!(["amy"]));
+        }
+
+        #[tokio::test]
+        async fn an_invite_is_inspected_then_accepted_then_the_user_logs_in() {
+            let app = TestApp::new().await;
+            let (id, secret, _) = app.create_invited_user("amy", None).await;
+
+            let (status, details) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::OK, "{details}");
+            assert_eq!(details["name"], "amy");
+            assert_eq!(details["email"], app.email("amy"));
+            assert!(details["expires_at"].is_string());
+
+            let (status, _) = app
+                .send(app.request(
+                    Method::POST,
+                    "/api/auth/invite/inspect",
+                    Caller::Anonymous,
+                    Csrf::Omitted,
+                    Some(json!({"token": secret})),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "inspect needs the CSRF header"
+            );
+
+            let (status, rejected) = app.accept(&secret, "short").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(rejected, json!({"error": "Password must be 8-72 bytes"}));
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+
+            let (status, accepted) = app.accept(&secret, PASSWORD).await;
+            assert_eq!(status, StatusCode::OK, "{accepted}");
+            assert_eq!(accepted, json!({"message": "Invite accepted"}));
+            assert_eq!(app.status_of(id), UserStatus::Active);
+
+            let (status, body) = app.login(&app.email("amy"), PASSWORD).await;
+            assert_eq!(status, StatusCode::OK);
+            let session: Value = serde_json::from_slice(&body).expect("login body");
+            assert_eq!(session["user"]["email"], app.email("amy"));
+
+            let (_, user) = app
+                .as_admin(Method::GET, &format!("/api/users/{id}"), None)
+                .await;
+            assert_eq!(user["status"], "active");
+            assert!(user["invite_expires_at"].is_null());
+        }
+
+        #[tokio::test]
+        async fn an_admin_password_activates_an_invited_user_and_closes_the_invite() {
+            let app = TestApp::new().await;
+            let (id, secret, _) = app.create_invited_user("amy", None).await;
+
+            let (status, updated) = app
+                .as_admin(
+                    Method::PUT,
+                    &format!("/api/users/{id}"),
+                    Some(json!({"password": PASSWORD})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{updated}");
+            assert_eq!(updated["status"], "active");
+            assert!(updated["invite_expires_at"].is_null());
+            assert_eq!(app.status_of(id), UserStatus::Active);
+
+            let (status, body) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, _) = app.login(&app.email("amy"), PASSWORD).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn login_for_an_invited_user_matches_a_wrong_password() {
+            let app = TestApp::new().await;
+            let active = app.email("active");
+            app.tracker
+                .create_user(&active, &password_hash(PASSWORD), "Active", Role::Viewer)
+                .expect("create active user");
+            let invited = app.email("invited");
+            // A real hash for the right password, so only the status gate can refuse it.
+            app.seed_invited(
+                &invited,
+                Role::Admin,
+                &password_hash(PASSWORD),
+                &invite_secret(),
+                &timestamp(Duration::days(7)),
+            );
+
+            let (wrong_status, wrong_body) = app.login(&active, "not the password").await;
+            let (invited_status, invited_body) = app.login(&invited, PASSWORD).await;
+            let (unknown_status, unknown_body) = app.login(&app.email("unknown"), PASSWORD).await;
+
+            assert_eq!(wrong_status, StatusCode::UNAUTHORIZED);
+            assert_eq!(invited_status, StatusCode::UNAUTHORIZED);
+            assert_eq!(unknown_status, StatusCode::UNAUTHORIZED);
+            assert_eq!(invited_body, wrong_body);
+            assert_eq!(unknown_body, wrong_body);
+        }
+
+        #[tokio::test]
+        async fn an_accepted_invite_cannot_be_reused() {
+            let app = TestApp::new().await;
+            let (_, secret, _) = app.create_invited_user("amy", None).await;
+
+            let (status, _) = app.accept(&secret, PASSWORD).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let (status, body) = app.accept(&secret, "another password").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, body) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+
+            let (status, _) = app.login(&app.email("amy"), PASSWORD).await;
+            assert_eq!(status, StatusCode::OK, "the first password still stands");
+        }
+
+        #[tokio::test]
+        async fn an_expired_invite_is_rejected() {
+            let app = TestApp::new().await;
+            let original = invite_secret();
+            let id = app.seed_invited(
+                &app.email("late"),
+                Role::Viewer,
+                &password_hash("never-used-password"),
+                &original,
+                &timestamp(Duration::days(7)),
+            );
+            let expired = invite_secret();
+            app.tracker
+                .issue_invite(
+                    id,
+                    &sha256_hex(&expired),
+                    &timestamp(-Duration::days(1)),
+                    app.admin.id,
+                )
+                .expect("issue expired invite");
+
+            for secret in [&expired, &original] {
+                let (status, body) = app.inspect(secret).await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(body, invalid_invite());
+                let (status, body) = app.accept(secret, PASSWORD).await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(body, invalid_invite());
+            }
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+        }
+
+        #[tokio::test]
+        async fn a_revoked_invite_is_rejected() {
+            let app = TestApp::new().await;
+            let (id, secret, _) = app.create_invited_user("amy", None).await;
+            let uri = format!("/api/users/{id}/invite");
+
+            let (status, body) = app.as_admin(Method::DELETE, &uri, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body, json!({"message": "Invite revoked"}));
+
+            let (status, body) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, _) = app.accept(&secret, PASSWORD).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            let (status, _) = app.as_admin(Method::DELETE, &uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "no open invite is left");
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+        }
+
+        #[tokio::test]
+        async fn reissuing_an_invite_invalidates_the_previous_link() {
+            let app = TestApp::new().await;
+            let (id, previous, _) = app.create_invited_user("amy", None).await;
+
+            let (status, invite) = app
+                .as_admin(Method::POST, &format!("/api/users/{id}/invite"), None)
+                .await;
+            assert!(status.is_success(), "re-issue: {status} {invite}");
+            let current = secret_of(&invite);
+            assert_ne!(current, previous);
+            assert!(invite["invite_url"].is_null());
+            assert!(invite["expires_at"].is_string());
+
+            let (status, body) = app.inspect(&previous).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, _) = app.accept(&previous, PASSWORD).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            let (status, _) = app.inspect(&current).await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _) = app.accept(&current, PASSWORD).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn issuing_an_invite_for_an_active_user_conflicts() {
+            let app = TestApp::new().await;
+
+            let (status, body) = app
+                .as_admin(
+                    Method::POST,
+                    &format!("/api/users/{}/invite", app.viewer.id),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, json!({"error": "User is already active"}));
+
+            let (status, _) = app
+                .as_admin(Method::POST, "/api/users/999999/invite", None)
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn viewers_cannot_manage_users_invites_or_the_directory() {
+            let app = TestApp::new().await;
+            let (id, _, _) = app.create_invited_user("amy", None).await;
+            let viewer = Caller::Session(&app.viewer.session);
+            let invite_uri = format!("/api/users/{id}/invite");
+            let directory = json!({"users": [{
+                "email": app.email("eve"), "name": "Eve", "role": "admin",
+            }]});
+            let count = app.user_count();
+
+            let (status, _) = app
+                .call(
+                    Method::POST,
+                    "/api/users",
+                    viewer,
+                    Some(json!({"email": app.email("eve"), "name": "Eve", "role": "admin"})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "POST /api/users");
+            let (status, _) = app.call(Method::POST, &invite_uri, viewer, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "POST invite");
+            let (status, _) = app.call(Method::DELETE, &invite_uri, viewer, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "DELETE invite");
+            let (status, _) = app
+                .call(
+                    Method::PUT,
+                    "/api/directory",
+                    viewer,
+                    Some(directory.clone()),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "PUT /api/directory by session"
+            );
+
+            let token = app.mint_bearer(app.viewer.id);
+            let (status, _) = app.put_directory(Caller::Bearer(&token), directory).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "PUT /api/directory by Bearer"
+            );
+
+            assert_eq!(app.user_count(), count);
+            assert!(app
+                .tracker
+                .get_open_invite_for_user(id)
+                .expect("open invite")
+                .is_some());
+        }
+
+        #[tokio::test]
+        async fn directory_takes_an_admin_bearer_without_csrf_but_not_a_bare_session() {
+            let app = TestApp::new().await;
+            let token = app.mint_bearer(app.admin.id);
+            let entry = |name: &str| json!({"users": [{"email": app.email(name), "name": name, "role": "viewer"}]});
+
+            let (status, body) = app
+                .put_directory(Caller::Bearer(&token), entry("amy"))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["users"][0]["created"], true);
+
+            let (status, _) = app
+                .put_directory(Caller::Session(&app.admin.session), entry("bob"))
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "a session still needs CSRF");
+
+            let mut request = app.request(
+                Method::PUT,
+                "/api/directory",
+                Caller::Session(&app.admin.session),
+                Csrf::Sent,
+                Some(entry("carl")),
+            );
+            request.headers_mut().insert(
+                "authorization",
+                "Bearer cldr_not-a-real-token".parse().expect("header"),
+            );
+            let (status, _) = app.send(request).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a bad Bearer never falls back to the cookie"
+            );
+
+            let (status, _) = app
+                .call(
+                    Method::POST,
+                    "/api/users",
+                    Caller::Bearer(&token),
+                    Some(json!({"email": app.email("dan"), "name": "Dan", "role": "viewer"})),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "Bearer is accepted only on PUT /api/directory"
+            );
+
+            for name in ["bob", "carl", "dan"] {
+                assert!(app
+                    .tracker
+                    .get_user_by_email(&app.email(name))
+                    .expect("lookup")
+                    .is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn bearer_token_of_an_invited_user_is_rejected() {
+            let app = TestApp::new().await;
+            let id = app.seed_invited(
+                &app.email("pending-admin"),
+                Role::Admin,
+                &password_hash("never-used-password"),
+                &invite_secret(),
+                &timestamp(Duration::days(7)),
+            );
+            let token = app.mint_bearer(id);
+            let count = app.user_count();
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [{"email": app.email("amy"), "name": "Amy", "role": "viewer"}]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body, json!({"error": "Invalid or expired token"}));
+            assert_eq!(app.user_count(), count);
+        }
+
+        #[tokio::test]
+        async fn directory_invited_users_are_live_in_the_registry() {
+            let app = TestApp::new().await;
+            let token = app.mint_bearer(app.admin.id);
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [{
+                        "email": app.email("amy"), "name": "Amy", "role": "viewer",
+                        "identities": {
+                            "github_usernames": ["amy"],
+                            "discord_id": DISCORD_ID,
+                            "slack_id": SLACK_ID,
+                        },
+                    }]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let entry = &body["users"][0];
+            assert_eq!(entry["email"], app.email("amy"));
+            assert_eq!(entry["created"], true);
+            assert_eq!(entry["status"], "invited");
+            assert_eq!(entry["identities"]["status"], "invited");
+            assert_eq!(
+                entry["identities"]["identities"]["github_usernames"],
+                json!(["amy"])
+            );
+            secret_of(&entry["invite"]);
+            let id = entry["user_id"].as_i64().expect("user id");
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+
+            let person = app.registry.resolve("github", "amy").expect("amy resolves");
+            assert_eq!(person.discord_id.as_deref(), Some(DISCORD_ID));
+            assert_eq!(
+                app.registry.discord_id_for_github("amy").as_deref(),
+                Some(DISCORD_ID)
+            );
+            let people = app.registry.users();
+            assert_eq!(
+                people[&person.slug].slack_id.as_deref(),
+                Some(SLACK_ID),
+                "registry.users() lists the invited person"
+            );
+        }
+
+        #[tokio::test]
+        async fn directory_rejects_the_whole_batch_when_one_entry_is_invalid() {
+            let app = TestApp::new().await;
+            let token = app.mint_bearer(app.admin.id);
+            let count = app.user_count();
+            let twin = app.email("amy").to_uppercase();
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [
+                        {"email": app.email("amy"), "name": "Amy", "role": "viewer",
+                         "identities": {"github_usernames": ["amy"]}},
+                        {"email": app.email("bob"), "name": "Bob", "role": "owner",
+                         "identities": {"discord_id": "not-a-snowflake"}},
+                        {"email": app.email("dan")},
+                        {"email": "not-an-email", "name": "X", "role": "viewer"},
+                        {"email": twin, "name": "Twice", "role": "viewer"},
+                    ]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], "Invalid directory entries");
+            let violations: Vec<(String, String)> = body["violations"]
+                .as_array()
+                .expect("violations")
+                .iter()
+                .map(|violation| {
+                    (
+                        violation["email"].as_str().unwrap_or_default().to_string(),
+                        violation["field"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            let expected = [
+                (app.email("bob"), "role"),
+                (app.email("bob"), "discord_id"),
+                (app.email("dan"), "name"),
+                (app.email("dan"), "role"),
+                ("not-an-email".to_string(), "email"),
+                (twin.clone(), "email"),
+            ];
+            assert_eq!(
+                violations,
+                expected
+                    .into_iter()
+                    .map(|(email, field)| (email, field.to_string()))
+                    .collect::<Vec<_>>(),
+                "every problem is reported and a case-insensitive repeat is a duplicate"
+            );
+            assert!(
+                !body.to_string().contains("not-a-snowflake"),
+                "rejected values are never echoed"
+            );
+
+            let duplicate = json!({"email": app.email("carl"), "name": "Carl", "role": "viewer"});
+            let (status, _) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [duplicate.clone(), duplicate]}),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "duplicate email in one batch"
+            );
+
+            assert_eq!(app.user_count(), count);
+            assert!(app
+                .tracker
+                .get_user_by_email(&app.email("amy"))
+                .expect("lookup")
+                .is_none());
+            assert!(app.registry.resolve("github", "amy").is_none());
+        }
+
+        #[tokio::test]
+        async fn directory_updates_an_existing_user_sparsely_without_an_invite() {
+            let app = TestApp::new().await;
+            app.seed_identities(
+                app.viewer.id,
+                Identities {
+                    github_usernames: vec!["jake-old".to_string()],
+                    discord_id: Some(DISCORD_ID.to_string()),
+                    ..Identities::default()
+                },
+            );
+            let token = app.mint_bearer(app.admin.id);
+            let count = app.user_count();
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [{
+                        "email": app.email("viewer"),
+                        "name": "Jake",
+                        "identities": {"linear_names": ["Jake Barnby"]},
+                    }]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let entry = &body["users"][0];
+            assert_eq!(entry["user_id"], app.viewer.id);
+            assert_eq!(entry["created"], false);
+            assert_eq!(entry["status"], "active");
+            assert!(entry["invite"].is_null());
+            let identities = &entry["identities"]["identities"];
+            assert_eq!(identities["github_usernames"], json!(["jake-old"]));
+            assert_eq!(identities["discord_id"], DISCORD_ID);
+            assert_eq!(identities["linear_names"], json!(["Jake Barnby"]));
+
+            assert_eq!(app.user_count(), count);
+            let user = app
+                .tracker
+                .get_user_by_id(app.viewer.id)
+                .expect("get user")
+                .expect("user exists");
+            assert_eq!(user.name, "Jake");
+            assert_eq!(user.role, Role::Viewer);
+            assert!(app
+                .tracker
+                .get_open_invite_for_user(app.viewer.id)
+                .expect("open invite")
+                .is_none());
+            assert!(app.registry.resolve("linear", "Jake Barnby").is_some());
+        }
+
+        #[tokio::test]
+        async fn deleting_a_user_removes_them_from_the_registry() {
+            let app = TestApp::new().await;
+            let id = app
+                .tracker
+                .create_user(&app.email("leaver"), "unused-hash", "Leaver", Role::Viewer)
+                .expect("create user");
+            app.seed_identities(
+                id,
+                Identities {
+                    github_usernames: vec!["leaver".to_string()],
+                    ..Identities::default()
+                },
+            );
+            let person = app
+                .registry
+                .resolve("github", "leaver")
+                .expect("leaver resolves before the delete");
+
+            let (status, body) = app
+                .as_admin(Method::DELETE, &format!("/api/users/{id}"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            assert!(app.registry.resolve("github", "leaver").is_none());
+            assert!(!app.registry.users().contains_key(&person.slug));
+        }
     }
 }

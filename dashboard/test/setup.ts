@@ -81,6 +81,7 @@ window.history.pushState = (state, title, url) => {
     const u = new URL(String(url), window.location.href);
     Object.defineProperty(window.location, "pathname", { value: u.pathname, writable: true, configurable: true });
     Object.defineProperty(window.location, "href", { value: u.href, writable: true, configurable: true });
+    Object.defineProperty(window.location, "hash", { value: u.hash, writable: true, configurable: true });
   }
 };
 
@@ -90,5 +91,6 @@ window.history.replaceState = (state, title, url) => {
     const u = new URL(String(url), window.location.href);
     Object.defineProperty(window.location, "pathname", { value: u.pathname, writable: true, configurable: true });
     Object.defineProperty(window.location, "href", { value: u.href, writable: true, configurable: true });
+    Object.defineProperty(window.location, "hash", { value: u.hash, writable: true, configurable: true });
   }
 };

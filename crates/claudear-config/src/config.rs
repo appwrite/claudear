@@ -646,6 +646,10 @@ pub struct DashboardConfig {
     pub max_plan_monthly_cost: f64,
     /// Hourly engineer rate for cost-savings calculation.
     pub hourly_engineer_rate: f64,
+    /// Externally reachable base URL of the dashboard (for example
+    /// `https://claudear.example.com`). When set, invite links are returned as absolute
+    /// URLs; otherwise only the relative link is available.
+    pub public_url: Option<String>,
 }
 
 impl Default for DashboardConfig {
@@ -653,6 +657,7 @@ impl Default for DashboardConfig {
         Self {
             max_plan_monthly_cost: 0.0,
             hourly_engineer_rate: 75.0,
+            public_url: None,
         }
     }
 }
@@ -1741,7 +1746,7 @@ pub struct TelegramConfig {
 }
 
 /// Per-user configuration mapping source identifiers to notification channel IDs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserConfig {
     /// User's display names in Linear (matched against issue assignee).
@@ -2744,9 +2749,6 @@ impl Config {
         let resolved_instructions = config.resolve_instructions_file(config_dir)?;
         config.agent.default_provider_config_mut().instructions = resolved_instructions;
 
-        // Resolve user slug references in global notification configs
-        config.resolve_user_slugs();
-
         // Validate project directory configuration
         config.validate_project_config()?;
 
@@ -2823,62 +2825,6 @@ impl Config {
             (None, Some(inline)) => Ok(Some(inline.clone())),
             (None, None) => Ok(None),
         }
-    }
-
-    /// Resolve user slug references in global notification configs.
-    ///
-    /// If a field like `discord.user_id` matches a key in `users`,
-    /// replace it with the user's actual channel-specific ID.
-    pub fn resolve_user_slugs(&mut self) {
-        // Resolve discord notifier user_id
-        if let Some(ref user_id) = self.notifiers.discord.user_id {
-            if let Some(user) = self.users.get(user_id) {
-                if let Some(ref discord_id) = user.discord_id {
-                    self.notifiers.discord.user_id = Some(discord_id.clone());
-                }
-            }
-        }
-
-        // Resolve email.to_addresses
-        let resolved_emails: Vec<String> = self
-            .notifiers
-            .email
-            .to_addresses
-            .iter()
-            .map(|addr| {
-                if let Some(user) = self.users.get(addr) {
-                    user.email.clone().unwrap_or_else(|| addr.clone())
-                } else {
-                    addr.clone()
-                }
-            })
-            .collect();
-        self.notifiers.email.to_addresses = resolved_emails;
-
-        // Resolve push.user_key
-        if let Some(ref user_key) = self.notifiers.push.user_key {
-            if let Some(user) = self.users.get(user_key) {
-                if let Some(ref push_key) = user.push_user_key {
-                    self.notifiers.push.user_key = Some(push_key.clone());
-                }
-            }
-        }
-
-        // Resolve sms.to_numbers
-        let resolved_numbers: Vec<String> = self
-            .notifiers
-            .sms
-            .to_numbers
-            .iter()
-            .map(|num| {
-                if let Some(user) = self.users.get(num) {
-                    user.sms_number.clone().unwrap_or_else(|| num.clone())
-                } else {
-                    num.clone()
-                }
-            })
-            .collect();
-        self.notifiers.sms.to_numbers = resolved_numbers;
     }
 
     /// Apply environment variable overrides to the config.
@@ -3396,6 +3342,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
         {
             self.retry.max_delay_ms = v;
+        }
+
+        if let Ok(v) = env::var("CLAUDEAR_DASHBOARD_PUBLIC_URL") {
+            let url = v.trim();
+            self.dashboard.public_url = (!url.is_empty()).then(|| url.to_string());
         }
 
         // Linear - apply overrides to existing config or create new one
@@ -4562,6 +4513,7 @@ mod tests {
         "CLAUDEAR_CLAUDE_INSTRUCTIONS_FILE",
         "CLAUDEAR_CLAUDE_PERMISSIONS",
         "CLAUDEAR_CLAUDE_SKIP_PERMISSIONS",
+        "CLAUDEAR_DASHBOARD_PUBLIC_URL",
     ];
 
     fn with_env<F, R>(vars: &[(&str, &str)], f: F) -> R
@@ -6621,97 +6573,6 @@ email = "alice@example.com"
     }
 
     #[test]
-    fn test_resolve_user_slug_in_discord_config() {
-        let toml_str = r#"
-[users.jake]
-discord_id = "123456789"
-email = "jake@example.com"
-
-[notifiers.discord]
-webhook_url = "https://discord.com/api/webhooks/123/abc"
-user_id = "jake"
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        assert_eq!(
-            config.notifiers.discord.user_id.as_deref(),
-            Some("123456789")
-        );
-    }
-
-    #[test]
-    fn test_resolve_user_slug_not_found_keeps_raw_value() {
-        let toml_str = r#"
-[users.jake]
-discord_id = "123456789"
-
-[notifiers.discord]
-webhook_url = "https://discord.com/api/webhooks/123/abc"
-user_id = "999888777"
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        assert_eq!(
-            config.notifiers.discord.user_id.as_deref(),
-            Some("999888777")
-        );
-    }
-
-    #[test]
-    fn test_resolve_user_slug_in_email_config() {
-        let toml_str = r#"
-[users.jake]
-email = "jake@resolved.com"
-
-[notifiers.email]
-smtp_host = "smtp.example.com"
-to_addresses = ["jake", "other@example.com"]
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        assert_eq!(
-            config.notifiers.email.to_addresses,
-            vec!["jake@resolved.com", "other@example.com"]
-        );
-    }
-
-    #[test]
-    fn test_resolve_user_slug_in_push_config() {
-        let toml_str = r#"
-[users.jake]
-push_user_key = "resolved_push_key"
-
-[notifiers.push]
-api_token = "token"
-user_key = "jake"
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        assert_eq!(
-            config.notifiers.push.user_key.as_deref(),
-            Some("resolved_push_key")
-        );
-    }
-
-    #[test]
-    fn test_resolve_user_slug_in_sms_config() {
-        let toml_str = r#"
-[users.jake]
-sms_number = "+1234567890"
-
-[notifiers.sms]
-account_sid = "sid"
-to_numbers = ["jake", "+9876543210"]
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        assert_eq!(
-            config.notifiers.sms.to_numbers,
-            vec!["+1234567890", "+9876543210"]
-        );
-    }
-
-    #[test]
     fn test_env_override_imap_settings() {
         let toml_str = r#"
 workspace = "/tmp/repos"
@@ -7464,56 +7325,6 @@ workspace = "/tmp/repos"
     }
 
     #[test]
-    fn test_resolve_user_slug_user_has_no_channel_id() {
-        let toml_str = r#"
-[users.jake]
-linear_names = ["Jake B"]
-
-[notifiers.discord]
-user_id = "jake"
-
-[notifiers.push]
-user_key = "jake"
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        // User exists but has no discord_id, should keep slug
-        assert_eq!(config.notifiers.discord.user_id.as_deref(), Some("jake"));
-        // User exists but has no push_user_key, should keep slug
-        assert_eq!(config.notifiers.push.user_key.as_deref(), Some("jake"));
-    }
-
-    #[test]
-    fn test_resolve_user_slug_email_user_has_no_email() {
-        let toml_str = r#"
-[users.jake]
-linear_names = ["Jake B"]
-
-[notifiers.email]
-to_addresses = ["jake"]
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        // User exists but has no email field, should keep the slug as-is
-        assert_eq!(config.notifiers.email.to_addresses, vec!["jake"]);
-    }
-
-    #[test]
-    fn test_resolve_user_slug_sms_user_has_no_number() {
-        let toml_str = r#"
-[users.jake]
-linear_names = ["Jake B"]
-
-[notifiers.sms]
-to_numbers = ["jake"]
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        // User exists but has no sms_number, should keep the slug as-is
-        assert_eq!(config.notifiers.sms.to_numbers, vec!["jake"]);
-    }
-
-    #[test]
     fn test_is_github_app_configured() {
         let mut config = Config::default();
         assert!(!config.is_github_app_configured());
@@ -7906,6 +7717,69 @@ hourly_engineer_rate = 200.0
             let config = Config::from_toml(toml_str).unwrap();
             assert!((config.dashboard.max_plan_monthly_cost - 100.0).abs() < f64::EPSILON);
             assert!((config.dashboard.hourly_engineer_rate - 200.0).abs() < f64::EPSILON);
+        });
+    }
+
+    #[test]
+    fn test_dashboard_public_url_defaults_to_none() {
+        assert!(DashboardConfig::default().public_url.is_none());
+        with_env(&[], || {
+            let config = Config::from_toml("workspace = \"/tmp/repos\"\n").unwrap();
+            assert!(config.dashboard.public_url.is_none());
+        });
+    }
+
+    #[test]
+    fn test_dashboard_public_url_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+workspace = "/tmp/repos"
+
+[dashboard]
+public_url = "https://claudear.example.com"
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert_eq!(
+                config.dashboard.public_url.as_deref(),
+                Some("https://claudear.example.com")
+            );
+        });
+    }
+
+    #[test]
+    fn test_dashboard_public_url_env_override() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[dashboard]
+public_url = "https://from-toml.example.com"
+"#;
+        with_env(
+            &[(
+                "CLAUDEAR_DASHBOARD_PUBLIC_URL",
+                "https://from-env.example.com",
+            )],
+            || {
+                let config = Config::from_toml(toml_str).unwrap();
+                assert_eq!(
+                    config.dashboard.public_url.as_deref(),
+                    Some("https://from-env.example.com")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_dashboard_public_url_empty_env_clears_value() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[dashboard]
+public_url = "https://from-toml.example.com"
+"#;
+        with_env(&[("CLAUDEAR_DASHBOARD_PUBLIC_URL", "")], || {
+            let config = Config::from_toml(toml_str).unwrap();
+            assert!(config.dashboard.public_url.is_none());
         });
     }
 

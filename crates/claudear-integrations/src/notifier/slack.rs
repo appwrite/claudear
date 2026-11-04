@@ -13,6 +13,7 @@ use claudear_analysis::distribution::Digest;
 use claudear_analysis::distribution::Markup;
 use claudear_analysis::distribution::PlainText;
 use claudear_config::config::SlackConfig;
+use claudear_config::users::NotificationChannel;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Error;
 use claudear_core::error::Result;
@@ -362,39 +363,35 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
                 .unwrap_or(false)
     }
 
+    fn configured_user_id(&self) -> Option<String> {
+        self.config.user_id.as_deref().map(|reference| {
+            self.user_registry
+                .resolve_reference(NotificationChannel::Slack, reference)
+        })
+    }
+
     fn get_user_mention(&self) -> Option<String> {
-        self.config.user_id.as_ref().map(|id| format!("<@{}>", id))
+        self.configured_user_id().map(|id| format!("<@{}>", id))
     }
 
     fn get_user_mention_for_issue(&self, issue: &Issue) -> Option<String> {
-        // Check for resolved user first
-        if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
-            if let Some(user) = self.user_registry.get_by_slug(&slug) {
-                if let Some(ref slack_id) = user.slack_id {
-                    return Some(format!("<@{}>", slack_id));
-                }
-            }
-        }
-        // Fall back to global config
-        self.config.user_id.as_ref().map(|id| format!("<@{}>", id))
+        self.get_target_slack_id_for_issue(issue)
+            .map(|id| format!("<@{}>", id))
     }
 
     fn get_target_slack_id_for_issue(&self, issue: &Issue) -> Option<String> {
-        if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
-            if let Some(user) = self.user_registry.get_by_slug(&slug) {
-                if let Some(ref slack_id) = user.slack_id {
-                    return Some(slack_id.clone());
-                }
-            }
-        }
-        self.config.user_id.clone()
+        issue
+            .get_metadata::<String>("resolved_user")
+            .and_then(|slug| self.user_registry.get_by_slug(&slug))
+            .and_then(|user| user.slack_id)
+            .or_else(|| self.configured_user_id())
     }
 
     fn expected_reply_user_id(&self, request: &AskRequest) -> Option<String> {
         request
             .target_slack_id
             .clone()
-            .or_else(|| self.config.user_id.clone())
+            .or_else(|| self.configured_user_id())
     }
 
     fn extract_reply_text(content: &str) -> Option<String> {
@@ -1449,6 +1446,7 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifier::test_support::{console_person, registry_with};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -4921,5 +4919,99 @@ mod tests {
         let blocks = msg.blocks.unwrap();
         let block_json = serde_json::to_string(&blocks).unwrap();
         assert!(!block_json.contains("Fix Confidence"));
+    }
+
+    fn slack_person(slack_id: Option<&str>) -> claudear_config::config::UserConfig {
+        claudear_config::config::UserConfig {
+            linear_names: vec!["Jake B".to_string()],
+            slack_id: slack_id.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn webhook_config_for(user_id: &str) -> SlackConfig {
+        SlackConfig {
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
+            user_id: Some(user_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_configured_user_id_person_key_resolves_to_slack_id() {
+        let notifier = SlackNotifier::with_http_client_and_registry(
+            webhook_config_for("jake"),
+            MockSlackHttpClient::success(),
+            registry_with("jake", slack_person(Some("U_JAKE"))),
+        );
+        let request = make_ask_request("tok-slug", "Q?", None, vec![], None, None);
+        assert_eq!(notifier.get_user_mention(), Some("<@U_JAKE>".to_string()));
+        assert_eq!(
+            notifier.get_user_mention_for_issue(&test_issue()),
+            Some("<@U_JAKE>".to_string())
+        );
+        assert_eq!(
+            notifier.get_target_slack_id_for_issue(&test_issue()),
+            Some("U_JAKE".to_string())
+        );
+        assert_eq!(
+            notifier.expected_reply_user_id(&request),
+            Some("U_JAKE".to_string())
+        );
+    }
+
+    #[test]
+    fn test_configured_user_id_unknown_reference_stays_literal() {
+        let notifier = SlackNotifier::with_http_client_and_registry(
+            webhook_config_for("U_LITERAL"),
+            MockSlackHttpClient::success(),
+            registry_with("jake", slack_person(Some("U_JAKE"))),
+        );
+        assert_eq!(
+            notifier.get_user_mention(),
+            Some("<@U_LITERAL>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_configured_user_id_person_without_slack_id_stays_literal() {
+        let notifier = SlackNotifier::with_http_client_and_registry(
+            webhook_config_for("jake"),
+            MockSlackHttpClient::success(),
+            registry_with("jake", slack_person(None)),
+        );
+        assert_eq!(notifier.get_user_mention(), Some("<@jake>".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_urgent_mention_follows_console_edit_without_rebuild() {
+        let registry = registry_with("jake", slack_person(Some("U_OLD")));
+        let notifier = SlackNotifier::with_http_client_and_registry(
+            webhook_config_for("jake"),
+            MockSlackHttpClient::success(),
+            registry.clone(),
+        );
+        let request = make_ask_request("tok-live", "Q?", None, vec![], None, None);
+
+        registry.replace_console(vec![console_person(
+            "jake",
+            claudear_core::identity::Identities {
+                slack_id: Some("U_NEW".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        notifier
+            .notify_urgent_issues(&[test_issue()])
+            .await
+            .unwrap();
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let body = body.to_string();
+        assert!(body.contains("<@U_NEW>"));
+        assert!(!body.contains("<@U_OLD>"));
+        assert_eq!(
+            notifier.expected_reply_user_id(&request),
+            Some("U_NEW".to_string())
+        );
     }
 }

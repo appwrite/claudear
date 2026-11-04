@@ -223,8 +223,19 @@ weight = 0.2
 # ============================================
 # Map team members to their identifiers across services.
 # When an issue is assigned to a user, notifications are routed to them specifically.
-# Global config fields (e.g. notifiers.discord.user_id) can reference user slugs instead of raw IDs.
-# A user with github_usernames is on the [pr_distribution] roster.
+# Global config fields (e.g. notifiers.discord.user_id) can reference user slugs instead of raw IDs;
+# they are resolved each time a notification is sent, so dashboard edits apply without a restart.
+#
+# These entries are the seed and fallback for identities edited in the dashboard
+# (Users page, or Settings > My Identities). A dashboard user's identities replace
+# this whole entry, config-only fields included, when their person key is "jake":
+# an admin set their slug to "jake", or their dashboard LOGIN email is
+# jake@example.com (the email below). The identity email they edit themselves
+# never links. Entries without a dashboard override stay active.
+# Reverting to config in the dashboard brings this entry back.
+#
+# A person with github_usernames (here or in the dashboard) is on the
+# [pr_distribution] roster.
 
 [users.jake]
 # Source identifiers (accepts a single string or a list of strings)
@@ -894,7 +905,9 @@ skip_if_previous_running = true
 # up to [retry] max_retries times.
 timeout_secs = 1800
 discord_channel_id = "990878183580651571"
-# GitHub login -> Discord user map for the FAIL @releaser mention. Use an
+# GitHub login -> Discord user map for the FAIL @releaser mention, used only
+# when the person who owns that GitHub login in the user registry ([users] or
+# dashboard identities) has no discord_id, or no person owns the login. Use an
 # absolute path: a relative one breaks under systemd and drops the mention.
 github_discord_map_path = "/etc/claudear/github-discord-map.json"
 # Optional; defaults to the bundled playbooks/deploy_qa.md. When set, use an
@@ -929,9 +942,12 @@ tag_filter = "any"
 # balanced so no single developer ends up holding every PR. If you're tagged,
 # it's your responsibility to get the PR over the line.
 #
-# The roster is every [users] entry with a github_usernames value plus every
-# login in the GitHub -> Discord map, minus `excluded`. Mentions use each
-# developer's Discord id on Discord and Slack id on Slack, and @login elsewhere.
+# The roster is everyone in the user directory (dashboard identities merged with
+# [users]) who owns a GitHub login, plus logins in the [deploy_qa]
+# github_discord_map_path map that nobody owns, minus `excluded`. It is rebuilt
+# for every PR and scheduled run, so dashboard edits apply without a restart.
+# Mentions use each developer's Discord id on Discord (the map fills in a
+# missing one) and Slack id on Slack, and @login elsewhere.
 #
 # Ownership, strongest first: who asked for the work (the issue's resolved
 # [users] assignee, a GitHub issue's assignee or author, or the Discord/Slack
@@ -961,9 +977,6 @@ excluded = []
 # PRs a developer may hold above the fair share before an owner loses a PR to
 # someone less loaded (default: 0)
 tolerance = 0
-# GitHub login -> Discord user map. Falls back to
-# [deploy_qa] github_discord_map_path when unset. Use an absolute path.
-# github_discord_map_path = "/etc/claudear/github-discord-map.json"
 
 # Enables chained follow-up fixes across repositories.
 
@@ -1250,6 +1263,14 @@ max_plan_monthly_cost = 0.0
 # Hourly engineer rate for cost-savings calculation (default: 150.0)
 hourly_engineer_rate = 150.0
 
+# Address people use to reach the dashboard, used to build absolute invite
+# links (invite_url). It must be the dashboard's origin with no sub-path,
+# because the dashboard is served from /. Unset, the API returns only the
+# relative /invite#cldi_... link and invite_url is null. A trailing slash is
+# fine.
+# Env override: CLAUDEAR_DASHBOARD_PUBLIC_URL (empty means unset).
+# public_url = "https://claudear.example.com"
+
 # ============================================
 # Local LLM
 # ============================================
@@ -1385,7 +1406,10 @@ reindex_interval_hours = 6.0
 # frequently and posts them once a week to your notifier(s), mentioning
 # notifiers.discord.user_id on Discord so a human can act. Report-only: it does
 # not change the fix pipeline. Requires a configured Sentry source + Discord
-# webhook.
+# webhook. The digest currently posts as plain text without the on-call
+# mention, because instrumented notifiers do not yet forward
+# notify_repetitive_digest; once they do, the mention resolves through the
+# registry like every other notifier reference.
 
 # Enable the weekly digest (default: false)
 enabled = false

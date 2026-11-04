@@ -54,6 +54,8 @@ mod push;
 mod slack;
 mod sms;
 mod telegram;
+#[cfg(test)]
+mod test_support;
 mod whatsapp;
 
 pub use ask_orchestrator::send_to_all_and_wait_first_reply;

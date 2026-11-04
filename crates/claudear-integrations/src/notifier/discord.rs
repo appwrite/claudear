@@ -18,6 +18,7 @@ use claudear_analysis::distribution::Digest;
 use claudear_analysis::distribution::Markup;
 use claudear_analysis::distribution::PlainText;
 use claudear_config::config::DiscordConfig;
+use claudear_config::users::NotificationChannel;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Error;
 use claudear_core::error::Result;
@@ -370,32 +371,28 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         }
     }
 
+    fn configured_user_id(&self) -> Option<String> {
+        self.config.user_id.as_deref().map(|reference| {
+            self.user_registry
+                .resolve_reference(NotificationChannel::Discord, reference)
+        })
+    }
+
     fn get_user_mention(&self) -> Option<String> {
-        self.config.user_id.as_ref().map(|id| format!("<@{}>", id))
+        self.configured_user_id().map(|id| format!("<@{}>", id))
     }
 
     fn get_user_mention_for_issue(&self, issue: &Issue) -> Option<String> {
-        // Check for resolved user first
-        if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
-            if let Some(user) = self.user_registry.get_by_slug(&slug) {
-                if let Some(ref discord_id) = user.discord_id {
-                    return Some(format!("<@{}>", discord_id));
-                }
-            }
-        }
-        // Fall back to global config
-        self.config.user_id.as_ref().map(|id| format!("<@{}>", id))
+        self.get_target_discord_id_for_issue(issue)
+            .map(|id| format!("<@{}>", id))
     }
 
     fn get_target_discord_id_for_issue(&self, issue: &Issue) -> Option<String> {
-        if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
-            if let Some(user) = self.user_registry.get_by_slug(&slug) {
-                if let Some(ref discord_id) = user.discord_id {
-                    return Some(discord_id.clone());
-                }
-            }
-        }
-        self.config.user_id.clone()
+        issue
+            .get_metadata::<String>("resolved_user")
+            .and_then(|slug| self.user_registry.get_by_slug(&slug))
+            .and_then(|user| user.discord_id)
+            .or_else(|| self.configured_user_id())
     }
 
     fn extract_reply_text(content: &str) -> Option<String> {
@@ -1684,6 +1681,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifier::test_support::{console_person, registry_with};
 
     fn empty_registry() -> claudear_config::users::UserRegistry {
         claudear_config::users::UserRegistry::new(std::collections::HashMap::new())
@@ -5535,5 +5533,162 @@ mod tests {
         let conf = fields.iter().find(|f| f.name == "Fix Confidence").unwrap();
         assert!(conf.value.contains("90/100"));
         assert!(conf.value.contains("Straightforward port"));
+    }
+
+    fn discord_person(discord_id: Option<&str>) -> claudear_config::config::UserConfig {
+        claudear_config::config::UserConfig {
+            linear_names: vec!["Jake B".to_string()],
+            discord_id: discord_id.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn discord_config_for(user_id: &str) -> DiscordConfig {
+        DiscordConfig {
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
+            user_id: Some(user_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn sent_content(notifier: &DiscordNotifier<MockDiscordWebhookClient>) -> Option<String> {
+        notifier
+            .http
+            .get_last_call()
+            .and_then(|(_, body)| body["content"].as_str().map(str::to_string))
+    }
+
+    fn repetitive_entry() -> crate::reports::RepetitiveEntry {
+        crate::reports::RepetitiveEntry {
+            issue_id: "A".to_string(),
+            short_id: "SENTRY-A".to_string(),
+            title: "Pool exhausted".to_string(),
+            url: "https://sentry.io/A".to_string(),
+            event_count: 1200,
+            is_escalating: true,
+            last_error: None,
+            repo: None,
+        }
+    }
+
+    #[test]
+    fn test_configured_user_id_person_key_resolves_to_discord_id() {
+        let registry = registry_with("jake", discord_person(Some("123456789")));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry,
+        );
+        assert_eq!(
+            notifier.get_user_mention(),
+            Some("<@123456789>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_configured_user_id_unknown_reference_stays_literal() {
+        let registry = registry_with("jake", discord_person(Some("123456789")));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("999888777"),
+            MockDiscordWebhookClient::success(),
+            registry,
+        );
+        assert_eq!(
+            notifier.get_user_mention(),
+            Some("<@999888777>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_configured_user_id_person_without_discord_id_stays_literal() {
+        let registry = registry_with("jake", discord_person(None));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry,
+        );
+        assert_eq!(notifier.get_user_mention(), Some("<@jake>".to_string()));
+    }
+
+    #[test]
+    fn test_issue_fallbacks_resolve_configured_person_key() {
+        let registry = registry_with("jake", discord_person(Some("123456789")));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry,
+        );
+        let issue = Issue::new("1", "P-1", "Test", "https://example.com", "linear");
+        assert_eq!(
+            notifier.get_user_mention_for_issue(&issue),
+            Some("<@123456789>".to_string())
+        );
+        assert_eq!(
+            notifier.get_target_discord_id_for_issue(&issue),
+            Some("123456789".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repetitive_digest_mention_follows_console_edit_without_rebuild() {
+        let registry = registry_with("jake", discord_person(Some("111111111")));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry.clone(),
+        );
+        let digest = test_digest(vec![repetitive_entry()]);
+
+        notifier.notify_repetitive_digest(&digest).await.unwrap();
+        assert_eq!(sent_content(&notifier).as_deref(), Some("<@111111111>"));
+
+        registry.replace_console(vec![console_person(
+            "jake",
+            claudear_core::identity::Identities {
+                discord_id: Some("222222222".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        notifier.notify_repetitive_digest(&digest).await.unwrap();
+        assert_eq!(sent_content(&notifier).as_deref(), Some("<@222222222>"));
+    }
+
+    #[tokio::test]
+    async fn test_urgent_mention_follows_console_edit_without_rebuild() {
+        let registry = registry_with("jake", discord_person(Some("111111111")));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry.clone(),
+        );
+        let issues = vec![Issue::new(
+            "1",
+            "P-1",
+            "Urgent",
+            "https://example.com",
+            "linear",
+        )];
+
+        registry.replace_console(vec![console_person(
+            "jake",
+            claudear_core::identity::Identities {
+                discord_id: Some("222222222".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        notifier.notify_urgent_issues(&issues).await.unwrap();
+        assert_eq!(sent_content(&notifier).as_deref(), Some("<@222222222>"));
+        assert_eq!(
+            notifier.get_target_discord_id_for_issue(&issues[0]),
+            Some("222222222".to_string())
+        );
+
+        registry.replace_console(Vec::new());
+        assert_eq!(
+            notifier.get_user_mention(),
+            Some("<@111111111>".to_string())
+        );
     }
 }

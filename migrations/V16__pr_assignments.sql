@@ -1,4 +1,4 @@
--- V15: The developer responsible for each open Claudear PR.
+-- V16: The developer responsible for each open Claudear PR.
 -- A PR keeps one active assignment until it is merged or closed (status
 -- 'closed') or its assignee leaves the roster (status 'released'); ended rows
 -- stay as history. The partial unique index keeps two processes sharing the

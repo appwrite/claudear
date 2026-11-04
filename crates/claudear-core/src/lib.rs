@@ -4,6 +4,7 @@
 //! and template rendering used across all claudear crates.
 
 pub mod error;
+pub mod identity;
 pub mod platform;
 pub mod secret;
 pub mod templates;

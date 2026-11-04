@@ -2,8 +2,10 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { SWRConfig } from 'swr'
 import { initSentry, Sentry } from './lib/sentry'
+import { captureInviteToken } from './lib/invite-token'
 import App from './App'
 
+captureInviteToken()
 initSentry()
 
 ReactDOM.createRoot(document.getElementById('root')!, {

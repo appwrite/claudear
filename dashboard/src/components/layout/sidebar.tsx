@@ -11,9 +11,16 @@ import {
 } from 'lucide-react'
 import { setSentryColorScheme } from '../../lib/sentry'
 
+type NavItem = {
+  path: string
+  label: string
+  icon: typeof LayoutDashboard
+  prefetch?: boolean
+}
+
 type NavGroup = {
   label?: string
-  items: { path: string; label: string; icon: typeof LayoutDashboard }[]
+  items: NavItem[]
 }
 
 const navGroups: NavGroup[] = [
@@ -69,16 +76,28 @@ export function Sidebar() {
   const { path, navigate } = useRouter()
   const { user, logout } = useAuth()
   const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'))
-
-  const handlePrefetch = (nextPath: string) => {
-    prefetchRouteData(nextPath)
-  }
+  const isAdmin = user?.role === 'admin'
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
     localStorage.setItem('theme', dark ? 'dark' : 'light')
     setSentryColorScheme(dark)
   }, [dark])
+
+  const groups: NavGroup[] = [...navGroups]
+  if (user) {
+    groups.push({
+      label: 'Team',
+      // The /users prefetch loads the admin-only user list, which a viewer cannot read.
+      items: [{ path: '/users', label: 'Users', icon: Users, prefetch: isAdmin }],
+    })
+  }
+  if (isAdmin) {
+    groups.push({
+      label: 'Admin',
+      items: [{ path: '/config', label: 'Config', icon: Settings }],
+    })
+  }
 
   return (
     <aside className="w-56 border-r bg-card flex flex-col h-screen sticky top-0">
@@ -89,78 +108,32 @@ export function Sidebar() {
         </h1>
       </div>
       <nav className="flex-1 p-2 overflow-y-auto">
-        {navGroups.map((group, gi) => (
-          <div key={gi} className={gi > 0 ? 'mt-3' : ''}>
+        {groups.map((group, index) => (
+          <div key={group.label ?? index} className={index > 0 ? 'mt-3' : ''}>
             {group.label && (
               <div className="mb-1 px-3 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">
                 {group.label}
               </div>
             )}
             <div className="space-y-0.5">
-              {group.items.map(({ path: itemPath, label, icon: Icon }) => {
-                const isActive = path === itemPath
-                return (
-                  <button
-                    key={itemPath}
-                    onClick={() => navigate(itemPath)}
-                    onMouseEnter={() => handlePrefetch(itemPath)}
-                    onFocus={() => handlePrefetch(itemPath)}
-                    className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
-                      isActive
-                        ? 'bg-primary/10 text-primary font-medium'
-                        : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                    }`}
-                  >
-                    <Icon className="h-4 w-4 shrink-0" />
-                    {label}
-                  </button>
-                )
-              })}
+              {group.items.map((item) => (
+                <NavButton
+                  key={item.path}
+                  item={item}
+                  active={path === item.path}
+                  onNavigate={navigate}
+                />
+              ))}
             </div>
           </div>
         ))}
-        {user?.role === 'admin' && (
-          <div className="mt-3">
-            <div className="mb-1 px-3 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">
-              Admin
-            </div>
-            <div className="space-y-0.5">
-              <button
-                onClick={() => navigate('/config')}
-                onMouseEnter={() => handlePrefetch('/config')}
-                onFocus={() => handlePrefetch('/config')}
-                className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
-                  path === '/config'
-                    ? 'bg-primary/10 text-primary font-medium'
-                    : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                }`}
-              >
-                <Settings className="h-4 w-4 shrink-0" />
-                Config
-              </button>
-              <button
-                onClick={() => navigate('/users')}
-                onMouseEnter={() => handlePrefetch('/users')}
-                onFocus={() => handlePrefetch('/users')}
-                className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
-                  path === '/users'
-                    ? 'bg-primary/10 text-primary font-medium'
-                    : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                }`}
-              >
-                <Users className="h-4 w-4 shrink-0" />
-                Users
-              </button>
-            </div>
-          </div>
-        )}
       </nav>
       <div className="p-3 border-t">
         <div className="flex items-center justify-between">
           <button
             onClick={() => navigate('/settings')}
-            onMouseEnter={() => handlePrefetch('/settings')}
-            onFocus={() => handlePrefetch('/settings')}
+            onMouseEnter={() => prefetchRouteData('/settings')}
+            onFocus={() => prefetchRouteData('/settings')}
             className="flex items-center gap-2 min-w-0 hover:opacity-80 transition-opacity"
             title="Account settings"
           >
@@ -204,5 +177,32 @@ export function Sidebar() {
         </div>
       </div>
     </aside>
+  )
+}
+
+function NavButton({
+  item: { path, label, icon: Icon, prefetch = true },
+  active,
+  onNavigate,
+}: {
+  item: NavItem
+  active: boolean
+  onNavigate: (path: string) => void
+}) {
+  const handlePrefetch = prefetch ? () => prefetchRouteData(path) : undefined
+  return (
+    <button
+      onClick={() => onNavigate(path)}
+      onMouseEnter={handlePrefetch}
+      onFocus={handlePrefetch}
+      className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
+        active
+          ? 'bg-primary/10 text-primary font-medium'
+          : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+      }`}
+    >
+      <Icon className="h-4 w-4 shrink-0" />
+      {label}
+    </button>
   )
 }
