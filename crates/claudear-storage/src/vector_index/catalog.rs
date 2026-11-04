@@ -18,12 +18,12 @@ impl Catalog {
     pub(crate) fn new() -> Self {
         let session = Arc::new(Session::new());
         Self {
-            qa: VectorIndex::new(Definition::QA, Arc::clone(&session)),
-            issue: VectorIndex::new(Definition::ISSUE, Arc::clone(&session)),
-            outcome: VectorIndex::new(Definition::OUTCOME, Arc::clone(&session)),
-            code_chunk: VectorIndex::new(Definition::CODE_CHUNK, Arc::clone(&session)),
+            qa: VectorIndex::new(Definition::Qa, Arc::clone(&session)),
+            issue: VectorIndex::new(Definition::Issue, Arc::clone(&session)),
+            outcome: VectorIndex::new(Definition::Outcome, Arc::clone(&session)),
+            code_chunk: VectorIndex::new(Definition::CodeChunk, Arc::clone(&session)),
             discord_message_chunk: VectorIndex::new(
-                Definition::DISCORD_MESSAGE_CHUNK,
+                Definition::DiscordMessageChunk,
                 Arc::clone(&session),
             ),
             session,

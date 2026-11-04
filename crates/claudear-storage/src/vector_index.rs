@@ -9,6 +9,7 @@ pub(crate) mod progress;
 pub(crate) mod session;
 pub(crate) mod signal;
 pub(crate) mod state;
+pub(crate) mod statements;
 
 use access::Access;
 use claudear_core::error::{Error, Result};
@@ -19,6 +20,7 @@ use progress::Progress;
 use rusqlite::{params, Connection, OptionalExtension};
 use session::Session;
 use state::State;
+use statements::Statements;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -80,7 +82,11 @@ impl VectorIndex {
     }
 
     pub(crate) fn table(&self) -> &'static str {
-        self.definition.table
+        self.statements().table
+    }
+
+    fn statements(&self) -> &'static Statements {
+        self.definition.statements()
     }
 
     pub(crate) fn prepare_search(&self, connection: &Connection, dimension: usize) -> Result<bool> {
@@ -277,7 +283,7 @@ impl VectorIndex {
         }
 
         let required = self
-            .definition
+            .statements()
             .minimum_capacity
             .max(self.count(connection, dimension)?.saturating_mul(2));
 
@@ -337,9 +343,7 @@ impl VectorIndex {
 
     fn drop_table(&self, state: &mut State, connection: &Connection) -> Result<bool> {
         self.session.generation(connection)?;
-        if let Err(error) =
-            connection.execute_batch(&format!("DROP TABLE IF EXISTS {}", self.table()))
-        {
+        if let Err(error) = connection.execute_batch(self.statements().drop) {
             tracing::warn!(table = self.table(), %error, "Failed to drop vector index; retrying on next use");
             Self::invalidate(state);
             return Ok(false);
@@ -386,16 +390,8 @@ impl VectorIndex {
             return Ok(0);
         };
         let limit = batch_size.max(1);
-        let Definition {
-            source_table,
-            id_column,
-            embedding_column,
-            ..
-        } = self.definition;
         let rows: Vec<(i64, Vec<u8>)> = connection
-            .prepare_cached(&format!(
-                "SELECT {id_column}, {embedding_column} FROM {source_table} WHERE {id_column} > ?1 AND {embedding_column} IS NOT NULL AND length({embedding_column}) = ?2 ORDER BY {id_column} LIMIT ?3"
-            ))?
+            .prepare_cached(self.statements().batch)?
             .query_map(
                 params![cursor, Self::byte_length(dimension), limit as i64],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -434,20 +430,16 @@ impl VectorIndex {
 
     fn write(&self, connection: &Connection, rowid: i64, blob: &[u8]) -> rusqlite::Result<()> {
         connection
-            .prepare_cached(&format!("DELETE FROM {} WHERE rowid = ?1", self.table()))?
+            .prepare_cached(self.statements().delete)?
             .execute(params![rowid])?;
         connection
-            .prepare_cached(&format!(
-                "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-                self.table()
-            ))?
+            .prepare_cached(self.statements().insert)?
             .execute(params![rowid, blob])?;
         Ok(())
     }
 
     fn delete(&self, connection: &Connection, rowids: &[i64]) -> rusqlite::Result<()> {
-        let mut statement =
-            connection.prepare_cached(&format!("DELETE FROM {} WHERE rowid = ?1", self.table()))?;
+        let mut statement = connection.prepare_cached(self.statements().delete)?;
         for rowid in rowids {
             statement.execute(params![rowid])?;
         }
@@ -455,15 +447,8 @@ impl VectorIndex {
     }
 
     fn count(&self, connection: &Connection, dimension: usize) -> Result<usize> {
-        let Definition {
-            source_table,
-            embedding_column,
-            ..
-        } = self.definition;
         let count: i64 = connection.query_row(
-            &format!(
-                "SELECT count(*) FROM {source_table} WHERE {embedding_column} IS NOT NULL AND length({embedding_column}) = ?1"
-            ),
+            self.statements().count,
             params![Self::byte_length(dimension)],
             |row| row.get(0),
         )?;
@@ -471,20 +456,8 @@ impl VectorIndex {
     }
 
     fn newest_length(&self, connection: &Connection) -> Result<Option<i64>> {
-        let Definition {
-            source_table,
-            id_column,
-            embedding_column,
-            ..
-        } = self.definition;
         Ok(connection
-            .query_row(
-                &format!(
-                    "SELECT length({embedding_column}) FROM {source_table} WHERE {embedding_column} IS NOT NULL ORDER BY {id_column} DESC LIMIT 1"
-                ),
-                [],
-                |row| row.get(0),
-            )
+            .query_row(self.statements().newest, [], |row| row.get(0))
             .optional()?)
     }
 
@@ -522,18 +495,8 @@ mod tests {
     const TABLE: &str = "test_vectors";
     const SOURCE: &str = "source";
 
-    fn definition(table: &'static str, source_table: &'static str) -> Definition {
-        Definition {
-            table,
-            source_table,
-            id_column: "id",
-            embedding_column: "embedding",
-            minimum_capacity: 4,
-        }
-    }
-
     fn index() -> VectorIndex {
-        VectorIndex::new(definition(TABLE, SOURCE), Arc::new(Session::new()))
+        VectorIndex::new(Definition::Test, Arc::new(Session::new()))
     }
 
     fn database() -> (TempDir, PathBuf) {
@@ -731,10 +694,7 @@ mod tests {
         );
 
         insert_rows(&connection, "larger_source", 1..=3, 4);
-        let larger = VectorIndex::new(
-            definition("larger_vectors", "larger_source"),
-            Arc::new(Session::new()),
-        );
+        let larger = VectorIndex::new(Definition::Larger, Arc::new(Session::new()));
         rebuild(&larger, &connection);
         assert_eq!(
             declared(&connection, "larger_vectors"),
@@ -824,11 +784,8 @@ mod tests {
             return;
         }
         let session = Arc::new(Session::new());
-        let sibling = VectorIndex::new(
-            definition("sibling_vectors", "sibling_source"),
-            Arc::clone(&session),
-        );
-        let index = VectorIndex::new(definition(TABLE, SOURCE), session);
+        let sibling = VectorIndex::new(Definition::Sibling, Arc::clone(&session));
+        let index = VectorIndex::new(Definition::Test, session);
         insert_rows(&connection, "sibling_source", 1..=2, 4);
         create_source(&connection, SOURCE);
         assert!(sibling.prepare_search(&connection, 4).unwrap());
@@ -1232,11 +1189,8 @@ mod tests {
             return;
         }
         let session = Arc::new(Session::new());
-        let sibling = VectorIndex::new(
-            definition("sibling_vectors", "sibling_source"),
-            Arc::clone(&session),
-        );
-        let index = VectorIndex::new(definition(TABLE, SOURCE), session);
+        let sibling = VectorIndex::new(Definition::Sibling, Arc::clone(&session));
+        let index = VectorIndex::new(Definition::Test, session);
         insert_rows(&first, "sibling_source", 1..=3, 4);
         insert_rows(&first, SOURCE, 1..=3, 4);
         assert!(sibling.prepare_search(&first, 4).unwrap());
