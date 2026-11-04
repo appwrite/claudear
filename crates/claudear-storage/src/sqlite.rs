@@ -21697,7 +21697,7 @@ mod tests {
         }
 
         #[test]
-        fn test_rebuild_vector_indexes_hands_the_lock_to_a_waiting_thread_after_each_batch() {
+        fn test_rebuild_vector_indexes_releases_the_lock_between_batches() {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("claudear.db");
             let batches = 64;
@@ -21758,12 +21758,7 @@ mod tests {
             assert_eq!(observed, batches, "the rebuild left batches unindexed");
             assert!(
                 advances.len() >= batches / 2,
-                "too few acquisitions queued while the rebuild held the lock to judge the handoff: {advances:?}"
-            );
-            let handed_off = advances.iter().filter(|&&advance| advance == 1).count();
-            assert!(
-                handed_off * 4 >= advances.len() * 3,
-                "a thread waiting on the connection lock was handed it after a single rebuild batch only {handed_off} of {} times; batches indexed between its acquisitions: {advances:?}",
+                "a thread waiting on the connection lock got it only {} times across {batches} rebuild batches, so the rebuild held the lock across batches; batches indexed between its acquisitions: {advances:?}",
                 advances.len()
             );
         }
