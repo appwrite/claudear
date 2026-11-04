@@ -147,27 +147,26 @@ pub(crate) async fn put_directory_handler(
     }
     let Json(request) = body?;
 
+    let unusable_hash = if names_unknown_user(&users_by_email(&state)?, &request.users) {
+        Some(unusable_password_hash().await?)
+    } else {
+        None
+    };
+
     let _writes = state.identity_writes.lock().await;
     registry::reload(&state.registry, state.tracker.as_ref());
-    let users: HashMap<String, UserRow> = state
-        .tracker
-        .list_users()
-        .map_err(ApiError::storage)?
-        .into_iter()
-        .map(|user| (normalize_login_email(&user.email), user))
-        .collect();
+    let users = users_by_email(&state)?;
     let identities = identities_by_user(&state)?;
 
     let staged = stage(&state.registry, &users, &identities, request.users)?;
     check_conflicts(&state.registry, &staged)?;
 
-    let unusable_hash = if staged
+    let creates_users = staged
         .iter()
-        .any(|entry| matches!(entry.user, StagedUser::New { .. }))
-    {
-        Some(unusable_password_hash().await?)
-    } else {
-        None
+        .any(|entry| matches!(entry.user, StagedUser::New { .. }));
+    let unusable_hash = match unusable_hash {
+        None if creates_users => Some(unusable_password_hash().await?),
+        prepared => prepared,
     };
     let invites: Vec<Option<NewInvite>> = staged
         .iter()
@@ -232,6 +231,24 @@ pub(crate) async fn put_directory_handler(
         "Directory loaded"
     );
     Ok(Json(DirectoryResponse { users: results }))
+}
+
+fn users_by_email(state: &ApiState) -> Result<HashMap<String, UserRow>, ApiError> {
+    Ok(state
+        .tracker
+        .list_users()
+        .map_err(ApiError::storage)?
+        .into_iter()
+        .map(|user| (normalize_login_email(&user.email), user))
+        .collect())
+}
+
+/// Whether any valid entry names an email no user has yet, so the batch may create users.
+fn names_unknown_user(users: &HashMap<String, UserRow>, entries: &[DirectoryEntry]) -> bool {
+    entries.iter().any(|entry| {
+        let email = normalize_login_email(entry.email.trim());
+        is_valid_login_email(&email) && !users.contains_key(&email)
+    })
 }
 
 fn identities_by_user(state: &ApiState) -> Result<HashMap<i64, ConsoleIdentity>, ApiError> {
@@ -525,6 +542,43 @@ mod tests {
         assert_eq!(DirectoryField::Email.as_str(), "email");
         assert_eq!(DirectoryField::Name.as_str(), "name");
         assert_eq!(DirectoryField::Role.as_str(), "role");
+    }
+
+    #[test]
+    fn only_a_valid_unknown_email_may_create_users() {
+        let tracker: Arc<dyn FixAttemptTracker> =
+            Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
+        tracker
+            .create_user("amy@example.com", "unused-hash", "Amy", Role::Viewer)
+            .expect("create user");
+        let users = tracker
+            .list_users()
+            .expect("list users")
+            .into_iter()
+            .map(|user| (normalize_login_email(&user.email), user))
+            .collect();
+        let entries = |emails: &[&str]| -> Vec<DirectoryEntry> {
+            emails
+                .iter()
+                .map(|email| DirectoryEntry {
+                    email: email.to_string(),
+                    name: None,
+                    role: None,
+                    identities: None,
+                })
+                .collect()
+        };
+
+        assert!(!names_unknown_user(
+            &users,
+            &entries(&[" AMY@example.com "])
+        ));
+        assert!(!names_unknown_user(&users, &entries(&["not-an-email"])));
+        assert!(!names_unknown_user(&users, &entries(&[])));
+        assert!(names_unknown_user(
+            &users,
+            &entries(&["amy@example.com", "bob@example.com"])
+        ));
     }
 
     #[tokio::test]
