@@ -463,6 +463,41 @@ describe("SecurityPage", () => {
     expect(posts(calls).every((call) => call.url === "/api/security/reports/2/override")).toBe(true);
   });
 
+  test("Not delivered asks first, warns that the reply is resent, and sends nothing when declined", async () => {
+    const calls = harness(admin);
+    const prompts: string[] = [];
+    window.confirm = (message?: string) => {
+      prompts.push(String(message));
+      return false;
+    };
+    render(<SecurityPage />, { wrapper: Wrapper });
+    await openReport("HS-1002");
+    fireEvent.click(screen.getByRole("button", { name: "Not delivered" }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(posts(calls)).toHaveLength(0);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("not delivered");
+    expect(prompts[0]).toContain("send it to the reporter again");
+  });
+
+  test("Mark awarded asks first, names the reward and recipient, and sends nothing when declined", async () => {
+    const calls = harness(admin);
+    const prompts: string[] = [];
+    window.confirm = (message?: string) => {
+      prompts.push(String(message));
+      return false;
+    };
+    render(<SecurityPage />, { wrapper: Wrapper });
+    await openReport("HS-1002");
+    fireEvent.click(screen.getByRole("button", { name: "Mark awarded" }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(posts(calls)).toHaveLength(0);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("SecurityResearchers");
+    expect(prompts[0]).toContain("second@researcher.test");
+    expect(prompts[0]).toContain("cannot be undone");
+  });
+
   test("Link PR posts the pull request url", async () => {
     const calls = harness(admin);
     render(<SecurityPage />, { wrapper: Wrapper });
