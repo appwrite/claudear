@@ -1253,8 +1253,6 @@ export async function deleteUser(id: number): Promise<void> {
   return deleteRequest(`${API_BASE}/users/${id}`)
 }
 
-// --- Personal access tokens -------------------------------------------------
-
 /** A personal access token (never includes the secret after creation). */
 export interface ApiToken {
   id: string
