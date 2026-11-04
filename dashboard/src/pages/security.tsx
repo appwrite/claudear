@@ -42,7 +42,14 @@ import {
 } from '../components/security/badges'
 import { ReportDetail } from '../components/security/report-detail'
 
-const OPEN_REPORT_STATES: SecurityReportState[] = ['received', 'assessing', 'needs_human', 'replying', 'tracking']
+const OPEN_REPORT_STATES: SecurityReportState[] = [
+  'received',
+  'assessing',
+  'needs_human',
+  'registering',
+  'replying',
+  'tracking',
+]
 
 const stateOptions = SECURITY_REPORT_STATES.map(value => ({ value, label: formatLabel(value) }))
 const outcomeOptions = SECURITY_OUTCOMES.map(value => ({ value, label: formatLabel(value) }))

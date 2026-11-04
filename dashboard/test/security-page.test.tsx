@@ -16,7 +16,7 @@ const admin = { id: 1, email: "admin@appwrite.io", name: "Admin", role: "admin",
 const viewer = { id: 2, email: "viewer@appwrite.io", name: "Viewer", role: "viewer", avatar_url: null };
 
 const summary: SecuritySummary = {
-  reports_by_state: { received: 1, needs_human: 2, tracking: 3, closed: 4 },
+  reports_by_state: { received: 1, needs_human: 2, registering: 1, tracking: 3, closed: 4 },
   reports_by_outcome: { valid: 3 },
   vulnerabilities_by_state: { awaiting_fix: 1, fixing: 1, merged: 1, live: 5 },
   pending_awards: 7,
@@ -280,7 +280,7 @@ describe("SecurityPage", () => {
     const needsHuman = (await screen.findByText("Needs Human")).closest(".rounded-lg") as HTMLElement;
     expect(within(needsHuman).getByText("2")).toBeTruthy();
     const open = screen.getByText("Open Reports").closest(".rounded-lg") as HTMLElement;
-    expect(within(open).getByText("6")).toBeTruthy();
+    expect(within(open).getByText("7")).toBeTruthy();
     const inFlight = screen.getByText("Fixes In Flight").closest(".rounded-lg") as HTMLElement;
     expect(within(inFlight).getByText("3")).toBeTruthy();
     const live = screen.getByText("Live Fixes").closest(".rounded-lg") as HTMLElement;

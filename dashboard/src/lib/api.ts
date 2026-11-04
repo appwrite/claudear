@@ -1279,6 +1279,7 @@ export const SECURITY_REPORT_STATES = [
   'received',
   'assessing',
   'needs_human',
+  'registering',
   'spam',
   'replying',
   'closed',
