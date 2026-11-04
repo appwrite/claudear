@@ -1055,46 +1055,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_identities_redacts_other_people_for_a_viewer() {
-        let app = test_app();
-
-        let (status, _) = send(&app, request("GET", "/api/identities", None, None)).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-        let (status, body) = send(
-            &app,
-            request("GET", "/api/identities", Some(&app.viewer.token), None),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let people = body.as_array().expect("array");
-        assert_eq!(people.len(), 2);
-        let admin = people
-            .iter()
-            .find(|person| person["user_id"] == app.admin.id)
-            .expect("admin listed");
-        assert_eq!(admin["origin"], "config");
-        assert_eq!(admin["person_key"], "jake");
-        assert_eq!(admin["slug"], Value::Null);
-        assert_eq!(admin["redacted"], true);
-        assert_eq!(admin["login_email"], Value::Null);
-        assert!(admin.get("email").is_none());
-        assert_eq!(admin["identities"]["sms_number"], Value::Null);
-        assert_eq!(
-            admin["identities"]["github_usernames"],
-            json!(["jakebarnby"])
-        );
-        let viewer = people
-            .iter()
-            .find(|person| person["user_id"] == app.viewer.id)
-            .expect("viewer listed");
-        assert_eq!(viewer["redacted"], false);
-        assert_eq!(viewer["login_email"], "viewer@example.com");
-        assert_eq!(viewer["origin"], "unset");
-        assert_eq!(viewer["status"], "active");
-    }
-
-    #[tokio::test]
     async fn get_user_identities_is_full_for_admins_and_404_when_missing() {
         let app = test_app();
 

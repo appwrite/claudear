@@ -681,60 +681,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_invalid_entry_rejects_the_whole_batch() {
-        let app = test_app(false);
-        let before = user_count(&app);
-
-        let (status, body) = put(
-            &app,
-            Some(&bearer(&app.admin)),
-            None,
-            json!({"users": [
-                {"email": "directory-ok@example.com", "name": "Ok", "role": "viewer",
-                 "identities": {"github_usernames": ["ok-gh"]}},
-                {"email": "directory-bad@example.com", "name": "Bad", "role": "owner",
-                 "identities": {"discord_id": "123"}},
-                {"email": "directory-nameless@example.com"},
-                {"email": "not-an-email", "name": "X", "role": "viewer"},
-                {"email": "DIRECTORY-OK@example.com", "name": "Twice", "role": "viewer"}
-            ]}),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "Invalid directory entries");
-        let violations: Vec<(String, String)> = body["violations"]
-            .as_array()
-            .expect("violations")
-            .iter()
-            .map(|violation| {
-                (
-                    violation["email"].as_str().unwrap_or_default().to_string(),
-                    violation["field"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect();
-        let expected = [
-            ("directory-bad@example.com", "role"),
-            ("directory-bad@example.com", "discord_id"),
-            ("directory-nameless@example.com", "name"),
-            ("directory-nameless@example.com", "role"),
-            ("not-an-email", "email"),
-            ("DIRECTORY-OK@example.com", "email"),
-        ];
-        assert_eq!(
-            violations,
-            expected
-                .iter()
-                .map(|(email, field)| (email.to_string(), field.to_string()))
-                .collect::<Vec<_>>()
-        );
-        assert!(!body.to_string().contains("123"));
-        assert_eq!(user_count(&app), before);
-        assert!(app.registry.resolve("github", "ok-gh").is_none());
-    }
-
-    #[tokio::test]
     async fn handle_conflicts_reject_the_batch_with_409() {
         let app = test_app(false);
         let before = user_count(&app);

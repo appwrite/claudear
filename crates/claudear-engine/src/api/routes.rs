@@ -8917,7 +8917,14 @@ mod tests {
 
         #[tokio::test]
         async fn identity_list_redacts_only_other_people_for_a_viewer() {
-            let harness = Harness::new(HashMap::new());
+            let harness = Harness::new(HashMap::from([(
+                "chief".to_string(),
+                UserConfig {
+                    github_usernames: vec!["chief-gh".to_string()],
+                    email: Some(ADMIN_EMAIL.to_string()),
+                    ..UserConfig::default()
+                },
+            )]));
             harness.seed(
                 harness.other.id,
                 None,
@@ -8928,15 +8935,32 @@ mod tests {
                 None,
                 sensitive_identities("viewer-gh", VIEWER_DISCORD_ID),
             );
+            let newcomer = account(
+                &harness.tracker,
+                "identity-newcomer@example.com",
+                "Newcomer",
+                "viewer",
+            );
 
             let (status, people) = harness
                 .send(auth_get("/api/identities", &harness.viewer.token))
                 .await;
             assert_eq!(status, StatusCode::OK);
+            assert_eq!(people.as_array().expect("array").len(), 4);
             let other = find_person(&people, harness.other.id);
             assert_redacted(other);
             assert_eq!(other["identities"]["github_usernames"], json!(["other-gh"]));
-            assert_redacted(find_person(&people, harness.admin.id));
+            let admin = find_person(&people, harness.admin.id);
+            assert_redacted(admin);
+            assert_eq!(admin["origin"], "config");
+            assert_eq!(admin["person_key"], "chief");
+            assert_eq!(admin["slug"], Value::Null);
+            assert!(admin.get("email").is_none(), "no login email field leaks");
+            assert_eq!(admin["identities"]["github_usernames"], json!(["chief-gh"]));
+            let newcomer = find_person(&people, newcomer.id);
+            assert_eq!(newcomer["origin"], "unset");
+            assert_eq!(newcomer["person_key"], Value::Null);
+            assert_eq!(newcomer["status"], "active");
             let own = find_person(&people, harness.viewer.id);
             assert_eq!(own["redacted"], false);
             assert_eq!(own["login_email"], VIEWER_EMAIL);
@@ -9756,8 +9780,9 @@ mod tests {
                 "inspect needs the CSRF header"
             );
 
-            let (status, _) = app.accept(&secret, "short").await;
+            let (status, rejected) = app.accept(&secret, "short").await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(rejected, json!({"error": "Password must be 8-72 bytes"}));
             assert_eq!(app.status_of(id), UserStatus::Invited);
 
             let (status, accepted) = app.accept(&secret, PASSWORD).await;
@@ -9775,6 +9800,30 @@ mod tests {
                 .await;
             assert_eq!(user["status"], "active");
             assert!(user["invite_expires_at"].is_null());
+        }
+
+        #[tokio::test]
+        async fn an_admin_password_activates_an_invited_user_and_closes_the_invite() {
+            let app = TestApp::new().await;
+            let (id, secret, _) = app.create_invited_user("amy", None).await;
+
+            let (status, updated) = app
+                .as_admin(
+                    Method::PUT,
+                    &format!("/api/users/{id}"),
+                    Some(json!({"password": PASSWORD})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{updated}");
+            assert_eq!(updated["status"], "active");
+            assert!(updated["invite_expires_at"].is_null());
+            assert_eq!(app.status_of(id), UserStatus::Active);
+
+            let (status, body) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, _) = app.login(&app.email("amy"), PASSWORD).await;
+            assert_eq!(status, StatusCode::OK);
         }
 
         #[tokio::test]
@@ -10110,6 +10159,7 @@ mod tests {
             let app = TestApp::new().await;
             let token = app.mint_bearer(app.admin.id);
             let count = app.user_count();
+            let twin = app.email("amy").to_uppercase();
 
             let (status, body) = app
                 .put_directory(
@@ -10117,18 +10167,47 @@ mod tests {
                     json!({"users": [
                         {"email": app.email("amy"), "name": "Amy", "role": "viewer",
                          "identities": {"github_usernames": ["amy"]}},
-                        {"email": app.email("bob"), "name": "Bob", "role": "viewer",
+                        {"email": app.email("bob"), "name": "Bob", "role": "owner",
                          "identities": {"discord_id": "not-a-snowflake"}},
+                        {"email": app.email("dan")},
+                        {"email": "not-an-email", "name": "X", "role": "viewer"},
+                        {"email": twin, "name": "Twice", "role": "viewer"},
                     ]}),
                 )
                 .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(body["error"], "Invalid directory entries");
-            let violations = body["violations"].as_array().expect("violations");
-            assert!(violations
+            let violations: Vec<(String, String)> = body["violations"]
+                .as_array()
+                .expect("violations")
                 .iter()
-                .any(|violation| violation["email"] == app.email("bob")
-                    && violation["field"] == "discord_id"));
+                .map(|violation| {
+                    (
+                        violation["email"].as_str().unwrap_or_default().to_string(),
+                        violation["field"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            let expected = [
+                (app.email("bob"), "role"),
+                (app.email("bob"), "discord_id"),
+                (app.email("dan"), "name"),
+                (app.email("dan"), "role"),
+                ("not-an-email".to_string(), "email"),
+                (twin.clone(), "email"),
+            ];
+            assert_eq!(
+                violations,
+                expected
+                    .into_iter()
+                    .map(|(email, field)| (email, field.to_string()))
+                    .collect::<Vec<_>>(),
+                "every problem is reported and a case-insensitive repeat is a duplicate"
+            );
+            assert!(
+                !body.to_string().contains("not-a-snowflake"),
+                "rejected values are never echoed"
+            );
 
             let duplicate = json!({"email": app.email("carl"), "name": "Carl", "role": "viewer"});
             let (status, _) = app
@@ -10141,18 +10220,6 @@ mod tests {
                 status,
                 StatusCode::BAD_REQUEST,
                 "duplicate email in one batch"
-            );
-
-            let (status, _) = app
-                .put_directory(
-                    Caller::Bearer(&token),
-                    json!({"users": [{"email": app.email("dan")}]}),
-                )
-                .await;
-            assert_eq!(
-                status,
-                StatusCode::BAD_REQUEST,
-                "an unknown email needs a name and role"
             );
 
             assert_eq!(app.user_count(), count);

@@ -3034,43 +3034,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn invited_login_fails_exactly_like_a_wrong_password() {
-            let app = test_app();
-            let hash = bcrypt::hash("right-password", 4).expect("hash");
-            app.tracker
-                .create_user("writes-active@example.com", &hash, "Active", "viewer")
-                .expect("create active user");
-            let (status, _) = send(
-                &app,
-                "POST",
-                "/api/users",
-                Some(&app.admin_token),
-                json!({"email": "writes-pending@example.com", "name": "Pending", "role": "viewer"}),
-            )
-            .await;
-            assert_eq!(status, StatusCode::CREATED);
-
-            let pending = send(
-                &app,
-                "POST",
-                "/api/auth/login",
-                None,
-                json!({"email": "writes-pending@example.com", "password": "anything-at-all"}),
-            )
-            .await;
-            let wrong = send(
-                &app,
-                "POST",
-                "/api/auth/login",
-                None,
-                json!({"email": "writes-active@example.com", "password": "wrong-password"}),
-            )
-            .await;
-            assert_eq!(pending.0, StatusCode::UNAUTHORIZED);
-            assert_eq!(pending, wrong);
-        }
-
-        #[tokio::test]
         async fn create_user_errors_are_json_and_emails_are_case_insensitive() {
             let app = test_app();
             let before = app.tracker.list_users().expect("list").len();
