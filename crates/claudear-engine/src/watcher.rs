@@ -1445,6 +1445,12 @@ impl Watcher {
         self.dry_run
     }
 
+    /// Reload console identities into the shared user registry, picking up
+    /// edits made by a separate dashboard process on the same database.
+    pub fn refresh_user_directory(&self) -> bool {
+        crate::registry::reload(&self.user_registry, self.tracker.as_ref())
+    }
+
     /// Returns the configured periodic reindex interval, or `None` if disabled (0).
     pub fn reindex_interval(&self) -> Option<std::time::Duration> {
         let hours = self.config.code_index.reindex_interval_hours;
@@ -6271,6 +6277,47 @@ mod tests {
         assert!(!watcher.dry_run);
         assert!(!watcher.is_running.load(Ordering::SeqCst));
         assert_eq!(watcher.active_processing.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn refresh_user_directory_applies_stored_identities_to_the_shared_registry() {
+        use claudear_core::identity::Identities;
+        use claudear_storage::{DirectoryUser, DirectoryWrite, IdentityWrite, UserStore};
+
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let registry = UserRegistry::new(HashMap::new());
+        let watcher = Watcher::new(WatcherOptions {
+            user_registry: registry.clone(),
+            ..live_watcher_options(Arc::new(MockNotifier::new(true)), tracker.clone(), vec![])
+        });
+        let user_id = tracker
+            .create_user("amy@example.com", "unused-hash", "Amy", "viewer")
+            .unwrap();
+        tracker
+            .save_directory(&[DirectoryWrite {
+                user: DirectoryUser::Existing {
+                    user_id,
+                    name: None,
+                    role: None,
+                },
+                identities: Some(IdentityWrite {
+                    slug: Some("amy".to_string()),
+                    identities: Identities {
+                        github_usernames: vec!["amy-gh".to_string()],
+                        ..Identities::default()
+                    },
+                }),
+                invite: None,
+            }])
+            .unwrap();
+        assert!(registry.resolve("github", "amy-gh").is_none());
+
+        assert!(watcher.refresh_user_directory());
+
+        let resolved = registry
+            .resolve("github", "amy-gh")
+            .expect("the watcher's refresh must reach every registry clone");
+        assert_eq!(resolved.slug, "amy");
     }
 
     #[test]

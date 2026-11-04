@@ -79,6 +79,7 @@ impl HousekeepingWorker {
             }
 
             cycle_count = cycle_count.wrapping_add(1);
+            self.watcher.refresh_user_directory();
 
             let cron_id = uuid::Uuid::new_v4().to_string();
             let cron_start = Instant::now();
