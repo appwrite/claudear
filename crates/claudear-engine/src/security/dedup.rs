@@ -43,6 +43,9 @@ pub(crate) enum RegistrationKind {
     Replaced,
     /// The report duplicates a vulnerability first reported by someone else.
     Duplicate,
+    /// The report was already linked to a vulnerability it does not first
+    /// report, for example one whose first reporter was replaced.
+    Relinked,
 }
 
 #[derive(Debug, Clone)]
@@ -95,12 +98,20 @@ impl ValidReport<'_> {
         }
     }
 
-    fn event(&self, kind: SecurityEventKind, vulnerability_id: i64) -> NewSecurityEvent {
+    fn event(
+        &self,
+        kind: SecurityEventKind,
+        vulnerability_id: i64,
+        registration: RegistrationKind,
+    ) -> NewSecurityEvent {
         let mut detail = self
             .assessment
             .detail(SecurityOutcome::Valid.as_str(), self.repository);
         detail["origin"] = self.origin.as_str().into();
         detail["vulnerability_id"] = vulnerability_id.into();
+        if registration == RegistrationKind::Relinked {
+            detail["relinked"] = true.into();
+        }
         NewSecurityEvent::new(kind).with_detail(detail)
     }
 
@@ -117,7 +128,9 @@ impl ValidReport<'_> {
 }
 
 impl SecurityInbox {
-    /// Link a valid report to its canonical vulnerability. Returns `None`
+    /// Link a valid report to its canonical vulnerability. A report already
+    /// linked to a vulnerability goes back to it without being judged again,
+    /// so it never spawns a second vulnerability or reward. Returns `None`
     /// when the report left its registering state meanwhile.
     pub(crate) async fn register(&self, valid: &ValidReport<'_>) -> Result<Option<Registration>> {
         let _registration = self.registration.lock().await;
@@ -126,7 +139,12 @@ impl SecurityInbox {
             .find_security_vulnerability_by_first_report(valid.report.id)?
         {
             return self
-                .link_first(valid, existing, RegistrationKind::Adopted)
+                .link_tracking(valid, existing, RegistrationKind::Adopted)
+                .await;
+        }
+        if let Some(linked) = self.linked_vulnerability(valid.report)? {
+            return self
+                .link_tracking(valid, linked, RegistrationKind::Relinked)
                 .await;
         }
         let embedding = self.embedding(valid.assessment).await;
@@ -160,8 +178,18 @@ impl SecurityInbox {
                     merge_commit: valid.merged.map(|merged| merged.commit.clone()),
                     merged_at: valid.merged.map(|merged| merged.merged_at),
                 })?;
-        self.link_first(valid, vulnerability, RegistrationKind::Created)
+        self.link_tracking(valid, vulnerability, RegistrationKind::Created)
             .await
+    }
+
+    fn linked_vulnerability(
+        &self,
+        report: &SecurityReport,
+    ) -> Result<Option<SecurityVulnerability>> {
+        match report.vulnerability_id {
+            Some(vulnerability_id) => self.tracker.get_security_vulnerability(vulnerability_id),
+            None => Ok(None),
+        }
     }
 
     async fn embedding(&self, assessment: &Assessment) -> Option<Vec<f32>> {
@@ -277,7 +305,7 @@ impl SecurityInbox {
                 .get_security_vulnerability(matched.id)?
                 .unwrap_or(matched);
             return self
-                .link_first(valid, replaced, RegistrationKind::Replaced)
+                .link_tracking(valid, replaced, RegistrationKind::Replaced)
                 .await;
         }
         let moved = self.tracker.transition_security_report(
@@ -285,7 +313,11 @@ impl SecurityInbox {
             valid.origin.registering_state(),
             SecurityReportState::Replying,
             &valid.changes(SecurityOutcome::Duplicate, matched.id),
-            &valid.event(SecurityEventKind::DuplicateLinked, matched.id),
+            &valid.event(
+                SecurityEventKind::DuplicateLinked,
+                matched.id,
+                RegistrationKind::Duplicate,
+            ),
         )?;
         Ok(moved.then_some(Registration {
             kind: RegistrationKind::Duplicate,
@@ -293,7 +325,7 @@ impl SecurityInbox {
         }))
     }
 
-    async fn link_first(
+    async fn link_tracking(
         &self,
         valid: &ValidReport<'_>,
         vulnerability: SecurityVulnerability,
@@ -304,7 +336,7 @@ impl SecurityInbox {
             valid.origin.registering_state(),
             SecurityReportState::Tracking,
             &valid.changes(SecurityOutcome::Valid, vulnerability.id),
-            &valid.event(SecurityEventKind::Assessed, vulnerability.id),
+            &valid.event(SecurityEventKind::Assessed, vulnerability.id, kind),
         )?;
         Ok(moved.then_some(Registration {
             kind,

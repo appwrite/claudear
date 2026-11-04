@@ -196,6 +196,7 @@ struct SentReply {
 struct MockSource {
     replies: Mutex<Vec<SentReply>>,
     outcomes: Mutex<VecDeque<ReporterReply>>,
+    conversation_outcomes: Mutex<HashMap<String, VecDeque<ReporterReply>>>,
     resolved: Mutex<Vec<String>>,
     spammed: Mutex<Vec<String>>,
     notes: Mutex<Vec<(String, String)>>,
@@ -205,6 +206,15 @@ struct MockSource {
 impl MockSource {
     fn queue(&self, outcome: ReporterReply) {
         self.outcomes.lock().unwrap().push_back(outcome);
+    }
+
+    fn queue_for(&self, conversation_id: &str, outcome: ReporterReply) {
+        self.conversation_outcomes
+            .lock()
+            .unwrap()
+            .entry(conversation_id.to_string())
+            .or_default()
+            .push_back(outcome);
     }
 
     fn replies(&self) -> Vec<SentReply> {
@@ -269,10 +279,14 @@ impl IssueSource for MockSource {
             body: body.to_string(),
             status,
         });
-        self.outcomes
+        let queued = self
+            .conversation_outcomes
             .lock()
             .unwrap()
-            .pop_front()
+            .get_mut(issue_id)
+            .and_then(VecDeque::pop_front);
+        queued
+            .or_else(|| self.outcomes.lock().unwrap().pop_front())
             .unwrap_or(ReporterReply::Sent)
     }
 
@@ -1257,6 +1271,110 @@ async fn an_earlier_reporter_replaces_the_first_before_an_award() {
     );
     assert_eq!(harness.report("1").state, SecurityReportState::Resolved);
     assert_eq!(harness.report("2").state, SecurityReportState::Resolved);
+}
+
+#[tokio::test]
+async fn an_admin_confirmed_replaced_reporter_returns_to_its_vulnerability_for_fix_live() {
+    let harness = Harness::build(test_config(), |inbox| {
+        inbox.with_reply_retry_backoff(Duration::ZERO)
+    });
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(5)))
+        .await;
+    let replaced = harness.report("1");
+    let vulnerability_id = replaced.vulnerability_id.unwrap();
+    harness.agent.queue(
+        Query::Duplicate,
+        Ok(json!({"duplicate_of": vulnerability_id.to_string(), "reason": "same"})),
+    );
+    harness
+        .route(&report_issue("2", REPORT_BODY, reported(0)))
+        .await;
+    let earlier = harness.report("2");
+    assert_eq!(
+        harness.vulnerability(vulnerability_id).first_report_id,
+        earlier.id
+    );
+
+    for _ in 0..3 {
+        harness.source.queue_for(
+            "1",
+            ReporterReply::Rejected("422 unprocessable".to_string()),
+        );
+    }
+    harness.ship(vulnerability_id).await;
+    harness.inbox.advance().await;
+    harness.inbox.advance().await;
+    let escalated = harness.report("1");
+    assert_eq!(escalated.state, SecurityReportState::NeedsHuman);
+    assert_eq!(
+        reply_kinds(&harness.tracker, escalated.id),
+        vec![
+            (SecurityReplyKind::Confirmed, DeliveryStatus::Sent),
+            (SecurityReplyKind::FixLive, DeliveryStatus::Failed),
+        ]
+    );
+    let duplicate_queries = harness.agent.calls_of(Query::Duplicate).len();
+    let replies_before = harness.source.replies_to("1").len();
+
+    harness.confirm(
+        escalated.id,
+        json!({
+            "title": "Session token survives logout",
+            "summary": "Sessions survive logout.",
+            "repository": REPOSITORY,
+        }),
+    );
+    let summary = harness.inbox.advance().await;
+    harness.inbox.advance().await;
+
+    let resolved = harness.report("1");
+    assert_eq!(resolved.state, SecurityReportState::Resolved);
+    assert_eq!(resolved.vulnerability_id, Some(vulnerability_id));
+    assert_eq!(resolved.outcome, Some(SecurityOutcome::Valid));
+    assert_eq!(summary.replies_sent, 1);
+    assert_eq!(
+        harness
+            .tracker
+            .list_security_vulnerabilities(None)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        harness.agent.calls_of(Query::Duplicate).len(),
+        duplicate_queries
+    );
+    let new_replies = harness.source.replies_to("1").split_off(replies_before);
+    assert_eq!(
+        new_replies
+            .iter()
+            .map(|reply| reply.body.as_str())
+            .collect::<Vec<_>>(),
+        vec![harness.templates().fix_live.as_str()]
+    );
+    assert_eq!(
+        reply_kinds(&harness.tracker, resolved.id),
+        vec![
+            (SecurityReplyKind::Confirmed, DeliveryStatus::Sent),
+            (SecurityReplyKind::FixLive, DeliveryStatus::Sent),
+        ]
+    );
+    let award = harness
+        .tracker
+        .get_security_award(vulnerability_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(award.report_id, earlier.id);
+    let relinked = harness
+        .timeline(resolved.id)
+        .into_iter()
+        .rev()
+        .find(|event| event.kind == SecurityEventKind::Assessed)
+        .unwrap();
+    assert_eq!(relinked.from_state.as_deref(), Some("registering"));
+    assert_eq!(relinked.to_state.as_deref(), Some("tracking"));
+    assert_eq!(relinked.detail["relinked"], json!(true));
 }
 
 #[tokio::test]

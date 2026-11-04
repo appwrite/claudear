@@ -418,8 +418,10 @@ impl SecurityInbox {
             )
             .await;
         }
-        if registration.kind == RegistrationKind::Duplicate {
-            return self.reply_with_outcome(report_id).await;
+        match registration.kind {
+            RegistrationKind::Duplicate => return self.reply_with_outcome(report_id).await,
+            RegistrationKind::Relinked => return Ok(()),
+            RegistrationKind::Created | RegistrationKind::Adopted | RegistrationKind::Replaced => {}
         }
         if self.config.acknowledge_valid {
             if let Some(report) = self.tracker.get_security_report(report_id)? {
