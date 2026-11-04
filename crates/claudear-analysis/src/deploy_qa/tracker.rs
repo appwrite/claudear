@@ -464,6 +464,12 @@ impl<C: HttpClient> DeployQaTracker<C> {
         let Some(announcer) = self.announcer.as_ref() else {
             return;
         };
+        let releaser_login = stored.author_login.clone().or(details.releaser_login);
+        if let (None, Some(login)) = (&stored.author_login, &releaser_login) {
+            if let Err(error) = self.store.update_deploy_qa_tip_author(stored.id, login) {
+                tracing::warn!(track = %track.name, tag = %tip.tag, %error, "deploy_qa: could not record the releaser");
+            }
+        }
         let announcement = DeployQaAnnouncement {
             track: track.name.clone(),
             repo: tip.repo.clone(),
@@ -478,7 +484,7 @@ impl<C: HttpClient> DeployQaTracker<C> {
                 .as_ref()
                 .and_then(|bare_tag| bare_tag.previous.clone()),
             deploy_run: details.deploy_run,
-            releaser_login: stored.author_login.clone().or(details.releaser_login),
+            releaser_login,
         };
         let message_id = match announcer.announce(&announcement).await {
             Ok(message_id) => message_id,
@@ -1663,6 +1669,36 @@ mod tests {
                 .discord_message_id
                 .as_deref(),
             Some("announcement-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tip_stored_before_announcements_keeps_its_releaser_for_fail() {
+        let sqlite = SqliteTracker::in_memory().unwrap();
+        sqlite
+            .upsert_deploy_qa_tip(&DeployQaTip::new(
+                "console",
+                MONOREPO,
+                "apps/console/1.2.141",
+            ))
+            .unwrap();
+        let store: Arc<dyn FixAttemptTracker> = Arc::new(sqlite);
+        let announcer = Arc::new(RecordingAnnouncer::default());
+
+        announcing_poller(console_http(), store.clone(), announcer.clone())
+            .poll_once()
+            .await;
+
+        assert_eq!(announcer.announced().len(), 1);
+        assert_eq!(
+            store
+                .get_deploy_qa_tip("console", "apps/console/1.2.141")
+                .unwrap()
+                .unwrap()
+                .author_login
+                .as_deref(),
+            Some("atharvadeosthale"),
+            "a FAIL on a tip announced after the upgrade must still @ whoever cut the tag"
         );
     }
 
