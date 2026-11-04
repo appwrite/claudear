@@ -689,6 +689,16 @@ export interface TelemetryLatency {
 }
 
 
+export class ApiError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 let onUnauthorized: (() => void) | null = null
 
 export function setOnUnauthorized(cb: () => void) {
@@ -732,10 +742,10 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
   })
   if (res.status === 401) {
     onUnauthorized?.()
-    throw new Error('Unauthorized')
+    throw new ApiError('Unauthorized', res.status)
   }
   if (!res.ok) {
-    const err = new Error(`Failed to post ${url}: ${res.status}`)
+    const err = new ApiError(`Failed to post ${url}: ${res.status}`, res.status)
     Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'POST', 'api.status': String(res.status) } })
     throw err
   }
@@ -782,7 +792,6 @@ async function deleteRequest(url: string): Promise<void> {
   }
 }
 
-// Existing
 export async function fetchOverview(): Promise<Overview> {
   return fetchJson(`${API_BASE}/stats/overview`);
 }
@@ -828,8 +837,6 @@ export async function getRetries(): Promise<RetriesResponse> {
 export async function getSources(): Promise<SourcesResponse> {
   return fetchJson(`${API_BASE}/sources`);
 }
-
-// New fetchers
 
 export async function fetchActivity(params?: {
   limit?: number;
@@ -1218,8 +1225,6 @@ export async function deleteUser(id: number): Promise<void> {
   return deleteRequest(`${API_BASE}/users/${id}`)
 }
 
-// --- Personal access tokens -------------------------------------------------
-
 /** A personal access token (never includes the secret after creation). */
 export interface ApiToken {
   id: string
@@ -1268,4 +1273,269 @@ export async function fetchMyTokens(): Promise<ApiToken[]> {
 /** Admin: every token with its owner. */
 export async function fetchAllTokens(): Promise<ApiTokenWithOwner[]> {
   return fetchJson(`${API_BASE}/tokens/all`)
+}
+
+export const SECURITY_REPORT_STATES = [
+  'received',
+  'assessing',
+  'needs_human',
+  'spam',
+  'replying',
+  'closed',
+  'tracking',
+  'resolved',
+] as const
+export type SecurityReportState = (typeof SECURITY_REPORT_STATES)[number]
+
+export const SECURITY_OUTCOMES = [
+  'spam',
+  'valid',
+  'not_reproducible',
+  'already_fixed',
+  'not_vulnerability',
+  'out_of_scope',
+  'duplicate',
+] as const
+export type SecurityOutcome = (typeof SECURITY_OUTCOMES)[number]
+export type SecurityOverrideOutcome = Exclude<SecurityOutcome, 'valid'>
+
+export const VULNERABILITY_STATES = ['awaiting_fix', 'fixing', 'merged', 'live', 'needs_human'] as const
+export type VulnerabilityState = (typeof VULNERABILITY_STATES)[number]
+
+export const SECURITY_SEVERITIES = ['critical', 'high', 'medium', 'low', 'informational'] as const
+export type SecuritySeverity = (typeof SECURITY_SEVERITIES)[number]
+
+export type SecurityReplyKind =
+  | 'confirmed'
+  | 'not_reproducible'
+  | 'already_fixed'
+  | 'not_vulnerability'
+  | 'out_of_scope'
+  | 'duplicate'
+  | 'fix_live'
+  | 'fix_live_rewarded'
+
+export type DeliveryStatus = 'sending' | 'sent' | 'failed' | 'unconfirmed'
+
+export type AwardStatus = 'prepared' | 'owner_notified' | 'awarded' | 'cancelled'
+
+export type SecurityEventKind =
+  | 'received'
+  | 'assessment_started'
+  | 'assessment_released'
+  | 'assessment_failed'
+  | 'needs_human'
+  | 'overridden'
+  | 'admin_confirmed'
+  | 'screened_spam'
+  | 'assessed'
+  | 'vulnerability_created'
+  | 'duplicate_linked'
+  | 'first_reporter_replaced'
+  | 'reply_sent'
+  | 'reply_failed'
+  | 'reply_unconfirmed'
+  | 'delivery_confirmed'
+  | 'conversation_closed'
+  | 'reporter_follow_up'
+  | 'fix_started'
+  | 'pull_request_opened'
+  | 'pull_request_linked'
+  | 'fix_failed'
+  | 'merged'
+  | 'cloud_bump_required'
+  | 'live'
+  | 'deployment_check_failed'
+  | 'award_prepared'
+  | 'owner_notified'
+  | 'awarded'
+
+export interface SecuritySummary {
+  reports_by_state: Partial<Record<SecurityReportState, number>>
+  reports_by_outcome: Partial<Record<SecurityOutcome, number>>
+  vulnerabilities_by_state: Partial<Record<VulnerabilityState, number>>
+  pending_awards: number
+  unconfirmed_replies: number
+}
+
+export interface SecurityReportRow {
+  id: number
+  short_id: string
+  url: string
+  subject: string
+  reporter_email: string | null
+  reported_at: string
+  state: SecurityReportState
+  outcome: SecurityOutcome | null
+  vulnerability_id: number | null
+  is_first_reporter: boolean
+  vulnerability_state: VulnerabilityState | null
+  severity: SecuritySeverity | null
+  pull_request_url: string | null
+  deployed_version: string | null
+  live_at: string | null
+  award_status: AwardStatus | null
+  unconfirmed_reply: boolean
+  updated_at: string
+}
+
+export interface SecurityReport {
+  id: number
+  source: string
+  conversation_id: string
+  short_id: string
+  mailbox_id: string
+  url: string
+  subject: string
+  reporter_email: string | null
+  reporter_customer_id: string | null
+  reported_at: string
+  state: SecurityReportState
+  outcome: SecurityOutcome | null
+  public_reason: string | null
+  assessment_summary: string | null
+  affected_repository: string | null
+  fixed_by_commit: string | null
+  fixed_on: string | null
+  spam_confidence: number | null
+  assessment_attempts: number
+  customer_thread_count: number
+  vulnerability_id: number | null
+  created_at: string
+  updated_at: string
+}
+
+export interface SecurityVulnerability {
+  id: number
+  title: string
+  summary: string
+  repository: string | null
+  severity: SecuritySeverity | null
+  state: VulnerabilityState
+  first_report_id: number
+  first_reported_at: string
+  fix_attempt_id: number | null
+  pull_request_url: string | null
+  merge_commit: string | null
+  merged_at: string | null
+  deployed_version: string | null
+  live_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface SecurityEvent {
+  id: number
+  report_id: number | null
+  vulnerability_id: number | null
+  kind: SecurityEventKind
+  from_state: string | null
+  to_state: string | null
+  actor: string | null
+  detail: unknown
+  created_at: string
+}
+
+export interface SecurityReply {
+  id: number
+  report_id: number
+  kind: SecurityReplyKind
+  status: DeliveryStatus
+  error: string | null
+  claimed_at: string
+  completed_at: string | null
+}
+
+export interface SecurityAward {
+  id: number
+  vulnerability_id: number
+  report_id: number
+  recipient_email: string | null
+  campaign: string
+  credits: number
+  status: AwardStatus
+  actor: string | null
+  note: string | null
+  prepared_at: string
+  updated_at: string
+}
+
+export interface SecurityReportDetail {
+  report: SecurityReport
+  vulnerability: SecurityVulnerability | null
+  events: SecurityEvent[]
+  replies: SecurityReply[]
+  award: SecurityAward | null
+  related_reports: SecurityReportRow[]
+}
+
+export type SecurityOverride =
+  | { action: 'reassess' }
+  | {
+      action: 'outcome'
+      outcome: SecurityOverrideOutcome
+      public_reason?: string
+      fixed_on?: string
+    }
+  | { action: 'confirm_delivery'; kind: SecurityReplyKind; delivered: boolean }
+  | {
+      action: 'confirm_valid'
+      title: string
+      summary: string
+      repository?: string
+      severity?: SecuritySeverity
+    }
+
+export interface SecurityReportFilter {
+  state?: SecurityReportState
+  outcome?: SecurityOutcome
+  limit?: number
+}
+
+export async function fetchSecuritySummary(): Promise<SecuritySummary> {
+  return fetchJson(`${API_BASE}/security/summary`)
+}
+
+export async function fetchSecurityReports(filter?: SecurityReportFilter): Promise<SecurityReportRow[]> {
+  const searchParams = new URLSearchParams()
+  if (filter?.state) searchParams.set('state', filter.state)
+  if (filter?.outcome) searchParams.set('outcome', filter.outcome)
+  if (filter?.limit) searchParams.set('limit', filter.limit.toString())
+  return fetchJson(`${API_BASE}/security/reports?${searchParams}`)
+}
+
+export async function fetchSecurityReport(id: number): Promise<SecurityReportDetail> {
+  return fetchJson(`${API_BASE}/security/reports/${id}`)
+}
+
+export async function overrideSecurityReport(
+  id: number,
+  override: SecurityOverride,
+): Promise<SecurityReport> {
+  return postJson(`${API_BASE}/security/reports/${id}/override`, override)
+}
+
+export async function markSecurityAwardGranted(
+  vulnerabilityId: number,
+  note?: string,
+): Promise<SecurityAward> {
+  return postJson(`${API_BASE}/security/vulnerabilities/${vulnerabilityId}/award`, note ? { note } : {})
+}
+
+export async function linkSecurityPullRequest(
+  vulnerabilityId: number,
+  pullRequestUrl: string,
+): Promise<SecurityVulnerability> {
+  return postJson(`${API_BASE}/security/vulnerabilities/${vulnerabilityId}/pull-request`, {
+    pull_request_url: pullRequestUrl,
+  })
+}
+
+export async function markSecurityLive(
+  vulnerabilityId: number,
+  deployedVersion: string,
+): Promise<SecurityVulnerability> {
+  return postJson(`${API_BASE}/security/vulnerabilities/${vulnerabilityId}/live`, {
+    deployed_version: deployedVersion,
+  })
 }

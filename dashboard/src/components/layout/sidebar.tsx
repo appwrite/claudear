@@ -7,13 +7,13 @@ import {
   BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
   Users, LogOut, Gauge, Settings, Sun, Moon, Ticket, GraduationCap, BookOpen,
-  MessageSquareCode, Package, Hash,
+  MessageSquareCode, Package, Hash, ShieldAlert,
 } from 'lucide-react'
 import { setSentryColorScheme } from '../../lib/sentry'
 
 type NavGroup = {
   label?: string
-  items: { path: string; label: string; icon: typeof LayoutDashboard }[]
+  items: { path: string; label: string; icon: typeof LayoutDashboard; adminOnly?: boolean }[]
 }
 
 const navGroups: NavGroup[] = [
@@ -28,6 +28,7 @@ const navGroups: NavGroup[] = [
       { path: '/issues', label: 'Issues', icon: Ticket },
       { path: '/attempts', label: 'Attempts', icon: ListChecks },
       { path: '/prs', label: 'PRs', icon: GitPullRequest },
+      { path: '/security', label: 'Security', icon: ShieldAlert, adminOnly: true },
     ],
   },
   {
@@ -97,7 +98,9 @@ export function Sidebar() {
               </div>
             )}
             <div className="space-y-0.5">
-              {group.items.map(({ path: itemPath, label, icon: Icon }) => {
+              {group.items
+                .filter(item => !item.adminOnly || user?.role === 'admin')
+                .map(({ path: itemPath, label, icon: Icon }) => {
                 const isActive = path === itemPath
                 return (
                   <button
