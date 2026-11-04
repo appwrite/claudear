@@ -1,7 +1,7 @@
 //! API route handlers for the dashboard.
 
 use super::auth::*;
-use super::config_file::{self, ConfigFileError, OptionalSection};
+use super::config_file::{self, ConfigFile, ConfigFileError, OptionalSection};
 use crate::retry::RetryManager;
 use axum::{
     extract::{
@@ -33,8 +33,8 @@ pub struct ApiState {
     pub tracker: Arc<dyn FixAttemptTracker>,
     /// Instant when the server started, for uptime calculation.
     pub start_time: Instant,
-    /// Path to the config file on disk (for read/write from dashboard).
-    pub config_path: PathBuf,
+    /// The config file on disk, for read/write from the dashboard.
+    pub config_file: ConfigFile,
     /// Watch channel for real-time indexing progress pushed from SQLite hooks.
     pub indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
     /// General-purpose storage directory for user uploads (avatars, etc.).
@@ -92,8 +92,11 @@ pub fn create_api_router_full(
     }
 
     let chat_service = chat_state.as_ref().map(|cs| cs.chat_service.clone());
-    let startup_config = std::fs::read_to_string(&config_path)
+    let file = ConfigFile::new(&config_path);
+    let startup_config = file
+        .read()
         .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|content| config_file::normalize(&content).ok())
         .map(Arc::new);
 
@@ -101,7 +104,7 @@ pub fn create_api_router_full(
         config,
         tracker,
         start_time: Instant::now(),
-        config_path,
+        config_file: file,
         indexing_rx,
         storage_dir: storage_dir.clone(),
         chat_service,
@@ -2639,7 +2642,7 @@ async fn get_config_handler(
     _user: AdminUser,
     State(state): State<ApiState>,
 ) -> Result<Json<ConfigResponse>, ConfigFileError> {
-    let bytes = config_file::read_locked(&state.config_path)
+    let bytes = config_file::read_locked(&state.config_file)
         .await
         .map_err(|error| ConfigFileError::unreadable(format!("Failed to read config: {error}")))?;
     let content = String::from_utf8(bytes)
@@ -2651,11 +2654,11 @@ async fn get_config_handler(
     let revision = config_file::revision(content.as_bytes());
     let restart_required = restart_required(&state, &current);
 
-    let path = state.config_path.clone();
+    let file = state.config_file.clone();
     let (writable, runtime_overrides) = tokio::task::spawn_blocking(move || {
         (
-            config_file::writable(&path),
-            config_file::runtime_overrides(&path, &disk),
+            config_file::writable(&file),
+            config_file::runtime_overrides(&file, &disk),
         )
     })
     .await
@@ -2702,7 +2705,7 @@ async fn save_config(
 ) -> Result<ConfigSaveResponse, ConfigFileError> {
     let incoming = config_file::parse_document(&body.content)?;
     let outcome = config_file::write_validated(
-        &state.config_path,
+        &state.config_file,
         body.revision.as_deref(),
         move |current| config_file::restore_all(incoming, &current),
     )

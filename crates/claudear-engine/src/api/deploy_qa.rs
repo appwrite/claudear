@@ -10,7 +10,7 @@
 //! `limit=0` returns none.
 
 use super::auth::{check_api_rate_limit, AdminUser, AuthUser};
-use super::config_file::{self, ConfigFileError};
+use super::config_file::{self, ConfigFile, ConfigFileError};
 use super::routes::ApiState;
 use axum::{
     extract::{rejection::JsonRejection, Query, State},
@@ -22,7 +22,6 @@ use claudear_config::config::{DeployQaConfig, DeployQaTagFilter, DeployQaTrackCo
 use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 const DEFAULT_TIPS_LIMIT: usize = 50;
@@ -314,8 +313,8 @@ impl FailureLog {
     }
 }
 
-async fn read_disk_section(path: &Path) -> Result<DiskSection, ConfigFileError> {
-    let bytes = match config_file::read_locked(path).await {
+async fn read_disk_section(file: &ConfigFile) -> Result<DiskSection, ConfigFileError> {
+    let bytes = match config_file::read_locked(file).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
@@ -366,7 +365,7 @@ pub(super) async fn status_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<DeployQaStatus>, StatusCode> {
-    let restart_required = match read_disk_section(&state.config_path)
+    let restart_required = match read_disk_section(&state.config_file)
         .await
         .and_then(|disk| restart_required(&state, &disk.config))
     {
@@ -453,10 +452,10 @@ pub(super) async fn get_config_handler(
     _admin: AdminUser,
     State(state): State<ApiState>,
 ) -> Result<Json<DeployQaConfigResponse>, ConfigFileError> {
-    let disk = read_disk_section(&state.config_path).await?;
+    let disk = read_disk_section(&state.config_file).await?;
     let restart_required = restart_required(&state, &disk.config)?;
-    let path = state.config_path.clone();
-    let writable = tokio::task::spawn_blocking(move || config_file::writable(&path))
+    let file = state.config_file.clone();
+    let writable = tokio::task::spawn_blocking(move || config_file::writable(&file))
         .await
         .map_err(|error| {
             ConfigFileError::unreadable(format!("Failed to inspect config: {error}"))
@@ -503,7 +502,7 @@ async fn save(
     let config = DeployQaConfig::try_from(update.settings)?;
     let section = section_value(&config)?;
     let outcome = config_file::write_validated(
-        &state.config_path,
+        &state.config_file,
         update.revision.as_deref(),
         move |mut document| {
             let table = document.as_table_mut().ok_or_else(|| {

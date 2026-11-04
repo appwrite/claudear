@@ -151,6 +151,7 @@ fn forwarded_host(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::config_file::ConfigFile;
     use crate::api::{apply_dashboard_middleware, create_api_router_full};
     use axum::body::Body;
     use claudear_analysis::feedback::EmbeddingConfig;
@@ -159,7 +160,7 @@ mod tests {
     use claudear_storage::SqliteTracker;
     use futures::{SinkExt, StreamExt};
     use serde_json::Value;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
@@ -200,7 +201,7 @@ mod tests {
             config,
             tracker: tracker.clone(),
             start_time: Instant::now(),
-            config_path: PathBuf::from("claudear.toml"),
+            config_file: ConfigFile::new(Path::new("claudear.toml")),
             indexing_rx: tracker.subscribe_indexing_progress(),
             chat_service: None,
             startup_config: None,

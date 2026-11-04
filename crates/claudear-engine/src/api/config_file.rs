@@ -11,6 +11,12 @@
 //! TOML errors never reach a response or a log through their `Display`, which
 //! quotes the offending source line: [`describe_toml_error`] reports the
 //! message with any echoed value removed, and the line number.
+//!
+//! Every read and write goes through a [`ConfigFile`], resolved once from the
+//! path claudear was started with. Each access canonicalizes it again and
+//! refuses it unless it is still a file inside the directory it was resolved
+//! into, so a request can never steer a read or write to another file, and a
+//! config swapped for a symlink to somewhere else is not followed.
 
 use axum::{
     extract::rejection::JsonRejection,
@@ -26,9 +32,10 @@ use claudear_core::secret::{with_redaction, REDACTED};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use toml::{Table, Value};
 
@@ -74,6 +81,77 @@ const REVISION_MISMATCH_MESSAGE: &str =
     "claudear.toml changed on disk since it was loaded; reload and reapply";
 
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+const OUTSIDE_DIRECTORY_MESSAGE: &str = "claudear.toml resolves outside its directory";
+
+const NOT_A_FILE_MESSAGE: &str = "claudear.toml is not a regular file";
+
+const UNNAMED_MESSAGE: &str = "claudear.toml has no usable file name";
+
+/// The config file claudear was started with: its canonical path and the
+/// directory every access must stay inside.
+#[derive(Debug, Clone)]
+pub struct ConfigFile {
+    path: PathBuf,
+    directory: PathBuf,
+}
+
+impl ConfigFile {
+    /// Resolve `path` (following a symlink to its target), or, when it does
+    /// not exist yet, its canonical directory joined with its file name.
+    pub fn new(path: &Path) -> Self {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| {
+            let directory = parent_directory(path);
+            let directory = fs::canonicalize(directory)
+                .or_else(|_| std::path::absolute(directory))
+                .unwrap_or_else(|_| directory.to_path_buf());
+            match path.file_name() {
+                Some(name) => directory.join(name),
+                None => directory,
+            }
+        });
+        let directory = parent_directory(&path).to_path_buf();
+        Self { path, directory }
+    }
+
+    /// The file's canonical path now, if it is still a regular file, or a
+    /// missing one, inside its directory.
+    fn resolve(&self) -> io::Result<PathBuf> {
+        let resolved = match fs::canonicalize(&self.path) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = self
+                    .path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, UNNAMED_MESSAGE))?;
+                if name.contains("..") {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, UNNAMED_MESSAGE));
+                }
+                fs::canonicalize(&self.directory)?.join(name)
+            }
+            Err(error) => return Err(error),
+        };
+        if !resolved.starts_with(&self.directory) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                OUTSIDE_DIRECTORY_MESSAGE,
+            ));
+        }
+        match fs::metadata(&resolved) {
+            Ok(metadata) if !metadata.is_file() => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                NOT_A_FILE_MESSAGE,
+            )),
+            _ => Ok(resolved),
+        }
+    }
+
+    /// The file's bytes.
+    pub fn read(&self) -> io::Result<Vec<u8>> {
+        fs::read(self.resolve()?)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -265,11 +343,11 @@ pub(super) fn revision(bytes: &[u8]) -> String {
 }
 
 /// The file's bytes, read while no write is in progress.
-pub(super) async fn read_locked(path: &Path) -> io::Result<Vec<u8>> {
-    let path = path.to_path_buf();
+pub(super) async fn read_locked(file: &ConfigFile) -> io::Result<Vec<u8>> {
+    let file = file.clone();
     tokio::task::spawn_blocking(move || {
         let _lock = lock_writes();
-        fs::read(path)
+        file.read()
     })
     .await
     .map_err(io::Error::other)?
@@ -277,7 +355,11 @@ pub(super) async fn read_locked(path: &Path) -> io::Result<Vec<u8>> {
 
 /// Whether the config could be saved, checked without opening the file for
 /// writing (a write-mode open fires change watchers on close).
-pub(super) fn writable(path: &Path) -> bool {
+pub(super) fn writable(file: &ConfigFile) -> bool {
+    file.resolve().is_ok_and(|path| is_writable(&path))
+}
+
+fn is_writable(path: &Path) -> bool {
     match fs::metadata(path) {
         Ok(_) => can_write(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -322,11 +404,14 @@ fn can_create_in(directory: &Path) -> bool {
 
 /// Paths whose values the daemon would see differently from the file:
 /// env overrides, resolved instructions and user slugs. Never values.
-pub(super) fn runtime_overrides(path: &Path, disk: &Config) -> Vec<String> {
+pub(super) fn runtime_overrides(config_file: &ConfigFile, disk: &Config) -> Vec<String> {
     let Ok(file) = toml::Value::try_from(disk) else {
         return Vec::new();
     };
-    let Some(loaded) = Config::load(path)
+    let Ok(path) = config_file.resolve() else {
+        return Vec::new();
+    };
+    let Some(loaded) = Config::load(&path)
         .ok()
         .and_then(|loaded| toml::Value::try_from(&loaded).ok())
     else {
@@ -351,29 +436,31 @@ pub(super) fn optional_sections(document: &Value) -> Vec<OptionalSection> {
 /// validate it as daemon startup would (env overrides, instructions files,
 /// user slugs), then write it without any of them.
 pub(super) async fn write_validated<Merge>(
-    path: &Path,
+    file: &ConfigFile,
     expected_revision: Option<&str>,
     merge: Merge,
 ) -> Result<WriteOutcome, ConfigFileError>
 where
     Merge: FnOnce(Value) -> Result<Value, ConfigFileError> + Send + 'static,
 {
-    let path = path.to_path_buf();
+    let file = file.clone();
     let expected_revision = expected_revision.map(str::to_owned);
     tokio::task::spawn_blocking(move || {
-        write_validated_blocking(&path, expected_revision.as_deref(), merge)
+        write_validated_blocking(&file, expected_revision.as_deref(), merge)
     })
     .await
     .map_err(|error| ConfigFileError::unreadable(format!("Config write failed: {error}")))?
 }
 
 fn write_validated_blocking(
-    path: &Path,
+    file: &ConfigFile,
     expected_revision: Option<&str>,
     merge: impl FnOnce(Value) -> Result<Value, ConfigFileError>,
 ) -> Result<WriteOutcome, ConfigFileError> {
     let _lock = lock_writes();
-    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = file.resolve().map_err(|error| {
+        ConfigFileError::unreadable(format!("Failed to read on-disk config: {error}"))
+    })?;
 
     let current = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -402,7 +489,7 @@ fn write_validated_blocking(
 
     validate_as_startup(&path, &parsed)?;
 
-    if !writable(&path) {
+    if !is_writable(&path) {
         return Err(ConfigFileError::read_only());
     }
     persist(&path, &content)?;
@@ -1357,9 +1444,11 @@ mod tests {
         fs::write(&path, "# comment\n").unwrap();
         let expected = revision(&fs::read(&path).unwrap());
 
-        let outcome = write_validated(&path, Some(&expected), |_| Ok(valid_document()))
-            .await
-            .unwrap();
+        let outcome = write_validated(&ConfigFile::new(&path), Some(&expected), |_| {
+            Ok(valid_document())
+        })
+        .await
+        .unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("fake-linear-key"));
@@ -1384,9 +1473,11 @@ mod tests {
         let path = directory.path().join("claudear.toml");
         fs::write(&path, "workspace = \"/tmp/repos\"\n").unwrap();
 
-        let error = write_validated(&path, Some("stale"), |_| Ok(valid_document()))
-            .await
-            .unwrap_err();
+        let error = write_validated(&ConfigFile::new(&path), Some("stale"), |_| {
+            Ok(valid_document())
+        })
+        .await
+        .unwrap_err();
 
         assert_eq!(error.code, ConfigErrorCode::RevisionMismatch);
         assert_eq!(error.status, StatusCode::CONFLICT);
@@ -1404,9 +1495,11 @@ mod tests {
         *lookup_mut(&mut document, "issues.linear.api_key").unwrap() =
             Value::String(REDACTED.to_string());
 
-        let error = write_validated(&path, None, move |current| restore_all(document, &current))
-            .await
-            .unwrap_err();
+        let error = write_validated(&ConfigFile::new(&path), None, move |current| {
+            restore_all(document, &current)
+        })
+        .await
+        .unwrap_err();
 
         assert_eq!(error.code, ConfigErrorCode::Invalid);
         assert!(error.message.contains("issues.linear.api_key"));
@@ -1419,7 +1512,7 @@ mod tests {
         let path = directory.path().join("claudear.toml");
         let document: Value = toml::from_str("workspace = \"/tmp/repos\"\n").unwrap();
 
-        let error = write_validated(&path, None, move |_| Ok(document))
+        let error = write_validated(&ConfigFile::new(&path), None, move |_| Ok(document))
             .await
             .unwrap_err();
 
@@ -1438,12 +1531,87 @@ mod tests {
         fs::write(&path, "").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
-        write_validated(&path, None, |_| Ok(valid_document()))
+        write_validated(&ConfigFile::new(&path), None, |_| Ok(valid_document()))
             .await
             .unwrap();
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_to_another_directory_named_at_startup_is_followed() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("real.toml");
+        let link = directory.path().join("claudear.toml");
+        fs::write(&target, "workspace = \"/tmp/repos\"\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let file = ConfigFile::new(&link);
+
+        assert_eq!(
+            read_locked(&file).await.unwrap(),
+            fs::read(&target).unwrap()
+        );
+        write_validated(&file, None, |_| Ok(valid_document()))
+            .await
+            .unwrap();
+        assert!(fs::read_to_string(&target)
+            .unwrap()
+            .contains("fake-linear-key"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_config_file_swapped_for_a_symlink_out_of_its_directory_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        let outside = elsewhere.path().join("outside.toml");
+        fs::write(&path, "workspace = \"/tmp/repos\"\n").unwrap();
+        fs::write(&outside, "untouched").unwrap();
+        let file = ConfigFile::new(&path);
+
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+
+        let error = read_locked(&file).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!writable(&file));
+        assert!(runtime_overrides(&file, &Config::default()).is_empty());
+        write_validated(&file, None, |_| Ok(valid_document()))
+            .await
+            .unwrap_err();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "untouched");
+    }
+
+    #[tokio::test]
+    async fn a_missing_config_file_is_created_in_its_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        let file = ConfigFile::new(&path);
+
+        let error = read_locked(&file).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(writable(&file));
+        write_validated(&file, None, |_| Ok(valid_document()))
+            .await
+            .unwrap();
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("fake-linear-key"));
+    }
+
+    #[tokio::test]
+    async fn a_directory_is_not_a_config_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = ConfigFile::new(directory.path());
+
+        let error = read_locked(&file).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!writable(&file));
     }
 
     #[cfg(unix)]
@@ -1455,7 +1623,7 @@ mod tests {
         fs::write(&target, "").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        write_validated(&link, None, |_| Ok(valid_document()))
+        write_validated(&ConfigFile::new(&link), None, |_| Ok(valid_document()))
             .await
             .unwrap();
 
@@ -1480,8 +1648,8 @@ mod tests {
             return;
         }
 
-        assert!(!writable(&path));
-        let error = write_validated(&path, None, |_| Ok(valid_document()))
+        assert!(!writable(&ConfigFile::new(&path)));
+        let error = write_validated(&ConfigFile::new(&path), None, |_| Ok(valid_document()))
             .await
             .unwrap_err();
 
@@ -1496,7 +1664,9 @@ mod tests {
     #[test]
     fn writable_reports_a_missing_file_in_a_writable_directory() {
         let directory = tempfile::tempdir().unwrap();
-        assert!(writable(&directory.path().join("claudear.toml")));
+        assert!(writable(&ConfigFile::new(
+            &directory.path().join("claudear.toml")
+        )));
     }
 
     #[test]
@@ -1536,7 +1706,7 @@ mod tests {
                        [agent.providers.claude]\ninstructions_file = \"extra.md\"\n";
         fs::write(&path, content).unwrap();
 
-        let overrides = runtime_overrides(&path, &parse(content).unwrap());
+        let overrides = runtime_overrides(&ConfigFile::new(&path), &parse(content).unwrap());
 
         assert!(
             overrides.contains(&"agent.providers.claude.instructions".to_string()),
@@ -1551,7 +1721,7 @@ mod tests {
     fn runtime_overrides_is_empty_when_the_file_cannot_load() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("missing.toml");
-        assert!(runtime_overrides(&path, &Config::default()).is_empty());
+        assert!(runtime_overrides(&ConfigFile::new(&path), &Config::default()).is_empty());
     }
 
     #[test]
@@ -1657,7 +1827,7 @@ mod tests {
             Value::String("fake-typed-secret-0001".to_string()),
         );
 
-        let error = write_validated(&path, None, move |_| Ok(document))
+        let error = write_validated(&ConfigFile::new(&path), None, move |_| Ok(document))
             .await
             .unwrap_err();
 
@@ -1672,7 +1842,7 @@ mod tests {
         let path = directory.path().join("claudear.toml");
         fs::write(&path, UNQUOTED_SECRET_FILE).unwrap();
 
-        let error = write_validated(&path, None, |_| Ok(valid_document()))
+        let error = write_validated(&ConfigFile::new(&path), None, |_| Ok(valid_document()))
             .await
             .unwrap_err();
 
@@ -1689,7 +1859,7 @@ mod tests {
         fs::write(&path, &base).unwrap();
         let expected = revision(base.as_bytes());
 
-        write_validated(&path, Some(&expected), move |current| {
+        write_validated(&ConfigFile::new(&path), Some(&expected), move |current| {
             assert_eq!(current, toml::from_str::<Value>(&base).unwrap());
             Ok(current)
         })
@@ -1708,7 +1878,7 @@ mod tests {
             .map(|index| {
                 let path = path.clone();
                 tokio::spawn(async move {
-                    write_validated(&path, None, move |mut current| {
+                    write_validated(&ConfigFile::new(&path), None, move |mut current| {
                         let templates = ["notifiers", "helpscout", "templates"].into_iter().fold(
                             &mut current,
                             |value, segment| {
@@ -1864,9 +2034,11 @@ mod tests {
         );
         linear.insert("api_key".to_string(), Value::String(REDACTED.to_string()));
 
-        let error = write_validated(&path, None, move |current| restore_all(incoming, &current))
-            .await
-            .unwrap_err();
+        let error = write_validated(&ConfigFile::new(&path), None, move |current| {
+            restore_all(incoming, &current)
+        })
+        .await
+        .unwrap_err();
 
         assert_eq!(error.code, ConfigErrorCode::Invalid);
         assert_eq!(
@@ -1894,8 +2066,10 @@ mod tests {
         let mut incoming = parse_document(&redact(&parse(disk).unwrap()).unwrap().content).unwrap();
         edit(&mut incoming);
 
-        let outcome =
-            write_validated(&path, None, move |current| restore_all(incoming, &current)).await;
+        let outcome = write_validated(&ConfigFile::new(&path), None, move |current| {
+            restore_all(incoming, &current)
+        })
+        .await;
 
         (outcome, fs::read_to_string(&path).unwrap())
     }
@@ -1956,9 +2130,11 @@ mod tests {
         *lookup_mut(&mut incoming, "issues.linear.api_key").unwrap() =
             Value::String(REDACTED.to_string());
 
-        write_validated(&path, None, move |current| restore_all(incoming, &current))
-            .await
-            .expect("a corrected config replaces one that does not deserialize");
+        write_validated(&ConfigFile::new(&path), None, move |current| {
+            restore_all(incoming, &current)
+        })
+        .await
+        .expect("a corrected config replaces one that does not deserialize");
 
         let saved = parse(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -1980,13 +2156,17 @@ mod tests {
 
         let (sender, receiver) = std::sync::mpsc::channel();
         let probe = path.clone();
-        std::thread::spawn(move || sender.send(writable(&probe)));
+        std::thread::spawn(move || sender.send(is_writable(&probe)));
 
         let result = receiver.recv_timeout(std::time::Duration::from_secs(5));
         assert_eq!(
             result,
             Ok(true),
-            "writable() blocked opening the file for writing"
+            "is_writable() blocked opening the file for writing"
+        );
+        assert!(
+            !writable(&ConfigFile::new(&path)),
+            "a fifo is not a config file"
         );
     }
 
@@ -2000,7 +2180,7 @@ mod tests {
             .tempfile_in(directory.path())
             .is_err();
 
-        let result = writable(&directory.path().join("claudear.toml"));
+        let result = writable(&ConfigFile::new(&directory.path().join("claudear.toml")));
 
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(result, !read_only);
@@ -2115,7 +2295,7 @@ mod tests {
 
         let read = tokio::spawn({
             let path = path.clone();
-            async move { read_locked(&path).await }
+            async move { read_locked(&ConfigFile::new(&path)).await }
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
@@ -2147,7 +2327,7 @@ mod tests {
         }
         let before = fs::metadata(&path).unwrap();
 
-        write_validated(&path, None, |_| Ok(valid_document()))
+        write_validated(&ConfigFile::new(&path), None, |_| Ok(valid_document()))
             .await
             .unwrap();
 
