@@ -108,7 +108,7 @@ const jsFilename = jsEntry.path.split("/").pop()!;
 let html = readFileSync(join(srcdir, "index.html"), "utf-8");
 html = html
   .replace(
-    '<link rel="icon" type="image/svg+xml" href="/vite.svg" />',
+    '<link rel="icon" type="image/svg+xml" href="/favicon.svg" />',
     `<link rel="icon" type="image/svg+xml" href="/favicon.svg" />\n    <link rel="stylesheet" href="/assets/${cssFilename}">`,
   )
   .replace(

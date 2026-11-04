@@ -53,6 +53,20 @@ describe('index.html under the dashboard content security policy', () => {
     expect(document.documentElement.classList.contains('dark')).toBe(true)
   })
 
+  test('every local reference except the bundled entry is served from public', () => {
+    const bundleEntry = '/src/main.tsx'
+    const references = [
+      ...[...page.querySelectorAll('[src]')].map(element => element.getAttribute('src')!),
+      ...[...page.querySelectorAll('[href]')].map(element => element.getAttribute('href')!),
+    ].filter(reference => isSameOrigin(reference) && reference !== bundleEntry)
+
+    expect(references).toContain('/favicon.svg')
+    for (const reference of references) {
+      const publicPath = join(dashboard, 'public', new URL(reference, 'http://dashboard.test/').pathname)
+      expect(existsSync(publicPath), reference).toBe(true)
+    }
+  })
+
   test('theme script runs before the app bundle', () => {
     const sources = [...page.querySelectorAll('script')].map(script => script.getAttribute('src'))
     expect(sources.indexOf('/theme.js')).toBeLessThan(sources.indexOf('/src/main.tsx'))
