@@ -12,11 +12,14 @@
 //! quotes the offending source line: [`describe_toml_error`] reports the
 //! message with any echoed value removed, and the line number.
 //!
-//! Every read and write goes through a [`ConfigFile`], resolved once from the
-//! path claudear was started with. Each access canonicalizes it again and
-//! refuses it unless it is still a file inside the directory it was resolved
-//! into, so a request can never steer a read or write to another file, and a
-//! config swapped for a symlink to somewhere else is not followed.
+//! Every read and write goes through a [`ConfigFile`]: the path claudear was
+//! started with, re-resolved on each access so a re-pointed symlink (or a
+//! Kubernetes ConfigMap's `..data` swap) is followed. The resolved file must
+//! be a regular file, or a missing one, inside one of the directories fixed
+//! at startup: the configured path's own directory, and the directory its
+//! symlink pointed into then. A request can never steer a read or write to
+//! another file, and a symlink later re-pointed into any other directory is
+//! refused until claudear is restarted with it.
 
 use axum::{
     extract::rejection::JsonRejection,
@@ -82,40 +85,42 @@ const REVISION_MISMATCH_MESSAGE: &str =
 
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-const OUTSIDE_DIRECTORY_MESSAGE: &str = "claudear.toml resolves outside its directory";
+const OUTSIDE_DIRECTORY_MESSAGE: &str =
+    "claudear.toml now resolves outside its configured directories; restart claudear";
 
 const NOT_A_FILE_MESSAGE: &str = "claudear.toml is not a regular file";
 
 const UNNAMED_MESSAGE: &str = "claudear.toml has no usable file name";
 
-/// The config file claudear was started with: its canonical path and the
-/// directory every access must stay inside.
+/// The config file claudear was started with: the path as given (absolute,
+/// symlinks unresolved) and the canonical directories every access must
+/// resolve inside.
 #[derive(Debug, Clone)]
 pub struct ConfigFile {
     path: PathBuf,
-    directory: PathBuf,
+    directories: Vec<PathBuf>,
 }
 
 impl ConfigFile {
-    /// Resolve `path` (following a symlink to its target), or, when it does
-    /// not exist yet, its canonical directory joined with its file name.
+    /// Keep `path` as given, made absolute, and fix the directories it may
+    /// resolve into: its own, and the one its symlink points into now.
     pub fn new(path: &Path) -> Self {
-        let path = fs::canonicalize(path).unwrap_or_else(|_| {
-            let directory = parent_directory(path);
-            let directory = fs::canonicalize(directory)
-                .or_else(|_| std::path::absolute(directory))
-                .unwrap_or_else(|_| directory.to_path_buf());
-            match path.file_name() {
-                Some(name) => directory.join(name),
-                None => directory,
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut directories = Vec::new();
+        if let Ok(directory) = fs::canonicalize(parent_directory(&path)) {
+            directories.push(directory);
+        }
+        if let Ok(target) = fs::canonicalize(&path) {
+            let directory = parent_directory(&target).to_path_buf();
+            if !directories.contains(&directory) {
+                directories.push(directory);
             }
-        });
-        let directory = parent_directory(&path).to_path_buf();
-        Self { path, directory }
+        }
+        Self { path, directories }
     }
 
-    /// The file's canonical path now, if it is still a regular file, or a
-    /// missing one, inside its directory.
+    /// The file's canonical path now, if it is a regular file, or a missing
+    /// one, inside one of its directories.
     fn resolve(&self) -> io::Result<PathBuf> {
         let resolved = match fs::canonicalize(&self.path) {
             Ok(resolved) => resolved,
@@ -128,23 +133,19 @@ impl ConfigFile {
                 if name.contains("..") {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, UNNAMED_MESSAGE));
                 }
-                fs::canonicalize(&self.directory)?.join(name)
+                fs::canonicalize(parent_directory(&self.path))?.join(name)
             }
             Err(error) => return Err(error),
         };
-        if !resolved.starts_with(&self.directory) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                OUTSIDE_DIRECTORY_MESSAGE,
-            ));
+        for directory in &self.directories {
+            if resolved.starts_with(directory) {
+                return regular_or_missing(resolved);
+            }
         }
-        match fs::metadata(&resolved) {
-            Ok(metadata) if !metadata.is_file() => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                NOT_A_FILE_MESSAGE,
-            )),
-            _ => Ok(resolved),
-        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            OUTSIDE_DIRECTORY_MESSAGE,
+        ))
     }
 
     /// The file's bytes.
@@ -340,6 +341,16 @@ fn normalize_document(document: &Value) -> Option<Value> {
 
 pub(super) fn revision(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn regular_or_missing(path: PathBuf) -> io::Result<PathBuf> {
+    match fs::metadata(&path) {
+        Ok(metadata) if !metadata.is_file() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            NOT_A_FILE_MESSAGE,
+        )),
+        _ => Ok(path),
+    }
 }
 
 /// The file's bytes, read while no write is in progress.
@@ -1559,6 +1570,61 @@ mod tests {
             .await
             .unwrap();
         assert!(fs::read_to_string(&target)
+            .unwrap()
+            .contains("fake-linear-key"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_re_pointed_within_its_directory_is_followed() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("a.toml");
+        let second = directory.path().join("b.toml");
+        let link = directory.path().join("claudear.toml");
+        fs::write(&first, "# a\n").unwrap();
+        fs::write(&second, "# b\n").unwrap();
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let file = ConfigFile::new(&link);
+
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&second, &link).unwrap();
+
+        assert_eq!(read_locked(&file).await.unwrap(), b"# b\n");
+        write_validated(&file, None, |_| Ok(valid_document()))
+            .await
+            .unwrap();
+        assert!(fs::read_to_string(&second)
+            .unwrap()
+            .contains("fake-linear-key"));
+        assert_eq!(fs::read_to_string(&first).unwrap(), "# a\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_config_map_update_is_followed_after_the_old_data_is_deleted() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let mount = directory.path();
+        let first = mount.join("..t1");
+        let second = mount.join("..t2");
+        fs::create_dir(&first).unwrap();
+        fs::write(first.join("claudear.toml"), "# t1\n").unwrap();
+        symlink("..t1", mount.join("..data")).unwrap();
+        symlink("..data/claudear.toml", mount.join("claudear.toml")).unwrap();
+        let file = ConfigFile::new(&mount.join("claudear.toml"));
+        assert_eq!(read_locked(&file).await.unwrap(), b"# t1\n");
+
+        fs::create_dir(&second).unwrap();
+        fs::write(second.join("claudear.toml"), "# t2\n").unwrap();
+        symlink("..t2", mount.join("..data_tmp")).unwrap();
+        fs::rename(mount.join("..data_tmp"), mount.join("..data")).unwrap();
+        fs::remove_dir_all(&first).unwrap();
+
+        assert_eq!(read_locked(&file).await.unwrap(), b"# t2\n");
+        write_validated(&file, None, |_| Ok(valid_document()))
+            .await
+            .unwrap();
+        assert!(fs::read_to_string(second.join("claudear.toml"))
             .unwrap()
             .contains("fake-linear-key"));
     }
