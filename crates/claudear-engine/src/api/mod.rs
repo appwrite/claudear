@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub(crate) mod embedded;
+mod identities;
 mod routes;
 mod security;
 mod tokens;
@@ -12,6 +13,7 @@ pub use routes::{create_api_router, create_api_router_full, create_api_router_wi
 
 use axum::http;
 use claudear_config::config::Config;
+use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_storage::FixAttemptTracker;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
@@ -137,6 +139,7 @@ impl ApiServer {
                 self.config_path,
                 indexing_rx,
                 self.dashboard_dir.clone(),
+                UserRegistry::new(self.config.users.clone()),
             ),
             tls_enabled,
         )
