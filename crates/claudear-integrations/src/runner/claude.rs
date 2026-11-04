@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use claudear_analysis::deploy_qa::{DEPLOY_QA_SOURCE, VERDICT_PREFIX};
 use claudear_config::{AgentConfig, McpServerConfig};
 use claudear_core::error::{Error, Result};
+use claudear_core::security::SECURITY_FIX_SOURCE;
 use claudear_core::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AgentResult, BlockingQuestion, Issue, ReplyKind, VerifyResult,
@@ -95,6 +96,28 @@ const HELP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const OUTPUT_HELD_OPEN_MESSAGE: &str =
     "Stopped reading Claude output held open by a process outside its process group";
+
+/// The fix prompt of a security fix. Unlike the per-source templates it
+/// names neither the issue's source nor its id, so neither reaches the pull
+/// request; the context carries the neutral pull request rules.
+const SECURITY_FIX_TEMPLATE: &str = r#"Here is the context for this fix:
+
+{{context}}
+{{#if repo_name}}
+IMPORTANT - Repository Verification:
+You are working in the repository: {{repo_name}}
+Before starting any work, verify this is the correct repository for this fix by checking that the file paths and modules it describes exist in this codebase.
+If this is NOT the correct repository, set "wrong_repo" in your response to the name of the repository you believe is correct (in "org/repo" format) and do NOT attempt any fixes.
+{{/if}}
+Your task:
+1. Analyze the problem described in the context
+2. Find the relevant code in this codebase
+3. Write a failing test that demonstrates the problem before changing any application code
+4. Implement the minimal fix to make the failing test pass
+5. Verify all existing tests still pass
+6. Create a PR with your changes
+7. Ensure all checks pass on the PR
+"#;
 
 /// Issue source whose ticket system renders reply bodies as HTML, not Markdown.
 const HELPSCOUT_SOURCE: &str = "helpscout";
@@ -579,7 +602,7 @@ impl ClaudeAgentRunner {
     fn build_prompt(&self, issue: &Issue, context: &str, project_dir: &Path) -> String {
         // Try to use template system
         let template_loader = TemplateLoader::new(project_dir);
-        if let Ok(template) = template_loader.get_template(issue) {
+        if let Ok(template) = Self::template_for(&template_loader, issue) {
             let agent_md = template_loader.load_agent_md();
             let mut template_context =
                 TemplateContext::new(issue.clone(), context.to_string()).with_agent_md(agent_md);
@@ -622,6 +645,18 @@ The PR title should include the issue ID: {}
 "#,
             issue.source, context, repo_name_section, issue.short_id
         )
+    }
+
+    /// The fix template for `issue`: [`SECURITY_FIX_TEMPLATE`] after any
+    /// AGENT.md for a security fix, the loader's template otherwise.
+    fn template_for(template_loader: &TemplateLoader, issue: &Issue) -> Result<String> {
+        if issue.source != SECURITY_FIX_SOURCE {
+            return template_loader.get_template(issue);
+        }
+        Ok(match template_loader.load_agent_md() {
+            Some(agent_md) => format!("{}\n\n---\n\n{SECURITY_FIX_TEMPLATE}", agent_md.trim()),
+            None => SECURITY_FIX_TEMPLATE.to_string(),
+        })
     }
 
     /// Check if a project has an AGENT.md file.
@@ -5360,6 +5395,100 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
         assert!(parsed["properties"]["success"].is_object());
         assert!(parsed["properties"]["pr_url"].is_object());
         assert!(parsed["properties"]["blocking_question"].is_object());
+    }
+
+    fn security_fix_issue() -> Issue {
+        let mut issue = Issue::new(
+            "SEC-7",
+            "SEC-7",
+            "Security fix SEC-7",
+            "",
+            SECURITY_FIX_SOURCE,
+        );
+        issue.set_metadata("target_repo_name", "appwrite/appwrite");
+        issue
+    }
+
+    fn assert_neutral_security_prompt(prompt: &str) {
+        assert!(prompt.contains("Harden the session revocation"), "{prompt}");
+        assert!(!prompt.contains("SEC-"), "{prompt}");
+        assert!(!prompt.contains("from security"), "{prompt}");
+        assert!(!prompt.contains("PR title should include"), "{prompt}");
+        assert!(!prompt.contains("issue ID"), "{prompt}");
+    }
+
+    #[test]
+    fn a_security_fix_prompt_names_neither_its_source_nor_its_id() {
+        let runner = new_simple(ClaudeRunnerConfig::default());
+        let project = tempfile::tempdir().unwrap();
+
+        let prompt = runner.build_prompt(
+            &security_fix_issue(),
+            "Harden the session revocation",
+            project.path(),
+        );
+
+        assert_neutral_security_prompt(&prompt);
+        assert!(prompt.contains("appwrite/appwrite"), "{prompt}");
+    }
+
+    #[test]
+    fn a_security_fix_prompt_after_an_agent_md_stays_neutral() {
+        let runner = new_simple(ClaudeRunnerConfig::default());
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENT.md"), "Run the unit tests first.").unwrap();
+
+        let prompt = runner.build_prompt(
+            &security_fix_issue(),
+            "Harden the session revocation",
+            project.path(),
+        );
+
+        assert_neutral_security_prompt(&prompt);
+        assert!(prompt.starts_with("Run the unit tests first."), "{prompt}");
+    }
+
+    #[test]
+    fn a_support_fix_prompt_still_names_its_source_and_id() {
+        let runner = new_simple(ClaudeRunnerConfig::default());
+        let project = tempfile::tempdir().unwrap();
+        let issue = Issue::new("1", "HS-1", "Login fails", "url", "helpscout");
+
+        let prompt = runner.build_prompt(&issue, "context", project.path());
+
+        assert!(
+            prompt.contains("You are fixing an issue from helpscout"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("The PR title should include the issue ID: HS-1"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn a_security_fix_environment_names_only_the_neutral_fix() {
+        let runner = new_simple(ClaudeRunnerConfig::default());
+        let issue = security_fix_issue();
+
+        let (environment, label) = runner.prepare_env_and_label(Some(&issue));
+
+        assert_eq!(label, "SEC-7");
+        assert_eq!(
+            environment
+                .get("SECURITY_ISSUE_SHORT_ID")
+                .map(String::as_str),
+            Some("SEC-7")
+        );
+        assert_eq!(
+            environment.get("SECURITY_ISSUE_URL").map(String::as_str),
+            Some("")
+        );
+        assert!(
+            !environment.keys().any(|key| key.starts_with("HELPSCOUT_")),
+            "{:?}",
+            environment.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
