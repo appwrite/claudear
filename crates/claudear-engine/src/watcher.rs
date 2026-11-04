@@ -3,12 +3,12 @@
 use crate::heartbeat::{Heartbeat, Liveness};
 use crate::intent::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
-use crate::processing::{belongs_to_security_inbox, refuse_security_issue, SECURITY_REFUSAL};
+use crate::processing::{refuse_security_issue, SECURITY_REFUSAL};
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
 use crate::security::{
-    is_security_issue, SecurityFixContext, SecurityFixRequest, SecurityInbox, SecurityPollDecision,
-    SecurityRoute,
+    belongs_to_security_inbox, is_security_issue, SecurityFixContext, SecurityFixRequest,
+    SecurityInbox, SecurityPollDecision, SecurityRoute,
 };
 use crate::shutdown::DRAIN_TIMEOUT;
 use chrono::{DateTime, Utc};

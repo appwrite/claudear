@@ -14,7 +14,7 @@ use claudear_analysis::qa::{
 };
 use claudear_analysis::repo::code_index::CodeSearchService;
 use claudear_analysis::repo::{worktree_path, GitOps};
-use claudear_config::config::{Config, HELPSCOUT_SOURCE, MAILBOX_ID_METADATA_KEY};
+use claudear_config::config::{Config, MAILBOX_ID_METADATA_KEY};
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::security::SECURITY_FIX_SOURCE;
@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::intent::{Intent, IntentClassifier};
-use crate::security::{is_security_issue, scrub_internal};
+use crate::security::{belongs_to_security_inbox, scrub_internal};
 
 /// Max concurrent agent calls when scoring retrieved chunks with the (opt-in)
 /// relevance judge — each call spawns an agent process, so keep the fan-out small.
@@ -177,35 +177,6 @@ const SECURITY_FIX_NEEDS_HUMAN: &str =
 pub(crate) fn refuse_security_issue() -> ProcessingOutcome {
     ProcessingOutcome::CompletedNoPr {
         reason: SECURITY_REFUSAL.to_string(),
-    }
-}
-
-/// Whether `issue` belongs to the security inbox and must never reach a
-/// generic pipeline: a security issue, or a HelpScout conversation the
-/// inbox already holds a report for, even after it moved to another mailbox.
-/// A report lookup that fails counts as held.
-pub(crate) fn belongs_to_security_inbox(
-    config: &Config,
-    tracker: &dyn FixAttemptTracker,
-    issue: &Issue,
-) -> bool {
-    is_security_issue(config, issue) || has_security_report(tracker, issue)
-}
-
-fn has_security_report(tracker: &dyn FixAttemptTracker, issue: &Issue) -> bool {
-    if issue.source != HELPSCOUT_SOURCE {
-        return false;
-    }
-    match tracker.get_security_report_by_conversation(HELPSCOUT_SOURCE, &issue.id) {
-        Ok(report) => report.is_some(),
-        Err(error) => {
-            tracing::warn!(
-                short_id = %issue.short_id,
-                error = %error,
-                "Failed to check for a security report, so the conversation is held back"
-            );
-            true
-        }
     }
 }
 

@@ -62,6 +62,35 @@ pub fn is_security_issue(config: &Config, issue: &Issue) -> bool {
         })
 }
 
+/// Whether `issue` belongs to the security inbox and must never reach a
+/// generic pipeline: a security issue, or a HelpScout conversation the
+/// inbox already holds a report for, even after it moved to another mailbox.
+/// A report lookup that fails counts as held.
+pub fn belongs_to_security_inbox(
+    config: &Config,
+    tracker: &dyn FixAttemptTracker,
+    issue: &Issue,
+) -> bool {
+    is_security_issue(config, issue) || has_security_report(tracker, issue)
+}
+
+fn has_security_report(tracker: &dyn FixAttemptTracker, issue: &Issue) -> bool {
+    if issue.source != HELPSCOUT_SOURCE {
+        return false;
+    }
+    match tracker.get_security_report_by_conversation(HELPSCOUT_SOURCE, &issue.id) {
+        Ok(report) => report.is_some(),
+        Err(error) => {
+            tracing::warn!(
+                short_id = %issue.short_id,
+                error = %error,
+                "Failed to check for a security report, so the conversation is held back"
+            );
+            true
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityPollDecision {
     /// Hand the conversation to [`SecurityInbox::route`].
