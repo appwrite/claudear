@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use claudear_core::error::Result;
+use claudear_core::security::SECURITY_FIX_SOURCE;
 use claudear_core::types::{AgentResult, Issue};
 use claudear_integrations::chat::llm::{GenerationParams, LlmEngine};
 use claudear_integrations::runner::{AgentRunner, ProviderCapabilities};
@@ -63,6 +64,51 @@ impl LlmAgentRunner {
     }
 
     /// Sanitize a string for use as a git branch segment.
+    /// The fix prompt for `issue`. A security fix's prompt names neither its
+    /// title, source, id nor URL, so none of them reaches the pull request.
+    fn issue_prompt(issue: &Issue, context: &str) -> String {
+        let mut prompt = String::new();
+        prompt.push_str(
+            "You are a software engineer. Fix the following bug by modifying the necessary source files.\n\n",
+        );
+        if issue.source != SECURITY_FIX_SOURCE {
+            prompt.push_str(&format!("## Issue: {}\n", issue.title));
+            if let Some(ref desc) = issue.description {
+                prompt.push_str(&format!("Description: {}\n", desc));
+            }
+            prompt.push_str(&format!("Source: {}\n", issue.source));
+            prompt.push_str(&format!("URL: {}\n\n", issue.url));
+        }
+
+        if !context.is_empty() {
+            prompt.push_str("## Context\n");
+            prompt.push_str(context);
+            prompt.push('\n');
+        }
+
+        prompt.push_str("\n## Output Format\n");
+        prompt.push_str(
+            "For each file you need to change, output the COMPLETE new file content using this exact format:\n\n",
+        );
+        prompt.push_str("=== FILE: path/to/file.ext ===\n");
+        prompt.push_str("<complete file content here>\n");
+        prompt.push_str("=== END FILE ===\n\n");
+        prompt.push_str(
+            "After all file changes, provide a brief summary of what you changed and why.\n",
+        );
+
+        prompt
+    }
+
+    /// The branch name suffix for `issue`. A security fix's branch does not
+    /// carry its id.
+    fn branch_suffix(issue: Option<&Issue>) -> String {
+        match issue.filter(|issue| issue.source != SECURITY_FIX_SOURCE) {
+            Some(issue) => Self::sanitize_for_branch(&issue.short_id),
+            None => format!("fix-{}", chrono::Utc::now().timestamp()),
+        }
+    }
+
     fn sanitize_for_branch(s: &str) -> String {
         let sanitized: String = s
             .to_lowercase()
@@ -147,11 +193,7 @@ impl LlmAgentRunner {
             Self::run_cmd(project_dir, "git", &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
 
         // Build branch name
-        let branch_suffix = if let Some(issue) = issue {
-            Self::sanitize_for_branch(&issue.short_id)
-        } else {
-            format!("fix-{}", chrono::Utc::now().timestamp())
-        };
+        let branch_suffix = Self::branch_suffix(issue);
         let mut branch = if let Some(aid) = attempt_id {
             format!("claudear/llm-{}-{}", branch_suffix, aid)
         } else {
@@ -289,35 +331,7 @@ impl AgentRunner for LlmAgentRunner {
     }
 
     fn build_prompt_for_issue(&self, issue: &Issue, context: &str, _project_dir: &Path) -> String {
-        let mut prompt = String::new();
-        prompt.push_str(
-            "You are a software engineer. Fix the following bug by modifying the necessary source files.\n\n",
-        );
-        prompt.push_str(&format!("## Issue: {}\n", issue.title));
-        if let Some(ref desc) = issue.description {
-            prompt.push_str(&format!("Description: {}\n", desc));
-        }
-        prompt.push_str(&format!("Source: {}\n", issue.source));
-        prompt.push_str(&format!("URL: {}\n\n", issue.url));
-
-        if !context.is_empty() {
-            prompt.push_str("## Context\n");
-            prompt.push_str(context);
-            prompt.push('\n');
-        }
-
-        prompt.push_str("\n## Output Format\n");
-        prompt.push_str(
-            "For each file you need to change, output the COMPLETE new file content using this exact format:\n\n",
-        );
-        prompt.push_str("=== FILE: path/to/file.ext ===\n");
-        prompt.push_str("<complete file content here>\n");
-        prompt.push_str("=== END FILE ===\n\n");
-        prompt.push_str(
-            "After all file changes, provide a brief summary of what you changed and why.\n",
-        );
-
-        prompt
+        Self::issue_prompt(issue, context)
     }
 
     async fn execute_with_attempt(
@@ -488,6 +502,46 @@ mod tests {
         assert!(prompt.contains("sentry"));
         assert!(prompt.contains("=== FILE:"));
         assert!(prompt.contains("=== END FILE ==="));
+    }
+
+    #[test]
+    fn a_security_fix_prompt_names_neither_its_source_nor_its_id() {
+        let issue = Issue::new("SEC-7", "SEC-7", "Hardening", "", SECURITY_FIX_SOURCE);
+
+        let prompt = LlmAgentRunner::issue_prompt(&issue, "Harden the session revocation");
+
+        assert!(prompt.contains("Harden the session revocation"), "{prompt}");
+        assert!(prompt.contains("=== FILE:"), "{prompt}");
+        assert!(!prompt.contains("SEC-"), "{prompt}");
+        assert!(!prompt.contains("Hardening"), "{prompt}");
+        assert!(!prompt.contains("## Issue"), "{prompt}");
+        assert!(!prompt.contains("Source:"), "{prompt}");
+        assert!(!prompt.contains("URL:"), "{prompt}");
+    }
+
+    #[test]
+    fn a_support_fix_prompt_still_names_its_title_and_source() {
+        let issue = Issue::new(
+            "1",
+            "HS-1",
+            "Login fails",
+            "https://example.com/1",
+            "helpscout",
+        );
+
+        let prompt = LlmAgentRunner::issue_prompt(&issue, "context");
+
+        assert!(prompt.contains("## Issue: Login fails"), "{prompt}");
+        assert!(prompt.contains("Source: helpscout"), "{prompt}");
+    }
+
+    #[test]
+    fn a_security_fix_branch_does_not_carry_its_id() {
+        let security = Issue::new("SEC-7", "SEC-7", "Hardening", "", SECURITY_FIX_SOURCE);
+        let support = Issue::new("1", "HS-1", "Login fails", "url", "helpscout");
+
+        assert!(!LlmAgentRunner::branch_suffix(Some(&security)).contains("sec"));
+        assert_eq!(LlmAgentRunner::branch_suffix(Some(&support)), "hs-1");
     }
 
     #[test]

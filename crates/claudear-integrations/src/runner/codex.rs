@@ -4,6 +4,7 @@ use super::{process_group, AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
 use claudear_config::AgentConfig;
 use claudear_core::error::{Error, Result};
+use claudear_core::security::SECURITY_FIX_SOURCE;
 use claudear_core::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
 use claudear_core::types::{ActivityLogEntry, AgentExecution, AgentResult, Issue};
 use claudear_storage::FixAttemptTracker;
@@ -17,6 +18,21 @@ use tokio::process::Command;
 
 const OUTPUT_HELD_OPEN_MESSAGE: &str =
     "Stopped reading Codex output held open by a process outside its process group";
+
+/// The fix prompt of a security fix. It names neither the issue's source nor
+/// its id, so neither reaches the pull request.
+const SECURITY_FIX_PROMPT: &str = r#"Here is the context for this fix:
+
+{context}
+
+Your task:
+1. Analyze the problem described in the context
+2. Find the relevant code in this codebase
+3. Implement a fix for the problem
+4. Write or update tests if applicable
+5. Create a PR with your changes
+6. Ensure all checks pass on the PR
+"#;
 
 /// Configuration for the Codex agent runner.
 #[derive(Debug, Clone)]
@@ -64,6 +80,9 @@ impl CodexAgentRunner {
 
     fn build_prompt(&self, issue: &Issue, context: &str, project_dir: &Path) -> String {
         let template_loader = TemplateLoader::new(project_dir);
+        if issue.source == SECURITY_FIX_SOURCE {
+            return Self::security_fix_prompt(context, template_loader.load_agent_md());
+        }
         if let Ok(template) = template_loader.get_template(issue) {
             let agent_md = template_loader.load_agent_md();
             let template_context =
@@ -88,6 +107,14 @@ The PR title should include the issue ID: {}
 "#,
             issue.source, context, issue.short_id
         )
+    }
+
+    fn security_fix_prompt(context: &str, agent_md: Option<String>) -> String {
+        let prompt = SECURITY_FIX_PROMPT.replace("{context}", context);
+        match agent_md {
+            Some(agent_md) => format!("{}\n\n---\n\n{prompt}", agent_md.trim()),
+            None => prompt,
+        }
     }
 
     /// Extract a PR URL from Codex text output.
@@ -422,6 +449,31 @@ mod tests {
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "context", Path::new("/tmp"));
         assert!(prompt.contains("TEST-1"));
+    }
+
+    #[test]
+    fn a_security_fix_prompt_names_neither_its_source_nor_its_id() {
+        let tracker = Arc::new(claudear_storage::NoopTracker);
+        let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
+        let issue = Issue::new("SEC-7", "SEC-7", "Hardening", "", SECURITY_FIX_SOURCE);
+        let bare = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENT.md"), "Run the unit tests first.").unwrap();
+
+        for prompt in [
+            runner.build_prompt(&issue, "Harden the session revocation", bare.path()),
+            runner.build_prompt(&issue, "Harden the session revocation", project.path()),
+        ] {
+            assert!(prompt.contains("Harden the session revocation"), "{prompt}");
+            assert!(!prompt.contains("SEC-"), "{prompt}");
+            assert!(!prompt.contains("Hardening"), "{prompt}");
+            assert!(!prompt.contains(SECURITY_FIX_SOURCE), "{prompt}");
+            assert!(!prompt.contains("PR title should include"), "{prompt}");
+            assert!(!prompt.contains("issue ID"), "{prompt}");
+        }
+        assert!(runner
+            .build_prompt(&issue, "Harden the session revocation", project.path())
+            .starts_with("Run the unit tests first."));
     }
 
     #[test]
