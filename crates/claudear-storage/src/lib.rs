@@ -559,6 +559,18 @@ pub trait ActivityStore: Send + Sync {
         Ok(0)
     }
 
+    /// Like [`Self::list_attempts`] across every source except `excluded_source`
+    /// (compared case-insensitively), so a page skips it without scanning.
+    fn list_attempts_excluding_source(
+        &self,
+        _status: Option<&str>,
+        _excluded_source: &str,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<FixAttempt>> {
+        Ok(Vec::new())
+    }
+
     /// List the most recent fix attempts.
     fn list_recent_attempts(&self, _limit: usize) -> Result<Vec<FixAttempt>> {
         Ok(Vec::new())
@@ -1235,6 +1247,17 @@ pub trait EmbeddingStore: Send + Sync {
     /// Count issues with optional source filter.
     fn count_issues(&self, _source: Option<&str>) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Like [`Self::list_issues`] across every source except `excluded_source`
+    /// (compared case-insensitively), so a page skips it without scanning.
+    fn list_issues_excluding_source(
+        &self,
+        _excluded_source: &str,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<IssueEmbedding>> {
+        Ok(Vec::new())
     }
 
     /// Record (upsert) the observed recurrence signal for an issue.

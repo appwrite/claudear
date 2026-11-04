@@ -25,6 +25,14 @@ pub struct Harness {
 
 impl Harness {
     pub fn start() -> Self {
+        Self::build(|router| router.layer(CookieManagerLayer::new()))
+    }
+
+    pub fn with_dashboard_middleware() -> Self {
+        Self::build(|router| super::apply_dashboard_middleware(router, false))
+    }
+
+    fn build(wrap: impl FnOnce(Router) -> Router) -> Self {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
         let password_hash = bcrypt::hash("test-password", 4).expect("hash");
@@ -45,13 +53,12 @@ impl Harness {
             ..Config::default()
         };
         let indexing = tracker.subscribe_indexing_progress();
-        let router = create_api_router(
+        let router = wrap(create_api_router(
             config,
             tracker.clone(),
             PathBuf::from("claudear.toml"),
             indexing,
-        )
-        .layer(CookieManagerLayer::new());
+        ));
         Self {
             tracker,
             router,
@@ -71,6 +78,25 @@ impl Harness {
         body: &str,
     ) -> (StatusCode, serde_json::Value) {
         self.send(request("POST", uri, session, Some(body))).await
+    }
+
+    pub async fn post_with_csrf(
+        &self,
+        uri: &str,
+        session: &str,
+        csrf: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = request("POST", uri, None, Some(body));
+        let headers = request.headers_mut();
+        headers.insert(
+            "cookie",
+            format!("claudear_session={session}; claudear_csrf={csrf}")
+                .parse()
+                .expect("cookie header"),
+        );
+        headers.insert("x-csrf-token", csrf.parse().expect("csrf header"));
+        self.send(request).await
     }
 
     async fn send(&self, request: Request<Body>) -> (StatusCode, serde_json::Value) {

@@ -2,6 +2,7 @@
 //! go-live confirmation and awards.
 
 use super::auth::{AdminUser, AuthUser};
+use super::pull_request::PullRequestLocation;
 use super::routes::ApiState;
 use axum::{
     extract::{rejection::JsonRejection, Path, Query, State},
@@ -19,11 +20,13 @@ use claudear_core::security::{
 use claudear_storage::FixAttemptTracker;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+use std::hash::Hash;
 
 const DEFAULT_REPORT_LIMIT: usize = 100;
 const MAX_REPORT_LIMIT: usize = 500;
 const MAX_PUBLIC_REASON_CHARS: usize = 1000;
+const MAX_AWARD_NOTE_CHARS: usize = 1000;
 const MAX_DEPLOYED_VERSION_CHARS: usize = 100;
 const LINKABLE_STATES: [VulnerabilityState; 2] = [
     VulnerabilityState::AwaitingFix,
@@ -37,9 +40,9 @@ type ApiResult<T> = Result<Json<T>, StatusCode>;
 
 #[derive(Debug, Serialize)]
 pub struct SecuritySummary {
-    pub reports_by_state: BTreeMap<&'static str, usize>,
-    pub reports_by_outcome: BTreeMap<&'static str, usize>,
-    pub vulnerabilities_by_state: BTreeMap<&'static str, usize>,
+    pub reports_by_state: HashMap<SecurityReportState, usize>,
+    pub reports_by_outcome: HashMap<SecurityOutcome, usize>,
+    pub vulnerabilities_by_state: HashMap<VulnerabilityState, usize>,
     pub pending_awards: usize,
     pub unconfirmed_replies: usize,
 }
@@ -105,11 +108,11 @@ fn internal_error(error: Error) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
-fn count_by<T>(
+fn count_by<T, K: Eq + Hash>(
     items: impl IntoIterator<Item = T>,
-    key: impl Fn(T) -> Option<&'static str>,
-) -> BTreeMap<&'static str, usize> {
-    let mut counts = BTreeMap::new();
+    key: impl Fn(T) -> Option<K>,
+) -> HashMap<K, usize> {
+    let mut counts = HashMap::new();
     for name in items.into_iter().filter_map(key) {
         *counts.entry(name).or_insert(0) += 1;
     }
@@ -227,12 +230,10 @@ pub async fn summary_handler(
     }
 
     Ok(Json(SecuritySummary {
-        reports_by_state: count_by(&reports, |report| Some(report.state.as_str())),
-        reports_by_outcome: count_by(&reports, |report| {
-            report.outcome.map(SecurityOutcome::as_str)
-        }),
+        reports_by_state: count_by(&reports, |report| Some(report.state)),
+        reports_by_outcome: count_by(&reports, |report| report.outcome),
         vulnerabilities_by_state: count_by(&vulnerabilities, |vulnerability| {
-            Some(vulnerability.state.as_str())
+            Some(vulnerability.state)
         }),
         pending_awards: awards
             .iter()
@@ -445,6 +446,9 @@ pub async fn award_handler(
         .as_deref()
         .map(str::trim)
         .filter(|note| !note.is_empty());
+    if note.is_some_and(|note| note.chars().count() > MAX_AWARD_NOTE_CHARS) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let tracker = state.tracker.as_ref();
     if tracker
         .get_security_award(vulnerability_id)
@@ -470,15 +474,6 @@ pub async fn award_handler(
         .map_err(internal_error)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
-}
-
-fn is_pull_request_url(value: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(value) else {
-        return false;
-    };
-    parsed.scheme() == "https"
-        && parsed.host_str().is_some()
-        && claudear_storage::parse_pr_url(value).is_some()
 }
 
 fn transition_vulnerability(
@@ -523,17 +518,28 @@ pub async fn pull_request_handler(
     body: Result<Json<PullRequestLink>, JsonRejection>,
 ) -> ApiResult<SecurityVulnerability> {
     let Json(link) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
-    let pull_request_url = link.pull_request_url.trim();
-    if !is_pull_request_url(pull_request_url) {
+    let location =
+        PullRequestLocation::parse(link.pull_request_url.trim()).ok_or(StatusCode::BAD_REQUEST)?;
+    let tracker = state.tracker.as_ref();
+    let vulnerability = tracker
+        .get_security_vulnerability(vulnerability_id)
+        .map_err(internal_error)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if vulnerability
+        .repository
+        .as_deref()
+        .is_some_and(|repository| !location.belongs_to(repository))
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let pull_request_url = location.url();
     transition_vulnerability(
-        state.tracker.as_ref(),
+        tracker,
         vulnerability_id,
         &LINKABLE_STATES,
         VulnerabilityState::Fixing,
         &SecurityVulnerabilityChanges {
-            pull_request_url: Some(pull_request_url.to_string()),
+            pull_request_url: Some(pull_request_url.clone()),
             ..SecurityVulnerabilityChanges::default()
         },
         &NewSecurityEvent::new(SecurityEventKind::PullRequestLinked)
@@ -637,13 +643,22 @@ mod tests {
             first: &SecurityReport,
             state: VulnerabilityState,
         ) -> SecurityVulnerability {
+            self.vulnerability_in(first, state, Some("appwrite/appwrite"))
+        }
+
+        fn vulnerability_in(
+            &self,
+            first: &SecurityReport,
+            state: VulnerabilityState,
+            repository: Option<&str>,
+        ) -> SecurityVulnerability {
             let vulnerability = self
                 .tracker
                 .create_security_vulnerability(&NewSecurityVulnerability {
                     title: "Session fixation".to_string(),
                     summary: "Sessions survive a password change.".to_string(),
                     embedding: Vec::new(),
-                    repository: Some("appwrite/appwrite".to_string()),
+                    repository: repository.map(str::to_string),
                     severity: Some(SecuritySeverity::High),
                     state,
                     first_report_id: first.id,
@@ -819,6 +834,52 @@ mod tests {
         for (uri, body) in &writes {
             assert_eq!(
                 harness.post(uri, Some(&harness.admin), body).await.0,
+                StatusCode::OK,
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn security_writes_without_the_csrf_token_are_rejected_by_the_dashboard_stack() {
+        let harness = Harness::with_dashboard_middleware();
+        let seed = Seed {
+            tracker: harness.tracker.as_ref(),
+        };
+        let report = seed.needs_human("150");
+        let awaiting = seed.vulnerability(&seed.report("151", 2), VulnerabilityState::AwaitingFix);
+        let override_uri = format!("/api/security/reports/{}/override", report.id);
+        let link_uri = format!("/api/security/vulnerabilities/{}/pull-request", awaiting.id);
+        let link = r#"{"pull_request_url":"https://github.com/appwrite/appwrite/pull/42"}"#;
+        let reassess = r#"{"action":"reassess"}"#;
+
+        for (uri, body) in [(&override_uri, reassess), (&link_uri, link)] {
+            assert_eq!(
+                harness.post(uri, Some(&harness.admin), body).await.0,
+                StatusCode::FORBIDDEN,
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            report_state(&harness, report.id).state,
+            SecurityReportState::NeedsHuman,
+            "a forged request changes nothing"
+        );
+        assert!(harness
+            .tracker
+            .get_security_vulnerability(awaiting.id)
+            .expect("read")
+            .expect("vulnerability")
+            .pull_request_url
+            .is_none());
+
+        let token = "a-matching-csrf-token";
+        for (uri, body) in [(&override_uri, reassess), (&link_uri, link)] {
+            assert_eq!(
+                harness
+                    .post_with_csrf(uri, &harness.admin, token, body)
+                    .await
+                    .0,
                 StatusCode::OK,
                 "{uri}"
             );
@@ -1326,6 +1387,22 @@ mod tests {
         );
 
         seed.award(&vulnerability);
+        let too_long =
+            serde_json::json!({ "note": "n".repeat(MAX_AWARD_NOTE_CHARS + 1) }).to_string();
+        assert_eq!(
+            harness.post(&uri, Some(&harness.admin), &too_long).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            harness
+                .tracker
+                .get_security_award(vulnerability.id)
+                .expect("read")
+                .expect("award")
+                .status,
+            AwardStatus::Prepared,
+            "an oversized note changes nothing"
+        );
         let (status, award) = harness
             .post(
                 &uri,
@@ -1368,6 +1445,13 @@ mod tests {
             "https://github.com/appwrite/appwrite/issues/1",
             "http://github.com/appwrite/appwrite/pull/1",
             "javascript:alert(1)//github.com/appwrite/appwrite/pull/1",
+            "https://evil.example/github.com/appwrite/appwrite/pull/1",
+            "https://evil.example/appwrite/appwrite/pull/1",
+            "https://user@github.com/appwrite/appwrite/pull/1",
+            "https://github.com/appwrite/appwrite/pull/1?x=1",
+            "https://github.com/appwrite/appwrite/pull/1#x",
+            "https://github.com/attacker/repo/pull/1",
+            "https://github.com/appwrite/appwrite-fork/pull/1",
         ] {
             let body = serde_json::json!({ "pull_request_url": url }).to_string();
             assert_eq!(
@@ -1396,6 +1480,17 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
+        assert_eq!(
+            harness
+                .tracker
+                .get_security_vulnerability(vulnerability.id)
+                .expect("read")
+                .expect("vulnerability")
+                .state,
+            VulnerabilityState::AwaitingFix,
+            "a rejected link changes nothing"
+        );
+
         let (status, body) = harness.post(&uri, Some(&harness.admin), valid).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "fixing");
@@ -1414,6 +1509,34 @@ mod tests {
             harness.post(&uri, Some(&harness.admin), valid).await.0,
             StatusCode::CONFLICT,
             "a fixing vulnerability is not relinked"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_request_link_without_a_known_repository_accepts_any_github_repository() {
+        let harness = Harness::start();
+        let seed = Seed {
+            tracker: harness.tracker.as_ref(),
+        };
+        let vulnerability = seed.vulnerability_in(
+            &seed.report("1250", 3),
+            VulnerabilityState::AwaitingFix,
+            None,
+        );
+        let (status, body) = harness
+            .post(
+                &format!(
+                    "/api/security/vulnerabilities/{}/pull-request",
+                    vulnerability.id
+                ),
+                Some(&harness.admin),
+                r#"{"pull_request_url":"https://github.com/appwrite/console/pull/9"}"#,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["pull_request_url"],
+            "https://github.com/appwrite/console/pull/9"
         );
     }
 

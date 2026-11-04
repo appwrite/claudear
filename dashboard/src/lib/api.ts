@@ -1306,50 +1306,74 @@ export type VulnerabilityState = (typeof VULNERABILITY_STATES)[number]
 export const SECURITY_SEVERITIES = ['critical', 'high', 'medium', 'low', 'informational'] as const
 export type SecuritySeverity = (typeof SECURITY_SEVERITIES)[number]
 
-export type SecurityReplyKind =
-  | 'confirmed'
-  | 'not_reproducible'
-  | 'already_fixed'
-  | 'not_vulnerability'
-  | 'out_of_scope'
-  | 'duplicate'
-  | 'fix_live'
-  | 'fix_live_rewarded'
+export const SECURITY_REPLY_KINDS = [
+  'confirmed',
+  'not_reproducible',
+  'already_fixed',
+  'not_vulnerability',
+  'out_of_scope',
+  'duplicate',
+  'fix_live',
+  'fix_live_rewarded',
+] as const
+export type SecurityReplyKind = (typeof SECURITY_REPLY_KINDS)[number]
 
-export type DeliveryStatus = 'sending' | 'sent' | 'failed' | 'unconfirmed'
+export const DELIVERY_STATUSES = ['sending', 'sent', 'failed', 'unconfirmed'] as const
+export type DeliveryStatus = (typeof DELIVERY_STATUSES)[number]
 
-export type AwardStatus = 'prepared' | 'owner_notified' | 'awarded' | 'cancelled'
+export const AWARD_STATUSES = ['prepared', 'owner_notified', 'awarded', 'cancelled'] as const
+export type AwardStatus = (typeof AWARD_STATUSES)[number]
 
-export type SecurityEventKind =
-  | 'received'
-  | 'assessment_started'
-  | 'assessment_released'
-  | 'assessment_failed'
-  | 'needs_human'
-  | 'overridden'
-  | 'admin_confirmed'
-  | 'screened_spam'
-  | 'assessed'
-  | 'vulnerability_created'
-  | 'duplicate_linked'
-  | 'first_reporter_replaced'
-  | 'reply_sent'
-  | 'reply_failed'
-  | 'reply_unconfirmed'
-  | 'delivery_confirmed'
-  | 'conversation_closed'
-  | 'reporter_follow_up'
-  | 'fix_started'
-  | 'pull_request_opened'
-  | 'pull_request_linked'
-  | 'fix_failed'
-  | 'merged'
-  | 'cloud_bump_required'
-  | 'live'
-  | 'deployment_check_failed'
-  | 'award_prepared'
-  | 'owner_notified'
-  | 'awarded'
+export const SECURITY_EVENT_KINDS = [
+  'received',
+  'assessment_started',
+  'assessment_released',
+  'assessment_failed',
+  'needs_human',
+  'overridden',
+  'admin_confirmed',
+  'screened_spam',
+  'assessed',
+  'vulnerability_created',
+  'duplicate_linked',
+  'first_reporter_replaced',
+  'reply_claimed',
+  'reply_sent',
+  'reply_failed',
+  'reply_unconfirmed',
+  'delivery_confirmed',
+  'conversation_closed',
+  'reporter_follow_up',
+  'fix_started',
+  'pull_request_opened',
+  'pull_request_linked',
+  'fix_failed',
+  'merged',
+  'cloud_bump_required',
+  'live',
+  'deployment_check_failed',
+  'award_prepared',
+  'owner_notified',
+  'awarded',
+  'award_cancelled',
+] as const
+export type SecurityEventKind = (typeof SECURITY_EVENT_KINDS)[number]
+
+export const SECURITY_REVIEW_REASONS = [
+  'assessment_failed',
+  'assessment_inconclusive',
+  'unverifiable_fix',
+  'attachment_evidence',
+  'untracked_repository',
+  'pull_request_closed',
+  'fix_failed',
+  'reply_unconfirmed',
+  'deployment_check_failed',
+  'fix_found_in_history',
+  'reply_failed',
+  'missing_merge_commit',
+] as const
+export type SecurityReviewReason = (typeof SECURITY_REVIEW_REASONS)[number]
 
 export interface SecuritySummary {
   reports_by_state: Partial<Record<SecurityReportState, number>>

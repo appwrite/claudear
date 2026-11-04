@@ -545,18 +545,17 @@ async fn attempts_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     };
     let offset = (page - 1) * per_page;
-    let rows = visibility
-        .page(
-            |limit, offset| {
-                state
-                    .tracker
-                    .list_attempts(status_filter, source_filter, limit, offset)
-            },
-            |attempt| visibility.shows(&attempt.source),
-            offset,
-            per_page,
-        )
-        .map_err(internal_error)?;
+    let rows = match visibility.excluded_source(source_filter) {
+        Some(excluded) => {
+            state
+                .tracker
+                .list_attempts_excluding_source(status_filter, excluded, per_page, offset)
+        }
+        None => state
+            .tracker
+            .list_attempts(status_filter, source_filter, per_page, offset),
+    }
+    .map_err(internal_error)?;
     let mut total = state
         .tracker
         .count_attempts(status_filter, source_filter)
@@ -1440,7 +1439,7 @@ async fn issue_timeline_handler(
 }
 
 async fn analytics_summary_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<claudear_core::types::AnalyticsSummary>, StatusCode> {
     let mut summary = state.tracker.get_analytics_summary().map_err(|e| {
@@ -1448,6 +1447,10 @@ async fn analytics_summary_handler(
         sentry::capture_error(&e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    let visibility = Visibility::for_user(&user);
+    summary
+        .success_rate_by_source
+        .retain(|source, _| visibility.shows(source));
 
     summary.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr().unwrap_or(None);
 
@@ -1516,7 +1519,7 @@ async fn rate_reply_handler(
 }
 
 async fn metrics_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<MetricsQuery>,
 ) -> Result<Json<Vec<claudear_core::types::ProcessingMetric>>, StatusCode> {
@@ -1534,9 +1537,13 @@ async fn metrics_handler(
         Some(chrono::Utc::now() - duration)
     });
 
-    state
-        .tracker
-        .get_metrics(metric_name, since, limit)
+    let visibility = Visibility::for_user(&user);
+    visibility
+        .prefix(
+            |limit| state.tracker.get_metrics(metric_name, since, limit),
+            |metric| visibility.shows_optional(metric.source.as_deref()),
+            limit,
+        )
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -1604,14 +1611,13 @@ async fn issues_handler(
         total = total.saturating_sub(hidden);
     }
 
-    let rows = visibility
-        .page(
-            |limit, offset| state.tracker.list_issues(source_filter, limit, offset),
-            |issue| visibility.shows(&issue.source),
-            offset,
-            per_page,
-        )
-        .map_err(internal_error)?;
+    let rows = match visibility.excluded_source(source_filter) {
+        Some(excluded) => state
+            .tracker
+            .list_issues_excluding_source(excluded, per_page, offset),
+        None => state.tracker.list_issues(source_filter, per_page, offset),
+    }
+    .map_err(internal_error)?;
 
     let issues: Vec<IssueSummary> = rows
         .into_iter()
@@ -2176,16 +2182,19 @@ async fn inference_history_handler(
 }
 
 async fn telemetry_overview_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<TelemetryOverviewResponse>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let now = Utc::now();
-    let stats = state.tracker.get_stats().map_err(|e| {
+    let mut stats = state.tracker.get_stats().map_err(|e| {
         tracing::error!(error = %e, "Internal server error");
         sentry::capture_error(&e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let recent_attempts = get_attempt_records_since(&state.tracker, now - Duration::days(7));
+    visibility.scrub_stats(&mut stats);
+    let mut recent_attempts = get_attempt_records_since(&state.tracker, now - Duration::days(7));
+    recent_attempts.retain(|attempt| visibility.shows(&attempt.source));
 
     let windows = vec![
         summarize_window(&recent_attempts, "1h", now - Duration::hours(1)),
@@ -2193,7 +2202,7 @@ async fn telemetry_overview_handler(
         summarize_window(&recent_attempts, "7d", now - Duration::days(7)),
     ];
 
-    let retryable = state
+    let mut retryable = state
         .tracker
         .get_retryable_issues(state.config.retry.max_retries)
         .map_err(|e| {
@@ -2201,6 +2210,7 @@ async fn telemetry_overview_handler(
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    retryable.retain(|attempt| visibility.shows(&attempt.source));
     let retry_manager = RetryManager::new(state.config.retry.clone(), state.tracker.clone());
     let ready_retries = retryable
         .iter()
@@ -2234,20 +2244,30 @@ async fn telemetry_overview_handler(
         }
     }
 
-    let processing_time_all = state
-        .tracker
-        .get_metrics("processing_time", None, 20_000)
-        .unwrap_or_default();
-    let processing_time_last_24h = state
-        .tracker
-        .get_metrics("processing_time", Some(now - Duration::hours(24)), 20_000)
-        .unwrap_or_default();
+    let processing_time_all = visibility.visible_metrics(
+        state
+            .tracker
+            .get_metrics("processing_time", None, 20_000)
+            .unwrap_or_default(),
+    );
+    let processing_time_last_24h = visibility.visible_metrics(
+        state
+            .tracker
+            .get_metrics("processing_time", Some(now - Duration::hours(24)), 20_000)
+            .unwrap_or_default(),
+    );
     let processing_time = TelemetryProcessingTime {
         all_time: compute_processing_time_summary(processing_time_all),
         last_24h: compute_processing_time_summary(processing_time_last_24h),
     };
 
-    let top_errors = state.tracker.get_error_patterns(10).unwrap_or_default();
+    let top_errors = visibility
+        .prefix(
+            |limit| state.tracker.get_error_patterns(limit),
+            |pattern| visibility.shows_all(pattern.sources.iter().flatten().map(String::as_str)),
+            10,
+        )
+        .unwrap_or_default();
 
     let activity_last_hour = state
         .tracker
@@ -2376,7 +2396,7 @@ async fn telemetry_overview_handler(
 }
 
 async fn telemetry_timeseries_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<TelemetryTimeseriesQuery>,
 ) -> Result<Json<TelemetryTimeseriesResponse>, StatusCode> {
@@ -2411,7 +2431,11 @@ async fn telemetry_timeseries_handler(
         cursor += Duration::seconds(bucket_seconds);
     }
 
-    for attempt in get_attempt_records_since(&state.tracker, start) {
+    let visibility = Visibility::for_user(&user);
+    for attempt in get_attempt_records_since(&state.tracker, start)
+        .into_iter()
+        .filter(|attempt| visibility.shows(&attempt.source))
+    {
         let bucket = floor_to_bucket(attempt.attempted_at, bucket_minutes).timestamp();
         if let Some(point) = buckets.get_mut(&bucket) {
             point.total += 1;
@@ -2436,7 +2460,7 @@ async fn telemetry_timeseries_handler(
 }
 
 async fn telemetry_pipeline_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<TelemetryPeriodQuery>,
 ) -> Result<Json<TelemetryPipelineResponse>, StatusCode> {
@@ -2509,7 +2533,11 @@ async fn telemetry_pipeline_handler(
         .tracker
         .get_metric_sums_by_source_since(&per_source_metric_names, since)
         .unwrap_or_default();
-    for ((metric_name, source), value) in per_source_sums {
+    let visibility = Visibility::for_user(&user);
+    for ((metric_name, source), value) in per_source_sums
+        .into_iter()
+        .filter(|((_, source), _)| visibility.shows(source))
+    {
         let entry = per_source
             .entry(source.clone())
             .or_insert_with(|| TelemetryPipelineSource {
@@ -2587,7 +2615,7 @@ async fn telemetry_pipeline_handler(
 }
 
 async fn telemetry_latency_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<TelemetryPeriodQuery>,
 ) -> Result<Json<TelemetryLatencyResponse>, StatusCode> {
@@ -2595,10 +2623,12 @@ async fn telemetry_latency_handler(
     let (period_label, period_duration) = parse_telemetry_period(query.period.as_deref(), "week");
     let since = now - period_duration;
 
-    let processing_metrics = state
-        .tracker
-        .get_metrics("processing_time", Some(since), 50_000)
-        .unwrap_or_default();
+    let processing_metrics = Visibility::for_user(&user).visible_metrics(
+        state
+            .tracker
+            .get_metrics("processing_time", Some(since), 50_000)
+            .unwrap_or_default(),
+    );
     let overall = compute_processing_time_summary(processing_metrics.clone());
 
     let all_values: Vec<f64> = processing_metrics.iter().map(|m| m.metric_value).collect();

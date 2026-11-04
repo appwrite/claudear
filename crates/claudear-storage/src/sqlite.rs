@@ -2846,6 +2846,33 @@ impl ActivityStore for SqliteTracker {
         Ok(count as usize)
     }
 
+    fn list_attempts_excluding_source(
+        &self,
+        status: Option<&str>,
+        excluded_source: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare_cached(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE source <> ?1 COLLATE NOCASE
+              AND (?2 IS NULL OR status = ?2)
+            ORDER BY attempted_at DESC
+            LIMIT ?3 OFFSET ?4
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![excluded_source, status, limit as i64, offset as i64],
+            Self::row_to_fix_attempt,
+        )?;
+        Ok(rows.flatten().collect())
+    }
+
     /// List recent attempts ordered by attempted time descending.
     fn list_recent_attempts(&self, limit: usize) -> Result<Vec<FixAttempt>> {
         self.list_attempts(None, None, limit, 0)
@@ -3837,6 +3864,33 @@ impl EmbeddingStore for SqliteTracker {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
                 claudear_core::error::Error::Storage(format!("Failed to list issues: {}", e))
+            })
+    }
+
+    fn list_issues_excluding_source(
+        &self,
+        excluded_source: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IssueEmbedding>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                   description, url, priority, status, labels, updated_at
+            FROM issues
+            WHERE source <> ?1 COLLATE NOCASE
+            ORDER BY COALESCE(updated_at, created_at) DESC
+            LIMIT ?2 OFFSET ?3
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![excluded_source, limit as i64, offset as i64],
+            |row| Self::row_to_issue_embedding(row, 8),
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                claudear_core::error::Error::Storage(format!("Failed to list issues: {error}"))
             })
     }
 
@@ -18603,6 +18657,78 @@ mod tests {
 
         let page3 = tracker.list_attempts(None, None, 2, 4).unwrap();
         assert_eq!(page3.len(), 1);
+    }
+
+    #[test]
+    fn list_attempts_excluding_source_pages_over_the_remaining_sources() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for index in 0..12 {
+            let source = match index % 3 {
+                0 => "security",
+                1 => "SECURITY",
+                _ => "linear",
+            };
+            tracker
+                .record_attempt(source, &index.to_string(), &format!("I-{index}"))
+                .unwrap();
+        }
+        tracker.mark_failed("linear", "2", "error").unwrap();
+
+        let all = tracker
+            .list_attempts_excluding_source(None, "security", 100, 0)
+            .unwrap();
+        assert_eq!(all.len(), 4);
+        assert!(all.iter().all(|attempt| attempt.source == "linear"));
+        let second_page = tracker
+            .list_attempts_excluding_source(None, "security", 2, 2)
+            .unwrap();
+        let ids = |attempts: &[FixAttempt]| -> Vec<i64> {
+            attempts.iter().map(|attempt| attempt.id).collect()
+        };
+        assert_eq!(ids(&second_page), ids(&all[2..4]));
+        let failed = tracker
+            .list_attempts_excluding_source(Some("failed"), "security", 100, 0)
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].issue_id, "2");
+    }
+
+    #[test]
+    fn list_issues_excluding_source_pages_over_the_remaining_sources() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for (index, source) in ["security", "linear", "Security", "sentry", "linear"]
+            .into_iter()
+            .enumerate()
+        {
+            tracker
+                .store_embedding(&IssueEmbedding {
+                    id: 0,
+                    source: source.to_string(),
+                    issue_id: index.to_string(),
+                    short_id: None,
+                    title: None,
+                    embedding: None,
+                    embedding_model: None,
+                    created_at: Utc::now() - chrono::Duration::minutes(index as i64),
+                    description: None,
+                    url: None,
+                    priority: None,
+                    status: None,
+                    labels: None,
+                    updated_at: None,
+                })
+                .unwrap();
+        }
+
+        let all = tracker
+            .list_issues_excluding_source("security", 100, 0)
+            .unwrap();
+        let ids: Vec<&str> = all.iter().map(|issue| issue.issue_id.as_str()).collect();
+        assert_eq!(ids, ["1", "3", "4"]);
+        let page = tracker
+            .list_issues_excluding_source("security", 1, 1)
+            .unwrap();
+        assert_eq!(page[0].issue_id, "3");
     }
 
     #[test]

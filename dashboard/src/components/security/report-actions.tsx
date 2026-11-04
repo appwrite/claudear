@@ -339,6 +339,15 @@ function ReassessAction({ report, onChanged }: { report: SecurityReport; onChang
   )
 }
 
+export function notDeliveredPrompt(reply: SecurityReply): string {
+  return `Record the ${formatLabel(reply.kind).toLowerCase()} reply as not delivered? Claudear will send it to the reporter again.`
+}
+
+export function awardedPrompt(award: SecurityAward): string {
+  const recipient = award.recipient_email ?? 'the first reporter'
+  return `Record the ${award.campaign} reward (${award.credits} credits) as granted to ${recipient}? Only confirm after the coupon or credits were actually sent. This cannot be undone.`
+}
+
 export function DeliveryConfirmation({
   report,
   replies,
@@ -381,11 +390,12 @@ export function DeliveryConfirmation({
               <button
                 type="button"
                 disabled={pending}
-                onClick={() =>
+                onClick={() => {
+                  if (!window.confirm(notDeliveredPrompt(reply))) return
                   void run(() =>
                     overrideSecurityReport(report.id, { action: 'confirm_delivery', kind: reply.kind, delivered: false }),
                   )
-                }
+                }}
                 className={secondaryButtonClass}
               >
                 Not delivered
@@ -505,6 +515,7 @@ export function AwardPanel({ award, onChanged }: { award: SecurityAward; onChang
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault()
     const trimmed = note.trim()
+    if (!window.confirm(awardedPrompt(award))) return
     if (await run(() => markSecurityAwardGranted(award.vulnerability_id, trimmed || undefined))) setNote('')
   }
 
