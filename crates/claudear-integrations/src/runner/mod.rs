@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use claudear_core::error::Result;
 use claudear_core::types::{AgentResult, Issue, ReplyKind, VerifyResult};
 use std::path::Path;
+use std::time::Duration;
 
 // Re-export concrete implementations and key types.
 pub use claude::{ClaudeAgentRunner, ClaudeRunnerConfig};
@@ -32,6 +33,35 @@ pub struct ProviderCapabilities {
     pub streaming_events: bool,
     pub cost_reporting: bool,
 }
+
+/// What a [`AgentRunner::security_query`] run may touch. Neither sandbox can
+/// run commands, fetch URLs, write files or load MCP servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecuritySandbox {
+    /// No tools at all: the model reasons over the prompt alone.
+    NoTools,
+    /// Read, Grep and Glob, confined to the project directory.
+    RepositoryRead,
+}
+
+/// The only environment variables a [`AgentRunner::security_query`] run
+/// inherits: enough to locate the CLI, its configuration and its credentials.
+pub const SECURITY_ENVIRONMENT_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
 
 /// Uniform interface for AI coding agent providers.
 ///
@@ -127,6 +157,26 @@ pub trait AgentRunner: Send + Sync {
     ) -> Result<serde_json::Value> {
         Err(claudear_core::error::Error::runner(
             "structured_query is not supported by this provider",
+        ))
+    }
+
+    /// Whether [`AgentRunner::security_query`] can enforce its sandboxes.
+    fn supports_security_query(&self) -> bool {
+        false
+    }
+
+    /// Run a schema-constrained query over untrusted input inside `sandbox`,
+    /// with no permission prompts, a minimal environment and `timeout`.
+    async fn security_query(
+        &self,
+        _prompt: &str,
+        _json_schema: &str,
+        _project_dir: &Path,
+        _sandbox: SecuritySandbox,
+        _timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        Err(claudear_core::error::Error::runner(
+            "security_query is not supported by this provider",
         ))
     }
 }
@@ -250,8 +300,6 @@ pub fn is_hard_error(message: &str) -> bool {
 mod tests {
     use super::*;
 
-    // --- ProviderCapabilities tests ---
-
     #[test]
     fn test_provider_capabilities_default_all_false() {
         let caps = ProviderCapabilities::default();
@@ -277,8 +325,6 @@ mod tests {
         assert!(caps.streaming_events);
         assert!(!caps.cost_reporting);
     }
-
-    // --- is_rate_limit_error tests ---
 
     #[test]
     fn test_is_rate_limit_error_rate_limit() {
@@ -396,8 +442,6 @@ mod tests {
         assert!(!is_rate_limit_error(""));
     }
 
-    // --- is_hard_error tests ---
-
     #[test]
     fn test_is_hard_error_spawn_failure() {
         assert!(is_hard_error("Failed to spawn process"));
@@ -453,8 +497,6 @@ mod tests {
         assert!(!is_hard_error("compilation error"));
         assert!(!is_hard_error(""));
     }
-
-    // --- Additional edge case tests ---
 
     #[test]
     fn test_is_rate_limit_error_partial_match_boundary() {
@@ -518,8 +560,6 @@ mod tests {
         assert!(is_hard_error(&long_msg));
     }
 
-    // --- contains_standalone_429 tests ---
-
     #[test]
     fn test_429_standalone() {
         assert!(is_rate_limit_error("429"));
@@ -580,5 +620,164 @@ mod tests {
         // "allowed" status is also informational
         let json = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","utilization":0.5}}"#;
         assert!(!is_rate_limit_error(json));
+    }
+
+    struct MinimalRunner;
+
+    #[async_trait]
+    impl AgentRunner for MinimalRunner {
+        fn name(&self) -> &str {
+            "minimal"
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &Path,
+        ) -> String {
+            String::new()
+        }
+
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &Path,
+        ) -> Result<AgentResult> {
+            Err(claudear_core::error::Error::runner("unused"))
+        }
+    }
+
+    /// A runner that records every security query and answers `{"ok": true}`.
+    #[derive(Default)]
+    pub(crate) struct SecurityRecorder {
+        pub(crate) queries: std::sync::Mutex<Vec<(String, String, SecuritySandbox, Duration)>>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for SecurityRecorder {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &Path,
+        ) -> String {
+            String::new()
+        }
+
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &Path,
+        ) -> Result<AgentResult> {
+            Err(claudear_core::error::Error::runner("unused"))
+        }
+
+        fn supports_security_query(&self) -> bool {
+            true
+        }
+
+        async fn security_query(
+            &self,
+            prompt: &str,
+            json_schema: &str,
+            _project_dir: &Path,
+            sandbox: SecuritySandbox,
+            timeout: Duration,
+        ) -> Result<serde_json::Value> {
+            self.queries.lock().unwrap().push((
+                prompt.to_string(),
+                json_schema.to_string(),
+                sandbox,
+                timeout,
+            ));
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    #[test]
+    fn test_security_query_is_unsupported_by_default() {
+        assert!(!MinimalRunner.supports_security_query());
+    }
+
+    #[tokio::test]
+    async fn test_security_query_errors_by_default() {
+        let error = MinimalRunner
+            .security_query(
+                "prompt",
+                "{}",
+                Path::new("."),
+                SecuritySandbox::NoTools,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("security_query is not supported"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_instrumented_runner_forwards_security_queries() {
+        let recorder = std::sync::Arc::new(SecurityRecorder::default());
+        let runner = crate::telemetry::InstrumentedRunner::wrap(recorder.clone());
+
+        assert!(runner.supports_security_query());
+        let answer = runner
+            .security_query(
+                "prompt",
+                "{\"type\":\"object\"}",
+                Path::new("."),
+                SecuritySandbox::RepositoryRead,
+                Duration::from_secs(7),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answer, serde_json::json!({"ok": true}));
+        assert_eq!(
+            *recorder.queries.lock().unwrap(),
+            vec![(
+                "prompt".to_string(),
+                "{\"type\":\"object\"}".to_string(),
+                SecuritySandbox::RepositoryRead,
+                Duration::from_secs(7),
+            )]
+        );
+    }
+
+    #[test]
+    fn test_security_environment_allowlist_excludes_credentials_of_other_services() {
+        for name in [
+            "GITHUB_TOKEN",
+            "CLAUDECODE",
+            "CLAUDEAR_MASTER_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(!SECURITY_ENVIRONMENT_ALLOWLIST.contains(&name), "{name}");
+        }
+        for name in ["PATH", "HOME", "CLAUDE_CONFIG_DIR"] {
+            assert!(SECURITY_ENVIRONMENT_ALLOWLIST.contains(&name), "{name}");
+        }
     }
 }

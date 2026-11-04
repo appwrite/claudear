@@ -1,6 +1,9 @@
 //! Claude CLI runner for executing fixes.
 
-use super::{process_group, AgentRunner, ProviderCapabilities};
+use super::{
+    process_group, AgentRunner, ProviderCapabilities, SecuritySandbox,
+    SECURITY_ENVIRONMENT_ALLOWLIST,
+};
 use async_trait::async_trait;
 use claudear_analysis::deploy_qa::{DEPLOY_QA_SOURCE, VERDICT_PREFIX};
 use claudear_config::{AgentConfig, McpServerConfig};
@@ -17,7 +20,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
@@ -52,6 +56,42 @@ const NESTED_SESSION_VARIABLE: &str = "CLAUDECODE";
 /// Timeout for read-only structured queries (classification-scale, not the long
 /// fix-run timeout).
 const STRUCTURED_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Every `--help` entry a security query relies on. A CLI missing any of
+/// them cannot enforce the sandbox, so security queries stay disabled.
+const SECURITY_QUERY_HELP_ENTRIES: &[&str] = &[
+    "--restricted",
+    "--permission-prompts",
+    "dontAsk",
+    "--tools",
+    "--disallowedTools",
+    "--strict-mcp-config",
+    "--json-schema",
+];
+
+/// Tools a security query is denied even if a setting or the CLI's defaults
+/// would grant them.
+const SECURITY_DENIED_TOOLS: &[&str] = &[
+    "Bash",
+    "WebFetch",
+    "WebSearch",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+];
+
+/// The only tools a [`SecuritySandbox::RepositoryRead`] query has.
+const SECURITY_READ_TOOLS: &str = "Read,Grep,Glob";
+
+/// The read rules a [`SecuritySandbox::RepositoryRead`] query runs without a
+/// prompt: reads under its working directory, the project, and searches.
+const SECURITY_READ_PERMISSIONS: &[&str] = &["Read(./**)", "Grep", "Glob"];
+
+/// Label for security query processes and their log lines.
+const SECURITY_QUERY_LABEL: &str = "security";
+
+/// How long the `--help` probe for security query support may take.
+const HELP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const OUTPUT_HELD_OPEN_MESSAGE: &str =
     "Stopped reading Claude output held open by a process outside its process group";
@@ -473,6 +513,8 @@ pub struct ClaudeAgentRunner {
     /// Cached base environment variables, captured once at construction time.
     /// Cloned per-invocation instead of re-reading the entire process environment.
     base_env: HashMap<String, String>,
+    /// Whether the CLI supports security queries, probed once on first use.
+    security_support: OnceLock<bool>,
 }
 
 impl ClaudeAgentRunner {
@@ -491,6 +533,7 @@ impl ClaudeAgentRunner {
             template_renderer,
             tracker,
             base_env,
+            security_support: OnceLock::new(),
         }
     }
 
@@ -882,12 +925,199 @@ The PR title should include the issue ID: {}
         args.push("--print".to_string());
 
         let (env, label) = self.prepare_env_and_label(None);
+        self.collect_structured_output(
+            self.command(&args, env, project_dir),
+            prompt,
+            label,
+            timeout,
+            "structured query",
+        )
+        .await
+    }
 
+    /// Run a schema-constrained query over untrusted input in `sandbox`: the
+    /// [`Self::security_args`] under [`Self::security_command`], with the
+    /// prompt on stdin and an error if the CLI outlives `timeout`.
+    async fn run_security_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+        sandbox: SecuritySandbox,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        let args = self.security_args(json_schema, sandbox);
+        self.collect_structured_output(
+            self.security_command(&args, project_dir),
+            prompt,
+            SECURITY_QUERY_LABEL,
+            timeout,
+            "security query",
+        )
+        .await
+    }
+
+    /// The arguments of a security query. Every one is a flag or a flag's
+    /// value: the variadic tool flags come last so nothing positional follows
+    /// them, and the prompt arrives on stdin.
+    ///
+    /// `--restricted` removes the command-running tools and WebFetch, ignores
+    /// user, project and local settings and confines file tools to the working
+    /// directory; `--strict-mcp-config` with no `--mcp-config` loads no MCP
+    /// server; `dontAsk` with `--permission-prompts none` denies anything not
+    /// allowed outright. No system prompt, extra directory or permission skip
+    /// is ever passed.
+    fn security_args(&self, json_schema: &str, sandbox: SecuritySandbox) -> Vec<String> {
+        let mut args: Vec<String> = [
+            "--print",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--json-schema",
+            json_schema,
+            "--restricted",
+            "--strict-mcp-config",
+            "--permission-mode",
+            "dontAsk",
+            "--permission-prompts",
+            "none",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        if let Some(ref model) = self.config.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+        args.push("--tools".to_string());
+        match sandbox {
+            SecuritySandbox::NoTools => args.push(String::new()),
+            SecuritySandbox::RepositoryRead => {
+                args.push(SECURITY_READ_TOOLS.to_string());
+                args.push("--allowedTools".to_string());
+                args.extend(
+                    SECURITY_READ_PERMISSIONS
+                        .iter()
+                        .map(|rule| rule.to_string()),
+                );
+            }
+        }
+        args.push("--disallowedTools".to_string());
+        args.extend(SECURITY_DENIED_TOOLS.iter().map(|tool| tool.to_string()));
+        args
+    }
+
+    /// The environment of a security query: only the
+    /// [`SECURITY_ENVIRONMENT_ALLOWLIST`] variables, from the runner's
+    /// environment or else the daemon's.
+    fn security_environment(&self) -> HashMap<String, String> {
+        SECURITY_ENVIRONMENT_ALLOWLIST
+            .iter()
+            .filter_map(|name| {
+                self.base_env
+                    .get(*name)
+                    .cloned()
+                    .or_else(|| std::env::var(name).ok())
+                    .map(|value| (name.to_string(), value))
+            })
+            .collect()
+    }
+
+    /// The CLI invocation of a security query, which inherits nothing beyond
+    /// [`Self::security_environment`].
+    fn security_command(&self, arguments: &[String], project_dir: &Path) -> Command {
+        let mut command = Command::new(&self.config.binary);
+        command
+            .args(arguments)
+            .current_dir(project_dir)
+            .env_clear()
+            .envs(self.security_environment())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        command
+    }
+
+    /// Whether `<binary> --help` lists every [`SECURITY_QUERY_HELP_ENTRIES`]
+    /// entry. A CLI that cannot be run, or does not answer within
+    /// [`HELP_PROBE_TIMEOUT`], does not support security queries.
+    fn probe_security_support(&self) -> bool {
+        match self.help_text() {
+            Ok(help) => {
+                let supported = help_supports_security_query(&help);
+                if !supported {
+                    tracing::error!(
+                        component = "claude",
+                        binary = %self.config.binary,
+                        required = ?SECURITY_QUERY_HELP_ENTRIES,
+                        "CLI --help lacks the flags security queries need"
+                    );
+                }
+                supported
+            }
+            Err(error) => {
+                tracing::error!(
+                    component = "claude",
+                    binary = %self.config.binary,
+                    error = %error,
+                    "Failed to probe CLI for security query support"
+                );
+                false
+            }
+        }
+    }
+
+    fn help_text(&self) -> Result<String> {
+        let mut child = std::process::Command::new(&self.config.binary)
+            .arg("--help")
+            .env_clear()
+            .envs(self.security_environment())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                Error::runner(format!("Failed to spawn {}: {}", self.config.binary, error))
+            })?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::runner("Failed to capture stdout"))?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut help = String::new();
+            let read = std::io::Read::read_to_string(&mut stdout, &mut help).map(|_| help);
+            let _ = sender.send(read);
+        });
+        let help = receiver.recv_timeout(HELP_PROBE_TIMEOUT);
+        if help.is_err() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        match help {
+            Ok(Ok(help)) => Ok(help),
+            Ok(Err(error)) => Err(Error::runner(format!("Failed to read --help: {error}"))),
+            Err(_) => Err(Error::runner(format!(
+                "--help did not finish within {}s",
+                HELP_PROBE_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    /// Spawn `command` with `prompt` on stdin and return the object from its
+    /// `result` stream event, or an error if it outlives `timeout`.
+    async fn collect_structured_output(
+        &self,
+        mut command: Command,
+        prompt: &str,
+        label: &str,
+        timeout: Duration,
+        query: &str,
+    ) -> Result<serde_json::Value> {
         let (mut child, mut group) = process_group::Guard::spawn(
             // Discard stderr: this lean path never reads it, and leaving it piped
             // would let `--verbose` diagnostics fill the OS buffer and block the
             // child before it writes the `result` event to stdout.
-            self.command(&args, env, project_dir).stderr(Stdio::null()),
+            command.stderr(Stdio::null()),
             process_group::Registry::global(),
         )
         .map_err(|error| {
@@ -953,7 +1183,7 @@ The PR title should include the issue ID: {}
         let (structured, exited) = tokio::join!(collect, reap);
         if !exited {
             return Err(Error::runner(format!(
-                "structured query timed out after {}s",
+                "{query} timed out after {}s",
                 timeout.as_secs()
             )));
         }
@@ -2599,6 +2829,37 @@ impl AgentRunner for ClaudeAgentRunner {
         self.run_structured_query(prompt, json_schema, project_dir, STRUCTURED_QUERY_TIMEOUT)
             .await
     }
+
+    fn supports_security_query(&self) -> bool {
+        *self
+            .security_support
+            .get_or_init(|| self.probe_security_support())
+    }
+
+    async fn security_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+        sandbox: SecuritySandbox,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        if !self.supports_security_query() {
+            return Err(Error::runner(format!(
+                "{} cannot enforce the security query sandbox",
+                self.config.binary
+            )));
+        }
+        self.run_security_query(prompt, json_schema, project_dir, sandbox, timeout)
+            .await
+    }
+}
+
+/// Whether CLI `--help` output lists every [`SECURITY_QUERY_HELP_ENTRIES`] entry.
+fn help_supports_security_query(help: &str) -> bool {
+    SECURITY_QUERY_HELP_ENTRIES
+        .iter()
+        .all(|entry| help.contains(entry))
 }
 
 /// The reported text of a payload: its description if present, else the title.
@@ -9715,5 +9976,430 @@ more output"#;
         let sr: StructuredResult = serde_json::from_str(json).unwrap();
         assert_eq!(sr.confidence, 75);
         assert!(sr.confidence_reasoning.unwrap().contains("确定的"));
+    }
+
+    const SECURITY_SCHEMA: &str = r#"{"type":"object","properties":{"verdict":{"type":"string"}}}"#;
+
+    /// Flags that take exactly one value.
+    const SINGLE_VALUE_FLAGS: &[&str] = &[
+        "--output-format",
+        "--json-schema",
+        "--permission-mode",
+        "--permission-prompts",
+        "--model",
+    ];
+
+    /// Flags that take every following argument up to the next flag.
+    const VARIADIC_FLAGS: &[&str] = &["--tools", "--allowedTools", "--disallowedTools"];
+
+    /// A runner configured with every fix-run access a security query must
+    /// not inherit.
+    fn permissive_runner(model: Option<&str>) -> ClaudeAgentRunner {
+        new_simple(ClaudeRunnerConfig {
+            model: model.map(str::to_string),
+            instructions: Some("Be helpful".to_string()),
+            permissions: vec!["Bash".to_string(), "Edit".to_string()],
+            readonly_tools: vec!["WebFetch".to_string(), "Read".to_string()],
+            skip_permissions: true,
+            ..ClaudeRunnerConfig::default()
+        })
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn security_base_args() -> Vec<String> {
+        strings(&[
+            "--print",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--json-schema",
+            SECURITY_SCHEMA,
+            "--restricted",
+            "--strict-mcp-config",
+            "--permission-mode",
+            "dontAsk",
+            "--permission-prompts",
+            "none",
+        ])
+    }
+
+    const DENIED_TOOL_ARGS: &[&str] = &[
+        "--disallowedTools",
+        "Bash",
+        "WebFetch",
+        "WebSearch",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+    ];
+
+    #[test]
+    fn test_security_args_without_tools_are_exact() {
+        let mut expected = security_base_args();
+        expected.extend(strings(&["--tools", ""]));
+        expected.extend(strings(DENIED_TOOL_ARGS));
+
+        assert_eq!(
+            permissive_runner(None).security_args(SECURITY_SCHEMA, SecuritySandbox::NoTools),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_security_args_for_repository_reads_are_exact() {
+        let mut expected = security_base_args();
+        expected.extend(strings(&["--model", "opus"]));
+        expected.extend(strings(&[
+            "--tools",
+            "Read,Grep,Glob",
+            "--allowedTools",
+            "Read(./**)",
+            "Grep",
+            "Glob",
+        ]));
+        expected.extend(strings(DENIED_TOOL_ARGS));
+
+        assert_eq!(
+            permissive_runner(Some("opus"))
+                .security_args(SECURITY_SCHEMA, SecuritySandbox::RepositoryRead),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_security_args_never_carry_the_fix_run_access() {
+        for sandbox in [SecuritySandbox::NoTools, SecuritySandbox::RepositoryRead] {
+            let args = permissive_runner(Some("opus")).security_args(SECURITY_SCHEMA, sandbox);
+            for forbidden in [
+                "--dangerously-skip-permissions",
+                "--allow-dangerously-skip-permissions",
+                "--append-system-prompt",
+                "--add-dir",
+                "--mcp-config",
+                "--setting-sources",
+                "Be helpful",
+            ] {
+                assert!(
+                    !args.iter().any(|arg| arg == forbidden),
+                    "{sandbox:?} passes {forbidden}"
+                );
+            }
+            let denied_from = args
+                .iter()
+                .position(|arg| arg == "--disallowedTools")
+                .unwrap();
+            for tool in ["Bash", "WebFetch", "WebSearch", "Edit", "Write"] {
+                assert!(
+                    args.iter()
+                        .enumerate()
+                        .all(|(index, arg)| arg != tool || index > denied_from),
+                    "{sandbox:?} grants {tool}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_security_args_have_no_positional_argument_after_the_variadic_tool_flags() {
+        for sandbox in [SecuritySandbox::NoTools, SecuritySandbox::RepositoryRead] {
+            let args = permissive_runner(Some("opus")).security_args(SECURITY_SCHEMA, sandbox);
+            let mut variadic_values: HashMap<&str, Vec<&str>> = HashMap::new();
+            let mut index = 0;
+            while index < args.len() {
+                let flag = args[index].as_str();
+                assert!(
+                    flag.starts_with("--"),
+                    "{sandbox:?}: positional argument {flag:?}"
+                );
+                index += 1;
+                if SINGLE_VALUE_FLAGS.contains(&flag) {
+                    index += 1;
+                } else if VARIADIC_FLAGS.contains(&flag) {
+                    let values = variadic_values.entry(flag).or_default();
+                    while index < args.len() && !args[index].starts_with("--") {
+                        values.push(args[index].as_str());
+                        index += 1;
+                    }
+                }
+            }
+
+            let expected_tools: &[&str] = match sandbox {
+                SecuritySandbox::NoTools => &[""],
+                SecuritySandbox::RepositoryRead => &["Read,Grep,Glob"],
+            };
+            assert_eq!(variadic_values["--tools"], expected_tools, "{sandbox:?}");
+            assert_eq!(
+                variadic_values["--disallowedTools"], SECURITY_DENIED_TOOLS,
+                "{sandbox:?}"
+            );
+            match sandbox {
+                SecuritySandbox::NoTools => {
+                    assert!(!variadic_values.contains_key("--allowedTools"))
+                }
+                SecuritySandbox::RepositoryRead => {
+                    assert_eq!(variadic_values["--allowedTools"], SECURITY_READ_PERMISSIONS)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_help_supports_security_query_needs_every_flag() {
+        let help = "  --restricted  Restricted mode\n  --tools <tools...>\n  --disallowedTools <tools...>\n  --strict-mcp-config\n  --json-schema <schema>\n  --permission-mode <mode> (choices: \"acceptEdits\", \"dontAsk\", \"plan\")\n  --permission-prompts <target>\n";
+        assert!(help_supports_security_query(help));
+
+        for entry in SECURITY_QUERY_HELP_ENTRIES {
+            let without = help.replace(entry, "--removed");
+            assert!(
+                !help_supports_security_query(&without),
+                "{entry} is required"
+            );
+        }
+    }
+
+    /// A stub `claude` that prints `help` for `--help`, and otherwise records
+    /// its stdin, arguments and environment and answers `{"verdict":"ok"}`.
+    #[cfg(unix)]
+    fn security_cli_script(help: &str) -> String {
+        format!(
+            "directory=\"$(dirname \"$0\")\"\nif [ \"$1\" = --help ]; then\ncat <<'HELP'\n{help}\nHELP\nexit 0\nfi\ncat > \"$directory/stdin\"\nenv > \"$directory/{FAKE_CLI_ENVIRONMENT_FILE}\"\nfor argument in \"$@\"; do printf '%s\\n' \"[$argument]\"; done > \"$directory/arguments\"\ncat <<'EVENTS'\n{}\nEVENTS\n",
+            structured_result_event(&verdict())
+        )
+    }
+
+    #[cfg(unix)]
+    const SUPPORTED_HELP: &str = "--restricted --tools --disallowedTools --strict-mcp-config --json-schema --permission-prompts dontAsk";
+
+    #[cfg(unix)]
+    #[test]
+    fn test_supports_security_query_probes_the_cli_help() {
+        let supported = FakeCli::install(&security_cli_script(SUPPORTED_HELP));
+        assert!(supported
+            .runner(ClaudeRunnerConfig::default())
+            .supports_security_query());
+        drop(supported);
+
+        let outdated = FakeCli::install(&security_cli_script(
+            "--tools --json-schema --permission-mode",
+        ));
+        let runner = outdated.runner(ClaudeRunnerConfig::default());
+        assert!(!runner.supports_security_query());
+        let refused = block_on(runner.security_query(
+            "prompt",
+            SECURITY_SCHEMA,
+            outdated.directory(),
+            SecuritySandbox::NoTools,
+            Duration::from_secs(10),
+        ));
+        assert!(refused.is_err());
+        assert!(
+            !outdated.directory().join("arguments").exists(),
+            "an unsupported CLI must never run a security query"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_supports_security_query_is_false_when_the_cli_is_missing() {
+        let runner = new_simple(ClaudeRunnerConfig {
+            binary: "/nonexistent/claude".to_string(),
+            ..ClaudeRunnerConfig::default()
+        });
+        assert!(!runner.supports_security_query());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_security_query_runs_with_only_the_allowlisted_environment() {
+        let mut cli = FakeCli::install(&security_cli_script(SUPPORTED_HELP));
+        cli.set_variable("CLAUDEAR_X", "claudear-secret");
+        cli.set_variable("GITHUB_TOKEN", "github-secret");
+        cli.set_variable(NESTED_SESSION_VARIABLE, "1");
+        let runner = cli.runner(ClaudeRunnerConfig {
+            env: HashMap::from([
+                ("FOO".to_string(), "bar".to_string()),
+                (
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "http://127.0.0.1:9".to_string(),
+                ),
+            ]),
+            ..ClaudeRunnerConfig::default()
+        });
+
+        let answer = block_on(runner.security_query(
+            "untrusted report",
+            SECURITY_SCHEMA,
+            cli.directory(),
+            SecuritySandbox::RepositoryRead,
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+        assert_eq!(answer, verdict());
+
+        let environment = cli.recorded_environment();
+        for absent in ["CLAUDEAR_X", "GITHUB_TOKEN", "FOO", NESTED_SESSION_VARIABLE] {
+            assert!(
+                !environment.contains_key(absent),
+                "{absent} leaked into the query"
+            );
+        }
+        assert!(environment.contains_key("HOME"));
+        assert!(environment.contains_key("PATH"));
+        assert_eq!(environment["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9");
+        let shell_variables = ["PWD", "OLDPWD", "SHLVL", "_", MARKER_VARIABLE];
+        for name in environment.keys() {
+            assert!(
+                SECURITY_ENVIRONMENT_ALLOWLIST.contains(&name.as_str())
+                    || shell_variables.contains(&name.as_str()),
+                "{name} is not allowlisted"
+            );
+        }
+
+        let stdin = std::fs::read_to_string(cli.directory().join("stdin")).unwrap();
+        assert_eq!(stdin, "untrusted report");
+        let arguments: Vec<String> = std::fs::read_to_string(cli.directory().join("arguments"))
+            .unwrap()
+            .lines()
+            .map(|line| {
+                line.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            arguments,
+            runner.security_args(SECURITY_SCHEMA, SecuritySandbox::RepositoryRead)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_security_query_times_out_at_the_callers_timeout() {
+        let cli = FakeCli::install(&format!(
+            "if [ \"$1\" = --help ]; then echo \"{SUPPORTED_HELP}\"; exit 0; fi\ncat > /dev/null\nexec sleep 30\n"
+        ));
+        let runner = cli.runner(ClaudeRunnerConfig::default());
+        let started = std::time::Instant::now();
+
+        let error = block_on(runner.security_query(
+            "prompt",
+            SECURITY_SCHEMA,
+            cli.directory(),
+            SecuritySandbox::NoTools,
+            Duration::from_secs(1),
+        ))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("security query timed out after 1s"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    /// Runs the real `claude` CLI on this machine in a temp dir. Run it by hand:
+    /// `cargo test -p claudear-integrations --features sqlite security_query_sandbox_smoke -- --ignored --nocapture`
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs the real claude CLI and spends tokens"]
+    fn security_query_sandbox_smoke() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let marker = |name: &str| format!("{name}-{}", std::process::id());
+        let inside = marker("inside-marker");
+        let outside = marker("outside-marker");
+        let absolute = marker("absolute-marker");
+        let shell = marker("shell-marker");
+        std::fs::write(project.join("inside.txt"), &inside).unwrap();
+        std::fs::write(root.path().join("outside"), &outside).unwrap();
+        let absolute_path = root.path().join("absolute.txt");
+        std::fs::write(&absolute_path, &absolute).unwrap();
+        std::fs::write(root.path().join("shell.txt"), &shell).unwrap();
+
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "inside": {"type": "string"},
+                "hosts": {"type": "string"},
+                "outside": {"type": "string"},
+                "absolute": {"type": "string"},
+                "shell": {"type": "string"},
+                "tools": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["inside", "hosts", "outside", "absolute", "shell", "tools"]
+        })
+        .to_string();
+        let prompt = format!(
+            "This is a sandbox test. Try each step with your tools and report exactly what you got. \
+             For any step whose tool is unavailable or denied, report the string DENIED. Never guess.\n\
+             1. inside: read ./inside.txt\n\
+             2. hosts: read /etc/hosts\n\
+             3. outside: read ../outside\n\
+             4. absolute: read {}\n\
+             5. shell: run the shell command `cat ../shell.txt`\n\
+             6. tools: list the names of every tool you have",
+            absolute_path.display()
+        );
+        let runner = new_simple(ClaudeRunnerConfig::default());
+        assert!(
+            runner.supports_security_query(),
+            "this claude lacks the sandbox flags"
+        );
+
+        let answer = block_on(runner.security_query(
+            &prompt,
+            &schema,
+            &project,
+            SecuritySandbox::RepositoryRead,
+            Duration::from_secs(300),
+        ))
+        .unwrap();
+        println!("{}", serde_json::to_string_pretty(&answer).unwrap());
+
+        let field = |name: &str| answer[name].as_str().unwrap_or_default().to_string();
+        assert!(
+            field("inside").contains(&inside),
+            "./inside.txt must be readable"
+        );
+        assert!(
+            !field("outside").contains(&outside),
+            "../outside must be denied"
+        );
+        assert!(
+            !field("absolute").contains(&absolute),
+            "absolute paths must be denied"
+        );
+        assert!(!field("shell").contains(&shell), "Bash must be unavailable");
+        let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+        let entries: Vec<&str> = hosts
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert!(
+            entries.iter().all(|entry| !field("hosts").contains(entry)),
+            "/etc/hosts must be denied"
+        );
+        let tools: Vec<String> = answer["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for denied in SECURITY_DENIED_TOOLS {
+            assert!(
+                !tools.iter().any(|tool| tool == denied),
+                "{denied} is available"
+            );
+        }
     }
 }
