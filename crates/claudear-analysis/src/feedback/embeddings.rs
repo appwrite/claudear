@@ -2,6 +2,7 @@
 //!
 //! Uses the Nomic Embed Text model for generating embeddings.
 
+use claudear_config::config::EmbeddingModelConfig;
 use claudear_core::error::{Error, Result};
 use fastembed::{EmbeddingModel, ExecutionProviderDispatch, TextEmbedding, TextInitOptions};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -88,6 +89,42 @@ impl EmbeddingConfig {
             pool_size,
             execution_providers: Vec::new(),
             sub_batch_size: 0,
+        }
+    }
+
+    /// Build from the `[embedding]` config section.
+    pub fn from_settings(settings: &EmbeddingModelConfig) -> Self {
+        #[allow(unused_mut)]
+        let mut execution_providers = Vec::new();
+        if settings.gpu {
+            #[cfg(feature = "cuda")]
+            {
+                execution_providers.push(
+                    ort::ep::CUDA::default()
+                        .with_device_id(settings.device_id)
+                        .build(),
+                );
+                tracing::info!(
+                    device_id = settings.device_id,
+                    "CUDA execution provider configured for embeddings"
+                );
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                tracing::warn!(
+                    "embedding.gpu = true but binary was compiled without --features cuda; falling back to CPU"
+                );
+            }
+        }
+
+        Self {
+            pool_size: match settings.pool_size {
+                0 => DEFAULT_POOL_SIZE,
+                size => size as usize,
+            },
+            execution_providers,
+            sub_batch_size: settings.sub_batch_size as usize,
+            ..Self::default()
         }
     }
 
@@ -453,6 +490,25 @@ mod tests {
         if let Err(e) = EmbeddingClient::warmup() {
             eprintln!("Embedding warmup failed (model may be unavailable): {e}");
         }
+    }
+
+    #[test]
+    fn from_settings_defaults_to_one_instance_and_auto_sub_batch() {
+        let config = EmbeddingConfig::from_settings(&EmbeddingModelConfig::default());
+        assert_eq!(config.pool_size, DEFAULT_POOL_SIZE);
+        assert_eq!(config.sub_batch_size, 0);
+        assert!(config.execution_providers.is_empty());
+    }
+
+    #[test]
+    fn from_settings_applies_overrides() {
+        let config = EmbeddingConfig::from_settings(&EmbeddingModelConfig {
+            pool_size: 3,
+            sub_batch_size: 64,
+            ..EmbeddingModelConfig::default()
+        });
+        assert_eq!(config.pool_size, 3);
+        assert_eq!(config.sub_batch_size, 64);
     }
 
     #[test]

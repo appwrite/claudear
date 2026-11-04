@@ -253,12 +253,15 @@ pub fn create_api_router_full(
             "/api/chat/models/download",
             axum::routing::post(download_model_handler),
         )
-        .with_state(state)
+        .with_state(state.clone())
         .nest_service("/avatars", ServeDir::new(avatars_dir));
 
     // Merge chat routes if enabled
     let api_routes = if let Some(chat_state) = chat_state {
-        api_routes.merge(claudear_integrations::chat::create_chat_router(chat_state))
+        api_routes.merge(super::chat::authenticated(
+            claudear_integrations::chat::create_chat_router(chat_state),
+            state,
+        ))
     } else {
         api_routes
     };

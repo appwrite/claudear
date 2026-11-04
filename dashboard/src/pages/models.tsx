@@ -2,7 +2,8 @@ import { useState, useCallback } from 'react'
 import useSWR from 'swr'
 import { PageHeader } from '../components/layout/page-header'
 import { useAuth } from '../lib/auth'
-import { fetchChatModels } from '../lib/chat'
+import { fetchChatModels, isChatDisabled } from '../lib/chat'
+import { ChatDisabledNotice } from '../components/chat/ChatDisabledNotice'
 import { browseModels, downloadModel, type BrowseModel, type BrowseResponse } from '../lib/models'
 import {
   Search, Download, Loader2, Package, HardDrive,
@@ -22,7 +23,7 @@ export default function ModelsPage() {
   const isAdmin = user?.role === 'admin'
 
   // Current model status
-  const { data: modelsData, mutate: mutateModels } = useSWR('chat-models', fetchChatModels, {
+  const { data: modelsData, error: modelsError, mutate: mutateModels } = useSWR('chat-models', fetchChatModels, {
     refreshInterval: 3000,
   })
   const currentModel = modelsData?.models?.[0]
@@ -119,7 +120,9 @@ export default function ModelsPage() {
         <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground mb-4">
           Current Model
         </h3>
-        {currentModel ? (
+        {isChatDisabled(modelsError) ? (
+          <ChatDisabledNotice />
+        ) : currentModel ? (
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <Cpu className={`h-5 w-5 ${statusColors[currentModel.status] ?? 'text-muted-foreground'}`} />

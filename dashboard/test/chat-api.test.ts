@@ -4,13 +4,15 @@ import {
   fetchChatSession,
   deleteChatSession,
   fetchChatModels,
+  isChatDisabled,
 } from "../src/lib/chat";
+import { ApiError } from "../src/lib/api";
 
-function mockFetch(data: unknown, ok = true) {
+function mockFetch(data: unknown, ok = true, status = ok ? 200 : 500) {
   globalThis.fetch = mock(() =>
     Promise.resolve({
       ok,
-      status: ok ? 200 : (ok === false ? 500 : 204),
+      status,
       statusText: ok ? "OK" : "Internal Server Error",
       json: () => Promise.resolve(data),
     })
@@ -67,9 +69,11 @@ describe("chat REST API helpers", () => {
     test("calls correct URL with DELETE method", async () => {
       mockFetch(null);
 
+      document.cookie = "claudear_csrf=csrf-token";
       await deleteChatSession("sess-456");
       expect(fetch).toHaveBeenCalledWith("/api/chat/sessions/sess-456", {
         method: "DELETE",
+        headers: { "x-csrf-token": "csrf-token" },
       });
     });
 
@@ -96,6 +100,24 @@ describe("chat REST API helpers", () => {
     test("throws on error response", async () => {
       mockFetch(null, false);
       expect(fetchChatModels()).rejects.toThrow("Failed to fetch models");
+    });
+  });
+
+  describe("disabled chat", () => {
+    test("a 404 rejects with an ApiError carrying the status", async () => {
+      mockFetch(null, false, 404);
+      const error = await fetchChatSessions().catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).status).toBe(404);
+      expect(isChatDisabled(error)).toBe(true);
+    });
+
+    test("other failures do not read as disabled", async () => {
+      mockFetch(null, false, 500);
+      const error = await fetchChatModels().catch((caught: unknown) => caught);
+      expect((error as ApiError).status).toBe(500);
+      expect(isChatDisabled(error)).toBe(false);
+      expect(isChatDisabled(new Error("Not Found"))).toBe(false);
     });
   });
 });

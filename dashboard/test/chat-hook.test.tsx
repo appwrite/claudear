@@ -60,9 +60,9 @@ class MockWebSocket extends EventTarget {
 }
 
 // Helper component to consume the hook and expose its state.
-function ChatHarness({ repoId }: { repoId?: number }) {
+function ChatHarness({ repoId, enabled }: { repoId?: number; enabled?: boolean }) {
   const { messages, sendMessage, stopStreaming, isStreaming, isConnected, error, sessionId, clearMessages } =
-    useChat(repoId);
+    useChat(repoId, enabled);
 
   return (
     <div>
@@ -100,6 +100,25 @@ describe("useChat hook", () => {
     const result = render(<ChatHarness repoId={repoId} />);
     return result;
   }
+
+  test("does not open a websocket when disabled", () => {
+    globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+    render(<ChatHarness enabled={false} />);
+    expect(lastWs).toBeNull();
+    expect(screen.getByTestId("connected").textContent).toBe("false");
+    fireEvent.click(screen.getByTestId("send"));
+    expect(screen.getByTestId("error").textContent).toBe("Not connected");
+  });
+
+  test("opens the websocket once enabled", () => {
+    globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+    const { rerender } = render(<ChatHarness enabled={false} />);
+    expect(lastWs).toBeNull();
+    rerender(<ChatHarness enabled />);
+    expect(lastWs).not.toBeNull();
+    act(() => getWs().simulateOpen());
+    expect(screen.getByTestId("connected").textContent).toBe("true");
+  });
 
   test("starts disconnected", () => {
     setup();

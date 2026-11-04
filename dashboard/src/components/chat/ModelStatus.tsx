@@ -1,6 +1,7 @@
 import { Cpu, AlertCircle, Loader2, Download } from 'lucide-react'
 import useSWR from 'swr'
-import { fetchChatModels } from '../../lib/chat'
+import { fetchChatModels, isChatDisabled } from '../../lib/chat'
+import { ChatDisabledBadge } from './ChatDisabledNotice'
 import { useAuth } from '../../lib/auth'
 import { useRouter } from '../../router'
 
@@ -14,6 +15,10 @@ export function ModelStatus() {
   })
 
   const model = data?.models?.[0]
+
+  if (isChatDisabled(error)) {
+    return <ChatDisabledBadge />
+  }
 
   if (error || !model) {
     return (
