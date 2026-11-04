@@ -625,6 +625,10 @@ claudear dashboard --dashboard-dir ./dashboard/dist
 - Source-by-source metrics (Linear, Sentry, Discord, GitHub)
 - Recent attempt history with direct PR links
 - Retryable issues with one-click retry
+- Deploy QA: per-track release tips and their QA results, with admin-editable track config
+- Integrations: every source, SCM, notifier and automation with its configured and enabled state
+
+Console config edits are written to `claudear.toml` in normalised form and apply after restart; secrets are write-only; read-only mounts disable saving.
 
 <p align="center">
   <img src="website/assets/screenshots/overview.png" alt="Dashboard overview" width="800" />
@@ -666,8 +670,26 @@ claudear dashboard --dashboard-dir ./dashboard/dist
 | `GET /api/repos/dependencies` | Dependency graph |
 | `GET /api/inference/stats` | Inference success rates |
 | `GET /api/regressions` | Regression checks |
+| `GET /api/deploy-qa` | Deploy QA status per track |
+| `GET /api/deploy-qa/tips` | Recent deploy QA tips (`?track=`) |
+| `GET/PUT /api/deploy-qa/config` | Deploy QA config (admin) |
+| `GET /api/features` | Integration and feature status |
 | `GET /api/telemetry/overview` | Telemetry overview |
 | `GET /api/telemetry/cost-analysis` | Cost analysis |
+
+#### Reverse proxy
+
+The chat websocket (`/api/chat/ws`) only accepts an upgrade whose `Origin` matches the host the browser connected to. Behind a reverse proxy, either preserve the original `Host` header or send it in `X-Forwarded-Host` or `Forwarded: host=`, otherwise every upgrade is rejected with 403. For nginx:
+
+```nginx
+location /api/chat/ws {
+    proxy_pass http://127.0.0.1:3100;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+}
+```
 
 ### Scheduled Reports
 

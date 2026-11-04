@@ -14,6 +14,7 @@ use tower_cookies::{Cookie, Cookies};
 const CSRF_COOKIE: &str = "claudear_csrf";
 const CSRF_HEADER: &str = "x-csrf-token";
 const CSRF_TOKEN_LEN: usize = 32;
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self'; frame-ancestors 'none'";
 
 /// Middleware that adds security headers to every response.
 pub async fn security_headers(request: Request, next: Next) -> Response {
@@ -35,9 +36,7 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
     );
     headers.insert(
         "content-security-policy",
-        HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self'; frame-ancestors 'none'",
-        ),
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
     );
 
     response
@@ -139,6 +138,21 @@ mod tests {
             .layer(CookieManagerLayer::new())
     }
 
+    fn directive(name: &str) -> Vec<&'static str> {
+        CONTENT_SECURITY_POLICY
+            .split(';')
+            .map(str::split_whitespace)
+            .find_map(|mut parts| (parts.next() == Some(name)).then(|| parts.collect()))
+            .unwrap_or_else(|| panic!("no {name} directive"))
+    }
+
+    #[test]
+    fn scripts_and_fonts_load_only_from_the_dashboard_origin() {
+        assert_eq!(directive("script-src"), ["'self'"]);
+        assert_eq!(directive("font-src"), ["'self'"]);
+        assert_eq!(directive("style-src"), ["'self'", "'unsafe-inline'"]);
+    }
+
     #[tokio::test]
     async fn test_security_headers_present() {
         let app = test_app();
@@ -161,7 +175,10 @@ mod tests {
             response.headers().get("referrer-policy").unwrap(),
             "strict-origin-when-cross-origin"
         );
-        assert!(response.headers().get("content-security-policy").is_some());
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            CONTENT_SECURITY_POLICY
+        );
         assert!(response.headers().get("permissions-policy").is_some());
     }
 

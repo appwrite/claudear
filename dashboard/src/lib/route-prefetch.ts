@@ -4,11 +4,14 @@ import {
   fetchAnalyticsSummary,
   fetchAttempts,
   fetchConfig,
+  fetchDeployQaStatus,
+  fetchDeployQaTips,
   fetchDependencies,
   fetchDiscordChannels,
   fetchDiscordChannelStats,
   fetchErrors,
   fetchExperiments,
+  fetchFeatures,
   fetchFeedback,
   fetchInferenceHistory,
   fetchInferenceStats,
@@ -78,6 +81,10 @@ const routePrefetchers: Record<string, () => void> = {
       queuePreload(['regressions', status], () => fetchRegressions(status))
     }
   },
+  '/deploy-qa': () => {
+    queuePreload('deploy-qa-status', fetchDeployQaStatus)
+    queuePreload(['deploy-qa-tips', ''], () => fetchDeployQaTips(''))
+  },
   '/experiments': () => {
     queuePreload('experiments', fetchExperiments)
   },
@@ -89,6 +96,9 @@ const routePrefetchers: Record<string, () => void> = {
   '/channels': () => {
     queuePreload('discord-channels', fetchDiscordChannels)
     queuePreload('discord-channel-stats', fetchDiscordChannelStats)
+  },
+  '/integrations': () => {
+    queuePreload('features', fetchFeatures)
   },
   '/learning': () => {
     queuePreload('repos', fetchRepos)
@@ -122,9 +132,13 @@ const routePrefetchers: Record<string, () => void> = {
   },
 }
 
-export function prefetchRouteData(path: string) {
+const adminRole = 'admin'
+const adminRoutes = new Set<string>(['/config', '/users'])
+
+export function prefetchRouteData(path: string, role?: string) {
   const prefetch = routePrefetchers[path]
   if (!prefetch || prefetchedRoutes.has(path)) return
+  if (adminRoutes.has(path) && role !== adminRole) return
 
   prefetchedRoutes.add(path)
   prefetch()

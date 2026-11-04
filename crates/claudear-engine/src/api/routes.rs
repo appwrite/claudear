@@ -1,14 +1,16 @@
 //! API route handlers for the dashboard.
 
 use super::auth::*;
+use super::config_file::{self, ConfigFile, ConfigFileError, OptionalSection};
 use crate::retry::RetryManager;
 use axum::{
     extract::{
+        rejection::JsonRejection,
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -31,14 +33,17 @@ pub struct ApiState {
     pub tracker: Arc<dyn FixAttemptTracker>,
     /// Instant when the server started, for uptime calculation.
     pub start_time: Instant,
-    /// Path to the config file on disk (for read/write from dashboard).
-    pub config_path: PathBuf,
+    /// The config file on disk, for read/write from the dashboard.
+    pub config_file: ConfigFile,
     /// Watch channel for real-time indexing progress pushed from SQLite hooks.
     pub indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
     /// General-purpose storage directory for user uploads (avatars, etc.).
     pub storage_dir: PathBuf,
     /// Chat service for model browsing/downloading (None if chat is disabled).
     pub chat_service: Option<Arc<claudear_integrations::chat::ChatService>>,
+    /// The config file as it was when the server started, normalized without
+    /// env overrides; `None` when it could not be read or parsed.
+    pub startup_config: Option<Arc<toml::Value>>,
 }
 
 /// Create the API router.
@@ -87,15 +92,23 @@ pub fn create_api_router_full(
     }
 
     let chat_service = chat_state.as_ref().map(|cs| cs.chat_service.clone());
+    let file = ConfigFile::new(&config_path);
+    let startup_config = file
+        .read()
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|content| config_file::normalize(&content).ok())
+        .map(Arc::new);
 
     let state = ApiState {
         config,
         tracker,
         start_time: Instant::now(),
-        config_path,
+        config_file: file,
         indexing_rx,
         storage_dir: storage_dir.clone(),
         chat_service,
+        startup_config,
     };
 
     let api_routes = Router::new()
@@ -117,6 +130,7 @@ pub fn create_api_router_full(
             get(attempt_retrieval_handler),
         )
         .route("/api/sources", get(sources_handler))
+        .route("/api/features", get(super::features::features_handler))
         .route("/api/retries", get(retries_handler))
         .route("/api/activity", get(activity_handler))
         .route("/api/analytics/summary", get(analytics_summary_handler))
@@ -136,6 +150,12 @@ pub fn create_api_router_full(
         )
         .route("/api/feedback", get(feedback_handler))
         .route("/api/regressions", get(regressions_handler))
+        .route("/api/deploy-qa", get(super::deploy_qa::status_handler))
+        .route("/api/deploy-qa/tips", get(super::deploy_qa::tips_handler))
+        .route(
+            "/api/deploy-qa/config",
+            get(super::deploy_qa::get_config_handler).put(super::deploy_qa::put_config_handler),
+        )
         .route(
             "/api/regressions/{id}/checks",
             get(regression_checks_handler),
@@ -237,29 +257,34 @@ pub fn create_api_router_full(
             "/api/chat/models/download",
             axum::routing::post(download_model_handler),
         )
-        .with_state(state)
+        .with_state(state.clone())
         .nest_service("/avatars", ServeDir::new(avatars_dir));
 
-    // Merge chat routes if enabled
-    let api_routes = if let Some(chat_state) = chat_state {
-        api_routes.merge(claudear_integrations::chat::create_chat_router(chat_state))
-    } else {
-        api_routes
-    };
+    let api_routes = super::chat::mount(
+        api_routes,
+        chat_state.map(claudear_integrations::chat::create_chat_router),
+        state,
+    );
 
     // If dashboard directory is provided, serve from filesystem (development override)
     if let Some(dashboard_path) = dashboard_dir {
         let index_file = dashboard_path.join("index.html");
-        let serve_dir =
-            ServeDir::new(&dashboard_path).not_found_service(ServeFile::new(&index_file));
+        let serve_dir = ServeDir::new(&dashboard_path).fallback(ServeFile::new(&index_file));
 
-        api_routes.fallback_service(serve_dir)
+        api_routes
+            .route("/api", axum::routing::any(api_not_found_handler))
+            .route("/api/{*path}", axum::routing::any(api_not_found_handler))
+            .fallback_service(serve_dir)
     } else if super::embedded::has_dashboard() {
         // Serve the embedded dashboard compiled into the binary
         api_routes.fallback_service(tower::service_fn(super::embedded::embedded_fallback))
     } else {
         api_routes
     }
+}
+
+async fn api_not_found_handler() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 #[derive(Serialize)]
@@ -2579,187 +2604,119 @@ async fn telemetry_latency_handler(
     }))
 }
 
+const CONFIG_SAVED_MESSAGE: &str = "Config saved. Restart claudear to apply changes.";
+
 #[derive(Serialize)]
 struct ConfigResponse {
     content: String,
+    secret_paths: Vec<String>,
+    runtime_overrides: Vec<String>,
+    restart_required: bool,
+    writable: bool,
+    revision: String,
+    optional_sections: Vec<OptionalSection>,
 }
 
 #[derive(Deserialize)]
 struct ConfigUpdateRequest {
     content: String,
+    #[serde(default)]
+    revision: Option<String>,
 }
 
-/// Redact values of keys that look like secrets in raw TOML content.
-fn redact_secrets(content: &str) -> String {
-    let re = regex_lite::Regex::new(
-        r#"(?im)^(\s*(?:[a-z_]*(?:token|secret|password|api_key|auth)[a-z_]*)\s*=\s*)("[^"]*"|'[^']*'|[^\n]*)"#,
-    )
-    .expect("valid regex");
-    re.replace_all(content, r#"${1}"[REDACTED]""#).into_owned()
+#[derive(Serialize)]
+struct ConfigSaveResponse {
+    ok: bool,
+    restart_required: bool,
+    revision: String,
+    message: &'static str,
 }
 
-/// Restore [REDACTED] to actual values before saving to disk
-const REDACTED: &str = "[REDACTED]";
-fn restore_redacted(incoming: &mut toml::Value, current: &toml::Value) {
-    match (incoming, current) {
-        (toml::Value::Table(inc), toml::Value::Table(cur)) => {
-            for (k, v) in inc.iter_mut() {
-                if let Some(cur_val) = cur.get(k) {
-                    restore_redacted(v, cur_val);
-                }
-            }
-        }
-        // Skipping arrays intentionally as secrets will not be stored in the arrays due to ordering issue
-        // (toml::Value::Array(inc), toml::Value::Array(cur)) => {
-        //     for (inc_val, cur_val) in inc.iter_mut().zip(cur.iter()) {
-        //         restore_redacted(inc_val, cur_val);
-        //     }
-        // }
-        (inc @ toml::Value::String(_), cur) if inc.as_str() == Some(REDACTED) => {
-            *inc = cur.clone();
-        }
-
-        _ => {}
-    }
+fn restart_required(state: &ApiState, current: &toml::Value) -> bool {
+    state.startup_config.as_deref() != Some(current)
 }
 
-fn find_redacted(value: &toml::Value, path: &str, out: &mut Vec<String>) {
-    match value {
-        toml::Value::Table(table) => {
-            for (k, v) in table {
-                let child = if path.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{path}.{k}")
-                };
-                find_redacted(v, &child, out);
-            }
-        }
-        toml::Value::Array(items) => {
-            for (i, v) in items.iter().enumerate() {
-                find_redacted(v, &format!("{path}[{i}]"), out);
-            }
-        }
-        toml::Value::String(s) if s == REDACTED => out.push(path.to_string()),
-        _ => {}
-    }
-}
-
-/// GET /api/config — return the raw TOML config file content with secrets redacted.
+/// GET /api/config — the config file rendered from its parsed form with every
+/// secret redacted, plus the file's revision and restart state.
 async fn get_config_handler(
     _user: AdminUser,
     State(state): State<ApiState>,
-) -> Result<Json<ConfigResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let content = tokio::fs::read_to_string(&state.config_path)
+) -> Result<Json<ConfigResponse>, ConfigFileError> {
+    let bytes = config_file::read_locked(&state.config_file)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Failed to read config: {}", e) })),
-            )
-        })?;
+        .map_err(|error| ConfigFileError::unreadable(format!("Failed to read config: {error}")))?;
+    let content = String::from_utf8(bytes)
+        .map_err(|error| ConfigFileError::unreadable(format!("Failed to read config: {error}")))?;
+    let disk = config_file::parse(&content)?;
+    let current = config_file::normalize(&content)?;
+    let document = config_file::redact(&disk)?;
+    let optional_sections = config_file::optional_sections(&current);
+    let revision = config_file::revision(content.as_bytes());
+    let restart_required = restart_required(&state, &current);
+
+    let file = state.config_file.clone();
+    let (writable, runtime_overrides) = tokio::task::spawn_blocking(move || {
+        (
+            config_file::writable(&file),
+            config_file::runtime_overrides(&file, &disk),
+        )
+    })
+    .await
+    .map_err(|error| ConfigFileError::unreadable(format!("Failed to inspect config: {error}")))?;
 
     Ok(Json(ConfigResponse {
-        content: redact_secrets(&content),
+        content: document.content,
+        secret_paths: document.secret_paths,
+        runtime_overrides,
+        restart_required,
+        writable,
+        revision,
+        optional_sections,
     }))
 }
 
-/// PUT /api/config — validate and write the TOML config file.
+/// PUT /api/config — restore redacted secrets, validate as daemon startup
+/// would, and write the file.
 async fn put_config_handler(
-    _user: AdminUser,
+    user: AdminUser,
     State(state): State<ApiState>,
-    Json(body): Json<ConfigUpdateRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !check_api_rate_limit(_user.0.id) {
-        return Err((
+    body: Result<Json<ConfigUpdateRequest>, JsonRejection>,
+) -> Response {
+    if !check_api_rate_limit(user.0.id) {
+        return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({ "error": "Rate limit exceeded" })),
-        ));
-    }
-
-    let mut incoming: toml::Value = toml::from_str(&body.content).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("Invalid TOML config: {}", e) })),
         )
-    })?;
-
-    let current: toml::Value = match tokio::fs::read_to_string(&state.config_path).await {
-        Ok(s) => toml::from_str(&s).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Invalid on-disk config: {}", e) })),
-            )
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            toml::Value::Table(toml::Table::new())
-        }
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({ "error": format!("Failed to read on-disk config: {}", e) }),
-                ),
-            ));
-        }
+            .into_response();
+    }
+    let result = match body {
+        Ok(Json(update)) => save_config(&state, update).await,
+        Err(rejection) => Err(ConfigFileError::rejected(&rejection)),
     };
-
-    // Replace any [REDACTED] sentinels in the submitted config with the real
-    // values from the on-disk config before validating and saving.
-    restore_redacted(&mut incoming, &current);
-
-    // Reject any sentinel that could not be restored — writing the literal
-    // "[REDACTED]" would silently corrupt the secret on the next restart.
-    let mut unrestored = Vec::new();
-    find_redacted(&incoming, "", &mut unrestored);
-    if !unrestored.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!(
-                    "Config still contains redacted placeholders for: {}. \
-                     Provide the actual value(s) for these fields.",
-                    unrestored.join(", ")
-                )
-            })),
-        ));
+    match result {
+        Ok(saved) => Json(saved).into_response(),
+        Err(error) => error.into_response(),
     }
+}
 
-    let parsed: Config = incoming.try_into().map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("Invalid TOML config: {}", e) })),
-        )
-    })?;
+async fn save_config(
+    state: &ApiState,
+    body: ConfigUpdateRequest,
+) -> Result<ConfigSaveResponse, ConfigFileError> {
+    let incoming = config_file::parse_document(&body.content)?;
+    let outcome = config_file::write_validated(
+        &state.config_file,
+        body.revision.as_deref(),
+        move |current| config_file::restore_all(incoming, &current),
+    )
+    .await?;
 
-    parsed.validate().map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("Config validation failed: {}", e) })),
-        )
-    })?;
-
-    // Re-serialize the validated config to ensure only parsed fields are written to disk.
-    // This prevents injection of arbitrary content via raw user input.
-    let re_serialized = toml::to_string_pretty(&parsed).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Failed to serialize config: {}", e) })),
-        )
-    })?;
-
-    tokio::fs::write(&state.config_path, &re_serialized)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Failed to write config: {}", e) })),
-            )
-        })?;
-
-    Ok(Json(
-        serde_json::json!({ "ok": true, "message": "Config saved. Restart to apply changes." }),
-    ))
+    Ok(ConfigSaveResponse {
+        ok: true,
+        restart_required: restart_required(state, &outcome.normalized),
+        revision: outcome.revision,
+        message: CONFIG_SAVED_MESSAGE,
+    })
 }
 
 #[derive(Serialize)]
@@ -5345,153 +5302,6 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_secrets_basic() {
-        let content = "api_token = \"sk-12345\"\nwebhook_secret = \"whsec_abc\"\nnormal_key = \"not_a_secret\"\n";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(redacted.contains("normal_key"));
-        assert!(!redacted.contains("sk-12345"));
-        assert!(!redacted.contains("whsec_abc"));
-    }
-
-    #[test]
-    fn test_redact_secrets_no_secrets() {
-        let content = "workspace = \"/tmp/repos\"\npoll_interval_ms = 300000\n";
-        let redacted = redact_secrets(content);
-        assert!(!redacted.contains("[REDACTED]"));
-        assert!(redacted.contains("/tmp/repos"));
-        assert!(redacted.contains("300000"));
-    }
-
-    #[test]
-    fn test_redact_secrets_password_key() {
-        let content = "password = \"my_secret_pass\"";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("my_secret_pass"));
-    }
-
-    #[test]
-    fn test_redact_secrets_api_key() {
-        let content = "api_key = \"key-abc123\"";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("key-abc123"));
-    }
-
-    /// Parse TOML, run restore_redacted against the on-disk version, return merged value.
-    fn merge_redacted(incoming: &str, current: &str) -> toml::Value {
-        let mut incoming: toml::Value = toml::from_str(incoming).expect("valid incoming toml");
-        let current: toml::Value = toml::from_str(current).expect("valid current toml");
-        restore_redacted(&mut incoming, &current);
-        incoming
-    }
-
-    #[test]
-    fn test_restore_redacted_replaces_sentinel() {
-        let merged = merge_redacted("api_token = \"[REDACTED]\"", "api_token = \"sk-real\"");
-        assert_eq!(merged["api_token"].as_str(), Some("sk-real"));
-    }
-
-    #[test]
-    fn test_restore_redacted_keeps_edited_value() {
-        // User typed a new secret — it must not be overwritten by the on-disk value.
-        let merged = merge_redacted("api_token = \"sk-new\"", "api_token = \"sk-old\"");
-        assert_eq!(merged["api_token"].as_str(), Some("sk-new"));
-    }
-
-    #[test]
-    fn test_restore_redacted_leaves_non_secret_values_untouched() {
-        let merged = merge_redacted(
-            "workspace = \"/tmp/repos\"\npoll_interval_ms = 300000",
-            "workspace = \"/other\"\npoll_interval_ms = 1",
-        );
-        assert_eq!(merged["workspace"].as_str(), Some("/tmp/repos"));
-        assert_eq!(merged["poll_interval_ms"].as_integer(), Some(300000));
-    }
-
-    #[test]
-    fn test_restore_redacted_nested_table() {
-        let merged = merge_redacted(
-            "[notifiers.helpscout]\napi_key = \"[REDACTED]\"\nmailbox = \"support\"",
-            "[notifiers.helpscout]\napi_key = \"hs-real\"\nmailbox = \"old\"",
-        );
-        assert_eq!(
-            merged["notifiers"]["helpscout"]["api_key"].as_str(),
-            Some("hs-real")
-        );
-        // Non-secret edit in the same table is preserved.
-        assert_eq!(
-            merged["notifiers"]["helpscout"]["mailbox"].as_str(),
-            Some("support")
-        );
-    }
-
-    #[test]
-    fn test_restore_redacted_leaves_arrays_untouched() {
-        // Arrays are intentionally not traversed during restore (the system never
-        // stores secrets in arrays). A sentinel inside an array is therefore left
-        // as-is by restore_redacted; find_redacted catches it and the handler
-        // rejects the save with a 400.
-        let merged = merge_redacted(
-            "tokens = [\"[REDACTED]\", \"keep\"]",
-            "tokens = [\"real-0\", \"stale-1\"]",
-        );
-        let arr = merged["tokens"].as_array().expect("array");
-        assert_eq!(arr[0].as_str(), Some("[REDACTED]"));
-        assert_eq!(arr[1].as_str(), Some("keep"));
-
-        // The unrestored sentinel is surfaced for rejection.
-        let mut out = Vec::new();
-        find_redacted(&merged, "", &mut out);
-        assert_eq!(out, vec!["tokens[0]"]);
-    }
-
-    #[test]
-    fn test_restore_redacted_missing_on_disk_key_keeps_sentinel() {
-        // A secret that was never set on disk cannot be restored, so the literal
-        // sentinel survives the merge. find_redacted is what catches this and the
-        // handler rejects it before writing (see tests below).
-        let merged = merge_redacted("api_token = \"[REDACTED]\"", "other = \"x\"");
-        assert_eq!(merged["api_token"].as_str(), Some("[REDACTED]"));
-    }
-
-    fn redacted_paths(content: &str) -> Vec<String> {
-        let value: toml::Value = toml::from_str(content).expect("valid toml");
-        let mut out = Vec::new();
-        find_redacted(&value, "", &mut out);
-        out
-    }
-
-    #[test]
-    fn test_find_redacted_none_when_fully_restored() {
-        let merged = merge_redacted("api_token = \"[REDACTED]\"", "api_token = \"sk-real\"");
-        let mut out = Vec::new();
-        find_redacted(&merged, "", &mut out);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn test_find_redacted_reports_top_level_key() {
-        assert_eq!(
-            redacted_paths("api_token = \"[REDACTED]\""),
-            vec!["api_token"]
-        );
-    }
-
-    #[test]
-    fn test_find_redacted_reports_nested_path() {
-        let paths = redacted_paths("[notifiers.helpscout]\napi_key = \"[REDACTED]\"");
-        assert_eq!(paths, vec!["notifiers.helpscout.api_key"]);
-    }
-
-    #[test]
-    fn test_find_redacted_reports_array_index() {
-        let paths = redacted_paths("tokens = [\"ok\", \"[REDACTED]\"]");
-        assert_eq!(paths, vec!["tokens[1]"]);
-    }
-
-    #[test]
     fn test_summarize_window_with_merged_and_cannotfix() {
         let now = chrono::Utc::now();
         let attempts = vec![
@@ -5783,6 +5593,11 @@ mod tests {
         let req: ConfigUpdateRequest =
             serde_json::from_str(r#"{"content": "key = \"value\""}"#).unwrap();
         assert_eq!(req.content, r#"key = "value""#);
+        assert!(req.revision.is_none());
+
+        let req: ConfigUpdateRequest =
+            serde_json::from_str(r#"{"content": "", "revision": "abc"}"#).unwrap();
+        assert_eq!(req.revision.as_deref(), Some("abc"));
     }
 
     #[test]
@@ -5880,10 +5695,22 @@ mod tests {
     fn test_config_response_serialization() {
         let resp = ConfigResponse {
             content: "workspace = \"/tmp\"".to_string(),
+            secret_paths: vec!["scm.github.token".to_string()],
+            runtime_overrides: Vec::new(),
+            restart_required: false,
+            writable: true,
+            revision: "abc".to_string(),
+            optional_sections: Vec::new(),
         };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("workspace"));
-        assert!(json.contains("content"));
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["content"], "workspace = \"/tmp\"");
+        assert_eq!(json["secret_paths"][0], "scm.github.token");
+        assert_eq!(json["restart_required"], false);
+        assert_eq!(json["writable"], true);
+        assert_eq!(json["revision"], "abc");
+        assert!(json["optional_sections"].is_array());
+        assert!(json["runtime_overrides"].is_array());
+        assert!(json.get("path").is_none());
     }
 
     #[test]
@@ -6317,45 +6144,6 @@ mod tests {
         assert!((summary.p50_secs.unwrap() - 50.5).abs() < 2.0);
         assert!(summary.p95_secs.unwrap() >= 94.0);
         assert!(summary.p99_secs.unwrap() >= 98.0);
-    }
-
-    #[test]
-    fn test_redact_secrets_single_quoted_values() {
-        let content = "api_token = 'sk-12345'\n";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("sk-12345"));
-    }
-
-    #[test]
-    fn test_redact_secrets_unquoted_values() {
-        let content = "auth_token = mytoken123\n";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("mytoken123"));
-    }
-
-    #[test]
-    fn test_redact_secrets_with_leading_whitespace() {
-        let content = "  client_secret = \"supersecret\"\n";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("supersecret"));
-    }
-
-    #[test]
-    fn test_redact_secrets_preserves_structure() {
-        let content = "[linear]\napi_key = \"lin_key\"\ntrigger_labels = [\"autofix\"]\n";
-        let redacted = redact_secrets(content);
-        assert!(!redacted.contains("lin_key"));
-        assert!(redacted.contains("trigger_labels"));
-        assert!(redacted.contains("[\"autofix\"]"));
-    }
-
-    #[test]
-    fn test_redact_secrets_empty_string() {
-        let redacted = redact_secrets("");
-        assert_eq!(redacted, "");
     }
 
     #[test]
@@ -8271,6 +8059,479 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    const FAKE_CONFIG_FILE: &str = "workspace = \"/tmp/repos\"\n\n\
+        [scm.github]\ntoken = \"fake-route-github-token\"\n\n\
+        [issues.linear]\napi_key = \"fake-route-linear-key\"\n\n\
+        [notifiers.discord]\nwebhook_url = \"https://discord.invalid/fake-route-webhook\"\n";
+
+    const FAKE_ROUTE_SECRETS: &[&str] = &[
+        "fake-route-github-token",
+        "fake-route-linear-key",
+        "fake-route-webhook",
+    ];
+
+    fn config_file_router(path: PathBuf, role: &str) -> (Router, String) {
+        let tracker = create_test_tracker();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        tracker
+            .create_user("config@test.com", &password_hash, "Config", role)
+            .unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(Config::default(), tracker, path, indexing_rx)
+            .layer(CookieManagerLayer::new());
+        (router, token)
+    }
+
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_get_config_redacts_secrets_by_type() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, FAKE_CONFIG_FILE).unwrap();
+        let (router, token) = config_file_router(path.clone(), "admin");
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let content = body["content"].as_str().unwrap();
+        for fake in FAKE_ROUTE_SECRETS {
+            assert!(!content.contains(fake), "{fake} leaked:\n{content}");
+            assert!(!body.to_string().contains(fake), "{fake} leaked: {body}");
+        }
+        let secret_paths: Vec<&str> = body["secret_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.as_str())
+            .collect();
+        for expected in [
+            "scm.github.token",
+            "issues.linear.api_key",
+            "notifiers.discord.webhook_url",
+        ] {
+            assert!(
+                secret_paths.contains(&expected),
+                "{expected}: {secret_paths:?}"
+            );
+        }
+        assert!(body["path"].is_null(), "path field should not be exposed");
+        assert_eq!(body["restart_required"], false);
+        assert_eq!(body["writable"], true);
+        assert_eq!(
+            body["revision"],
+            config_file::revision(FAKE_CONFIG_FILE.as_bytes())
+        );
+        assert!(body["runtime_overrides"].is_array());
+        let optional: Vec<&str> = body["optional_sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|section| section["key"].as_str())
+            .collect();
+        assert!(optional.contains(&"issues.sentry"));
+        assert!(!optional.contains(&"issues.linear"));
+    }
+
+    #[tokio::test]
+    async fn test_put_config_keeps_redacted_secrets_and_tracks_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, FAKE_CONFIG_FILE).unwrap();
+        let (router, token) = config_file_router(path.clone(), "admin");
+
+        let loaded = json_body(
+            router
+                .clone()
+                .oneshot(auth_get("/api/config", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let content = loaded["content"].as_str().unwrap().to_string();
+        assert!(content.contains("token = \"[REDACTED]\""), "{content}");
+
+        let response = router
+            .clone()
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": content, "revision": loaded["revision"] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = json_body(response).await;
+        assert_eq!(saved["ok"], true);
+        assert_eq!(saved["restart_required"], false);
+        assert_eq!(
+            saved["message"],
+            "Config saved. Restart claudear to apply changes."
+        );
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        for fake in FAKE_ROUTE_SECRETS {
+            assert!(on_disk.contains(fake), "{fake} lost from disk:\n{on_disk}");
+        }
+        assert!(!on_disk.contains("[REDACTED]"));
+        assert_eq!(saved["revision"], config_file::revision(on_disk.as_bytes()));
+
+        let changed = content.replace("poll_interval_ms = 300000", "poll_interval_ms = 300001");
+        assert_ne!(changed, content);
+        let response = router
+            .clone()
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": changed, "revision": saved["revision"] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["restart_required"], true);
+
+        let reloaded = json_body(
+            router
+                .oneshot(auth_get("/api/config", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(reloaded["restart_required"], true);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_rejects_a_stale_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, FAKE_CONFIG_FILE).unwrap();
+        let (router, token) = config_file_router(path.clone(), "admin");
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": FAKE_CONFIG_FILE, "revision": "stale" }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(response).await["code"], "revision_mismatch");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_validation_failure_returns_invalid_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, FAKE_CONFIG_FILE).unwrap();
+        let (router, token) = config_file_router(path.clone(), "admin");
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": "workspace = \"/tmp/repos\"\n" }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("No sources configured"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    fn config_router_with(content: &str) -> (Router, String, tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, content).unwrap();
+        let (router, token) = config_file_router(path.clone(), "admin");
+        (router, token, directory, path)
+    }
+
+    #[tokio::test]
+    async fn test_get_config_omits_lines_of_an_unparseable_file() {
+        let content = "workspace = \"/tmp/repos\"\n\n[scm.github]\ntoken = fake-secret-unquoted\n";
+        let (router, token, _directory, _path) = config_router_with(content);
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(
+            !body.to_string().contains("fake-secret-unquoted"),
+            "secret leaked: {body}"
+        );
+        assert!(
+            body["error"].as_str().unwrap().contains("(line 4)"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_config_omits_lines_of_unparseable_content() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({
+                    "content": "workspace = \"/tmp/repos\"\n[scm.github]\ntoken = fake-typed-secret\n"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(
+            !body.to_string().contains("fake-typed-secret"),
+            "secret leaked: {body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_omits_values_from_type_errors() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({
+                    "content": "workspace = \"/tmp/repos\"\npoll_interval_ms = \"fake-misplaced-secret\"\n"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert!(
+            !body.to_string().contains("fake-misplaced-secret"),
+            "secret leaked: {body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_rejects_a_malformed_body_as_invalid() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": 5 }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(body["error"].is_string(), "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_refuses_a_kept_secret_for_a_changed_host() {
+        let content = format!(
+            "{FAKE_CONFIG_FILE}\n[notifiers.email]\nsmtp_host = \"smtp.invalid\"\n\
+             smtp_password = \"fake-route-smtp-password\"\n"
+        );
+        let (router, token, _directory, path) = config_router_with(&content);
+        let loaded = json_body(
+            router
+                .clone()
+                .oneshot(auth_get("/api/config", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let redacted = loaded["content"].as_str().unwrap();
+        let redirected = redacted.replace(
+            "smtp_host = \"smtp.invalid\"",
+            "smtp_host = \"evil.invalid\"",
+        );
+        assert_ne!(redirected, redacted);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": redirected, "revision": loaded["revision"] }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert_eq!(
+            body["error"],
+            "Re-enter notifiers.email.smtp_password when changing notifiers.email.smtp_host"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn test_get_config_redacts_pushover_and_twilio_identifiers() {
+        let content = format!(
+            "{FAKE_CONFIG_FILE}\n[notifiers.sms]\naccount_sid = \"fake-route-twilio-sid\"\n\n\
+             [notifiers.push]\nuser_key = \"fake-route-pushover-user\"\n\n\
+             [users.jake]\npush_user_key = \"fake-route-pushover-registry\"\n"
+        );
+        let (router, token, _directory, _path) = config_router_with(&content);
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        for fake in [
+            "fake-route-twilio-sid",
+            "fake-route-pushover-user",
+            "fake-route-pushover-registry",
+        ] {
+            assert!(!body.to_string().contains(fake), "{fake} leaked: {body}");
+        }
+        let secret_paths = body["secret_paths"].to_string();
+        for path in [
+            "notifiers.sms.account_sid",
+            "notifiers.push.user_key",
+            "users.jake.push_user_key",
+        ] {
+            assert!(secret_paths.contains(path), "{path}: {secret_paths}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_config_waits_for_an_in_progress_write() {
+        let (router, token, _directory, _path) = config_router_with(FAKE_CONFIG_FILE);
+        let held = config_file::HeldWriteLock::acquire();
+
+        let request = tokio::spawn(router.oneshot(auth_get("/api/config", &token)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !request.is_finished(),
+            "GET /api/config read the file during a write"
+        );
+
+        held.release();
+        assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_restores_secrets_from_the_file_it_writes_over() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+        let loaded = json_body(
+            router
+                .clone()
+                .oneshot(auth_get("/api/config", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let held = config_file::HeldWriteLock::acquire();
+
+        let request = tokio::spawn(router.oneshot(auth_put_json(
+            "/api/config",
+            &token,
+            serde_json::json!({ "content": loaded["content"] }),
+        )));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::fs::write(
+            &path,
+            FAKE_CONFIG_FILE.replace("fake-route-github-token", "fake-rotated-github-token"),
+        )
+        .unwrap();
+        held.release();
+
+        assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("fake-rotated-github-token"), "{on_disk}");
+        assert!(!on_disk.contains("fake-route-github-token"), "{on_disk}");
+    }
+
+    #[tokio::test]
+    async fn test_config_endpoints_forbid_viewers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, FAKE_CONFIG_FILE).unwrap();
+        let (router, token) = config_file_router(path.clone(), "viewer");
+
+        let response = router
+            .clone()
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": "workspace = \"/tmp/other\"\n" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_put_config_returns_401() {
+        let tracker = create_test_tracker();
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            Config::default(),
+            tracker,
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"content":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn test_put_config_endpoint_valid_toml_fails_validation() {
         let tracker = create_test_tracker();
@@ -8292,6 +8553,9 @@ mod tests {
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "invalid");
     }
 
     #[test]
@@ -8338,5 +8602,58 @@ mod tests {
         assert_eq!(summary.samples, 0);
         assert!(summary.avg_secs.is_none());
         assert!(summary.max_secs.is_none());
+    }
+
+    #[tokio::test]
+    async fn dashboard_dir_serves_spa_routes_and_rejects_unknown_api_paths() {
+        let dashboard = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(dashboard.path().join("index.html"), "<html>console</html>").unwrap();
+        std::fs::write(dashboard.path().join("app.js"), "console.log(1)").unwrap();
+        let tracker = create_test_tracker();
+        let config = Config {
+            storage_dir: storage.path().to_path_buf(),
+            ..Config::default()
+        };
+        let router = create_api_router_with_dashboard(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            test_indexing_rx(&tracker),
+            Some(dashboard.path().to_path_buf()),
+        )
+        .layer(CookieManagerLayer::new());
+
+        let request = |uri: &str| Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let body = |response: axum::response::Response| async {
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+
+        for uri in ["/api/nope", "/api", "/api/attempts/1/unknown"] {
+            let response = router.clone().oneshot(request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(
+                !body(response).await.contains("console"),
+                "{uri} served index.html"
+            );
+        }
+
+        for uri in ["/deploy-qa", "/", "/attempts/abc"] {
+            let response = router.clone().oneshot(request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(body(response).await, "<html>console</html>", "{uri}");
+        }
+
+        let response = router.clone().oneshot(request("/app.js")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body(response).await, "console.log(1)");
+
+        let response = router.oneshot(request("/api/health")).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a registered API route must still reach its handler"
+        );
     }
 }

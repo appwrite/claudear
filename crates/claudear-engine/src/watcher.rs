@@ -788,47 +788,7 @@ impl Watcher {
             "Repository index built for inference"
         );
 
-        // Build execution providers from config
-        #[allow(unused_mut)]
-        let mut execution_providers = Vec::new();
-        if config.embedding.gpu {
-            #[cfg(feature = "cuda")]
-            {
-                let cuda_ep = ort::ep::CUDA::default()
-                    .with_device_id(config.embedding.device_id)
-                    .build();
-                execution_providers.push(cuda_ep);
-                tracing::info!(
-                    device_id = config.embedding.device_id,
-                    "CUDA execution provider configured for embeddings"
-                );
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                tracing::warn!(
-                    "embedding.gpu = true but binary was compiled without --features cuda; falling back to CPU"
-                );
-            }
-        }
-
-        let emb_pool_size = if config.embedding.pool_size > 0 {
-            config.embedding.pool_size as usize
-        } else if config.embedding.gpu {
-            1 // GPU: default to single instance to avoid wasting VRAM
-        } else {
-            0 // 0 triggers auto-detection in EmbeddingConfig::default()
-        };
-
-        let emb_config = EmbeddingConfig {
-            pool_size: if emb_pool_size > 0 {
-                emb_pool_size
-            } else {
-                EmbeddingConfig::default().pool_size
-            },
-            execution_providers,
-            sub_batch_size: config.embedding.sub_batch_size as usize,
-            ..EmbeddingConfig::default()
-        };
+        let emb_config = EmbeddingConfig::from_settings(&config.embedding);
 
         // Try to initialize embedding client
         match EmbeddingClient::new(emb_config) {
