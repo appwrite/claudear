@@ -189,6 +189,14 @@ pub fn create_api_router_full(
             axum::routing::put(update_profile_handler),
         )
         .route(
+            "/api/auth/invite/inspect",
+            axum::routing::post(super::invites::inspect_invite_handler),
+        )
+        .route(
+            "/api/auth/invite/accept",
+            axum::routing::post(super::invites::accept_invite_handler),
+        )
+        .route(
             "/api/auth/avatar",
             axum::routing::post(upload_avatar_handler)
                 .layer(axum::extract::DefaultBodyLimit::max(6 * 1024 * 1024)),
@@ -212,6 +220,15 @@ pub fn create_api_router_full(
             axum::routing::get(get_user_handler)
                 .put(update_user_handler)
                 .delete(delete_user_handler),
+        )
+        .route(
+            "/api/users/{id}/invite",
+            axum::routing::post(super::invites::issue_invite_handler)
+                .delete(super::invites::revoke_invite_handler),
+        )
+        .route(
+            "/api/directory",
+            axum::routing::put(super::directory::put_directory_handler),
         )
         .route(
             "/api/identities",

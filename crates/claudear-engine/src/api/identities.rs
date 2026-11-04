@@ -248,7 +248,18 @@ pub(crate) fn find_conflicts(
     registry: &UserRegistry,
     plans: &[IdentityPlan],
 ) -> Vec<IdentityViolation> {
-    let mut violations = Vec::new();
+    conflicts_by_plan(registry, plans)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// [`find_conflicts`] grouped by plan: element `i` holds the conflicts of `plans[i]`.
+pub(crate) fn conflicts_by_plan(
+    registry: &UserRegistry,
+    plans: &[IdentityPlan],
+) -> Vec<Vec<IdentityViolation>> {
+    let mut conflicts = Vec::with_capacity(plans.len());
     let mut claimed: HashMap<(IdentityField, String), Claimant> = HashMap::new();
     let mut claim = |field: IdentityField, value: &str, claimant: Claimant| -> bool {
         let value = if field.is_case_insensitive() {
@@ -260,6 +271,7 @@ pub(crate) fn find_conflicts(
     };
 
     for (index, plan) in plans.iter().enumerate() {
+        let mut violations = Vec::new();
         let claimant = plan.user_id.map_or(Claimant::Entry(index), Claimant::User);
         if let Some(slug) = &plan.write.slug {
             let owner = registry.owner(IdentityField::Slug, slug);
@@ -283,8 +295,9 @@ pub(crate) fn find_conflicts(
                 }
             }
         }
+        conflicts.push(violations);
     }
-    violations
+    conflicts
 }
 
 /// Who claims a value within one batch: an existing user, or a not-yet-created entry.
