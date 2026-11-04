@@ -5915,6 +5915,7 @@ mod tests {
     use claudear_config::config::{
         CascadeRule, CascadeTrigger, DeployQaConfig, DeployQaTrackConfig,
     };
+    use claudear_core::identity::Role;
     use claudear_core::types::{IndexedRepo, IssuePriority, RepoIndex};
     use claudear_integrations::notifier::Notifier;
     use claudear_integrations::reports::Report;
@@ -6291,7 +6292,7 @@ mod tests {
             ..live_watcher_options(Arc::new(MockNotifier::new(true)), tracker.clone(), vec![])
         });
         let user_id = tracker
-            .create_user("amy@example.com", "unused-hash", "Amy", "viewer")
+            .create_user("amy@example.com", "unused-hash", "Amy", Role::Viewer)
             .unwrap();
         tracker
             .save_directory(&[DirectoryWrite {

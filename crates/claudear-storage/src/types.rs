@@ -1,6 +1,6 @@
 //! Shared storage types used across trait signatures and API responses.
 
-use claudear_core::identity::{Identities, UserStatus};
+use claudear_core::identity::{Identities, Role, UserStatus};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -13,7 +13,7 @@ pub struct UserRow {
     #[serde(skip_serializing)]
     pub password_hash: String,
     pub name: String,
-    pub role: String,
+    pub role: Role,
     pub avatar_url: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -67,14 +67,14 @@ pub enum DirectoryUser {
     Existing {
         user_id: i64,
         name: Option<String>,
-        role: Option<String>,
+        role: Option<Role>,
     },
     /// A user to create. `Active` carries a real password hash and no invite;
     /// `Invited` carries an unusable hash and normally an invite.
     New {
         email: String,
         name: String,
-        role: String,
+        role: Role,
         password_hash: String,
         status: UserStatus,
     },

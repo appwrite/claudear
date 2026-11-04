@@ -509,7 +509,7 @@ fn seed_admin(
     password_hash: &str,
     name: &str,
 ) -> claudear_core::error::Result<SeededAdmin> {
-    let role = claudear_core::identity::Role::Admin.as_str();
+    let role = claudear_core::identity::Role::Admin;
     match store.get_user_by_email(email)? {
         Some(existing) if existing.status == claudear_core::identity::UserStatus::Invited => {
             store.activate_user(existing.id, password_hash)?;
@@ -539,7 +539,7 @@ fn seed_admin(
 #[cfg(test)]
 mod seed_admin_tests {
     use super::*;
-    use claudear_core::identity::UserStatus;
+    use claudear_core::identity::{Role, UserStatus};
     use claudear_storage::{DirectoryUser, DirectoryWrite, InviteWrite, UserRow};
     use std::sync::Mutex;
 
@@ -558,7 +558,7 @@ mod seed_admin_tests {
                     email: "admin@example.com".to_string(),
                     password_hash: "$2b$12$old".to_string(),
                     name: "Old".to_string(),
-                    role: "viewer".to_string(),
+                    role: Role::Viewer,
                     avatar_url: None,
                     created_at: String::new(),
                     updated_at: String::new(),
@@ -583,7 +583,7 @@ mod seed_admin_tests {
             _email: &str,
             _password_hash: &str,
             _name: &str,
-            _role: &str,
+            _role: Role,
         ) -> claudear_core::error::Result<i64> {
             *self.password_writes.lock().unwrap() += 1;
             Ok(1)
@@ -595,7 +595,7 @@ mod seed_admin_tests {
             _email: Option<&str>,
             password_hash: Option<&str>,
             _name: Option<&str>,
-            _role: Option<&str>,
+            _role: Option<Role>,
             _avatar_url: Option<&str>,
         ) -> claudear_core::error::Result<bool> {
             if password_hash.is_some() {
@@ -649,21 +649,21 @@ mod seed_admin_tests {
         assert_eq!(users[0].email, "admin@example.com");
         assert_eq!(users[0].password_hash, "$2b$12$second");
         assert_eq!(users[0].name, "Root");
-        assert_eq!(users[0].role, "admin");
+        assert_eq!(users[0].role, Role::Admin);
     }
 
     #[test]
     fn activates_an_invited_user_and_revokes_their_invite() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let creator = tracker
-            .create_user("owner@example.com", HASH, "Owner", "admin")
+            .create_user("owner@example.com", HASH, "Owner", Role::Admin)
             .unwrap();
         let invited = tracker
             .save_directory(&[DirectoryWrite {
                 user: DirectoryUser::New {
                     email: "amy@example.com".to_string(),
                     name: "Amy".to_string(),
-                    role: "viewer".to_string(),
+                    role: Role::Viewer,
                     password_hash: "$2b$12$unusable".to_string(),
                     status: UserStatus::Invited,
                 },
@@ -684,7 +684,7 @@ mod seed_admin_tests {
         let user = tracker.get_user_by_id(invited).unwrap().unwrap();
         assert_eq!(user.status, UserStatus::Active);
         assert_eq!(user.password_hash, HASH);
-        assert_eq!(user.role, "admin");
+        assert_eq!(user.role, Role::Admin);
         assert!(tracker.get_open_invite_for_user(invited).unwrap().is_none());
     }
 }

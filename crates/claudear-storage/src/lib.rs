@@ -28,7 +28,7 @@ pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
-use claudear_core::identity::ConsoleIdentity;
+use claudear_core::identity::{ConsoleIdentity, Role};
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, DeployQaTip, DeployQaTipStatus,
     ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, IssueTimeline,
@@ -1755,7 +1755,7 @@ pub trait UserStore: Send + Sync {
         _email: &str,
         _password_hash: &str,
         _name: &str,
-        _role: &str,
+        _role: Role,
     ) -> Result<i64> {
         Ok(0)
     }
@@ -1783,7 +1783,7 @@ pub trait UserStore: Send + Sync {
         _email: Option<&str>,
         _password_hash: Option<&str>,
         _name: Option<&str>,
-        _role: Option<&str>,
+        _role: Option<Role>,
         _avatar_url: Option<&str>,
     ) -> Result<bool> {
         Ok(false)
@@ -3365,7 +3365,7 @@ mod tests {
         fn test_default_create_user_returns_zero() {
             let t = MockUserExt;
             assert_eq!(
-                t.create_user("user@example.com", "hash", "User", "admin")
+                t.create_user("user@example.com", "hash", "User", Role::Admin)
                     .unwrap(),
                 0
             );
@@ -3402,7 +3402,7 @@ mod tests {
                     None,
                     Some("hash"),
                     Some("Name"),
-                    Some("user"),
+                    Some(Role::Viewer),
                     Some("url")
                 )
                 .unwrap());

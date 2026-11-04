@@ -575,6 +575,7 @@ mod tests {
     use axum::response::Response;
     use axum::Router;
     use claudear_config::config::Config;
+    use claudear_core::identity::Role;
     use claudear_storage::{FixAttemptTracker, SqliteTracker};
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
@@ -996,7 +997,7 @@ mod tests {
         viewer: Session,
     }
 
-    fn session(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: &str) -> Session {
+    fn session(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: Role) -> Session {
         let id = tracker
             .create_user(email, "unused-hash", email, role)
             .expect("create user");
@@ -1009,8 +1010,8 @@ mod tests {
     fn test_app() -> TestApp {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
-        let admin = session(&tracker, "jake@example.com", "admin");
-        let viewer = session(&tracker, "viewer@example.com", "viewer");
+        let admin = session(&tracker, "jake@example.com", Role::Admin);
+        let viewer = session(&tracker, "viewer@example.com", Role::Viewer);
         let config = Config {
             users: config_users(),
             storage_dir: std::env::temp_dir().join("claudear-identities-tests"),
@@ -1292,7 +1293,7 @@ mod tests {
                 session(
                     &app.tracker,
                     &format!("claimant{index}@example.com"),
-                    "viewer",
+                    Role::Viewer,
                 )
             })
             .collect();

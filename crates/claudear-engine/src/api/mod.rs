@@ -250,6 +250,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use claudear_config::config::UserConfig;
+    use claudear_core::identity::Role;
     use claudear_storage::SqliteTracker;
     use std::collections::HashMap;
     use tower::ServiceExt;
@@ -270,7 +271,7 @@ mod tests {
         let server = server(HashMap::new());
         let tracker = server.tracker.clone();
         let admin = tracker
-            .create_user("admin@example.com", "unused-hash", "Admin", "admin")
+            .create_user("admin@example.com", "unused-hash", "Admin", Role::Admin)
             .expect("create admin");
         let token = tracker
             .create_session(admin, "2099-12-31 23:59:59")

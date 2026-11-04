@@ -1274,6 +1274,7 @@ mod tests {
     use crate::types::Outcome;
     use crate::types::{Issue, MatchPriority, MatchResult};
     use async_trait::async_trait;
+    use claudear_core::identity::Role;
     use futures::FutureExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3513,7 +3514,7 @@ mod tests {
     async fn test_router_mcp_requires_valid_token() {
         let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
         let uid = tracker
-            .create_user("mcp@test.com", "h", "Mcp", "viewer")
+            .create_user("mcp@test.com", "h", "Mcp", Role::Viewer)
             .unwrap();
         let secret = "cldr_router_secret";
         tracker

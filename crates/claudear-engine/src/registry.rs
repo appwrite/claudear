@@ -22,7 +22,7 @@ pub fn reload(registry: &UserRegistry, store: &dyn FixAttemptTracker) -> bool {
 mod tests {
     use super::*;
     use claudear_config::config::UserConfig;
-    use claudear_core::identity::{Identities, IdentityOrigin};
+    use claudear_core::identity::{Identities, IdentityOrigin, Role};
     use claudear_storage::{
         DirectoryUser, DirectoryWrite, IdentityWrite, SqliteTracker, UserStore,
     };
@@ -32,7 +32,7 @@ mod tests {
     fn reload_applies_stored_identities_to_every_clone() {
         let tracker = SqliteTracker::in_memory().expect("in-memory tracker");
         let user_id = tracker
-            .create_user("amy@example.com", "unused-hash", "Amy", "viewer")
+            .create_user("amy@example.com", "unused-hash", "Amy", Role::Viewer)
             .expect("create user");
         tracker
             .save_directory(&[DirectoryWrite {

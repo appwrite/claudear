@@ -188,7 +188,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claudear_core::identity::IdentityField;
+    use claudear_core::identity::{IdentityField, Role};
     use claudear_storage::{SqliteTracker, UserStore};
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
@@ -229,10 +229,10 @@ mod tests {
     async fn a_duplicate_login_email_from_storage_is_a_conflict() {
         let tracker = SqliteTracker::in_memory().expect("in-memory tracker");
         tracker
-            .create_user("taken@example.com", "unused-hash", "Taken", "viewer")
+            .create_user("taken@example.com", "unused-hash", "Taken", Role::Viewer)
             .expect("create user");
         let error = tracker
-            .create_user("taken@example.com", "unused-hash", "Again", "viewer")
+            .create_user("taken@example.com", "unused-hash", "Again", Role::Viewer)
             .expect_err("unique email");
 
         let (status, body) = render(ApiError::user_write(error)).await;

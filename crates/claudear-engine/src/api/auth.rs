@@ -5,10 +5,9 @@ use axum::{
     http::{header, request::Parts, HeaderMap, StatusCode},
     Json,
 };
-use claudear_core::identity::{normalize_login_email, Identities, UserStatus};
+use claudear_core::identity::{normalize_login_email, Identities, Role, UserStatus};
 use claudear_storage::{DirectoryUser, DirectoryWrite, FixAttemptTracker, UserRow};
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 use tower_cookies::{Cookie, Cookies};
@@ -31,41 +30,6 @@ pub(crate) const BEARER_PREFIX: &str = "Bearer ";
 /// A bcrypt hash (cost 12) of a value nobody knows. Logins for unknown emails verify
 /// against it so they take as long as logins for real accounts.
 const TIMING_DUMMY_HASH: &str = "$2b$12$K4v3LB7TzMIXvbQZDz1F9eZ8cU2smBGz.iAU5h1DhGGCk5mPIFY3K";
-
-/// A console user's role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    Admin,
-    Viewer,
-}
-
-impl Role {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Admin => "admin",
-            Self::Viewer => "viewer",
-        }
-    }
-}
-
-impl fmt::Display for Role {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Role {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "admin" => Ok(Self::Admin),
-            "viewer" => Ok(Self::Viewer),
-            other => Err(format!("unknown role: {other}")),
-        }
-    }
-}
 
 /// Extract the client IP address from request headers.
 /// Checks `x-forwarded-for` first, then `x-real-ip`, then falls back to "unknown".
@@ -100,13 +64,13 @@ pub struct AuthUser {
     pub id: i64,
     pub email: String,
     pub name: String,
-    pub role: String,
+    pub role: Role,
     pub avatar_url: Option<String>,
 }
 
 impl AuthUser {
     pub fn is_admin(&self) -> bool {
-        self.role == Role::Admin.as_str()
+        self.role == Role::Admin
     }
 
     fn identify(&self) {
@@ -117,7 +81,7 @@ impl AuthUser {
                 username: Some(self.name.clone()),
                 ..Default::default()
             }));
-            scope.set_tag("user.role", &self.role);
+            scope.set_tag("user.role", self.role);
         });
     }
 }
@@ -250,7 +214,7 @@ pub struct AuthUserResponse {
     pub id: i64,
     pub email: String,
     pub name: String,
-    pub role: String,
+    pub role: Role,
     pub avatar_url: Option<String>,
 }
 
@@ -260,7 +224,7 @@ impl From<&AuthUser> for AuthUserResponse {
             id: u.id,
             email: u.email.clone(),
             name: u.name.clone(),
-            role: u.role.clone(),
+            role: u.role,
             avatar_url: u.avatar_url.clone(),
         }
     }
@@ -291,7 +255,7 @@ pub struct UserResponse {
     pub id: i64,
     pub email: String,
     pub name: String,
-    pub role: String,
+    pub role: Role,
     pub avatar_url: Option<String>,
     pub status: UserStatus,
     /// Expiry of the invited user's open invite, past or not.
@@ -407,7 +371,7 @@ pub async fn login_handler(
             username: Some(user.name.clone()),
             ..Default::default()
         }));
-        scope.set_tag("user.role", &user.role);
+        scope.set_tag("user.role", user.role);
     });
 
     Ok(Json(LoginResponse {
@@ -777,7 +741,7 @@ pub(crate) async fn create_user_handler(
             user: DirectoryUser::New {
                 email,
                 name: name.to_string(),
-                role: role.as_str().to_string(),
+                role,
                 password_hash,
                 status,
             },
@@ -823,7 +787,7 @@ fn apply_user_update(
             update.email,
             update.password_hash,
             update.name,
-            update.role.map(Role::as_str),
+            update.role,
             None,
         )
         .map_err(ApiError::user_write)?;
@@ -1013,7 +977,7 @@ mod tests {
     ) -> (i64, String) {
         let password_hash = bcrypt::hash("password", 4).unwrap();
         let user_id = tracker
-            .create_user("admin@test.com", &password_hash, "Admin User", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin User", Role::Admin)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31 23:59:59")
@@ -1027,7 +991,12 @@ mod tests {
     ) -> (i64, String) {
         let password_hash = bcrypt::hash("password", 4).unwrap();
         let user_id = tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer User", "viewer")
+            .create_user(
+                "viewer@test.com",
+                &password_hash,
+                "Viewer User",
+                Role::Viewer,
+            )
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31 23:59:59")
@@ -1042,7 +1011,7 @@ mod tests {
         // Seed a user (not via seed_admin, to test login flow directly)
         let password_hash = bcrypt::hash("secret123", 4).unwrap();
         tracker
-            .create_user("user@test.com", &password_hash, "Test User", "admin")
+            .create_user("user@test.com", &password_hash, "Test User", Role::Admin)
             .unwrap();
 
         let response = router
@@ -1083,7 +1052,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("correct_password", 4).unwrap();
         tracker
-            .create_user("user@test.com", &password_hash, "Test User", "admin")
+            .create_user("user@test.com", &password_hash, "Test User", Role::Admin)
             .unwrap();
 
         let response = router
@@ -1245,7 +1214,7 @@ mod tests {
     ) -> (i64, String) {
         let password_hash = bcrypt::hash("password", 4).unwrap();
         let user_id = tracker
-            .create_user(email, &password_hash, "Admin User", "admin")
+            .create_user(email, &password_hash, "Admin User", Role::Admin)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31 23:59:59")
@@ -1376,7 +1345,7 @@ mod tests {
         // Create a user first
         let hash = bcrypt::hash("password", 4).unwrap();
         tracker
-            .create_user("dup@test.com", &hash, "Dup User", "viewer")
+            .create_user("dup@test.com", &hash, "Dup User", Role::Viewer)
             .unwrap();
 
         // Try to create another user with the same email
@@ -1406,7 +1375,7 @@ mod tests {
         // Create a target user to update
         let hash = bcrypt::hash("password", 4).unwrap();
         let target_id = tracker
-            .create_user("target-update@test.com", &hash, "Target", "viewer")
+            .create_user("target-update@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1454,7 +1423,7 @@ mod tests {
         // Create a target user to delete
         let hash = bcrypt::hash("password", 4).unwrap();
         let target_id = tracker
-            .create_user("target-del@test.com", &hash, "Target", "viewer")
+            .create_user("target-del@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1504,7 +1473,7 @@ mod tests {
         // Create an additional user
         let hash = bcrypt::hash("password", 4).unwrap();
         tracker
-            .create_user("extra-list@test.com", &hash, "Extra User", "viewer")
+            .create_user("extra-list@test.com", &hash, "Extra User", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1539,7 +1508,7 @@ mod tests {
         // Create a target user
         let hash = bcrypt::hash("password", 4).unwrap();
         let target_id = tracker
-            .create_user("target-get@test.com", &hash, "Target Get", "viewer")
+            .create_user("target-get@test.com", &hash, "Target Get", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1612,7 +1581,7 @@ mod tests {
             id: 42,
             email: "convert@test.com".to_string(),
             name: "Convert User".to_string(),
-            role: "admin".to_string(),
+            role: Role::Admin,
             avatar_url: None,
         };
 
@@ -1621,7 +1590,7 @@ mod tests {
         assert_eq!(response.id, 42);
         assert_eq!(response.email, "convert@test.com");
         assert_eq!(response.name, "Convert User");
-        assert_eq!(response.role, "admin");
+        assert_eq!(response.role, Role::Admin);
     }
 
     #[test]
@@ -1705,7 +1674,7 @@ mod tests {
             id: 99,
             email: "avatar@test.com".to_string(),
             name: "Avatar User".to_string(),
-            role: "viewer".to_string(),
+            role: Role::Viewer,
             avatar_url: Some("/avatars/99_abc.png".to_string()),
         };
 
@@ -1714,7 +1683,7 @@ mod tests {
         assert_eq!(response.id, 99);
         assert_eq!(response.email, "avatar@test.com");
         assert_eq!(response.name, "Avatar User");
-        assert_eq!(response.role, "viewer");
+        assert_eq!(response.role, Role::Viewer);
         assert_eq!(response.avatar_url.as_deref(), Some("/avatars/99_abc.png"));
     }
 
@@ -1744,7 +1713,7 @@ mod tests {
 
         let hash = bcrypt::hash("password", 4).unwrap();
         let target_id = tracker
-            .create_user("target-update-pw@test.com", &hash, "Target", "viewer")
+            .create_user("target-update-pw@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1770,7 +1739,12 @@ mod tests {
 
         let hash = bcrypt::hash("password", 4).unwrap();
         let target_id = tracker
-            .create_user("target-update-longpw@test.com", &hash, "Target", "viewer")
+            .create_user(
+                "target-update-longpw@test.com",
+                &hash,
+                "Target",
+                Role::Viewer,
+            )
             .unwrap();
 
         let long_pw = "a".repeat(73);
@@ -1799,7 +1773,12 @@ mod tests {
 
         let hash = bcrypt::hash("password", 4).unwrap();
         let target_id = tracker
-            .create_user("target-update-validpw@test.com", &hash, "Target", "viewer")
+            .create_user(
+                "target-update-validpw@test.com",
+                &hash,
+                "Target",
+                Role::Viewer,
+            )
             .unwrap();
 
         let response = router
@@ -1825,7 +1804,12 @@ mod tests {
 
         let hash = bcrypt::hash("password", 4).unwrap();
         let target_id = tracker
-            .create_user("target-name-upd@test.com", &hash, "Original Name", "viewer")
+            .create_user(
+                "target-name-upd@test.com",
+                &hash,
+                "Original Name",
+                Role::Viewer,
+            )
             .unwrap();
 
         let response = router
@@ -1854,7 +1838,7 @@ mod tests {
 
         let hash = bcrypt::hash("password", 4).unwrap();
         let target_id = tracker
-            .create_user("target-role-upd@test.com", &hash, "Target", "viewer")
+            .create_user("target-role-upd@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1933,7 +1917,7 @@ mod tests {
         let (router, tracker) = create_test_app();
         let password_hash = bcrypt::hash("secret123", 4).unwrap();
         tracker
-            .create_user("iptest@test.com", &password_hash, "IP User", "admin")
+            .create_user("iptest@test.com", &password_hash, "IP User", Role::Admin)
             .unwrap();
 
         let response = router
@@ -2304,7 +2288,12 @@ mod tests {
         let (router, tracker) = create_test_app();
         let password_hash = bcrypt::hash("testpass1", 4).unwrap();
         tracker
-            .create_user("struct@test.com", &password_hash, "Struct User", "viewer")
+            .create_user(
+                "struct@test.com",
+                &password_hash,
+                "Struct User",
+                Role::Viewer,
+            )
             .unwrap();
 
         let response = router
@@ -2338,7 +2327,7 @@ mod tests {
 
         let hash = bcrypt::hash("password", 4).unwrap();
         let target_id = tracker
-            .create_user("original-email@test.com", &hash, "Email User", "viewer")
+            .create_user("original-email@test.com", &hash, "Email User", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -2404,7 +2393,12 @@ mod tests {
 
         let password_hash = bcrypt::hash("password", 4).unwrap();
         tracker
-            .create_user("avatar@test.com", &password_hash, "Avatar User", "admin")
+            .create_user(
+                "avatar@test.com",
+                &password_hash,
+                "Avatar User",
+                Role::Admin,
+            )
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2472,7 +2466,12 @@ mod tests {
 
         let password_hash = bcrypt::hash("password", 4).unwrap();
         tracker
-            .create_user("avatar2@test.com", &password_hash, "Avatar User", "admin")
+            .create_user(
+                "avatar2@test.com",
+                &password_hash,
+                "Avatar User",
+                Role::Admin,
+            )
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2525,7 +2524,12 @@ mod tests {
 
         let password_hash = bcrypt::hash("password", 4).unwrap();
         tracker
-            .create_user("avatar3@test.com", &password_hash, "Avatar User", "admin")
+            .create_user(
+                "avatar3@test.com",
+                &password_hash,
+                "Avatar User",
+                Role::Admin,
+            )
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2584,7 +2588,12 @@ mod tests {
 
         let password_hash = bcrypt::hash("password", 4).unwrap();
         tracker
-            .create_user("avatar4@test.com", &password_hash, "Avatar User", "admin")
+            .create_user(
+                "avatar4@test.com",
+                &password_hash,
+                "Avatar User",
+                Role::Admin,
+            )
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2638,7 +2647,12 @@ mod tests {
 
         let password_hash = bcrypt::hash("password", 4).unwrap();
         tracker
-            .create_user("avatar5@test.com", &password_hash, "Avatar User", "admin")
+            .create_user(
+                "avatar5@test.com",
+                &password_hash,
+                "Avatar User",
+                Role::Admin,
+            )
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2857,7 +2871,12 @@ mod tests {
             let tracker: Arc<dyn FixAttemptTracker> =
                 Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
             let admin = tracker
-                .create_user("writes-admin@example.com", "unused-hash", "Admin", "admin")
+                .create_user(
+                    "writes-admin@example.com",
+                    "unused-hash",
+                    "Admin",
+                    Role::Admin,
+                )
                 .expect("create admin");
             let admin_token = tracker
                 .create_session(admin, "2099-12-31 23:59:59")
@@ -3118,12 +3137,17 @@ mod tests {
                     "writes-holder@example.com",
                     "unused-hash",
                     "Holder",
-                    "viewer",
+                    Role::Viewer,
                 )
                 .expect("create holder");
             let mover = app
                 .tracker
-                .create_user("writes-mover@example.com", "unused-hash", "Mover", "viewer")
+                .create_user(
+                    "writes-mover@example.com",
+                    "unused-hash",
+                    "Mover",
+                    Role::Viewer,
+                )
                 .expect("create mover");
 
             let (status, body) = send(
@@ -3167,14 +3191,19 @@ mod tests {
         fn a_taken_email_fails_the_update_before_the_invited_user_is_activated() {
             let tracker = SqliteTracker::in_memory().expect("in-memory tracker");
             tracker
-                .create_user("writes-taken@example.com", "unused-hash", "Taken", "viewer")
+                .create_user(
+                    "writes-taken@example.com",
+                    "unused-hash",
+                    "Taken",
+                    Role::Viewer,
+                )
                 .expect("create holder");
             let invited = tracker
                 .save_directory(&[DirectoryWrite {
                     user: DirectoryUser::New {
                         email: "writes-invited@example.com".to_string(),
                         name: "Invited".to_string(),
-                        role: "viewer".to_string(),
+                        role: Role::Viewer,
                         password_hash: "unused-hash".to_string(),
                         status: UserStatus::Invited,
                     },

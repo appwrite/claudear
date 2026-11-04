@@ -3081,6 +3081,7 @@ mod tests {
         LearningConfig, NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig,
         ScmConfig,
     };
+    use claudear_core::identity::Role;
     use claudear_core::secret::SecretValue;
     use claudear_storage::{IndexingProgress, SqliteTracker};
     use http_body_util::BodyExt;
@@ -3148,7 +3149,7 @@ mod tests {
         // Create a test user and session
         let password_hash = bcrypt::hash("testpass", 4).unwrap(); // cost=4 for speed
         tracker
-            .create_user("test@example.com", &password_hash, "Test User", "admin")
+            .create_user("test@example.com", &password_hash, "Test User", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4220,7 +4221,7 @@ mod tests {
         // Use a nonexistent config path to test the error case
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4249,7 +4250,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4282,7 +4283,7 @@ mod tests {
         let config = test_config();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4332,7 +4333,7 @@ mod tests {
         let config = test_config();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6144,7 +6145,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6187,7 +6188,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6224,7 +6225,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6932,7 +6933,7 @@ mod tests {
         // Test that "events" is also a valid stream
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -7064,7 +7065,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -7528,7 +7529,7 @@ mod tests {
         let config = test_config();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@test.com", &password_hash, "Test", "admin")
+            .create_user("test@test.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         // Create a session that already expired
         let token = tracker.create_session(1, "2020-01-01 00:00:00").unwrap();
@@ -7938,7 +7939,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8041,7 +8042,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8080,7 +8081,7 @@ mod tests {
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8262,7 +8263,7 @@ mod tests {
                 "todelete@example.com",
                 &bcrypt::hash("pass", 4).unwrap(),
                 "Delete Me",
-                "viewer",
+                Role::Viewer,
             )
             .unwrap();
 
@@ -8283,7 +8284,7 @@ mod tests {
         let config = test_config();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8384,7 +8385,7 @@ mod tests {
     }
 
     mod identity_authorization {
-        use super::{auth_get, auth_put_json, create_test_tracker, test_config};
+        use super::{auth_get, auth_put_json, create_test_tracker, test_config, Role};
         use crate::api::create_api_router_with_dashboard;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -8430,9 +8431,9 @@ mod tests {
         impl Harness {
             fn new(users: HashMap<String, UserConfig>) -> Self {
                 let tracker = create_test_tracker();
-                let admin = account(&tracker, ADMIN_EMAIL, "Admin", "admin");
-                let viewer = account(&tracker, VIEWER_EMAIL, "Viewer", "viewer");
-                let other = account(&tracker, OTHER_EMAIL, "Other", "viewer");
+                let admin = account(&tracker, ADMIN_EMAIL, "Admin", Role::Admin);
+                let viewer = account(&tracker, VIEWER_EMAIL, "Viewer", Role::Viewer);
+                let other = account(&tracker, OTHER_EMAIL, "Other", Role::Viewer);
                 let config = Config {
                     users,
                     ..test_config()
@@ -8518,7 +8519,7 @@ mod tests {
             tracker: &Arc<dyn FixAttemptTracker>,
             email: &str,
             name: &str,
-            role: &str,
+            role: Role,
         ) -> Account {
             let id = tracker
                 .create_user(email, "unused-hash", name, role)
@@ -8939,7 +8940,7 @@ mod tests {
                 &harness.tracker,
                 "identity-newcomer@example.com",
                 "Newcomer",
-                "viewer",
+                Role::Viewer,
             );
 
             let (status, people) = harness
@@ -9364,8 +9365,8 @@ mod tests {
 
             async fn build(public_url: Option<String>) -> Self {
                 let tracker = create_test_tracker();
-                let admin = account(&tracker, "admin@invite.test", "admin");
-                let viewer = account(&tracker, "viewer@invite.test", "viewer");
+                let admin = account(&tracker, "admin@invite.test", Role::Admin);
+                let viewer = account(&tracker, "viewer@invite.test", Role::Viewer);
 
                 let mut config = test_config();
                 config.storage_dir = std::env::temp_dir().join("claudear-invite-directory-tests");
@@ -9542,7 +9543,7 @@ mod tests {
             fn seed_invited(
                 &self,
                 email: &str,
-                role: &str,
+                role: Role,
                 password_hash: &str,
                 secret: &str,
                 expires_at: &str,
@@ -9553,7 +9554,7 @@ mod tests {
                         user: DirectoryUser::New {
                             email: email.to_string(),
                             name: "Seeded".to_string(),
-                            role: role.to_string(),
+                            role,
                             password_hash: password_hash.to_string(),
                             status: UserStatus::Invited,
                         },
@@ -9618,7 +9619,7 @@ mod tests {
             }
         }
 
-        fn account(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: &str) -> Account {
+        fn account(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: Role) -> Account {
             let id = tracker
                 .create_user(email, "unused-hash", email, role)
                 .expect("create user");
@@ -9831,13 +9832,13 @@ mod tests {
             let app = TestApp::new().await;
             let active = app.email("active");
             app.tracker
-                .create_user(&active, &password_hash(PASSWORD), "Active", "viewer")
+                .create_user(&active, &password_hash(PASSWORD), "Active", Role::Viewer)
                 .expect("create active user");
             let invited = app.email("invited");
             // A real hash for the right password, so only the status gate can refuse it.
             app.seed_invited(
                 &invited,
-                "admin",
+                Role::Admin,
                 &password_hash(PASSWORD),
                 &invite_secret(),
                 &timestamp(Duration::days(7)),
@@ -9879,7 +9880,7 @@ mod tests {
             let original = invite_secret();
             let id = app.seed_invited(
                 &app.email("late"),
-                "viewer",
+                Role::Viewer,
                 &password_hash("never-used-password"),
                 &original,
                 &timestamp(Duration::days(7)),
@@ -10089,7 +10090,7 @@ mod tests {
             let app = TestApp::new().await;
             let id = app.seed_invited(
                 &app.email("pending-admin"),
-                "admin",
+                Role::Admin,
                 &password_hash("never-used-password"),
                 &invite_secret(),
                 &timestamp(Duration::days(7)),
@@ -10273,7 +10274,7 @@ mod tests {
                 .expect("get user")
                 .expect("user exists");
             assert_eq!(user.name, "Jake");
-            assert_eq!(user.role, "viewer");
+            assert_eq!(user.role, Role::Viewer);
             assert!(app
                 .tracker
                 .get_open_invite_for_user(app.viewer.id)
@@ -10287,7 +10288,7 @@ mod tests {
             let app = TestApp::new().await;
             let id = app
                 .tracker
-                .create_user(&app.email("leaver"), "unused-hash", "Leaver", "viewer")
+                .create_user(&app.email("leaver"), "unused-hash", "Leaver", Role::Viewer)
                 .expect("create user");
             app.seed_identities(
                 id,

@@ -16,7 +16,9 @@ use crate::vector_index::progress::Progress;
 use crate::vector_index::{embedding_blob, embedding_from_blob, REBUILD_BATCH_SIZE};
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
-use claudear_core::identity::{normalize_login_email, ConsoleIdentity, Identities, UserStatus};
+use claudear_core::identity::{
+    normalize_login_email, ConsoleIdentity, Identities, Role, UserStatus,
+};
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
     ExperimentProviderStats, FixAttempt, FixAttemptStats, FixAttemptStatus, FixOutcome,
@@ -67,7 +69,7 @@ impl UserRow {
             email: row.get(1)?,
             password_hash: row.get(2)?,
             name: row.get(3)?,
-            role: row.get(4)?,
+            role: read_role(row, 4)?,
             avatar_url: row.get(5)?,
             created_at: row.get(6)?,
             updated_at: row.get(7)?,
@@ -96,6 +98,20 @@ fn read_status(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<UserSt
     value.parse().map_err(|error: String| {
         rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, error.into())
     })
+}
+
+/// A stored role this build does not know is read as a viewer, so a corrupt or
+/// future value can never grant admin.
+fn read_role(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Role> {
+    let value: String = row.get(index)?;
+    Ok(value.parse().unwrap_or_else(|_| {
+        let user_id: Option<i64> = row.get(0).ok();
+        tracing::warn!(
+            ?user_id,
+            "Unknown stored role; treating the user as a viewer"
+        );
+        Role::Viewer
+    }))
 }
 
 fn read_list(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Vec<String>> {
@@ -199,7 +215,7 @@ fn write_directory_user(connection: &Connection, user: &DirectoryUser) -> Result
                 "UPDATE users SET name = COALESCE(?2, name), role = COALESCE(?3, role),
                      updated_at = CASE WHEN ?2 IS NULL AND ?3 IS NULL THEN updated_at ELSE datetime('now') END
                  WHERE id = ?1",
-                params![user_id, name, role],
+                params![user_id, name, role.map(Role::as_str)],
             )?;
             if updated == 0 {
                 return Err(claudear_core::error::Error::Database(format!(
@@ -219,7 +235,7 @@ fn write_directory_user(connection: &Connection, user: &DirectoryUser) -> Result
             ensure_login_email_available(connection, &email, None)?;
             connection.execute(
                 "INSERT INTO users (email, password_hash, name, role, status) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![email, password_hash, name, role, status.as_str()],
+                params![email, password_hash, name, role.as_str(), status.as_str()],
             )?;
             Ok(connection.last_insert_rowid())
         }
@@ -4366,14 +4382,14 @@ impl UserStore for SqliteTracker {
         SqliteTracker::set_channel_cursor(self, channel, cursor_key, cursor_value)
     }
 
-    fn create_user(&self, email: &str, password_hash: &str, name: &str, role: &str) -> Result<i64> {
+    fn create_user(&self, email: &str, password_hash: &str, name: &str, role: Role) -> Result<i64> {
         let email = normalize_login_email(email);
         let mut connection = self.acquire_lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_login_email_available(&transaction, &email, None)?;
         transaction.execute(
             "INSERT INTO users (email, password_hash, name, role) VALUES (?1, ?2, ?3, ?4)",
-            params![email, password_hash, name, role],
+            params![email, password_hash, name, role.as_str()],
         )?;
         let user_id = transaction.last_insert_rowid();
         transaction.commit()?;
@@ -4420,7 +4436,7 @@ impl UserStore for SqliteTracker {
         email: Option<&str>,
         password_hash: Option<&str>,
         name: Option<&str>,
-        role: Option<&str>,
+        role: Option<Role>,
         avatar_url: Option<&str>,
     ) -> Result<bool> {
         let email = email.map(normalize_login_email);
@@ -4444,7 +4460,7 @@ impl UserStore for SqliteTracker {
         }
         if let Some(role) = role {
             sets.push("role = ?");
-            values.push(Box::new(role.to_string()));
+            values.push(Box::new(role.as_str()));
         }
         if let Some(avatar_url) = avatar_url {
             sets.push("avatar_url = ?");
@@ -13433,20 +13449,20 @@ mod tests {
     fn test_create_and_get_user() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("test@example.com", "$2b$12$hash", "Test User", "admin")
+            .create_user("test@example.com", "$2b$12$hash", "Test User", Role::Admin)
             .unwrap();
         assert!(id > 0);
         let user = tracker.get_user_by_id(id).unwrap().unwrap();
         assert_eq!(user.email, "test@example.com");
         assert_eq!(user.name, "Test User");
-        assert_eq!(user.role, "admin");
+        assert_eq!(user.role, Role::Admin);
     }
 
     #[test]
     fn test_get_user_by_email() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker
-            .create_user("alice@example.com", "$2b$12$hash", "Alice", "viewer")
+            .create_user("alice@example.com", "$2b$12$hash", "Alice", Role::Viewer)
             .unwrap();
         let user = tracker
             .get_user_by_email("alice@example.com")
@@ -13461,10 +13477,10 @@ mod tests {
     fn test_list_users() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker
-            .create_user("a@test.com", "hash", "A", "admin")
+            .create_user("a@test.com", "hash", "A", Role::Admin)
             .unwrap();
         tracker
-            .create_user("b@test.com", "hash", "B", "viewer")
+            .create_user("b@test.com", "hash", "B", Role::Viewer)
             .unwrap();
         let users = tracker.list_users().unwrap();
         assert_eq!(users.len(), 2);
@@ -13474,7 +13490,7 @@ mod tests {
     fn test_update_user() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("old@test.com", "hash", "Old Name", "viewer")
+            .create_user("old@test.com", "hash", "Old Name", Role::Viewer)
             .unwrap();
         tracker
             .update_user(
@@ -13482,21 +13498,21 @@ mod tests {
                 Some("new@test.com"),
                 None,
                 Some("New Name"),
-                Some("admin"),
+                Some(Role::Admin),
                 None,
             )
             .unwrap();
         let user = tracker.get_user_by_id(id).unwrap().unwrap();
         assert_eq!(user.email, "new@test.com");
         assert_eq!(user.name, "New Name");
-        assert_eq!(user.role, "admin");
+        assert_eq!(user.role, Role::Admin);
     }
 
     #[test]
     fn test_delete_user() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("del@test.com", "hash", "Delete Me", "viewer")
+            .create_user("del@test.com", "hash", "Delete Me", Role::Viewer)
             .unwrap();
         assert!(tracker.delete_user(id).unwrap());
         assert!(tracker.get_user_by_id(id).unwrap().is_none());
@@ -13507,9 +13523,9 @@ mod tests {
     fn test_duplicate_email_fails() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker
-            .create_user("dup@test.com", "hash", "First", "admin")
+            .create_user("dup@test.com", "hash", "First", Role::Admin)
             .unwrap();
-        let result = tracker.create_user("dup@test.com", "hash", "Second", "viewer");
+        let result = tracker.create_user("dup@test.com", "hash", "Second", Role::Viewer);
         assert!(result.is_err());
     }
 
@@ -13517,7 +13533,7 @@ mod tests {
     fn test_create_and_validate_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("sess@test.com", "hash", "Session User", "admin")
+            .create_user("sess@test.com", "hash", "Session User", Role::Admin)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31T23:59:59")
@@ -13532,7 +13548,7 @@ mod tests {
     fn test_expired_session_returns_none() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("exp@test.com", "hash", "Expired", "viewer")
+            .create_user("exp@test.com", "hash", "Expired", Role::Viewer)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2000-01-01T00:00:00")
@@ -13545,7 +13561,7 @@ mod tests {
     fn test_api_token_expiry_is_enforced_on_lookup() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("tok@test.com", "hash", "Tok", "viewer")
+            .create_user("tok@test.com", "hash", "Tok", Role::Viewer)
             .unwrap();
 
         // Past expiry → not resolvable.
@@ -13592,7 +13608,7 @@ mod tests {
     fn test_delete_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("delsess@test.com", "hash", "Del Sess", "admin")
+            .create_user("delsess@test.com", "hash", "Del Sess", Role::Admin)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31T23:59:59")
@@ -13606,7 +13622,7 @@ mod tests {
     fn test_cleanup_expired_sessions() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("clean@test.com", "hash", "Clean", "admin")
+            .create_user("clean@test.com", "hash", "Clean", Role::Admin)
             .unwrap();
         tracker
             .create_session(user_id, "2000-01-01T00:00:00")
@@ -13625,7 +13641,7 @@ mod tests {
     fn test_touch_session_updates_last_active() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("touch@test.com", "hash", "Touch", "admin")
+            .create_user("touch@test.com", "hash", "Touch", Role::Admin)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31T23:59:59")
@@ -13641,10 +13657,10 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
         assert_eq!(tracker.count_users().unwrap(), 0);
         tracker
-            .create_user("c1@test.com", "hash", "C1", "admin")
+            .create_user("c1@test.com", "hash", "C1", Role::Admin)
             .unwrap();
         tracker
-            .create_user("c2@test.com", "hash", "C2", "viewer")
+            .create_user("c2@test.com", "hash", "C2", Role::Viewer)
             .unwrap();
         assert_eq!(tracker.count_users().unwrap(), 2);
     }
@@ -19481,7 +19497,7 @@ mod tests {
     fn test_delete_user_sessions() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker
-            .create_user("test@example.com", "hash", "Test", "user")
+            .create_user("test@example.com", "hash", "Test", Role::Viewer)
             .unwrap();
         let user = tracker
             .get_user_by_email("test@example.com")
@@ -21045,14 +21061,14 @@ mod tests {
     fn test_get_user_by_id() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("user@example.com", "hash123", "Test User", "admin")
+            .create_user("user@example.com", "hash123", "Test User", Role::Admin)
             .unwrap();
 
         let user = tracker.get_user_by_id(id).unwrap().unwrap();
         assert_eq!(user.id, id);
         assert_eq!(user.email, "user@example.com");
         assert_eq!(user.name, "Test User");
-        assert_eq!(user.role, "admin");
+        assert_eq!(user.role, Role::Admin);
     }
 
     #[test]
@@ -21465,7 +21481,7 @@ mod tests {
     fn test_update_user_no_fields() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("u@ex.com", "h", "Name", "admin")
+            .create_user("u@ex.com", "h", "Name", Role::Admin)
             .unwrap();
 
         // Calling update with all None should return false (no fields to update)
@@ -21479,7 +21495,7 @@ mod tests {
     fn test_update_user_partial_fields() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("u@ex.com", "oldhash", "OldName", "viewer")
+            .create_user("u@ex.com", "oldhash", "OldName", Role::Viewer)
             .unwrap();
 
         // Update only the name
@@ -21491,14 +21507,14 @@ mod tests {
         let user = tracker.get_user_by_id(id).unwrap().unwrap();
         assert_eq!(user.name, "NewName");
         assert_eq!(user.email, "u@ex.com"); // unchanged
-        assert_eq!(user.role, "viewer"); // unchanged
+        assert_eq!(user.role, Role::Viewer); // unchanged
     }
 
     #[test]
     fn test_update_user_avatar_url() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("u@ex.com", "h", "Name", "admin")
+            .create_user("u@ex.com", "h", "Name", Role::Admin)
             .unwrap();
 
         let result = tracker
@@ -23101,7 +23117,7 @@ mod tests {
 
         fn create_admin(tracker: &SqliteTracker) -> i64 {
             tracker
-                .create_user("admin@example.com", "$2b$12$admin", "Admin", "admin")
+                .create_user("admin@example.com", "$2b$12$admin", "Admin", Role::Admin)
                 .unwrap()
         }
 
@@ -23117,7 +23133,7 @@ mod tests {
             DirectoryUser::New {
                 email: email.to_string(),
                 name: "Person".to_string(),
-                role: "viewer".to_string(),
+                role: Role::Viewer,
                 password_hash: match status {
                     UserStatus::Active => PASSWORD_HASH,
                     UserStatus::Invited => UNUSABLE_HASH,
@@ -23189,7 +23205,7 @@ mod tests {
         fn test_user_identities_round_trip_every_field() {
             let tracker = SqliteTracker::in_memory().unwrap();
             let user_id = tracker
-                .create_user("jake@example.com", "hash", "Jake", "admin")
+                .create_user("jake@example.com", "hash", "Jake", Role::Admin)
                 .unwrap();
 
             let ids = tracker
@@ -23216,7 +23232,7 @@ mod tests {
         fn test_user_identities_upsert_replaces_the_whole_row() {
             let tracker = SqliteTracker::in_memory().unwrap();
             let user_id = tracker
-                .create_user("jake@example.com", "hash", "Jake", "admin")
+                .create_user("jake@example.com", "hash", "Jake", Role::Admin)
                 .unwrap();
             tracker
                 .save_directory(&[identities_write(
@@ -23241,7 +23257,7 @@ mod tests {
             let tracker = SqliteTracker::in_memory().unwrap();
             let admin = create_admin(&tracker);
             tracker
-                .create_user("plain@example.com", "hash", "Plain", "viewer")
+                .create_user("plain@example.com", "hash", "Plain", Role::Viewer)
                 .unwrap();
             let invited = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
             tracker
@@ -23264,7 +23280,7 @@ mod tests {
         fn test_delete_user_identities_reports_whether_a_row_existed() {
             let tracker = SqliteTracker::in_memory().unwrap();
             let user_id = tracker
-                .create_user("jake@example.com", "hash", "Jake", "admin")
+                .create_user("jake@example.com", "hash", "Jake", Role::Admin)
                 .unwrap();
             assert!(!tracker.delete_user_identities(user_id).unwrap());
 
@@ -23294,6 +23310,33 @@ mod tests {
         }
 
         #[test]
+        fn test_an_unknown_stored_role_reads_as_a_viewer() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            for (email, role) in [
+                ("owner@example.com", "owner"),
+                ("shout@example.com", "ADMIN"),
+            ] {
+                tracker
+                    .acquire_lock()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO users (email, password_hash, name, role) VALUES (?1, 'hash', 'Odd', ?2)",
+                        params![email, role],
+                    )
+                    .unwrap();
+            }
+
+            for user in tracker.list_users().unwrap() {
+                assert_eq!(user.role, Role::Viewer, "{}", user.email);
+            }
+            let owner = tracker
+                .get_user_by_email("owner@example.com")
+                .unwrap()
+                .unwrap();
+            assert_eq!(owner.role, Role::Viewer);
+        }
+
+        #[test]
         fn test_users_inserted_without_a_status_read_as_active() {
             let tracker = SqliteTracker::in_memory().unwrap();
             tracker
@@ -23305,7 +23348,7 @@ mod tests {
                 )
                 .unwrap();
             let created = tracker
-                .create_user("new@example.com", "hash", "New", "admin")
+                .create_user("new@example.com", "hash", "New", Role::Admin)
                 .unwrap();
 
             let old = tracker
@@ -23433,7 +23476,7 @@ mod tests {
             let tracker = SqliteTracker::in_memory().unwrap();
             let admin = create_admin(&tracker);
             let existing = tracker
-                .create_user("jake@example.com", "hash", "Jake", "viewer")
+                .create_user("jake@example.com", "hash", "Jake", Role::Viewer)
                 .unwrap();
 
             let result = tracker.save_directory(&[
@@ -23467,10 +23510,10 @@ mod tests {
         fn test_save_directory_rolls_back_the_batch_on_a_duplicate_slug() {
             let tracker = SqliteTracker::in_memory().unwrap();
             let first = tracker
-                .create_user("first@example.com", "hash", "First", "viewer")
+                .create_user("first@example.com", "hash", "First", Role::Viewer)
                 .unwrap();
             let second = tracker
-                .create_user("second@example.com", "hash", "Second", "viewer")
+                .create_user("second@example.com", "hash", "Second", Role::Viewer)
                 .unwrap();
 
             let result = tracker.save_directory(&[
@@ -23486,7 +23529,7 @@ mod tests {
         fn test_save_directory_updates_existing_users_sparsely() {
             let tracker = SqliteTracker::in_memory().unwrap();
             let user_id = tracker
-                .create_user("jake@example.com", "hash", "Jake", "viewer")
+                .create_user("jake@example.com", "hash", "Jake", Role::Viewer)
                 .unwrap();
 
             tracker
@@ -23502,14 +23545,14 @@ mod tests {
                 .unwrap();
             let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
             assert_eq!(user.name, "Jake Barnby");
-            assert_eq!(user.role, "viewer");
+            assert_eq!(user.role, Role::Viewer);
 
             tracker
                 .save_directory(&[DirectoryWrite {
                     user: DirectoryUser::Existing {
                         user_id,
                         name: None,
-                        role: Some("admin".to_string()),
+                        role: Some(Role::Admin),
                     },
                     identities: None,
                     invite: None,
@@ -23517,7 +23560,7 @@ mod tests {
                 .unwrap();
             let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
             assert_eq!(user.name, "Jake Barnby");
-            assert_eq!(user.role, "admin");
+            assert_eq!(user.role, Role::Admin);
             assert!(tracker.list_user_identities().unwrap().is_empty());
         }
 
@@ -23533,7 +23576,7 @@ mod tests {
         fn test_save_directory_returns_user_ids_in_entry_order() {
             let tracker = SqliteTracker::in_memory().unwrap();
             let existing = tracker
-                .create_user("jake@example.com", "hash", "Jake", "viewer")
+                .create_user("jake@example.com", "hash", "Jake", Role::Viewer)
                 .unwrap();
             let ids = tracker
                 .save_directory(&[
@@ -23649,7 +23692,7 @@ mod tests {
             let tracker = SqliteTracker::in_memory().unwrap();
             let admin = create_admin(&tracker);
             let active = tracker
-                .create_user("jake@example.com", "hash", "Jake", "viewer")
+                .create_user("jake@example.com", "hash", "Jake", Role::Viewer)
                 .unwrap();
             tracker
                 .issue_invite(active, "hash_active", FUTURE, admin)
@@ -23784,7 +23827,7 @@ mod tests {
         fn test_create_user_stores_the_normalized_login_email() {
             let tracker = SqliteTracker::in_memory().unwrap();
             let user_id = tracker
-                .create_user("  Amy@Example.COM ", "hash", "Amy", "viewer")
+                .create_user("  Amy@Example.COM ", "hash", "Amy", Role::Viewer)
                 .unwrap();
 
             let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
@@ -23795,7 +23838,7 @@ mod tests {
         fn test_get_user_by_email_is_case_insensitive() {
             let tracker = SqliteTracker::in_memory().unwrap();
             let user_id = tracker
-                .create_user("amy@example.com", "hash", "Amy", "viewer")
+                .create_user("amy@example.com", "hash", "Amy", Role::Viewer)
                 .unwrap();
             let legacy = insert_raw_user(&tracker, "Bob@Example.com");
 
@@ -23838,12 +23881,22 @@ mod tests {
         fn test_create_user_rejects_a_case_variant_of_an_existing_email() {
             let tracker = SqliteTracker::in_memory().unwrap();
             tracker
-                .create_user("amy@example.com", "hash", "Amy", "viewer")
+                .create_user("amy@example.com", "hash", "Amy", Role::Viewer)
                 .unwrap();
             insert_raw_user(&tracker, "Bob@Example.com");
 
-            assert_duplicate_email(tracker.create_user("Amy@Example.com", "hash", "Amy", "admin"));
-            assert_duplicate_email(tracker.create_user("bob@example.com", "hash", "Bob", "admin"));
+            assert_duplicate_email(tracker.create_user(
+                "Amy@Example.com",
+                "hash",
+                "Amy",
+                Role::Admin,
+            ));
+            assert_duplicate_email(tracker.create_user(
+                "bob@example.com",
+                "hash",
+                "Bob",
+                Role::Admin,
+            ));
             assert_eq!(count(&tracker, "users"), 2);
         }
 
@@ -23851,7 +23904,7 @@ mod tests {
         fn test_save_directory_rejects_case_variant_emails_and_rolls_back() {
             let tracker = SqliteTracker::in_memory().unwrap();
             tracker
-                .create_user("amy@example.com", "hash", "Amy", "viewer")
+                .create_user("amy@example.com", "hash", "Amy", Role::Viewer)
                 .unwrap();
 
             assert_duplicate_email(tracker.save_directory(&[DirectoryWrite {
@@ -23890,10 +23943,10 @@ mod tests {
         fn test_update_user_normalizes_and_rejects_another_users_email() {
             let tracker = SqliteTracker::in_memory().unwrap();
             let amy = tracker
-                .create_user("amy@example.com", "hash", "Amy", "viewer")
+                .create_user("amy@example.com", "hash", "Amy", Role::Viewer)
                 .unwrap();
             let bob = tracker
-                .create_user("bob@example.com", "hash", "Bob", "viewer")
+                .create_user("bob@example.com", "hash", "Bob", Role::Viewer)
                 .unwrap();
 
             assert_duplicate_email(tracker.update_user(
@@ -23928,10 +23981,10 @@ mod tests {
         fn test_get_user_identities_returns_one_users_row() {
             let tracker = SqliteTracker::in_memory().unwrap();
             let amy = tracker
-                .create_user("amy@example.com", "hash", "Amy", "viewer")
+                .create_user("amy@example.com", "hash", "Amy", Role::Viewer)
                 .unwrap();
             let bob = tracker
-                .create_user("bob@example.com", "hash", "Bob", "viewer")
+                .create_user("bob@example.com", "hash", "Bob", Role::Viewer)
                 .unwrap();
             tracker
                 .save_directory(&[

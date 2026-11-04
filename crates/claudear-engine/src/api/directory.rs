@@ -6,7 +6,7 @@
 //! the whole batch is stored in one transaction, so a request either applies fully or not
 //! at all.
 
-use super::auth::{is_valid_login_email, AdminCaller, Role};
+use super::auth::{is_valid_login_email, AdminCaller};
 use super::error::ApiError;
 use super::identities::{
     conflicts_by_plan, plan_update, IdentityPlan, UpdateIdentitiesRequest, UserIdentities,
@@ -20,7 +20,7 @@ use axum::{
 };
 use claudear_config::users::UserRegistry;
 use claudear_core::identity::{
-    normalize_login_email, ConsoleIdentity, IdentityField, IdentityViolation, UserStatus,
+    normalize_login_email, ConsoleIdentity, IdentityField, IdentityViolation, Role, UserStatus,
 };
 use claudear_storage::{DirectoryUser, DirectoryWrite, UserRow};
 use serde::{Deserialize, Serialize, Serializer};
@@ -188,12 +188,12 @@ pub(crate) async fn put_directory_handler(
                 } => DirectoryUser::Existing {
                     user_id: *user_id,
                     name: name.clone(),
-                    role: role.map(|role| role.as_str().to_string()),
+                    role: *role,
                 },
                 StagedUser::New { name, role } => DirectoryUser::New {
                     email: entry.email.clone(),
                     name: name.clone(),
-                    role: role.as_str().to_string(),
+                    role: *role,
                     password_hash: unusable_hash.clone().unwrap_or_default(),
                     status: UserStatus::Invited,
                 },
@@ -416,7 +416,7 @@ mod tests {
 
     fn caller(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: Role) -> Caller {
         let id = tracker
-            .create_user(email, "unused-hash", email, role.as_str())
+            .create_user(email, "unused-hash", email, role)
             .expect("create user");
         let session = tracker
             .create_session(id, "2099-12-31 23:59:59")
@@ -655,7 +655,7 @@ mod tests {
             .expect("lookup")
             .expect("viewer exists");
         assert_eq!(viewer.name, "directory-viewer@example.com");
-        assert_eq!(viewer.role, "viewer");
+        assert_eq!(viewer.role, Role::Viewer);
 
         let (status, body) = put(
             &app,
@@ -677,7 +677,7 @@ mod tests {
             .expect("lookup")
             .expect("viewer exists");
         assert_eq!(viewer.name, "Vera");
-        assert_eq!(viewer.role, "admin");
+        assert_eq!(viewer.role, Role::Admin);
     }
 
     #[tokio::test]
