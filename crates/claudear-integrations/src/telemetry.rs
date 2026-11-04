@@ -564,4 +564,19 @@ impl AgentRunner for InstrumentedRunner {
             .structured_query(prompt, json_schema, project_dir)
             .await
     }
+
+    delegate!(fn supports_security_query(&self) -> bool);
+
+    async fn security_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+        sandbox: crate::runner::SecuritySandbox,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
+        self.inner
+            .security_query(prompt, json_schema, project_dir, sandbox, timeout)
+            .await
+    }
 }
