@@ -2,6 +2,8 @@
 //!
 //! All verified or unverified: reply under the automated release announcement
 //! (no @). FAIL: post in the announcement's thread and `@` the mapped releaser.
+//! A tip nothing announced, such as a bare monorepo tag, gets a post of its own
+//! in the channel instead, with the same `@` rule.
 
 use claudear_analysis::deploy_qa::{
     classify_deploy_qa_verdict, DeployQaVerdict, GitHubDiscordMap, DEPLOY_QA_SOURCE,
@@ -165,6 +167,47 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
         Ok((thread_id, sent.id))
     }
 
+    /// Post the outcome as a message of its own in the channel, for a tip with
+    /// no release announcement to reply under. FAIL still `@`s the releaser.
+    pub async fn post_unannounced(
+        &self,
+        tip: &DeployQaTip,
+        verdict: DeployQaVerdict,
+        report: &str,
+    ) -> Result<String> {
+        let release_url = tip.html_url.as_deref();
+        let (headline, embed) = match verdict {
+            DeployQaVerdict::AllVerified => (
+                format!("Deploy QA for `{}` (`{}`).", tip.tag, tip.repo),
+                self.report_embed(TITLE_VERIFIED, COLOR_VERIFIED, report, release_url),
+            ),
+            DeployQaVerdict::Unverified => (
+                format!("Deploy QA for `{}` (`{}`).", tip.tag, tip.repo),
+                self.report_embed(TITLE_UNVERIFIED, COLOR_UNVERIFIED, report, release_url),
+            ),
+            DeployQaVerdict::Fail => {
+                let summary = format!("Deploy QA failed for `{}` (`{}`).", tip.tag, tip.repo);
+                let headline = match self.releaser_mention(tip) {
+                    Some(mention) => format!("{mention} {summary}"),
+                    None => summary,
+                };
+                let title = format!("FAIL {}", tip.tag);
+                (
+                    headline,
+                    self.report_embed(&title, COLOR_FAIL, report, release_url),
+                )
+            }
+        };
+        let sent = self
+            .client
+            .send_message(
+                &self.channel_id,
+                CreateMessageParams::with_embed(headline, embed),
+            )
+            .await?;
+        Ok(sent.id)
+    }
+
     /// Embed `report`, redacted before it is truncated so a cut can never
     /// leave part of a secret that no longer matches.
     fn report_embed(
@@ -241,9 +284,12 @@ impl<H: DiscordHttpClient> DeployQaDiscord<H> {
 /// redacts credentials only from what it posts, so a redacted line can never
 /// hide a `LIVE FAIL`.
 ///
+/// A tip with no announcement in `#releases` (a bare tag, which no release
+/// feed posts) gets its own post instead of a reply.
+///
 /// Only loading the tip or persisting its status can fail. Once the status is
-/// stored, Discord problems (no reporter, no announcement, a failed post, ids
-/// that could not be recorded) are logged instead, so a report Discord already
+/// stored, Discord problems (no reporter, a failed search or post, ids that
+/// could not be recorded) are logged instead, so a report Discord already
 /// received is never broadcast again.
 pub async fn report_deploy_qa_outcome<S, H>(
     store: &S,
@@ -275,10 +321,18 @@ where
         None => match discord.find_release_message(&tip).await {
             Ok(Some(id)) => id,
             Ok(None) => {
-                tracing::warn!(
+                tracing::info!(
                     tag = %tip.tag,
-                    "deploy_qa: no #releases announcement found; skipping Discord post"
+                    "deploy_qa: no #releases announcement found; posting the outcome on its own"
                 );
+                if let Err(error) = discord.post_unannounced(&tip, verdict, report).await {
+                    tracing::warn!(
+                        tag = %tip.tag,
+                        ?verdict,
+                        %error,
+                        "deploy_qa: failed to post the outcome to #releases"
+                    );
+                }
                 return Ok(verdict);
             }
             Err(error) => {
@@ -916,18 +970,105 @@ mod tests {
         }
     }
 
+    const CONSOLE_REPO: &str = "appwrite/appwrite";
+    const CONSOLE_TAG: &str = "apps/console/1.2.141";
+
+    /// A console tip: a bare monorepo tag that no release feed announces.
+    fn console_tip() -> DeployQaTip {
+        let mut tip = DeployQaTip::new("console", CONSOLE_REPO, CONSOLE_TAG);
+        tip.id = 9;
+        tip.html_url = Some(release_url(CONSOLE_REPO, CONSOLE_TAG));
+        tip.author_login = Some(RELEASER.to_string());
+        tip
+    }
+
     #[tokio::test]
-    async fn missing_release_message_persists_status_without_posting() {
+    async fn unannounced_fail_posts_on_its_own_and_mentions_the_releaser() {
         let store = MemoryStore::new(tip());
         let (discord, requests) = reporter(vec![announcement("2222", REPO, "1.2.2")], false);
 
         let verdict = report(&store, &discord, &verdict_report("LIVE FAIL", VERDICT_FAIL)).await;
 
         assert_eq!(verdict, DeployQaVerdict::Fail);
-        assert!(posts(&requests).is_empty());
+        let posted = posts(&requests);
+        assert_eq!(posted.len(), 1, "one standalone post: {posted:?}");
+        let post = &posted[0];
+        assert!(post.is_post_to(&format!("/channels/{CHANNEL}/messages")));
+        assert!(
+            post.body["message_reference"].is_null(),
+            "the post must not reply to another release's announcement: {:?}",
+            post.body
+        );
+        let content = post.body["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains(&format!("<@{RELEASER_DISCORD_ID}>")),
+            "{content}"
+        );
+        assert!(content.contains(TAG), "{content}");
+        assert_eq!(post.body["embeds"][0]["title"], format!("FAIL {TAG}"));
         let stored = store.tip();
         assert_eq!(stored.status, DeployQaTipStatus::Failed);
-        assert_eq!(stored.discord_message_id, None);
+        assert_eq!(
+            stored.discord_message_id, None,
+            "Claudear's own post is not a release announcement"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_tag_outcomes_post_on_their_own_naming_the_slashed_tag() {
+        let cases = [
+            (
+                verdict_report("LIVE PASS", VERDICT_ALL_VERIFIED),
+                TITLE_VERIFIED,
+            ),
+            (
+                verdict_report("LIVE BLOCKED", VERDICT_UNVERIFIED),
+                TITLE_UNVERIFIED,
+            ),
+        ];
+        for (text, title) in cases {
+            let store = MemoryStore::new(console_tip());
+            let (discord, requests) =
+                reporter(vec![announcement(RELEASE_MESSAGE, REPO, TAG)], false);
+
+            report(&store, &discord, &text).await;
+
+            let posted = posts(&requests);
+            assert_eq!(posted.len(), 1, "{title}: {posted:?}");
+            let post = &posted[0];
+            assert!(
+                post.body["message_reference"].is_null(),
+                "{title}: a console tag must not reply under a cloud release: {:?}",
+                post.body
+            );
+            let content = post.body["content"].as_str().unwrap_or_default();
+            assert!(content.contains(CONSOLE_TAG), "{title}: {content}");
+            assert!(!content.contains("<@"), "{title}: {content}");
+            assert_eq!(post.body["embeds"][0]["title"], title);
+            assert_eq!(
+                post.body["embeds"][0]["url"],
+                "https://github.com/appwrite/appwrite/releases/tag/apps/console/1.2.141"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn console_tag_matches_an_announcement_naming_it() {
+        let (discord, _) = reporter(
+            vec![
+                announcement("3000", CONSOLE_REPO, "apps/console/1.2.1410"),
+                announcement("2000", CONSOLE_REPO, "console/1.2.141"),
+                announcement(RELEASE_MESSAGE, CONSOLE_REPO, CONSOLE_TAG),
+            ],
+            false,
+        );
+        let mut tip = console_tip();
+        tip.html_url = None;
+
+        assert_eq!(
+            discord.find_release_message(&tip).await.unwrap().as_deref(),
+            Some(RELEASE_MESSAGE)
+        );
     }
 
     #[tokio::test]
