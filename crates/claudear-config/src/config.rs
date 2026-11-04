@@ -2297,7 +2297,8 @@ impl Default for RegressionConfig {
 
 /// Tag filter for a `[deploy_qa]` track.
 ///
-/// TOML values: `"any"`, `"suffix:-db"`, `"not_suffix:-db"`.
+/// TOML values: `"any"`, `"suffix:-db"`, `"not_suffix:-db"`,
+/// `"prefix:apps/console/"`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DeployQaTagFilter {
     /// Match every release tag.
@@ -2307,32 +2308,56 @@ pub enum DeployQaTagFilter {
     Suffix(String),
     /// Match tags that do **not** end with the given suffix.
     NotSuffix(String),
+    /// Match tags that start with the given prefix (e.g. `apps/console/`), as
+    /// a monorepo namespaces one app's tags. The version is what follows it.
+    Prefix(String),
 }
 
 impl DeployQaTagFilter {
+    const ANY: &str = "any";
+    const SUFFIX: &str = "suffix:";
+    const NOT_SUFFIX: &str = "not_suffix:";
+    const PREFIX: &str = "prefix:";
+
     /// Parse a tag filter from its TOML string form.
     pub fn parse(raw: &str) -> std::result::Result<Self, String> {
         let raw = raw.trim();
-        if raw.is_empty() || raw.eq_ignore_ascii_case("any") {
+        if raw.is_empty() || raw.eq_ignore_ascii_case(Self::ANY) {
             return Ok(Self::Any);
         }
-        if let Some(suffix) = raw.strip_prefix("suffix:") {
-            let suffix = suffix.trim();
-            if suffix.is_empty() {
-                return Err("tag_filter 'suffix:' requires a non-empty suffix".to_string());
-            }
-            return Ok(Self::Suffix(suffix.to_string()));
+        if let Some(suffix) = raw.strip_prefix(Self::SUFFIX) {
+            return Self::operand(Self::SUFFIX, suffix).map(Self::Suffix);
         }
-        if let Some(suffix) = raw.strip_prefix("not_suffix:") {
-            let suffix = suffix.trim();
-            if suffix.is_empty() {
-                return Err("tag_filter 'not_suffix:' requires a non-empty suffix".to_string());
+        if let Some(suffix) = raw.strip_prefix(Self::NOT_SUFFIX) {
+            return Self::operand(Self::NOT_SUFFIX, suffix).map(Self::NotSuffix);
+        }
+        if let Some(prefix) = raw.strip_prefix(Self::PREFIX) {
+            let prefix = Self::operand(Self::PREFIX, prefix)?;
+            if let Some(invalid) = prefix.chars().find(|character| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/'))
+            }) {
+                return Err(format!(
+                    "tag_filter '{raw}' has '{invalid}' in its prefix (allowed: ASCII letters, digits, '-', '_', '.', '/')"
+                ));
             }
-            return Ok(Self::NotSuffix(suffix.to_string()));
+            if prefix.starts_with('/') || prefix.contains("..") || prefix.contains("//") {
+                return Err(format!(
+                    "tag_filter '{raw}' prefix must not start with '/' or contain '..' or '//', which no git tag can"
+                ));
+            }
+            return Ok(Self::Prefix(prefix));
         }
         Err(format!(
-            "unknown tag_filter '{raw}' (expected any | suffix:<text> | not_suffix:<text>)"
+            "unknown tag_filter '{raw}' (expected any | suffix:<text> | not_suffix:<text> | prefix:<text>)"
         ))
+    }
+
+    fn operand(kind: &str, operand: &str) -> std::result::Result<String, String> {
+        let operand = operand.trim();
+        if operand.is_empty() {
+            return Err(format!("tag_filter '{kind}' requires a non-empty value"));
+        }
+        Ok(operand.to_string())
     }
 
     /// Whether `tag` matches this filter.
@@ -2341,15 +2366,26 @@ impl DeployQaTagFilter {
             Self::Any => true,
             Self::Suffix(suffix) => tag.ends_with(suffix),
             Self::NotSuffix(suffix) => !tag.ends_with(suffix),
+            Self::Prefix(prefix) => tag.len() > prefix.len() && tag.starts_with(prefix),
+        }
+    }
+
+    /// The version a matching `tag` names: the tag without a
+    /// [`Self::Prefix`] prefix, otherwise the whole tag.
+    pub fn version<'a>(&self, tag: &'a str) -> &'a str {
+        match self {
+            Self::Prefix(prefix) => tag.strip_prefix(prefix.as_str()).unwrap_or(tag),
+            Self::Any | Self::Suffix(_) | Self::NotSuffix(_) => tag,
         }
     }
 
     /// Canonical TOML string for this filter.
     pub fn as_str(&self) -> String {
         match self {
-            Self::Any => "any".to_string(),
-            Self::Suffix(suffix) => format!("suffix:{suffix}"),
-            Self::NotSuffix(suffix) => format!("not_suffix:{suffix}"),
+            Self::Any => Self::ANY.to_string(),
+            Self::Suffix(suffix) => format!("{}{suffix}", Self::SUFFIX),
+            Self::NotSuffix(suffix) => format!("{}{suffix}", Self::NOT_SUFFIX),
+            Self::Prefix(prefix) => format!("{}{prefix}", Self::PREFIX),
         }
     }
 }
@@ -5718,6 +5754,107 @@ monitoring_duration_hours = 12
     }
 
     #[test]
+    fn test_deploy_qa_tag_filter_parses_prefixes() {
+        assert_eq!(
+            DeployQaTagFilter::parse("prefix:apps/console/").unwrap(),
+            DeployQaTagFilter::Prefix("apps/console/".into())
+        );
+        assert_eq!(
+            DeployQaTagFilter::parse("  prefix: apps/console/ ").unwrap(),
+            DeployQaTagFilter::Prefix("apps/console/".into())
+        );
+        for invalid in [
+            "prefix:",
+            "prefix:   ",
+            "prefix:apps console/",
+            "prefix:apps/console?",
+            "prefix:apps/console#",
+            "prefix:apps/%2e%2e/",
+            "prefix:../",
+            "prefix:apps/../",
+            "prefix:/apps/console/",
+            "prefix:apps//console/",
+        ] {
+            assert!(
+                DeployQaTagFilter::parse(invalid).is_err(),
+                "'{invalid}' must be rejected: it is empty or unsafe in a GitHub API path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_tag_filter_round_trips_through_toml() {
+        #[derive(Serialize, Deserialize)]
+        struct Holder {
+            tag_filter: DeployQaTagFilter,
+        }
+
+        for filter in [
+            DeployQaTagFilter::Any,
+            DeployQaTagFilter::Suffix("-db".into()),
+            DeployQaTagFilter::NotSuffix("-db".into()),
+            DeployQaTagFilter::Prefix("apps/console/".into()),
+        ] {
+            let serialized = toml::to_string(&Holder {
+                tag_filter: filter.clone(),
+            })
+            .unwrap();
+            let parsed: Holder = toml::from_str(&serialized).unwrap();
+            assert_eq!(parsed.tag_filter, filter, "{serialized}");
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_console_prefix_skips_the_monorepos_other_tags() {
+        let console = DeployQaTagFilter::parse("prefix:apps/console/").unwrap();
+        for other in [
+            "2.7.0",
+            "1.9.10",
+            "2.0.0-rc.3",
+            "cl-1.9.0-5",
+            "console/0.3.0",
+            "cl-1.6.0-console-roles.3",
+            "storage/4.5.0",
+            "apps/console",
+            "apps/console/",
+            "apps/consoles/1.0.0",
+            "packages/apps/console/1.0.0",
+        ] {
+            assert!(
+                !console.matches(other),
+                "console must not consume '{other}'"
+            );
+        }
+        assert!(console.matches("apps/console/1.2.141"));
+        assert_eq!(console.version("apps/console/1.2.141"), "1.2.141");
+        assert_eq!(DeployQaTagFilter::Any.version("1.53.30"), "1.53.30");
+        assert_eq!(
+            DeployQaTagFilter::Suffix("-db".into()).version("0.16.10-db"),
+            "0.16.10-db"
+        );
+    }
+
+    #[test]
+    fn test_deploy_qa_edge_tracks_split_every_tag_between_them() {
+        let network = DeployQaTagFilter::parse("not_suffix:-db").unwrap();
+        let database = DeployQaTagFilter::parse("suffix:-db").unwrap();
+        for tag in [
+            "0.10.61",
+            "0.16.10-db",
+            "1.0.0-rc.3-db",
+            "0.10.0-rc.1",
+            "0.9.0-dbx",
+        ] {
+            assert!(
+                network.matches(tag) ^ database.matches(tag),
+                "exactly one edge track must consume '{tag}'"
+            );
+        }
+        assert!(network.matches("0.10.61"));
+        assert!(database.matches("0.16.10-db"));
+    }
+
+    #[test]
     fn test_config_deploy_qa_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
@@ -5747,9 +5884,14 @@ repo = "appwrite-labs/edge"
 tag_filter = "not_suffix:-db"
 
 [[deploy_qa.tracks]]
-name = "vibes"
-repo = "appwrite/vibes"
+name = "website"
+repo = "appwrite/website"
 tag_filter = "any"
+
+[[deploy_qa.tracks]]
+name = "console"
+repo = "appwrite/appwrite"
+tag_filter = "prefix:apps/console/"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
             assert!(config.deploy_qa.enabled);
@@ -5759,7 +5901,7 @@ tag_filter = "any"
                 config.deploy_qa.discord_channel_id.as_deref(),
                 Some("990878183580651571")
             );
-            assert_eq!(config.deploy_qa.tracks.len(), 4);
+            assert_eq!(config.deploy_qa.tracks.len(), 5);
             assert_eq!(config.deploy_qa.tracks[0].name, "cloud");
             assert_eq!(
                 config.deploy_qa.tracks[0].tag_filter,
@@ -5773,7 +5915,12 @@ tag_filter = "any"
                 config.deploy_qa.tracks[2].tag_filter,
                 DeployQaTagFilter::NotSuffix("-db".into())
             );
-            assert_eq!(config.deploy_qa.tracks[3].repo, "appwrite/vibes");
+            assert_eq!(config.deploy_qa.tracks[3].repo, "appwrite/website");
+            assert_eq!(
+                config.deploy_qa.tracks[4].tag_filter,
+                DeployQaTagFilter::Prefix("apps/console/".into())
+            );
+            config.deploy_qa.validate().unwrap();
             assert_eq!(
                 config.regression.enabled,
                 RegressionConfig::default().enabled
@@ -8603,7 +8750,7 @@ sms_number = "+1111111111"
             &[
                 ("edge-db", "appwrite-labs/edge"),
                 ("edge-network", "appwrite-labs/edge"),
-                ("vibes", "appwrite/vibes"),
+                ("website", "appwrite/website"),
             ],
         );
         assert!(config.validate().is_ok());
@@ -8615,7 +8762,7 @@ sms_number = "+1111111111"
             true,
             &[
                 ("cloud", "appwrite-labs/cloud"),
-                ("cloud", "appwrite/vibes"),
+                ("cloud", "appwrite/website"),
             ],
         );
         let error = config.validate().unwrap_err().to_string();

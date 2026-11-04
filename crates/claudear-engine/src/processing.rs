@@ -7230,6 +7230,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_deploy_qa_directory_name_flattens_a_slashed_tag() {
+        for short_id in ["console-apps/console/1.2.141", "console-../../etc"] {
+            let prefix = live_qa_directory_prefix(short_id);
+            assert!(
+                !prefix.contains('/'),
+                "a tag's '/' must never nest or escape the run directory: {prefix}"
+            );
+            let base = std::path::Path::new("/workspace").join(LIVE_QA_DIRECTORY);
+            assert_eq!(base.join(&prefix).parent(), Some(base.as_path()));
+        }
+        assert_eq!(
+            live_qa_directory_prefix("console-apps/console/1.2.141"),
+            "console-apps_console_1.2.141-"
+        );
+    }
+
     #[tokio::test]
     async fn test_deploy_qa_runs_never_share_a_directory() {
         let fixture = AnsweringFixture::new();

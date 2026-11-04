@@ -185,9 +185,9 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 
 ### Deploy QA
 - Durable last-seen watches for GitHub release tips (separate from regression inclusion tracking)
-- Tag filters (`any`, `suffix:-db`, `not_suffix:-db`) per track
+- Tag filters (`any`, `suffix:-db`, `not_suffix:-db`, `prefix:apps/console/`) per track, so tracks can split one repo's tags, including a monorepo's app-namespaced bare tags
 - Live QA agent enqueue — runs real checks against the release from a private per-run directory, and is told never to open fix PRs for a release announcement
-- Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + mapped `@releaser`
+- Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + mapped `@releaser`; a post of its own when nothing announced the tip
 
 ### Notifications
 - **Discord**: Webhook messages + bot reply polling for Q&A, rich embeds, thread tracking
@@ -752,7 +752,7 @@ claudear inference feedback 43 --actual-repo my-other-repo
 
 ### Deploy QA
 
-Durable driver for **new GitHub release tips** (Appwrite Labs cloud / edge / vibes). Separate from `[regression]` release tracking, which watches **bug-fix inclusion** after a merge.
+Durable driver for **new GitHub release tips** (Appwrite Labs cloud / edge / edge-db, and the console's tags in the `appwrite/appwrite` monorepo). Separate from `[regression]` release tracking, which watches **bug-fix inclusion** after a merge.
 
 Works in every daemon mode — `claudear start` (no `--poll` needed), `claudear webhook` and `claudear poll`. After each release poll, pending tips are dispatched to the QA agent, at most `qa.max_concurrent` at a time, once the daemon has finished warm start. That dispatch is the only path that runs tips inside the daemon: the `--poll` source loop and `claudear seed` leave `deploy_qa` tips to it, and a tip another process started or finished in the meantime is skipped.
 
@@ -768,8 +768,15 @@ github_discord_map_path = "/etc/claudear/github-discord-map.json"  # absolute: r
 [[deploy_qa.tracks]]
 name = "cloud"
 repo = "appwrite-labs/cloud"
-tag_filter = "any"                 # any | suffix:-db | not_suffix:-db
+tag_filter = "any"                 # any | suffix:-db | not_suffix:-db | prefix:apps/console/
+
+[[deploy_qa.tracks]]
+name = "console"
+repo = "appwrite/appwrite"
+tag_filter = "prefix:apps/console/"
 ```
+
+A track's newest tip is the first matching published release in GitHub's release order. A repo with no published releases falls back to its tags, newest by semantic version. A `prefix:` track always reads the tags under its prefix (`git/matching-refs`, so a monorepo's other tags never crowd them out), takes the highest semantic version after the prefix (`apps/console/1.2.141` beats `apps/console/1.2.99`), and skips prefixed tags that are not a version. It uses the tag's release when one is published and otherwise QAs the bare tag, giving the agent the compare range since the previous tag on the track and the version without its prefix. Tracks on one repo need filters that split its tags (`suffix:-db` / `not_suffix:-db`), or each runs QA on the same tag.
 
 On a new tip Claudear:
 
@@ -780,6 +787,9 @@ On a new tip Claudear:
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
    - **Unverified** — nothing failed, but a PR is `LIVE BLOCKED`, the footer is `DEPLOY_QA_VERDICT: UNVERIFIED`, or the footer is missing: reply, no @, so blocked checks never page the releaser but are never reported as verified either.
    - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser via `github-discord-map.json` (reusing the announcement's existing thread when it already has one).
+   - **No announcement found** — when none of the last 50 `#releases` messages announces the tip, the outcome is posted as a message of its own naming the repo and tag, so it is never dropped. This should be rare: a release whose announcement scrolled away, or a bare tag (no GitHub release, so the release feed never posts it). FAIL still `@`s the releaser when the tip has one; a bare tag has no release author, so it posts without the mention.
+
+   Announcements are matched by the release URL first, so a release whose name differs from its tag (`Console 1.2.141` for `apps/console/1.2.141`) is still found, and otherwise by a title naming both the repo and the whole tag, where `console/0.3.0` never matches `apps/console/0.3.0`.
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
 
