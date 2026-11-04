@@ -21781,17 +21781,13 @@ mod tests {
             }
 
             let tracker = Arc::new(SqliteTracker::new(&path).unwrap());
-            let (first, last): (i64, i64) = {
-                let connection = tracker.acquire_lock().unwrap();
-                assert!(require_vectorlite_for_tests(&connection));
-                connection
-                    .query_row(
-                        "SELECT min(id), max(id) FROM code_chunk_embeddings",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .unwrap()
-            };
+            let blocking = tracker.acquire_lock().unwrap();
+            assert!(require_vectorlite_for_tests(&blocking));
+            let last: i64 = blocking
+                .query_row("SELECT max(id) FROM code_chunk_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
 
             let rebuilding = Arc::clone(&tracker);
             let rebuild = std::thread::spawn(move || {
@@ -21812,12 +21808,7 @@ mod tests {
                     std::thread::sleep(HOLD);
                 }
             };
-            let blocking = loop {
-                let connection = tracker.acquire_lock().unwrap();
-                if is_indexed(&connection, first) {
-                    break connection;
-                }
-            };
+            std::thread::sleep(QUEUE);
             let requesting = Arc::new(AtomicBool::new(false));
             let queued = {
                 let tracker = Arc::clone(&tracker);
@@ -21832,7 +21823,7 @@ mod tests {
                 std::thread::yield_now();
             }
             std::thread::sleep(QUEUE);
-            drop(blocking);
+            MutexGuard::unlock_fair(blocking);
             while !tracker.connection.is_locked() {
                 std::hint::spin_loop();
             }
