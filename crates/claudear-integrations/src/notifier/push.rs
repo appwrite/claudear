@@ -3,7 +3,7 @@
 use super::Notifier;
 use async_trait::async_trait;
 use claudear_config::config::PushConfig;
-use claudear_config::users::UserRegistry;
+use claudear_config::users::{NotificationChannel, UserRegistry};
 use claudear_core::error::{Error, Result};
 use claudear_core::types::{AskDelivery, AskRequest, Issue};
 use serde::Serialize;
@@ -49,16 +49,16 @@ impl PushNotifier {
     }
 
     fn resolve_user_key(&self, issue: Option<&Issue>) -> Option<String> {
-        if let Some(issue) = issue {
-            if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
-                if let Some(user) = self.user_registry.get_by_slug(&slug) {
-                    if user.push_user_key.is_some() {
-                        return user.push_user_key.clone();
-                    }
-                }
-            }
-        }
-        self.config.user_key.clone()
+        issue
+            .and_then(|issue| issue.get_metadata::<String>("resolved_user"))
+            .and_then(|slug| self.user_registry.get_by_slug(&slug))
+            .and_then(|user| user.push_user_key)
+            .or_else(|| {
+                self.config.user_key.as_deref().map(|reference| {
+                    self.user_registry
+                        .resolve_reference(NotificationChannel::Push, reference)
+                })
+            })
     }
 
     async fn send_push(
@@ -386,6 +386,7 @@ impl Notifier for PushNotifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifier::test_support::{console_person, registry_with};
 
     fn empty_registry() -> UserRegistry {
         UserRegistry::new(std::collections::HashMap::new())
@@ -796,8 +797,6 @@ mod tests {
         assert!(!json_str.contains("sound"));
     }
 
-    // --- ask_question tests ---
-
     #[tokio::test]
     async fn test_ask_question_disabled_returns_ok() {
         let notifier = PushNotifier::new(disabled_config(), empty_registry());
@@ -881,8 +880,6 @@ mod tests {
         assert!(PushNotifier::new(config, empty_registry()).is_enabled());
     }
 
-    // --- Tests for cascade success (disabled config) ---
-
     #[tokio::test]
     async fn test_notify_success_cascade_disabled() {
         let notifier = PushNotifier::new(disabled_config(), empty_registry());
@@ -896,8 +893,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- Tests for PR update success (disabled config) ---
-
     #[tokio::test]
     async fn test_notify_success_pr_update_disabled() {
         let notifier = PushNotifier::new(disabled_config(), empty_registry());
@@ -910,8 +905,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- Tests for regression resolved completed (disabled config) ---
-
     #[tokio::test]
     async fn test_notify_completed_regression_resolved_disabled() {
         let notifier = PushNotifier::new(disabled_config(), empty_registry());
@@ -921,8 +914,6 @@ mod tests {
         let result = notifier.notify_completed(&issue).await;
         assert!(result.is_ok());
     }
-
-    // --- Tests for regression detected failed (disabled config) ---
 
     #[tokio::test]
     async fn test_notify_failed_regression_detected_disabled() {
@@ -934,8 +925,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- Tests for cascade failed (disabled config) ---
-
     #[tokio::test]
     async fn test_notify_failed_cascade_disabled() {
         let notifier = PushNotifier::new(disabled_config(), empty_registry());
@@ -945,8 +934,6 @@ mod tests {
         let result = notifier.notify_failed(&issue, "Build error").await;
         assert!(result.is_ok());
     }
-
-    // --- Tests for notify_merged and notify_closed (disabled config) ---
 
     #[tokio::test]
     async fn test_notify_merged_disabled() {
@@ -969,8 +956,6 @@ mod tests {
             .await;
         assert!(result.is_ok());
     }
-
-    // --- Tests for PushoverMessage truncation ---
 
     #[test]
     fn test_pushover_message_long_message_truncation() {
@@ -997,8 +982,6 @@ mod tests {
         assert_eq!(truncated, "Hello world");
     }
 
-    // --- Tests for resolve_user_key with user not found in registry ---
-
     #[test]
     fn test_resolve_user_key_unknown_user_falls_back() {
         let config = PushConfig {
@@ -1016,8 +999,6 @@ mod tests {
             Some("global-key".to_string())
         );
     }
-
-    // --- Test notify_urgent_issues with multiple sources (disabled) ---
 
     #[tokio::test]
     async fn test_notify_urgent_issues_multiple_sources_disabled() {
@@ -1063,5 +1044,77 @@ mod tests {
         let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
         let result = notifier.notify_start(&issue).await;
         assert!(result.is_ok());
+    }
+
+    fn push_person(push_user_key: Option<&str>) -> claudear_config::config::UserConfig {
+        claudear_config::config::UserConfig {
+            linear_names: vec!["Jake B".to_string()],
+            push_user_key: push_user_key.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn config_for(user_key: &str) -> PushConfig {
+        PushConfig {
+            api_token: Some("token".into()),
+            user_key: Some(user_key.to_string()),
+            device: None,
+            priority: None,
+        }
+    }
+
+    #[test]
+    fn test_user_key_person_key_resolves_to_push_key() {
+        let notifier = PushNotifier::new(
+            config_for("jake"),
+            registry_with("jake", push_person(Some("resolved_push_key"))),
+        );
+        assert_eq!(
+            notifier.resolve_user_key(None),
+            Some("resolved_push_key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_user_key_unknown_reference_stays_literal() {
+        let notifier = PushNotifier::new(
+            config_for("literal_key"),
+            registry_with("jake", push_person(Some("resolved_push_key"))),
+        );
+        assert_eq!(
+            notifier.resolve_user_key(None),
+            Some("literal_key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_user_key_person_without_push_key_stays_literal() {
+        let notifier =
+            PushNotifier::new(config_for("jake"), registry_with("jake", push_person(None)));
+        assert_eq!(notifier.resolve_user_key(None), Some("jake".to_string()));
+    }
+
+    #[test]
+    fn test_user_key_follows_console_edit_without_rebuild() {
+        let registry = registry_with("jake", push_person(Some("old_key")));
+        let notifier = PushNotifier::new(config_for("jake"), registry.clone());
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        assert_eq!(
+            notifier.resolve_user_key(Some(&issue)),
+            Some("old_key".to_string())
+        );
+
+        registry.replace_console(vec![console_person(
+            "jake",
+            claudear_core::identity::Identities {
+                push_user_key: Some("new_key".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        assert_eq!(
+            notifier.resolve_user_key(Some(&issue)),
+            Some("new_key".to_string())
+        );
     }
 }

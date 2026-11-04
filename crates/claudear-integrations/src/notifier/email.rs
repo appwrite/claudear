@@ -4,7 +4,7 @@ use super::Notifier;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use claudear_config::config::EmailConfig;
-use claudear_config::users::UserRegistry;
+use claudear_config::users::{NotificationChannel, UserRegistry};
 use claudear_core::error::{Error, Result};
 use claudear_core::types::{AskDelivery, AskReply, AskRequest, Issue};
 use lettre::{
@@ -30,7 +30,7 @@ impl EmailNotifier {
             config.smtp_username.as_ref(),
             config.smtp_password.as_ref(),
         ) {
-            let creds = Credentials::new(username.clone(), password.expose().to_string());
+            let credentials = Credentials::new(username.clone(), password.expose().to_string());
 
             let builder = if config.use_tls {
                 AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
@@ -42,7 +42,7 @@ impl EmailNotifier {
             Some(
                 builder
                     .port(config.smtp_port)
-                    .credentials(creds)
+                    .credentials(credentials)
                     .timeout(Some(std::time::Duration::from_secs(10)))
                     .build(),
             )
@@ -57,17 +57,18 @@ impl EmailNotifier {
         })
     }
 
+    fn configured_addresses(&self) -> Vec<String> {
+        self.user_registry
+            .resolve_references(NotificationChannel::Email, &self.config.to_addresses)
+    }
+
     fn resolve_recipients(&self, issue: Option<&Issue>) -> Vec<String> {
-        if let Some(issue) = issue {
-            if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
-                if let Some(user) = self.user_registry.get_by_slug(&slug) {
-                    if let Some(ref email) = user.email {
-                        return vec![email.clone()];
-                    }
-                }
-            }
-        }
-        self.config.to_addresses.clone()
+        issue
+            .and_then(|issue| issue.get_metadata::<String>("resolved_user"))
+            .and_then(|slug| self.user_registry.get_by_slug(&slug))
+            .and_then(|user| user.email)
+            .map(|email| vec![email])
+            .unwrap_or_else(|| self.configured_addresses())
     }
 
     fn target_email_for_issue(&self, issue: &Issue) -> Option<String> {
@@ -78,10 +79,9 @@ impl EmailNotifier {
         if let Some(ref target) = request.target_email {
             return std::iter::once(target.to_lowercase()).collect();
         }
-        self.config
-            .to_addresses
+        self.configured_addresses()
             .iter()
-            .map(|v| v.to_lowercase())
+            .map(|address| address.to_lowercase())
             .collect()
     }
 
@@ -573,6 +573,7 @@ impl Notifier for EmailNotifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifier::test_support::{console_person, registry_with};
     use claudear_core::types::{IssuePriority, IssueStatus};
 
     fn empty_registry() -> UserRegistry {
@@ -2711,8 +2712,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- Tests that exercise send_email internals (with transport) ---
-
     fn send_config() -> EmailConfig {
         EmailConfig {
             smtp_host: Some("localhost".to_string()),
@@ -2981,8 +2980,6 @@ mod tests {
         assert!(err_str.contains("Invalid to address") || err_str.contains("email"));
     }
 
-    // --- Dynamic dispatch (Box<dyn Notifier>) tests ---
-
     fn boxed_email_notifier(config: EmailConfig) -> Box<dyn Notifier> {
         Box::new(EmailNotifier::new(config, empty_registry()).unwrap())
     }
@@ -3061,5 +3058,99 @@ mod tests {
         let n = boxed_email_notifier(send_config());
         assert_eq!(n.name(), "email");
         assert!(n.is_enabled());
+    }
+
+    fn email_person(email: Option<&str>) -> claudear_config::config::UserConfig {
+        claudear_config::config::UserConfig {
+            linear_names: vec!["Jake B".to_string()],
+            email: email.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn untargeted_request() -> AskRequest {
+        AskRequest {
+            correlation_id: "tok-reference".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: claudear_core::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        }
+    }
+
+    fn config_to(addresses: &[&str]) -> EmailConfig {
+        EmailConfig {
+            to_addresses: addresses
+                .iter()
+                .map(|address| address.to_string())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_to_addresses_person_key_resolves_to_email() {
+        let notifier = EmailNotifier::new(
+            config_to(&["jake", "other@example.com"]),
+            registry_with("jake", email_person(Some("jake@resolved.com"))),
+        )
+        .unwrap();
+        assert_eq!(
+            notifier.resolve_recipients(None),
+            vec!["jake@resolved.com", "other@example.com"]
+        );
+        let expected = notifier.expected_reply_emails(&untargeted_request());
+        assert!(expected.contains("jake@resolved.com"));
+        assert!(expected.contains("other@example.com"));
+        assert!(!expected.contains("jake"));
+    }
+
+    #[test]
+    fn test_to_addresses_person_without_email_stays_literal() {
+        let notifier = EmailNotifier::new(
+            config_to(&["jake"]),
+            registry_with("jake", email_person(None)),
+        )
+        .unwrap();
+        assert_eq!(notifier.resolve_recipients(None), vec!["jake"]);
+    }
+
+    #[test]
+    fn test_to_addresses_follow_console_edit_without_rebuild() {
+        let registry = registry_with("jake", email_person(Some("old@example.com")));
+        let notifier = EmailNotifier::new(config_to(&["jake"]), registry.clone()).unwrap();
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        assert_eq!(
+            notifier.target_email_for_issue(&issue).as_deref(),
+            Some("old@example.com")
+        );
+
+        registry.replace_console(vec![console_person(
+            "jake",
+            claudear_core::identity::Identities {
+                email: Some("new@example.com".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        assert_eq!(
+            notifier.target_email_for_issue(&issue).as_deref(),
+            Some("new@example.com")
+        );
+        let expected = notifier.expected_reply_emails(&untargeted_request());
+        assert_eq!(
+            expected,
+            std::iter::once("new@example.com".to_string()).collect()
+        );
     }
 }
