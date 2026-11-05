@@ -1054,6 +1054,7 @@ dependencies = [
  "rand 0.10.3",
  "regex-lite",
  "reqwest 0.13.5",
+ "rusqlite",
  "rust-embed",
  "sentry",
  "serde",

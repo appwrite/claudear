@@ -268,7 +268,7 @@ fn stage(
     identities: &HashMap<i64, ConsoleIdentity>,
     entries: Vec<DirectoryEntry>,
 ) -> Result<Vec<StagedEntry>, ApiError> {
-    let mut staged = Vec::with_capacity(entries.len());
+    let mut staged = Vec::new();
     let mut violations = Vec::new();
     let mut seen = HashSet::new();
 
@@ -400,6 +400,7 @@ fn check_conflicts(registry: &UserRegistry, staged: &[StagedEntry]) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::fixture;
     use crate::api::rate_limit::ADDRESS_ATTEMPTS;
     use crate::api::tokens::hash_secret;
     use crate::api::{apply_dashboard_middleware, create_api_router_with_dashboard};
@@ -450,8 +451,13 @@ mod tests {
     }
 
     fn test_app(with_middleware: bool) -> TestApp {
-        let tracker: Arc<dyn FixAttemptTracker> =
-            Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
+        test_app_on(
+            Arc::new(SqliteTracker::in_memory().expect("in-memory tracker")),
+            with_middleware,
+        )
+    }
+
+    fn test_app_on(tracker: Arc<dyn FixAttemptTracker>, with_middleware: bool) -> TestApp {
         let admin = caller(&tracker, "directory-admin@example.com", Role::Admin);
         let viewer = caller(&tracker, "directory-viewer@example.com", Role::Viewer);
         let config = Config {
@@ -760,6 +766,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_handle_storage_refuses_rolls_the_batch_back_with_409() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let app = test_app_on(
+            fixture::tracker_refusing_handle_claims(directory.path()),
+            false,
+        );
+        let before = user_count(&app);
+
+        let (status, body) = put(
+            &app,
+            Some(&bearer(&app.admin)),
+            None,
+            json!({"users": [
+                {"email": "directory-new@example.com", "name": "New", "role": "viewer"},
+                {"email": "directory-claim@example.com", "name": "Claim", "role": "viewer",
+                 "identities": {"github_usernames": ["claimed-gh"]}}
+            ]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            json!({"error": "Identities already belong to another person"})
+        );
+        assert_eq!(user_count(&app), before);
+        assert!(app.registry.resolve("github", "claimed-gh").is_none());
+    }
+
+    #[tokio::test]
     async fn unknown_entry_fields_are_rejected() {
         let app = test_app(false);
         let (status, body) = put(
@@ -767,7 +803,7 @@ mod tests {
             Some(&bearer(&app.admin)),
             None,
             json!({"users": [{"email": "directory-x@example.com", "name": "X",
-                              "role": "viewer", "password": "hunter2hunter2"}]}),
+                              "role": "viewer", "password": fixture::password()}]}),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

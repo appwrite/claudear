@@ -3105,7 +3105,7 @@ mod tests {
         let config = test_config();
 
         // Create a test user and session
-        let password_hash = bcrypt::hash("testpass", 4).unwrap(); // cost=4 for speed
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap(); // cost=4 for speed
         tracker
             .create_user("test@example.com", &password_hash, "Test User", Role::Admin)
             .unwrap();
@@ -4177,7 +4177,7 @@ mod tests {
         let config = test_config();
 
         // Use a nonexistent config path to test the error case
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
@@ -4206,7 +4206,7 @@ mod tests {
         let tracker = create_test_tracker();
         let config = test_config();
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
@@ -4239,7 +4239,7 @@ mod tests {
     async fn test_get_config_endpoint_viewer_forbidden() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
@@ -4289,7 +4289,7 @@ mod tests {
     async fn test_put_config_endpoint_viewer_forbidden() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
@@ -5971,7 +5971,7 @@ mod tests {
             ..claudear_config::config::LinearConfig::default()
         });
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
@@ -6014,7 +6014,7 @@ mod tests {
             ..claudear_config::config::SentryConfig::default()
         });
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
@@ -6051,7 +6051,7 @@ mod tests {
         config.issues.linear = Some(claudear_config::config::LinearConfig::default());
         config.issues.sentry = Some(claudear_config::config::SentryConfig::default());
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
@@ -6720,7 +6720,7 @@ mod tests {
         let tracker = create_test_tracker();
 
         // Test that "events" is also a valid stream
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
@@ -6852,7 +6852,7 @@ mod tests {
         });
         let valid_toml = toml::to_string_pretty(&valid_config).unwrap();
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
@@ -7316,7 +7316,7 @@ mod tests {
     async fn test_expired_session_returns_401() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("test@test.com", &password_hash, "Test", Role::Admin)
             .unwrap();
@@ -7726,7 +7726,7 @@ mod tests {
         let tracker = create_test_tracker();
         let config = test_config();
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
@@ -7829,7 +7829,7 @@ mod tests {
             Some(claudear_core::secret::SecretValue::new("wa_token"));
         config.notifiers.whatsapp.phone_number_id = Some("12345".to_string());
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
@@ -7868,7 +7868,7 @@ mod tests {
             Some(claudear_core::secret::SecretValue::new("tg_bot_token"));
         config.notifiers.telegram.chat_id = Some("123456789".to_string());
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
@@ -7952,7 +7952,7 @@ mod tests {
                 &token,
                 serde_json::json!({
                     "email": "newuser@example.com",
-                    "password": "securepass123",
+                    "password": crate::api::fixture::password(),
                     "name": "New User",
                     "role": "viewer"
                 }),
@@ -7980,7 +7980,7 @@ mod tests {
                 &token,
                 serde_json::json!({
                     "email": "test@example.com",
-                    "password": "password123",
+                    "password": crate::api::fixture::password(),
                     "name": "Duplicate",
                     "role": "viewer"
                 }),
@@ -8050,7 +8050,7 @@ mod tests {
         tracker
             .create_user(
                 "todelete@example.com",
-                &bcrypt::hash("pass", 4).unwrap(),
+                &bcrypt::hash(crate::api::fixture::password(), 4).unwrap(),
                 "Delete Me",
                 Role::Viewer,
             )
@@ -8071,7 +8071,7 @@ mod tests {
     async fn test_users_endpoint_viewer_forbidden() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
@@ -8093,7 +8093,7 @@ mod tests {
                 &token,
                 serde_json::json!({
                     "email": "new@example.com",
-                    "password": "password123",
+                    "password": crate::api::fixture::password(),
                     "name": "New User",
                     "role": "viewer"
                 }),
@@ -8117,7 +8117,7 @@ mod tests {
 
     fn config_file_router(path: PathBuf, role: Role) -> (Router, String) {
         let tracker = create_test_tracker();
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
             .create_user("config@test.com", &password_hash, "Config", role)
             .unwrap();
@@ -9578,13 +9578,13 @@ mod tests {
     mod invite_directory {
         use super::*;
         use crate::api::apply_dashboard_middleware;
+        use crate::api::fixture;
         use axum::body::Bytes;
         use axum::http::Method;
         use claudear_core::identity::{Identities, UserStatus};
         use claudear_storage::{DirectoryUser, DirectoryWrite, IdentityWrite, InviteWrite};
         use serde_json::{json, Value};
 
-        const PASSWORD: &str = "correct horse battery";
         const INVALID_INVITE: &str = "This invite link is invalid or has expired";
         const PUBLIC_URL: &str = "https://claudear.example.com/";
         const DISCORD_ID: &str = "452316113016193024";
@@ -9950,6 +9950,7 @@ mod tests {
 
         #[tokio::test]
         async fn post_users_without_a_password_creates_an_invited_user() {
+            let password = fixture::password();
             let app = TestApp::new().await;
 
             let (id, _, body) = app.create_invited_user("amy", None).await;
@@ -9974,7 +9975,7 @@ mod tests {
                         "email": app.email("bob"),
                         "name": "Bob",
                         "role": "viewer",
-                        "password": PASSWORD,
+                        "password": &password,
                     })),
                 )
                 .await;
@@ -10037,6 +10038,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_invite_is_inspected_then_accepted_then_the_user_logs_in() {
+            let password = fixture::password();
             let app = TestApp::new().await;
             let (id, secret, _) = app.create_invited_user("amy", None).await;
 
@@ -10061,17 +10063,17 @@ mod tests {
                 "inspect needs the CSRF header"
             );
 
-            let (status, rejected) = app.accept(&secret, "short").await;
+            let (status, rejected) = app.accept(&secret, &fixture::password_with_length(5)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(rejected, json!({"error": "Password must be 8-72 bytes"}));
             assert_eq!(app.status_of(id), UserStatus::Invited);
 
-            let (status, accepted) = app.accept(&secret, PASSWORD).await;
+            let (status, accepted) = app.accept(&secret, &password).await;
             assert_eq!(status, StatusCode::OK, "{accepted}");
             assert_eq!(accepted, json!({"message": "Invite accepted"}));
             assert_eq!(app.status_of(id), UserStatus::Active);
 
-            let (status, body) = app.login(&app.email("amy"), PASSWORD).await;
+            let (status, body) = app.login(&app.email("amy"), &password).await;
             assert_eq!(status, StatusCode::OK);
             let session: Value = serde_json::from_slice(&body).expect("login body");
             assert_eq!(session["user"]["email"], app.email("amy"));
@@ -10085,6 +10087,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_admin_password_activates_an_invited_user_and_closes_the_invite() {
+            let password = fixture::password();
             let app = TestApp::new().await;
             let (id, secret, _) = app.create_invited_user("amy", None).await;
 
@@ -10092,7 +10095,7 @@ mod tests {
                 .as_admin(
                     Method::PUT,
                     &format!("/api/users/{id}"),
-                    Some(json!({"password": PASSWORD})),
+                    Some(json!({"password": &password})),
                 )
                 .await;
             assert_eq!(status, StatusCode::OK, "{updated}");
@@ -10103,30 +10106,31 @@ mod tests {
             let (status, body) = app.inspect(&secret).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
             assert_eq!(body, invalid_invite());
-            let (status, _) = app.login(&app.email("amy"), PASSWORD).await;
+            let (status, _) = app.login(&app.email("amy"), &password).await;
             assert_eq!(status, StatusCode::OK);
         }
 
         #[tokio::test]
         async fn login_for_an_invited_user_matches_a_wrong_password() {
+            let password = fixture::password();
             let app = TestApp::new().await;
             let active = app.email("active");
             app.tracker
-                .create_user(&active, &password_hash(PASSWORD), "Active", Role::Viewer)
+                .create_user(&active, &password_hash(&password), "Active", Role::Viewer)
                 .expect("create active user");
             let invited = app.email("invited");
             // A real hash for the right password, so only the status gate can refuse it.
             app.seed_invited(
                 &invited,
                 Role::Admin,
-                &password_hash(PASSWORD),
+                &password_hash(&password),
                 &invite_secret(),
                 &timestamp(Duration::days(7)),
             );
 
-            let (wrong_status, wrong_body) = app.login(&active, "not the password").await;
-            let (invited_status, invited_body) = app.login(&invited, PASSWORD).await;
-            let (unknown_status, unknown_body) = app.login(&app.email("unknown"), PASSWORD).await;
+            let (wrong_status, wrong_body) = app.login(&active, &fixture::password()).await;
+            let (invited_status, invited_body) = app.login(&invited, &password).await;
+            let (unknown_status, unknown_body) = app.login(&app.email("unknown"), &password).await;
 
             assert_eq!(wrong_status, StatusCode::UNAUTHORIZED);
             assert_eq!(invited_status, StatusCode::UNAUTHORIZED);
@@ -10137,31 +10141,33 @@ mod tests {
 
         #[tokio::test]
         async fn an_accepted_invite_cannot_be_reused() {
+            let password = fixture::password();
             let app = TestApp::new().await;
             let (_, secret, _) = app.create_invited_user("amy", None).await;
 
-            let (status, _) = app.accept(&secret, PASSWORD).await;
+            let (status, _) = app.accept(&secret, &password).await;
             assert_eq!(status, StatusCode::OK);
 
-            let (status, body) = app.accept(&secret, "another password").await;
+            let (status, body) = app.accept(&secret, &fixture::password()).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
             assert_eq!(body, invalid_invite());
             let (status, body) = app.inspect(&secret).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
             assert_eq!(body, invalid_invite());
 
-            let (status, _) = app.login(&app.email("amy"), PASSWORD).await;
+            let (status, _) = app.login(&app.email("amy"), &password).await;
             assert_eq!(status, StatusCode::OK, "the first password still stands");
         }
 
         #[tokio::test]
         async fn an_expired_invite_is_rejected() {
+            let password = fixture::password();
             let app = TestApp::new().await;
             let original = invite_secret();
             let id = app.seed_invited(
                 &app.email("late"),
                 Role::Viewer,
-                &password_hash("never-used-password"),
+                &password_hash(&fixture::password()),
                 &original,
                 &timestamp(Duration::days(7)),
             );
@@ -10179,7 +10185,7 @@ mod tests {
                 let (status, body) = app.inspect(secret).await;
                 assert_eq!(status, StatusCode::NOT_FOUND);
                 assert_eq!(body, invalid_invite());
-                let (status, body) = app.accept(secret, PASSWORD).await;
+                let (status, body) = app.accept(secret, &password).await;
                 assert_eq!(status, StatusCode::NOT_FOUND);
                 assert_eq!(body, invalid_invite());
             }
@@ -10188,6 +10194,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_revoked_invite_is_rejected() {
+            let password = fixture::password();
             let app = TestApp::new().await;
             let (id, secret, _) = app.create_invited_user("amy", None).await;
             let uri = format!("/api/users/{id}/invite");
@@ -10199,7 +10206,7 @@ mod tests {
             let (status, body) = app.inspect(&secret).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
             assert_eq!(body, invalid_invite());
-            let (status, _) = app.accept(&secret, PASSWORD).await;
+            let (status, _) = app.accept(&secret, &password).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
 
             let (status, _) = app.as_admin(Method::DELETE, &uri, None).await;
@@ -10209,6 +10216,7 @@ mod tests {
 
         #[tokio::test]
         async fn reissuing_an_invite_invalidates_the_previous_link() {
+            let password = fixture::password();
             let app = TestApp::new().await;
             let (id, previous, _) = app.create_invited_user("amy", None).await;
 
@@ -10224,12 +10232,12 @@ mod tests {
             let (status, body) = app.inspect(&previous).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
             assert_eq!(body, invalid_invite());
-            let (status, _) = app.accept(&previous, PASSWORD).await;
+            let (status, _) = app.accept(&previous, &password).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
 
             let (status, _) = app.inspect(&current).await;
             assert_eq!(status, StatusCode::OK);
-            let (status, _) = app.accept(&current, PASSWORD).await;
+            let (status, _) = app.accept(&current, &password).await;
             assert_eq!(status, StatusCode::OK);
         }
 
@@ -10371,7 +10379,7 @@ mod tests {
             let id = app.seed_invited(
                 &app.email("pending-admin"),
                 Role::Admin,
-                &password_hash("never-used-password"),
+                &password_hash(&fixture::password()),
                 &invite_secret(),
                 &timestamp(Duration::days(7)),
             );

@@ -54,7 +54,7 @@ impl Drop for EnvironmentVariable {
 
 fn admin_router(path: &Path) -> (Router, String) {
     let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-    let password_hash = bcrypt::hash("testpass", 4).unwrap();
+    let password_hash = bcrypt::hash(rand::random::<u64>().to_string(), 4).unwrap();
     tracker
         .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
         .unwrap();
