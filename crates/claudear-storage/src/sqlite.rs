@@ -1727,8 +1727,9 @@ impl ActivityStore for SqliteTracker {
         &self,
         status: Option<&str>,
         limit: usize,
+        scope: AttemptScope,
     ) -> Result<Vec<claudear_core::types::PrRecord>> {
-        SqliteTracker::list_prs(self, status, limit)
+        SqliteTracker::list_prs(self, status, limit, scope)
     }
 
     fn update_pr_fix_quality_score(&self, pr_url: &str, score: f64) -> Result<()> {
@@ -7767,49 +7768,32 @@ impl SqliteTracker {
         })
     }
 
-    /// List PRs with optional status filter and limit.
+    /// The newest `limit` PRs within `scope`, optionally with `status`.
     pub fn list_prs(
         &self,
         status: Option<&str>,
         limit: usize,
+        scope: AttemptScope,
     ) -> Result<Vec<claudear_core::types::PrRecord>> {
         let conn = self.acquire_lock()?;
-        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
-            Some(s) => (
-                r#"
-                    SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
-                           title, description, author, head_branch, base_branch, status,
-                           created_at, updated_at, merged_at, closed_at,
-                           approvals_count, changes_requested_count, comments_count, last_review_at,
-                           time_to_first_review_mins, time_to_merge_mins, review_cycles,
-                           files_changed, lines_added, lines_removed
-                    FROM prs WHERE status = ?1
-                    ORDER BY created_at DESC LIMIT ?2
-                "#
-                .to_string(),
-                vec![
-                    Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>,
-                    Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>,
-                ],
-            ),
-            None => (
-                r#"
-                    SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
-                           title, description, author, head_branch, base_branch, status,
-                           created_at, updated_at, merged_at, closed_at,
-                           approvals_count, changes_requested_count, comments_count, last_review_at,
-                           time_to_first_review_mins, time_to_merge_mins, review_cycles,
-                           files_changed, lines_added, lines_removed
-                    FROM prs ORDER BY created_at DESC LIMIT ?1
-                "#
-                .to_string(),
-                vec![Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>],
-            ),
-        };
-        let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt.query_map(param_refs.as_slice(), Self::row_to_pr_record)?;
+        let mut statement = conn.prepare(&format!(
+            r#"
+                SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
+                       title, description, author, head_branch, base_branch, status,
+                       created_at, updated_at, merged_at, closed_at,
+                       approvals_count, changes_requested_count, comments_count, last_review_at,
+                       time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                       files_changed, lines_added, lines_removed
+                FROM prs
+                WHERE (?1 IS NULL OR status = ?1) AND {}
+                ORDER BY created_at DESC LIMIT ?2
+            "#,
+            scope::pull_request("prs", 3)
+        ))?;
+        let rows = statement.query_map(
+            params![status, limit as i64, scope.excluded_source()],
+            Self::row_to_pr_record,
+        )?;
         Ok(rows.flatten().collect())
     }
 
@@ -18256,7 +18240,7 @@ mod tests {
             .upsert_pr(&make_pr_record("https://github.com/a/b/pull/2", "a/b", 2))
             .unwrap();
 
-        let all = tracker.list_prs(None, 100).unwrap();
+        let all = tracker.list_prs(None, 100, AttemptScope::All).unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -18272,11 +18256,15 @@ mod tests {
             .upsert_pr(&make_pr_record("https://github.com/a/b/pull/2", "a/b", 2))
             .unwrap();
 
-        let merged = tracker.list_prs(Some("merged"), 100).unwrap();
+        let merged = tracker
+            .list_prs(Some("merged"), 100, AttemptScope::All)
+            .unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].pr_url, "https://github.com/a/b/pull/1");
 
-        let open = tracker.list_prs(Some("open"), 100).unwrap();
+        let open = tracker
+            .list_prs(Some("open"), 100, AttemptScope::All)
+            .unwrap();
         assert_eq!(open.len(), 1);
     }
 
@@ -18292,8 +18280,54 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let prs = tracker.list_prs(None, 3).unwrap();
+        let prs = tracker.list_prs(None, 3, AttemptScope::All).unwrap();
         assert_eq!(prs.len(), 3);
+    }
+
+    #[test]
+    fn listing_prs_without_security_leaves_out_prs_of_security_issues_and_attempts() {
+        use claudear_core::security::SECURITY_FIX_SOURCE;
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt(SECURITY_FIX_SOURCE, "SEC-1", "SEC-1")
+            .unwrap();
+        let security_attempt = tracker
+            .get_attempt(SECURITY_FIX_SOURCE, "SEC-1")
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let mut by_issue = make_pr_record("https://github.com/a/b/pull/1", "a/b", 1);
+        by_issue.issue_source = Some(SECURITY_FIX_SOURCE.to_string());
+        let mut by_attempt = make_pr_record("https://github.com/a/b/pull/2", "a/b", 2);
+        by_attempt.issue_source = Some("linear".to_string());
+        by_attempt.attempt_id = Some(security_attempt);
+        let mut other = make_pr_record("https://github.com/a/b/pull/3", "a/b", 3);
+        other.issue_source = Some("linear".to_string());
+        for record in [&by_issue, &by_attempt, &other] {
+            tracker.upsert_pr(record).unwrap();
+        }
+
+        let urls = |status: Option<&str>, scope: AttemptScope| -> Vec<String> {
+            let mut urls: Vec<String> = tracker
+                .list_prs(status, 100, scope)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.pr_url)
+                .collect();
+            urls.sort();
+            urls
+        };
+        assert_eq!(
+            urls(None, AttemptScope::WithoutSecurity),
+            [other.pr_url.clone()]
+        );
+        assert_eq!(
+            urls(Some("open"), AttemptScope::WithoutSecurity),
+            [other.pr_url.clone()]
+        );
+        assert_eq!(urls(None, AttemptScope::All).len(), 3);
+        assert_eq!(urls(Some("merged"), AttemptScope::All).len(), 0);
     }
 
     #[test]

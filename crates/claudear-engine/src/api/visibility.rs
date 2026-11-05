@@ -674,6 +674,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_admin_pull_requests_leave_out_those_of_security_attempts() {
+        let harness = Harness::start();
+        let seeded = seed(harness.tracker.as_ref());
+        let mut record = pull_request(3, OTHER_SOURCE);
+        record.attempt_id = Some(seeded.security_attempt);
+        harness.tracker.upsert_pr(&record).expect("pull request");
+
+        let urls = |body: &Value| -> Vec<String> {
+            let mut urls: Vec<String> = body
+                .as_array()
+                .expect("pull requests")
+                .iter()
+                .filter_map(|row| row["pr_url"].as_str().map(str::to_string))
+                .collect();
+            urls.sort();
+            urls
+        };
+        let (_, viewer) = harness.get("/api/prs", Some(&harness.viewer)).await;
+        assert_eq!(urls(&viewer), [pull_request(2, OTHER_SOURCE).pr_url]);
+        let (_, admin) = harness.get("/api/prs", Some(&harness.admin)).await;
+        assert_eq!(urls(&admin).len(), 3);
+    }
+
+    #[tokio::test]
     async fn non_admin_aggregates_still_count_other_work() {
         let harness = Harness::start();
         seed_merged_fix(harness.tracker.as_ref(), OTHER_SOURCE, 1);

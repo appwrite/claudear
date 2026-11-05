@@ -1650,15 +1650,12 @@ async fn prs_handler(
     State(state): State<ApiState>,
     Query(query): Query<PrsQuery>,
 ) -> Result<Json<Vec<claudear_core::types::PrRecord>>, StatusCode> {
-    let visibility = Visibility::for_user(&user);
+    let scope = Visibility::for_user(&user).scope();
     let limit = query.limit.unwrap_or(100).min(500);
 
-    visibility
-        .prefix(
-            |limit| state.tracker.list_prs(query.status.as_deref(), limit),
-            |pull_request| visibility.shows_optional(pull_request.issue_source.as_deref()),
-            limit,
-        )
+    state
+        .tracker
+        .list_prs(query.status.as_deref(), limit, scope)
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
