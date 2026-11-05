@@ -22,6 +22,7 @@ use claudear_config::config::PrDistributionConfig;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Error;
 use claudear_core::error::Result;
+use claudear_core::security::SECURITY_FIX_SOURCE;
 use claudear_core::types::AssignmentStatus;
 use claudear_core::types::Issue;
 use claudear_core::types::PrAssignment;
@@ -145,12 +146,13 @@ impl Distributor {
     /// A PR that already has an assignee keeps it, so review reruns that
     /// report the same PR change nothing. Returns `None` when assignment on
     /// open is turned off, the PR is not a GitHub PR, or it does not need
-    /// anyone yet; the scheduled run picks those up later. Only the caller
+    /// anyone yet; the scheduled run picks those up later. A security fix is
+    /// never assigned, since a ping would announce it in a shared channel. Only the caller
     /// whose assignment is recorded pings, so concurrent callers never ping
     /// two people for one PR; a ping that fails or reaches no remote channel
     /// leaves the assignment unnotified for the scheduled run to ping again.
     pub async fn assign_opened(&self, pr_url: &str, issue: &Issue) -> Result<Option<PrAssignment>> {
-        if !self.notify_on_open {
+        if !self.notify_on_open || issue.source == SECURITY_FIX_SOURCE {
             return Ok(None);
         }
         let Some((repo, number)) = github_pull_request(pr_url) else {
@@ -248,6 +250,9 @@ impl Distributor {
 
         let mut open: BTreeMap<String, (String, i64)> = BTreeMap::new();
         for attempt in self.store.get_pending_prs()? {
+            if attempt.source == SECURITY_FIX_SOURCE {
+                continue;
+            }
             if let Some(url) = attempt.pr_url {
                 if let Some(pull_request) = github_pull_request(&url) {
                     open.insert(url, pull_request);
@@ -815,12 +820,17 @@ mod tests {
 
         /// Record that Claudear opened PR `number`.
         fn opened(&self, number: i64) {
+            self.opened_from("linear", number);
+        }
+
+        /// Record that Claudear opened PR `number` for an issue from `source`.
+        fn opened_from(&self, source: &str, number: i64) {
             let issue_id = format!("issue-{number}");
             self.store
-                .record_attempt("linear", &issue_id, &issue_id)
+                .record_attempt(source, &issue_id, &issue_id)
                 .unwrap();
             self.store
-                .mark_success("linear", &issue_id, &url(number))
+                .mark_success(source, &issue_id, &url(number))
                 .unwrap();
         }
 
@@ -1011,6 +1021,41 @@ mod tests {
             .is_none());
         assert!(harness.assignees().is_empty());
         assert!(harness.recorder.notices.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_security_fix_pr_is_never_assigned_or_announced_on_open() {
+        let harness = Harness::new(FakeHost::with([open(1)]));
+        harness.opened_from(SECURITY_FIX_SOURCE, 1);
+        let distributor = harness.distributor(&["amy"], config());
+        let fix = Issue::new("1", "SEC-1", "Title", "url", SECURITY_FIX_SOURCE);
+
+        let assignment = distributor.assign_opened(&url(1), &fix).await.unwrap();
+
+        assert!(assignment.is_none());
+        assert!(harness.assignees().is_empty());
+        assert!(harness.pinged().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_leaves_security_fix_prs_out_of_assignments_and_digests() {
+        let harness = Harness::new(FakeHost::with([open(1), open(2)]));
+        harness.opened(1);
+        harness.opened_from(SECURITY_FIX_SOURCE, 2);
+        let distributor = harness.distributor(&["amy"], config());
+
+        let outcome = distributor.distribute(Utc::now()).await.unwrap();
+
+        assert_eq!(outcome.assigned, 1);
+        assert_eq!(outcome.listed, 1);
+        assert_eq!(harness.assignees(), vec![(1, "amy".to_string())]);
+        let digested: Vec<String> = harness.recorder.digests.lock().unwrap()[0]
+            .groups
+            .iter()
+            .flat_map(|group| group.pull_requests.iter())
+            .map(|pull_request| pull_request.url.clone())
+            .collect();
+        assert_eq!(digested, vec![url(1)]);
     }
 
     #[tokio::test]
