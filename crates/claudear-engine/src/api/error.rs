@@ -15,10 +15,6 @@ use std::borrow::Cow;
 /// How SQLite reports a second user with the same login email.
 const DUPLICATE_EMAIL_CONSTRAINT: &str = "UNIQUE constraint failed: users.email";
 
-/// How storage reports a handle another user already claims, which only a writer in
-/// another process can cause once the up-front registry check has passed.
-const DUPLICATE_HANDLE_CONSTRAINT: &str = "UNIQUE constraint failed: user_handles";
-
 const IDENTITY_CONFLICT: &str = "Identities already belong to another person";
 
 /// Per-field problems attached to a 400 or 409.
@@ -137,7 +133,7 @@ impl ApiError {
                 Self::duplicate_email()
             }
             claudear_core::error::Error::Database(message)
-                if message.contains(DUPLICATE_HANDLE_CONSTRAINT) =>
+                if message.contains(claudear_storage::DUPLICATE_HANDLE) =>
             {
                 Self::duplicate_handle()
             }
@@ -271,7 +267,8 @@ mod tests {
     #[tokio::test]
     async fn a_handle_storage_refuses_is_a_conflict_that_names_no_one() {
         let error = claudear_core::error::Error::Database(format!(
-            "{DUPLICATE_HANDLE_CONSTRAINT}.field, user_handles.value"
+            "{}.field, user_handles.value",
+            claudear_storage::DUPLICATE_HANDLE
         ));
 
         let (status, body) = render(ApiError::user_write(error)).await;
