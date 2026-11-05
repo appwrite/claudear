@@ -1016,8 +1016,8 @@ mod tests {
     use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
     use claudear_storage::{
         ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
-        EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
-        SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
+        EvaluationStore, ExperimentStore, KnowledgeStore, PrAssignmentStore, RegressionStore,
+        RepoStore, SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
     };
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -1187,6 +1187,7 @@ mod tests {
     impl SimilarityStore for MockTracker {}
     impl DiscordStore for MockTracker {}
     impl DeployQaStore for MockTracker {}
+    impl PrAssignmentStore for MockTracker {}
     impl SecurityReportStore for MockTracker {}
 
     fn make_service(

@@ -1007,6 +1007,7 @@ mod tests {
     use crate::storage::{SqliteTracker, UserStore};
     use async_trait::async_trait;
     use axum::http::HeaderName;
+    use claudear_core::identity::Role;
     use claudear_core::types::{Issue, MatchPriority, MatchResult};
     use claudear_integrations::discord::DiscordUser;
 
@@ -1532,7 +1533,7 @@ mod tests {
     fn authenticate_bearer_resolves_created_token() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("dev@example.com", "hash", "Dev", "viewer")
+            .create_user("dev@example.com", "hash", "Dev", Role::Viewer)
             .unwrap();
         // Mint a token the way the API does: store its hash + prefix.
         let secret = "cldr_secret_value";
@@ -1565,7 +1566,9 @@ mod tests {
     #[tokio::test]
     async fn handler_requires_bearer_token() {
         let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let uid = tracker.create_user("d@e.com", "h", "D", "viewer").unwrap();
+        let uid = tracker
+            .create_user("d@e.com", "h", "D", Role::Viewer)
+            .unwrap();
         let secret = "cldr_handler_secret";
         tracker
             .create_api_token(uid, "t", &hash_token(secret), "cldr_h", None)

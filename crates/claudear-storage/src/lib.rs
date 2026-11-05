@@ -20,16 +20,17 @@ pub use scope::AttemptScope;
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteTracker, VectorIndexRebuilder};
 pub use types::{
-    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
-    DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,
-    PurgeResult, StoredDependency, StoredDiscordChannel, StoredIndexedRepo, StoredRepository,
-    UserRow,
+    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts, DirectoryUser,
+    DirectoryWrite, DiscordKnowledgebaseStats, IdentityWrite, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, InviteRow, InviteWrite, PurgeResult, StoredDependency,
+    StoredDiscordChannel, StoredIndexedRepo, StoredRepository, UserRow,
 };
 #[cfg(feature = "sqlite")]
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 
 use chrono::{DateTime, Utc};
 use claudear_core::error::{Error, Result};
+use claudear_core::identity::{ConsoleIdentity, Role};
 use claudear_core::security::{
     AwardStatus, DeliveryStatus, NewSecurityAward, NewSecurityEvent, NewSecurityReport,
     NewSecurityVulnerability, ReportTransition, SecurityAward, SecurityEvent, SecurityEventKind,
@@ -38,13 +39,19 @@ use claudear_core::security::{
     SecurityVulnerabilityChanges, VulnerabilityState,
 };
 use claudear_core::types::{
-    ActivityLogEntry, AgentExecution, AnalyticsSummary, DeployQaTip, DeployQaTipStatus,
-    ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, IssueTimeline,
-    PrAnalytics, PrRecord, PrReviewRecord, ProcessingMetric, PromptExperiment, QaKnowledgeEntry,
-    QaMatch, RegressionCheck, RegressionWatch, RegressionWatchStatus, SimilarIssue,
+    ActivityLogEntry, AgentExecution, AnalyticsSummary, AssignmentStatus, DeployQaTip,
+    DeployQaTipStatus, ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding,
+    IssueTimeline, PrAnalytics, PrAssignment, PrRecord, PrReviewRecord, ProcessingMetric,
+    PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck, RegressionWatch,
+    RegressionWatchStatus, SimilarIssue,
 };
 use claudear_core::types::{CrossRepoCorrelation, FixOutcome};
 use std::collections::{HashMap, HashSet};
+
+/// Contained in the [`claudear_core::error::Error::Database`] message of an identity write
+/// that would give a person a source login, Discord id or Slack id another person already
+/// claims; the whole write is rolled back.
+pub const DUPLICATE_HANDLE: &str = "UNIQUE constraint failed: user_handles";
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -1797,8 +1804,8 @@ pub trait DiscordStore: Send + Sync {
     }
 }
 
-/// User management, sessions, channels, regression, experiments, diagnostics,
-/// User CRUD, sessions, and channel cursors (all defaulted).
+/// User CRUD, sessions, API tokens, the identity directory, invites and channel
+/// cursors (all defaulted).
 pub trait UserStore: Send + Sync {
     /// Retrieve a channel cursor value.
     fn get_channel_cursor(&self, _channel: &str, _cursor_key: &str) -> Result<Option<String>> {
@@ -1815,18 +1822,20 @@ pub trait UserStore: Send + Sync {
         Ok(())
     }
 
-    /// Create a new user.
+    /// Create a new user. The login email is stored normalized (see
+    /// [`claudear_core::identity::normalize_login_email`]); one that matches another
+    /// user's case-insensitively is a `UNIQUE` violation.
     fn create_user(
         &self,
         _email: &str,
         _password_hash: &str,
         _name: &str,
-        _role: &str,
+        _role: Role,
     ) -> Result<i64> {
         Ok(0)
     }
 
-    /// Get a user by email.
+    /// Get a user by login email, compared case-insensitively.
     fn get_user_by_email(&self, _email: &str) -> Result<Option<UserRow>> {
         Ok(None)
     }
@@ -1841,14 +1850,15 @@ pub trait UserStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Update user fields. Returns true if a row was modified.
+    /// Update user fields. Returns true if a row was modified. A new email is stored
+    /// normalized and must not match another user's case-insensitively.
     fn update_user(
         &self,
         _id: i64,
         _email: Option<&str>,
         _password_hash: Option<&str>,
         _name: Option<&str>,
-        _role: Option<&str>,
+        _role: Option<Role>,
         _avatar_url: Option<&str>,
     ) -> Result<bool> {
         Ok(false)
@@ -1930,6 +1940,86 @@ pub trait UserStore: Send + Sync {
     /// that owner (self-service); `None` allows an admin to revoke any token.
     /// Returns whether a row was removed.
     fn delete_api_token(&self, _id: &str, _user_id: Option<i64>) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Every console user with saved identities, invited users included, joined
+    /// with their login email and name, ordered by user id.
+    fn list_user_identities(&self) -> Result<Vec<ConsoleIdentity>> {
+        Ok(Vec::new())
+    }
+
+    /// One console user's saved identities joined with their login email and name;
+    /// `None` when the user has no identities row.
+    fn get_user_identities(&self, _user_id: i64) -> Result<Option<ConsoleIdentity>> {
+        Ok(None)
+    }
+
+    /// Remove a user's identities, freeing their handles, so the person falls back to
+    /// config. Returns whether a row was deleted.
+    fn delete_user_identities(&self, _user_id: i64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Apply every write in one transaction (all or nothing): create or update
+    /// each user, replace their identities and issue their invite. Returns the
+    /// user id of each entry, in order. An `Active` new user with an invite is
+    /// rejected, and a new user's login email is normalized and must not match an
+    /// existing (or earlier in the batch) user's case-insensitively. A handle another
+    /// person keeps after the batch fails it with [`DUPLICATE_HANDLE`].
+    fn save_directory(&self, _writes: &[DirectoryWrite]) -> Result<Vec<i64>> {
+        Err(claudear_core::error::Error::Other(
+            "save_directory not supported".to_string(),
+        ))
+    }
+
+    /// Revoke the user's open invite (if any) and insert a new one, in one
+    /// transaction. `expires_at` is UTC `%Y-%m-%d %H:%M:%S`.
+    fn issue_invite(
+        &self,
+        _user_id: i64,
+        _token_hash: &str,
+        _expires_at: &str,
+        _created_by: i64,
+    ) -> Result<InviteRow> {
+        Err(claudear_core::error::Error::Other(
+            "issue_invite not supported".to_string(),
+        ))
+    }
+
+    /// Revoke the user's open invite, expired or not. Returns whether one was
+    /// revoked.
+    fn revoke_invite(&self, _user_id: i64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// The user's newest invite that is neither accepted nor revoked, including
+    /// an expired one so callers can report it as expired.
+    fn get_open_invite_for_user(&self, _user_id: i64) -> Result<Option<InviteRow>> {
+        Ok(None)
+    }
+
+    /// The expiry of every user's newest open invite, keyed by user id, in one query;
+    /// the bulk form of [`Self::get_open_invite_for_user`].
+    fn open_invite_expiries(&self) -> Result<HashMap<i64, String>> {
+        Ok(HashMap::new())
+    }
+
+    /// The invite behind a token hash if it is open: not accepted, not revoked,
+    /// not expired, and its user is still invited.
+    fn find_open_invite(&self, _token_hash: &str) -> Result<Option<(InviteRow, UserRow)>> {
+        Ok(None)
+    }
+
+    /// Consume an open invite (single-use), set the password, activate the user
+    /// and revoke their other invites. `None` if the invite is not open.
+    fn accept_invite(&self, _token_hash: &str, _password_hash: &str) -> Result<Option<UserRow>> {
+        Ok(None)
+    }
+
+    /// Set the password and status active, and revoke open invites. Returns
+    /// whether the user exists.
+    fn activate_user(&self, _user_id: i64, _password_hash: &str) -> Result<bool> {
         Ok(false)
     }
 }
@@ -2023,6 +2113,39 @@ pub trait DeployQaStore: Send + Sync {
         _thread_id: Option<&str>,
     ) -> Result<()> {
         Ok(())
+    }
+}
+
+/// The developer responsible for each open Claudear PR (all defaulted).
+pub trait PrAssignmentStore: Send + Sync {
+    /// Every active assignment, oldest first.
+    fn active_pr_assignments(&self) -> Result<Vec<PrAssignment>> {
+        Ok(Vec::new())
+    }
+
+    /// The active assignment of `pr_url`, if it has one.
+    fn active_pr_assignment(&self, _pr_url: &str) -> Result<Option<PrAssignment>> {
+        Ok(None)
+    }
+
+    /// Record `assignment` as its PR's active assignment.
+    ///
+    /// Returns the stored row, or `None` when the PR already has an active
+    /// assignment, so of two processes assigning the same PR only one wins.
+    fn record_pr_assignment(&self, _assignment: &PrAssignment) -> Result<Option<PrAssignment>> {
+        Ok(None)
+    }
+
+    /// End the active assignment `id` with `status`, returning whether it was
+    /// still active.
+    fn end_pr_assignment(&self, _id: i64, _status: AssignmentStatus) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Record that a ping reached the assignee of the active assignment `id`,
+    /// returning whether it was still active and not yet notified.
+    fn mark_pr_assignment_notified(&self, _id: i64) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -2407,6 +2530,7 @@ pub trait FixAttemptTracker:
     + UserStore
     + RegressionStore
     + DeployQaStore
+    + PrAssignmentStore
     + SecurityReportStore
     + ChatStore
     + DiscordStore
@@ -2426,6 +2550,7 @@ impl<T> FixAttemptTracker for T where
         + UserStore
         + RegressionStore
         + DeployQaStore
+        + PrAssignmentStore
         + SecurityReportStore
         + ChatStore
         + DiscordStore
@@ -2518,6 +2643,7 @@ impl RepoStore for NoopTracker {}
 impl UserStore for NoopTracker {}
 impl RegressionStore for NoopTracker {}
 impl DeployQaStore for NoopTracker {}
+impl PrAssignmentStore for NoopTracker {}
 impl SecurityReportStore for NoopTracker {}
 impl ChatStore for NoopTracker {}
 impl DiscordStore for NoopTracker {}
@@ -2704,6 +2830,7 @@ mod tests {
         impl UserStore for FullTracker {}
         impl RegressionStore for FullTracker {}
         impl DeployQaStore for FullTracker {}
+        impl PrAssignmentStore for FullTracker {}
         impl SecurityReportStore for FullTracker {}
         impl ChatStore for FullTracker {}
         impl DiscordStore for FullTracker {}
@@ -3342,6 +3469,22 @@ mod tests {
             // set_channel_cursor should succeed silently
             assert!(t.set_channel_cursor("ch", "key", "val").is_ok());
         }
+
+        #[test]
+        fn test_default_directory_reads_are_empty_and_writes_fail_loudly() {
+            let store = MockUser;
+            assert!(store.list_user_identities().unwrap().is_empty());
+            assert!(!store.delete_user_identities(1).unwrap());
+            assert!(!store.revoke_invite(1).unwrap());
+            assert!(store.get_open_invite_for_user(1).unwrap().is_none());
+            assert!(store.find_open_invite("hash").unwrap().is_none());
+            assert!(store.accept_invite("hash", "password").unwrap().is_none());
+            assert!(!store.activate_user(1, "password").unwrap());
+            assert!(store.save_directory(&[]).is_err());
+            assert!(store
+                .issue_invite(1, "hash", "2099-01-01 00:00:00", 1)
+                .is_err());
+        }
     }
 
     mod regression_store_defaults {
@@ -3791,7 +3934,7 @@ mod tests {
         fn test_default_create_user_returns_zero() {
             let t = MockUserExt;
             assert_eq!(
-                t.create_user("user@example.com", "hash", "User", "admin")
+                t.create_user("user@example.com", "hash", "User", Role::Admin)
                     .unwrap(),
                 0
             );
@@ -3828,7 +3971,7 @@ mod tests {
                     None,
                     Some("hash"),
                     Some("Name"),
-                    Some("user"),
+                    Some(Role::Viewer),
                     Some("url")
                 )
                 .unwrap());

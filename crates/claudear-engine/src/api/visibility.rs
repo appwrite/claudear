@@ -89,6 +89,7 @@ mod tests {
     use super::super::test_support::Harness;
     use super::*;
     use axum::http::StatusCode;
+    use claudear_core::identity::Role;
     use claudear_core::security::SECURITY_FIX_SOURCE;
     use claudear_core::types::{
         ActivityLogEntry, AgentExecution, ErrorPattern, Issue, IssueEmbedding, PrRecord,
@@ -97,12 +98,12 @@ mod tests {
     use serde_json::Value;
     use std::convert::Infallible;
 
-    fn user(role: &str) -> AuthUser {
+    fn user(role: Role) -> AuthUser {
         AuthUser {
             id: 1,
             email: "person@example.com".to_string(),
             name: "Person".to_string(),
-            role: role.to_string(),
+            role,
             avatar_url: None,
         }
     }
@@ -122,8 +123,8 @@ mod tests {
 
     #[test]
     fn only_admins_see_security_sources() {
-        assert!(Visibility::for_user(&user("admin")).shows(SECURITY_FIX_SOURCE));
-        let viewer = Visibility::for_user(&user("viewer"));
+        assert!(Visibility::for_user(&user(Role::Admin)).shows(SECURITY_FIX_SOURCE));
+        let viewer = Visibility::for_user(&user(Role::Viewer));
         assert!(!viewer.shows(SECURITY_FIX_SOURCE));
         assert!(!viewer.shows("Security"));
         assert!(viewer.shows("linear"));
@@ -135,10 +136,10 @@ mod tests {
 
     #[test]
     fn only_admins_read_every_attempt_and_the_diagnostics() {
-        let admin = Visibility::for_user(&user("admin"));
+        let admin = Visibility::for_user(&user(Role::Admin));
         assert_eq!(admin.scope(), AttemptScope::All);
         assert!(admin.shows_diagnostics());
-        let viewer = Visibility::for_user(&user("viewer"));
+        let viewer = Visibility::for_user(&user(Role::Viewer));
         assert_eq!(viewer.scope(), AttemptScope::WithoutSecurity);
         assert!(!viewer.shows_diagnostics());
     }
@@ -158,9 +159,9 @@ mod tests {
                 .map(|metric| metric.metric_value)
                 .collect()
         };
-        assert_eq!(values(Visibility::for_user(&user("viewer"))), [2.0]);
+        assert_eq!(values(Visibility::for_user(&user(Role::Viewer))), [2.0]);
         assert_eq!(
-            values(Visibility::for_user(&user("admin"))),
+            values(Visibility::for_user(&user(Role::Admin))),
             [1.0, 2.0, 3.0]
         );
     }
@@ -174,7 +175,7 @@ mod tests {
                 .into_iter()
                 .map(|(index, source)| (index + 200, source)),
         );
-        let viewer = Visibility::for_user(&user("viewer"));
+        let viewer = Visibility::for_user(&user(Role::Viewer));
         let mut requests = Vec::new();
         let shown = viewer
             .prefix(

@@ -5,15 +5,18 @@
 
 use axum::{
     extract::Request,
-    http::{HeaderValue, Method, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::Response,
 };
 use tower_cookies::{Cookie, Cookies};
 
+use super::auth::BEARER_PREFIX;
+
 const CSRF_COOKIE: &str = "claudear_csrf";
 const CSRF_HEADER: &str = "x-csrf-token";
 const CSRF_TOKEN_LEN: usize = 32;
+const DIRECTORY_PATH: &str = "/api/directory";
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self'; frame-ancestors 'none'";
 
 /// Middleware that adds security headers to every response.
@@ -49,7 +52,8 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
 /// - Mutating requests (POST/PUT/DELETE) must include the token in the X-CSRF-Token header
 /// - The header value must match the cookie value
 ///
-/// Login is exempted since there's no session/CSRF cookie yet.
+/// Login is exempted since there's no session/CSRF cookie yet, and so is a
+/// Bearer-authenticated `PUT /api/directory` (see [`is_bearer_directory_request`]).
 pub async fn csrf_protection(
     request: Request,
     next: Next,
@@ -62,7 +66,9 @@ pub async fn csrf_protection(
 
     // Login and logout are exempted: login has no CSRF cookie yet,
     // and logout is safe (just clears the session).
-    let is_exempt = path == "/api/auth/login" || path == "/api/auth/logout";
+    let is_exempt = path == "/api/auth/login"
+        || path == "/api/auth/logout"
+        || is_bearer_directory_request(&request);
 
     // Access the Cookies extension from the request (set by CookieManagerLayer).
     let cookies = request
@@ -111,6 +117,19 @@ pub async fn csrf_protection(
     Ok(response)
 }
 
+/// A bulk directory load authenticated by an API token. Its extractor ignores cookies
+/// whenever an `Authorization` header is present, so there is no ambient credential
+/// to forge, and browsers cannot add that header cross-origin without a CORS preflight.
+fn is_bearer_directory_request(request: &Request) -> bool {
+    request.method() == Method::PUT
+        && request.uri().path() == DIRECTORY_PATH
+        && request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with(BEARER_PREFIX))
+}
+
 fn generate_csrf_token() -> String {
     hex::encode(rand::random::<[u8; CSRF_TOKEN_LEN]>())
 }
@@ -120,7 +139,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use axum::routing::{get, post};
+    use axum::routing::{get, post, put};
     use axum::Router;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -131,6 +150,11 @@ mod tests {
             .route("/api/test", get(|| async { "ok" }))
             .route("/api/test", post(|| async { "created" }))
             .route("/api/auth/login", post(|| async { "logged in" }))
+            .route(
+                "/api/directory",
+                put(|| async { "loaded" }).post(|| async { "posted" }),
+            )
+            .route("/api/users", put(|| async { "updated" }))
             .layer(axum::middleware::from_fn(security_headers))
             .layer(axum::middleware::from_fn(move |req, next| {
                 csrf_protection(req, next, false)
@@ -275,6 +299,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    async fn status_without_csrf(
+        method: &str,
+        uri: &str,
+        authorization: Option<&str>,
+    ) -> StatusCode {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(authorization) = authorization {
+            builder = builder.header("authorization", authorization);
+        }
+        test_app()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn test_csrf_exempts_only_bearer_put_directory() {
+        assert_eq!(
+            status_without_csrf("PUT", "/api/directory", Some("Bearer cldr_token")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_without_csrf("PUT", "/api/directory", None).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_without_csrf("PUT", "/api/directory", Some("Basic abc")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_without_csrf("POST", "/api/directory", Some("Bearer cldr_token")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_without_csrf("PUT", "/api/users", Some("Bearer cldr_token")).await,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]

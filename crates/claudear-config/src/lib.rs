@@ -6,4 +6,4 @@ pub mod security_inbox;
 pub mod users;
 
 pub use config::*;
-pub use users::{ResolvedUser, UserRegistry};
+pub use users::{NotificationChannel, ResolvedUser, UserRegistry};

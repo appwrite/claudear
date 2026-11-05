@@ -1,8 +1,10 @@
-import { useState, useRef } from 'react'
+import { useId, useRef, useState } from 'react'
 import { useAuth } from '../lib/auth'
-import { uploadAvatar } from '../lib/api'
+import { ADMIN_ROLE, uploadAvatar } from '../lib/api'
 import { getInitials } from '../lib/formatters'
+import { passwordLengthProblem } from '../lib/password'
 import { PageHeader } from '../components/layout/page-header'
+import { IdentityForm } from '../components/users/identity-form'
 import { PersonalTokensCard } from '../components/settings/personal-tokens'
 import { Camera, Check, Loader2 } from 'lucide-react'
 
@@ -19,12 +21,13 @@ export default function SettingsPage() {
   const [nameError, setNameError] = useState('')
   const [nameSuccess, setNameSuccess] = useState(false)
 
+  const passwordFieldId = useId()
   const [currentPassword, setCurrentPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
-  const [pwLoading, setPwLoading] = useState(false)
-  const [pwError, setPwError] = useState('')
-  const [pwSuccess, setPwSuccess] = useState(false)
+  const [passwordLoading, setPasswordLoading] = useState(false)
+  const [passwordError, setPasswordError] = useState('')
+  const [passwordSuccess, setPasswordSuccess] = useState(false)
 
   const handleAvatarChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -64,28 +67,29 @@ export default function SettingsPage() {
 
   const handlePasswordSave = async (e: React.FormEvent) => {
     e.preventDefault()
-    setPwError('')
-    setPwSuccess(false)
-    if (newPassword.length < 8) {
-      setPwError('New password must be at least 8 characters')
+    setPasswordError('')
+    setPasswordSuccess(false)
+    const lengthProblem = passwordLengthProblem(newPassword)
+    if (lengthProblem) {
+      setPasswordError(lengthProblem)
       return
     }
     if (newPassword !== confirmPassword) {
-      setPwError('Passwords do not match')
+      setPasswordError('Passwords do not match')
       return
     }
-    setPwLoading(true)
+    setPasswordLoading(true)
     try {
       await updateProfile({ password: newPassword, current_password: currentPassword })
       setCurrentPassword('')
       setNewPassword('')
       setConfirmPassword('')
-      setPwSuccess(true)
-      setTimeout(() => setPwSuccess(false), 2000)
+      setPasswordSuccess(true)
+      setTimeout(() => setPasswordSuccess(false), 2000)
     } catch {
-      setPwError('Failed to change password. Check your current password.')
+      setPasswordError('Failed to change password. Check your current password.')
     } finally {
-      setPwLoading(false)
+      setPasswordLoading(false)
     }
   }
 
@@ -169,8 +173,9 @@ export default function SettingsPage() {
         <h3 className="font-medium mb-4">Change Password</h3>
         <form onSubmit={handlePasswordSave} className="space-y-4 max-w-md">
           <div className="space-y-1">
-            <label className="text-sm font-medium">Current Password</label>
+            <label htmlFor={`${passwordFieldId}-current`} className="text-sm font-medium">Current Password</label>
             <input
+              id={`${passwordFieldId}-current`}
               type="password"
               value={currentPassword}
               onChange={(e) => setCurrentPassword(e.target.value)}
@@ -180,8 +185,9 @@ export default function SettingsPage() {
             />
           </div>
           <div className="space-y-1">
-            <label className="text-sm font-medium">New Password</label>
+            <label htmlFor={`${passwordFieldId}-new`} className="text-sm font-medium">New Password</label>
             <input
+              id={`${passwordFieldId}-new`}
               type="password"
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
@@ -191,8 +197,9 @@ export default function SettingsPage() {
             />
           </div>
           <div className="space-y-1">
-            <label className="text-sm font-medium">Confirm New Password</label>
+            <label htmlFor={`${passwordFieldId}-confirm`} className="text-sm font-medium">Confirm New Password</label>
             <input
+              id={`${passwordFieldId}-confirm`}
               type="password"
               value={confirmPassword}
               onChange={(e) => setConfirmPassword(e.target.value)}
@@ -201,16 +208,24 @@ export default function SettingsPage() {
               className={inputClass}
             />
           </div>
-          {pwError && <p className="text-destructive text-sm">{pwError}</p>}
-          {pwSuccess && <p className="text-green-500 text-sm flex items-center gap-1"><Check className="h-3 w-3" /> Password changed</p>}
+          {passwordError && <p className="text-destructive text-sm">{passwordError}</p>}
+          {passwordSuccess && <p className="text-green-500 text-sm flex items-center gap-1"><Check className="h-3 w-3" /> Password changed</p>}
           <button
             type="submit"
-            disabled={pwLoading}
+            disabled={passwordLoading}
             className="px-4 py-2 bg-primary text-primary-foreground rounded-md text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
           >
-            {pwLoading ? 'Changing...' : 'Change Password'}
+            {passwordLoading ? 'Changing...' : 'Change Password'}
           </button>
         </form>
+      </div>
+
+      <div className="border rounded-lg p-6 bg-card">
+        <h3 className="font-medium mb-1">My Identities</h3>
+        <p className="text-sm text-muted-foreground mb-4">
+          The handles Claudear uses to recognise you across trackers and to reach you in chat.
+        </p>
+        <IdentityForm userId={user.id} canEditSlug={user.role === ADMIN_ROLE} />
       </div>
 
       <PersonalTokensCard />

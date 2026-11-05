@@ -235,6 +235,25 @@ impl CreateThreadParams {
     }
 }
 
+/// Which mentions in a message Discord may turn into pings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AllowedMentions {
+    /// Mention kinds parsed from the content (`users`, `roles`, `everyone`).
+    pub parse: Vec<String>,
+    /// User ids that may be pinged.
+    pub users: Vec<String>,
+}
+
+impl AllowedMentions {
+    /// Ping only `users`: no `@everyone`, `@here`, role or other user pings.
+    pub fn users(users: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            parse: Vec::new(),
+            users: users.into_iter().collect(),
+        }
+    }
+}
+
 /// Parameters for creating a message.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateMessageParams {
@@ -249,6 +268,9 @@ pub struct CreateMessageParams {
     /// Reference to another message (for replies).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_reference: Option<DiscordMessageReference>,
+    /// Which mentions may ping; Discord's default when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_mentions: Option<AllowedMentions>,
 }
 
 impl CreateMessageParams {
@@ -265,6 +287,7 @@ impl CreateMessageParams {
             tts: None,
             embeds: None,
             message_reference: None,
+            allowed_mentions: None,
         }
     }
 
@@ -281,6 +304,7 @@ impl CreateMessageParams {
             tts: None,
             embeds: Some(vec![embed]),
             message_reference: None,
+            allowed_mentions: None,
         }
     }
 

@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use claudear_config::config::Config;
+use claudear_core::identity::Role;
 use claudear_engine::api::create_api_router;
 use claudear_storage::{FixAttemptTracker, SqliteTracker};
 use http_body_util::BodyExt;
@@ -53,9 +54,9 @@ impl Drop for EnvironmentVariable {
 
 fn admin_router(path: &Path) -> (Router, String) {
     let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-    let password_hash = bcrypt::hash("testpass", 4).unwrap();
+    let password_hash = bcrypt::hash(rand::random::<u64>().to_string(), 4).unwrap();
     tracker
-        .create_user("admin@test.com", &password_hash, "Admin", "admin")
+        .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
         .unwrap();
     let session = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
     let indexing_rx = tracker.subscribe_indexing_progress();

@@ -1,191 +1,39 @@
 //! Authentication and user management handlers.
 
 use axum::{
-    extract::{FromRequestParts, Path, State},
-    http::{request::Parts, HeaderMap, StatusCode},
+    extract::{rejection::JsonRejection, FromRequestParts, Path, State},
+    http::{header, request::Parts, HeaderMap, StatusCode},
     Json,
 };
+use claudear_core::identity::{normalize_login_email, Identities, Role, UserStatus};
+use claudear_storage::{DirectoryUser, DirectoryWrite, FixAttemptTracker, UserRow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::ops::RangeInclusive;
+use std::str::FromStr;
 use tower_cookies::{Cookie, Cookies};
 
+use super::error::ApiError;
+use super::identities::{find_conflicts, plan_update, UpdateIdentitiesRequest};
+use super::invites::{unusable_password_hash, NewInvite, UserInvite};
 use super::routes::ApiState;
+use super::tokens::hash_secret;
+use crate::registry;
 
 const SESSION_COOKIE: &str = "claudear_session";
-const ADMIN_ROLE: &str = "admin";
 const SESSION_MAX_AGE_DAYS: i64 = 7;
 
-/// Maximum number of login attempts per email within the rate limit window.
-const LOGIN_RATE_LIMIT_MAX_ATTEMPTS: usize = 10;
+/// Allowed password length in bytes; bcrypt ignores everything past 72.
+pub(crate) const PASSWORD_LENGTH: RangeInclusive<usize> = 8..=72;
 
-/// Duration of the rate limit window in seconds.
-const LOGIN_RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
+pub(crate) const BEARER_PREFIX: &str = "Bearer ";
 
-/// Maximum number of unique keys (email addresses) tracked in the rate limiter.
-/// When exceeded, the oldest entries are evicted to prevent memory exhaustion.
-const LOGIN_RATE_LIMIT_MAX_KEYS: usize = 10_000;
-
-/// Maximum number of login attempts per IP address within the rate limit window.
-/// More generous than per-email to avoid blocking legitimate users behind shared IPs.
-const IP_RATE_LIMIT_MAX_ATTEMPTS: usize = 100;
-
-/// Duration of the IP rate limit window in seconds.
-const IP_RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
-
-/// In-memory rate limiter for login attempts, keyed by email address.
-/// This protects against brute force attacks on specific accounts and
-/// mitigates CPU exhaustion from repeated bcrypt verification.
-static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// In-memory rate limiter for login attempts, keyed by client IP address.
-/// This prevents a single IP from brute-forcing across many email addresses
-/// and limits distributed credential-stuffing attacks.
-static IP_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Maximum number of API requests per user within the rate limit window.
-/// Applies to sensitive endpoints (profile, avatar, config, user management).
-const API_RATE_LIMIT_MAX_REQUESTS: usize = 30;
-
-/// Duration of the API rate limit window in seconds.
-const API_RATE_LIMIT_WINDOW_SECS: u64 = 60; // 1 minute
-
-/// In-memory rate limiter for sensitive API endpoints, keyed by user ID.
-static API_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Check if a login attempt is allowed for the given key (email).
-/// Returns true if the attempt is within rate limits, false if it should be rejected.
-fn check_login_rate_limit(key: &str) -> bool {
-    let mut limiter = match LOGIN_RATE_LIMITER.lock() {
-        Ok(l) => l,
-        Err(poisoned) => {
-            tracing::warn!("Login rate limiter mutex was poisoned, recovering");
-            poisoned.into_inner()
-        }
-    };
-
-    let now = Instant::now();
-    let window = std::time::Duration::from_secs(LOGIN_RATE_LIMIT_WINDOW_SECS);
-
-    let attempts = limiter.entry(key.to_string()).or_default();
-
-    // Remove attempts outside the window
-    attempts.retain(|t| now.duration_since(*t) < window);
-
-    if attempts.len() >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS {
-        return false;
-    }
-
-    attempts.push(now);
-
-    // Sweep expired entries from other keys to prevent unbounded memory growth
-    limiter.retain(|_, v| !v.is_empty() && v.iter().any(|t| now.duration_since(*t) < window));
-
-    // Cap total entries to prevent memory exhaustion from distributed attacks
-    if limiter.len() > LOGIN_RATE_LIMIT_MAX_KEYS {
-        // Find and remove entries with the oldest most-recent attempt
-        let mut entries: Vec<(String, Instant)> = limiter
-            .iter()
-            .filter_map(|(k, v)| v.last().map(|t| (k.clone(), *t)))
-            .collect();
-        entries.sort_by_key(|(_, t)| *t);
-        let to_remove = limiter.len() - LOGIN_RATE_LIMIT_MAX_KEYS;
-        for (k, _) in entries.into_iter().take(to_remove) {
-            limiter.remove(&k);
-        }
-    }
-
-    true
-}
-
-/// Check if a login attempt is allowed for the given IP address.
-/// Returns true if the attempt is within rate limits, false if it should be rejected.
-fn check_ip_rate_limit(ip: &str) -> bool {
-    let mut limiter = match IP_RATE_LIMITER.lock() {
-        Ok(l) => l,
-        Err(poisoned) => {
-            tracing::warn!("IP rate limiter mutex was poisoned, recovering");
-            poisoned.into_inner()
-        }
-    };
-
-    let now = Instant::now();
-    let window = std::time::Duration::from_secs(IP_RATE_LIMIT_WINDOW_SECS);
-
-    let attempts = limiter.entry(ip.to_string()).or_default();
-
-    // Remove attempts outside the window
-    attempts.retain(|t| now.duration_since(*t) < window);
-
-    if attempts.len() >= IP_RATE_LIMIT_MAX_ATTEMPTS {
-        return false;
-    }
-
-    attempts.push(now);
-
-    // Sweep expired entries from other keys to prevent unbounded memory growth
-    limiter.retain(|_, v| !v.is_empty() && v.iter().any(|t| now.duration_since(*t) < window));
-
-    // Cap total entries to prevent memory exhaustion from distributed attacks
-    if limiter.len() > LOGIN_RATE_LIMIT_MAX_KEYS {
-        let mut entries: Vec<(String, Instant)> = limiter
-            .iter()
-            .filter_map(|(k, v)| v.last().map(|t| (k.clone(), *t)))
-            .collect();
-        entries.sort_by_key(|(_, t)| *t);
-        let to_remove = limiter.len() - LOGIN_RATE_LIMIT_MAX_KEYS;
-        for (k, _) in entries.into_iter().take(to_remove) {
-            limiter.remove(&k);
-        }
-    }
-
-    true
-}
-
-/// Reset the API rate limiter. Only for use in tests.
-#[cfg(test)]
-pub(crate) fn reset_api_rate_limiter() {
-    let mut limiter = API_RATE_LIMITER.lock().unwrap();
-    limiter.clear();
-}
-
-/// Check if an API request is allowed for the given user ID.
-/// Applied to sensitive endpoints like profile, avatar, config, and user management.
-pub(crate) fn check_api_rate_limit(user_id: i64) -> bool {
-    let key = user_id.to_string();
-    let mut limiter = match API_RATE_LIMITER.lock() {
-        Ok(l) => l,
-        Err(poisoned) => {
-            tracing::warn!("API rate limiter mutex was poisoned, recovering");
-            poisoned.into_inner()
-        }
-    };
-
-    let now = Instant::now();
-    let window = std::time::Duration::from_secs(API_RATE_LIMIT_WINDOW_SECS);
-
-    let attempts = limiter.entry(key).or_default();
-    attempts.retain(|t| now.duration_since(*t) < window);
-
-    if attempts.len() >= API_RATE_LIMIT_MAX_REQUESTS {
-        return false;
-    }
-
-    attempts.push(now);
-
-    // Sweep expired entries
-    limiter.retain(|_, v| !v.is_empty() && v.iter().any(|t| now.duration_since(*t) < window));
-
-    true
-}
+/// A bcrypt hash (cost 12) of a value nobody knows. Logins for unknown emails verify
+/// against it so they take as long as logins for real accounts.
+const TIMING_DUMMY_HASH: &str = "$2b$12$K4v3LB7TzMIXvbQZDz1F9eZ8cU2smBGz.iAU5h1DhGGCk5mPIFY3K";
 
 /// Extract the client IP address from request headers.
 /// Checks `x-forwarded-for` first, then `x-real-ip`, then falls back to "unknown".
-fn extract_client_ip(headers: &HeaderMap) -> String {
+pub(crate) fn extract_client_ip(headers: &HeaderMap) -> String {
     if let Some(forwarded) = headers.get("x-forwarded-for") {
         if let Ok(value) = forwarded.to_str() {
             // x-forwarded-for can contain multiple IPs; the first is the client
@@ -216,70 +64,77 @@ pub struct AuthUser {
     pub id: i64,
     pub email: String,
     pub name: String,
-    pub role: String,
+    pub role: Role,
     pub avatar_url: Option<String>,
 }
 
 impl AuthUser {
     pub fn is_admin(&self) -> bool {
-        self.role == ADMIN_ROLE
+        self.role == Role::Admin
+    }
+
+    fn identify(&self) {
+        sentry::configure_scope(|scope| {
+            scope.set_user(Some(sentry::User {
+                id: Some(self.id.to_string()),
+                email: Some(self.email.clone()),
+                username: Some(self.name.clone()),
+                ..Default::default()
+            }));
+            scope.set_tag("user.role", self.role);
+        });
     }
 }
 
-impl FromRequestParts<ApiState> for AuthUser {
-    type Rejection = StatusCode;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &ApiState,
-    ) -> Result<Self, Self::Rejection> {
-        // Extract cookies from the request
-        let cookies = Cookies::from_request_parts(parts, state)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        let token = cookies
-            .get(SESSION_COOKIE)
-            .map(|c| c.value().to_string())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-
-        let user = state
-            .tracker
-            .get_session_user(&token)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-
-        // Refresh the idle session timeout on every authenticated request
-        let _ = state.tracker.touch_session(&token);
-
-        let auth_user = AuthUser {
+impl From<UserRow> for AuthUser {
+    fn from(user: UserRow) -> Self {
+        Self {
             id: user.id,
             email: user.email,
             name: user.name,
             role: user.role,
             avatar_url: user.avatar_url,
-        };
+        }
+    }
+}
 
-        sentry::configure_scope(|scope| {
-            scope.set_user(Some(sentry::User {
-                id: Some(auth_user.id.to_string()),
-                email: Some(auth_user.email.clone()),
-                username: Some(auth_user.name.clone()),
-                ..Default::default()
-            }));
-            scope.set_tag("user.role", &auth_user.role);
-        });
+impl FromRequestParts<ApiState> for AuthUser {
+    type Rejection = ApiError;
 
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ApiState,
+    ) -> Result<Self, Self::Rejection> {
+        let cookies = Cookies::from_request_parts(parts, state)
+            .await
+            .map_err(|_| ApiError::internal())?;
+
+        let token = cookies
+            .get(SESSION_COOKIE)
+            .map(|c| c.value().to_string())
+            .ok_or_else(ApiError::unauthenticated)?;
+
+        let user = state
+            .tracker
+            .get_session_user(&token)
+            .map_err(ApiError::storage)?
+            .ok_or_else(ApiError::unauthenticated)?;
+
+        // Refresh the idle session timeout on every authenticated request
+        let _ = state.tracker.touch_session(&token);
+
+        let auth_user = AuthUser::from(user);
+        auth_user.identify();
         Ok(auth_user)
     }
 }
 
-/// Admin user extractor — wraps AuthUser and checks it is an admin.
+/// Admin user extractor: an [`AuthUser`] whose role is admin.
 #[derive(Debug, Clone)]
 pub struct AdminUser(pub AuthUser);
 
 impl FromRequestParts<ApiState> for AdminUser {
-    type Rejection = StatusCode;
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -287,9 +142,59 @@ impl FromRequestParts<ApiState> for AdminUser {
     ) -> Result<Self, Self::Rejection> {
         let user = AuthUser::from_request_parts(parts, state).await?;
         if !user.is_admin() {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(ApiError::admin_required());
         }
         Ok(AdminUser(user))
+    }
+}
+
+/// An admin authenticated by `Authorization: Bearer <api token>` or, when that header
+/// is absent, by session. With the header present the cookie is never consulted, which
+/// is what makes the CSRF exemption for Bearer requests safe. Failed Bearer attempts
+/// spend the client address's bearer limit; once it is spent every Bearer attempt from
+/// that address is refused before the token is looked up.
+#[derive(Debug, Clone)]
+pub(crate) struct AdminCaller(pub AuthUser);
+
+impl FromRequestParts<ApiState> for AdminCaller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ApiState,
+    ) -> Result<Self, Self::Rejection> {
+        let Some(authorization) = parts.headers.get(header::AUTHORIZATION) else {
+            let AdminUser(user) = AdminUser::from_request_parts(parts, state).await?;
+            return Ok(Self(user));
+        };
+        let address = extract_client_ip(&parts.headers);
+        if state.limiters.bearer.exhausted(&address) {
+            return Err(ApiError::rate_limited());
+        }
+        let user = authorization
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix(BEARER_PREFIX))
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                state
+                    .tracker
+                    .get_user_by_api_token_hash(&hash_secret(token))
+            })
+            .transpose()
+            .map_err(ApiError::storage)?
+            .flatten()
+            .map(AuthUser::from);
+        let Some(user) = user else {
+            state.limiters.bearer.allow(&address);
+            return Err(ApiError::invalid_token());
+        };
+        user.identify();
+        if !user.is_admin() {
+            return Err(ApiError::admin_required());
+        }
+        Ok(Self(user))
     }
 }
 
@@ -309,7 +214,7 @@ pub struct AuthUserResponse {
     pub id: i64,
     pub email: String,
     pub name: String,
-    pub role: String,
+    pub role: Role,
     pub avatar_url: Option<String>,
 }
 
@@ -319,18 +224,22 @@ impl From<&AuthUser> for AuthUserResponse {
             id: u.id,
             email: u.email.clone(),
             name: u.name.clone(),
-            role: u.role.clone(),
+            role: u.role,
             avatar_url: u.avatar_url.clone(),
         }
     }
 }
 
+/// Without a password the user is created invited and an invite link is returned.
 #[derive(Deserialize)]
 pub struct CreateUserRequest {
     pub email: String,
-    pub password: String,
+    #[serde(default)]
+    pub password: Option<String>,
     pub name: String,
     pub role: String,
+    #[serde(default)]
+    pub(crate) identities: Option<UpdateIdentitiesRequest>,
 }
 
 #[derive(Deserialize)]
@@ -346,10 +255,37 @@ pub struct UserResponse {
     pub id: i64,
     pub email: String,
     pub name: String,
-    pub role: String,
+    pub role: Role,
     pub avatar_url: Option<String>,
+    pub status: UserStatus,
+    /// Expiry of the invited user's open invite, past or not.
+    pub invite_expires_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl UserResponse {
+    fn new(user: UserRow, invite_expires_at: Option<String>) -> Self {
+        Self {
+            id: user.id,
+            email: user.email,
+            name: user.name,
+            role: user.role,
+            avatar_url: user.avatar_url,
+            status: user.status,
+            invite_expires_at,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+        }
+    }
+}
+
+/// A newly created user; `invite` carries the one-time link for an invited user.
+#[derive(Serialize)]
+pub(crate) struct CreatedUserResponse {
+    #[serde(flatten)]
+    pub user: UserResponse,
+    pub invite: Option<UserInvite>,
 }
 
 #[derive(Serialize)]
@@ -365,52 +301,42 @@ pub async fn login_handler(
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
     let client_ip = extract_client_ip(&headers);
+    let email = normalize_login_email(&body.email);
 
     // Rate limit login attempts by IP to prevent distributed brute force across many emails
-    if !check_ip_rate_limit(&client_ip) {
+    if !state.limiters.address.allow(&client_ip) {
         tracing::warn!(ip = %client_ip, "Login IP rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
     // Rate limit login attempts by email to prevent brute force and bcrypt CPU exhaustion
-    if !check_login_rate_limit(&body.email) {
-        tracing::warn!(email = %body.email, ip = %client_ip, "Login rate limit exceeded");
+    if !state.limiters.login.allow(&email) {
+        tracing::warn!(ip = %client_ip, "Login rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    // Look up user by email
     let user = state
         .tracker
-        .get_user_by_email(&body.email)
+        .get_user_by_email(&email)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Always perform bcrypt verification to prevent timing oracle that reveals user existence.
-    // When no user is found, verify against a dummy hash to equalize response time.
-    let (hash_to_verify, user_found) = match user {
-        Some(ref u) => (u.password_hash.clone(), true),
-        None => {
-            // Pre-computed bcrypt hash of "dummy" with cost 12. The actual value doesn't matter;
-            // the goal is to spend the same CPU time as a real verification to prevent
-            // attackers from enumerating valid email addresses via response timing.
-            (
-                "$2b$12$K4v3LB7TzMIXvbQZDz1F9eZ8cU2smBGz.iAU5h1DhGGCk5mPIFY3K".to_string(),
-                false,
-            )
-        }
-    };
+    // Unknown, invited and wrong-password logins all run one cost-12 bcrypt verification
+    // and fail with the same 401, so neither timing nor body reveals which case it was.
+    let hash_to_verify = user.as_ref().map_or_else(
+        || TIMING_DUMMY_HASH.to_string(),
+        |u| u.password_hash.clone(),
+    );
 
-    let pw = body.password.clone();
-    let valid = tokio::task::spawn_blocking(move || bcrypt::verify(&pw, &hash_to_verify))
+    let password = body.password.clone();
+    let valid = tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash_to_verify))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .unwrap_or(false);
 
-    if !user_found || !valid {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    // SAFETY: user_found is true so user is Some
-    let user = user.unwrap();
+    let user = match user {
+        Some(user) if valid && user.status == UserStatus::Active => user,
+        _ => return Err(StatusCode::UNAUTHORIZED),
+    };
 
     // Create session
     let expires_at = chrono::Utc::now() + chrono::Duration::days(SESSION_MAX_AGE_DAYS);
@@ -445,7 +371,7 @@ pub async fn login_handler(
             username: Some(user.name.clone()),
             ..Default::default()
         }));
-        scope.set_tag("user.role", &user.role);
+        scope.set_tag("user.role", user.role);
     });
 
     Ok(Json(LoginResponse {
@@ -499,7 +425,7 @@ pub async fn update_profile_handler(
     State(state): State<ApiState>,
     Json(body): Json<UpdateProfileRequest>,
 ) -> Result<Json<UserResponse>, StatusCode> {
-    if !check_api_rate_limit(user.id) {
+    if !state.limiters.api.allow(&user.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -513,11 +439,11 @@ pub async fn update_profile_handler(
     // If changing password, require current_password verification
     let password_hash = match &body.password {
         Some(new_pw) => {
-            if new_pw.len() < 8 || new_pw.len() > 72 {
+            if !PASSWORD_LENGTH.contains(&new_pw.len()) {
                 return Err(StatusCode::BAD_REQUEST);
             }
             // Rate limit password change to prevent bcrypt CPU exhaustion
-            if !check_login_rate_limit(&user.email) {
+            if !state.limiters.login.allow(&user.email) {
                 return Err(StatusCode::TOO_MANY_REQUESTS);
             }
             let current_pw = body
@@ -544,14 +470,11 @@ pub async fn update_profile_handler(
                 return Err(StatusCode::FORBIDDEN);
             }
 
-            let new_pw_owned = new_pw.clone();
-            let hashed = tokio::task::spawn_blocking(move || {
-                bcrypt::hash(&new_pw_owned, bcrypt::DEFAULT_COST)
-            })
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            Some(hashed)
+            Some(
+                hash_password(new_pw.clone())
+                    .await
+                    .map_err(|error| error.status())?,
+            )
         }
         None => None,
     };
@@ -576,15 +499,9 @@ pub async fn update_profile_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(UserResponse {
-        id: updated.id,
-        email: updated.email,
-        name: updated.name,
-        role: updated.role,
-        avatar_url: updated.avatar_url,
-        created_at: updated.created_at,
-        updated_at: updated.updated_at,
-    }))
+    Ok(Json(
+        user_response(&state, updated).map_err(|error| error.status())?,
+    ))
 }
 
 /// POST /api/auth/avatar
@@ -593,7 +510,7 @@ pub async fn upload_avatar_handler(
     State(state): State<ApiState>,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !check_api_rate_limit(user.id) {
+    if !state.limiters.api.allow(&user.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     const MAX_SIZE: usize = 5 * 1024 * 1024; // 5MB
@@ -676,26 +593,91 @@ pub async fn upload_avatar_handler(
     Err(StatusCode::BAD_REQUEST)
 }
 
+/// Hash a password with the default bcrypt cost, off the async runtime.
+pub(crate) async fn hash_password(password: String) -> Result<String, ApiError> {
+    tokio::task::spawn_blocking(move || bcrypt::hash(password, bcrypt::DEFAULT_COST))
+        .await
+        .map_err(|_| ApiError::internal())?
+        .map_err(|_| ApiError::internal())
+}
+
+/// Whether `email` is usable as a login email (same rules as an identity email).
+pub(crate) fn is_valid_login_email(email: &str) -> bool {
+    Identities {
+        email: Some(email.to_string()),
+        ..Identities::default()
+    }
+    .validate()
+    .is_ok()
+}
+
+fn validate_login_email(email: &str) -> Result<(), ApiError> {
+    if is_valid_login_email(email) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("Email must be a valid email address"))
+    }
+}
+
+fn validate_password(password: Option<&String>) -> Result<(), ApiError> {
+    if password.is_none_or(|password| PASSWORD_LENGTH.contains(&password.len())) {
+        Ok(())
+    } else {
+        Err(ApiError::invalid_password())
+    }
+}
+
+fn validate_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() {
+        Err(ApiError::bad_request("Name must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_role(role: &str) -> Result<Role, ApiError> {
+    Role::from_str(role).map_err(|_| ApiError::invalid_role())
+}
+
+fn user_response(state: &ApiState, user: UserRow) -> Result<UserResponse, ApiError> {
+    let invite_expires_at = match user.status {
+        UserStatus::Active => None,
+        UserStatus::Invited => state
+            .tracker
+            .get_open_invite_for_user(user.id)
+            .map_err(ApiError::storage)?
+            .map(|invite| invite.expires_at),
+    };
+    Ok(UserResponse::new(user, invite_expires_at))
+}
+
+fn find_user(state: &ApiState, id: i64) -> Result<UserRow, ApiError> {
+    state
+        .tracker
+        .get_user_by_id(id)
+        .map_err(ApiError::storage)?
+        .ok_or_else(ApiError::user_not_found)
+}
+
 /// GET /api/users
 pub async fn list_users_handler(
     _admin: AdminUser,
     State(state): State<ApiState>,
-) -> Result<Json<Vec<UserResponse>>, StatusCode> {
-    let users = state
+) -> Result<Json<Vec<UserResponse>>, ApiError> {
+    let users = state.tracker.list_users().map_err(ApiError::storage)?;
+    let mut expiries = state
         .tracker
-        .list_users()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .open_invite_expiries()
+        .map_err(ApiError::storage)?;
 
-    let response: Vec<UserResponse> = users
+    let response = users
         .into_iter()
-        .map(|u| UserResponse {
-            id: u.id,
-            email: u.email,
-            name: u.name,
-            role: u.role,
-            avatar_url: u.avatar_url,
-            created_at: u.created_at,
-            updated_at: u.updated_at,
+        .map(|user| {
+            let invite_expires_at = match user.status {
+                UserStatus::Active => None,
+                UserStatus::Invited => expiries.remove(&user.id),
+            };
+            UserResponse::new(user, invite_expires_at)
         })
         .collect();
 
@@ -707,195 +689,215 @@ pub async fn get_user_handler(
     _admin: AdminUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
-) -> Result<Json<UserResponse>, StatusCode> {
-    let user = state
-        .tracker
-        .get_user_by_id(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    Ok(Json(UserResponse {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        role: user.role,
-        avatar_url: user.avatar_url,
-        created_at: user.created_at,
-        updated_at: user.updated_at,
-    }))
+) -> Result<Json<UserResponse>, ApiError> {
+    let user = find_user(&state, id)?;
+    Ok(Json(user_response(&state, user)?))
 }
 
 /// POST /api/users
-pub async fn create_user_handler(
-    _admin: AdminUser,
+pub(crate) async fn create_user_handler(
+    AdminUser(admin): AdminUser,
     State(state): State<ApiState>,
-    Json(body): Json<CreateUserRequest>,
-) -> Result<(StatusCode, Json<UserResponse>), StatusCode> {
-    if !check_api_rate_limit(_admin.0.id) {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+    body: Result<Json<CreateUserRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CreatedUserResponse>), ApiError> {
+    if !state.limiters.api.allow(&admin.id) {
+        return Err(ApiError::rate_limited());
     }
+    let Json(body) = body?;
 
-    // Validate role
-    if body.role != "admin" && body.role != "viewer" {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let role = parse_role(&body.role)?;
+    let email = normalize_login_email(&body.email);
+    let name = body.name.trim();
+    validate_login_email(&email)?;
+    validate_name(name)?;
+    validate_password(body.password.as_ref())?;
 
-    // Validate email
-    if body.email.trim().is_empty() || !body.email.contains('@') {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let (password_hash, status, invite) = match body.password {
+        Some(password) => (hash_password(password).await?, UserStatus::Active, None),
+        None => (
+            unusable_password_hash().await?,
+            UserStatus::Invited,
+            Some(NewInvite::generate(admin.id)),
+        ),
+    };
 
-    // Validate password (minimum 8, maximum 72 characters — bcrypt limit)
-    if body.password.len() < 8 || body.password.len() > 72 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Validate name
-    if body.name.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Check for duplicate email
+    let _writes = state.identity_writes.lock().await;
     if state
         .tracker
-        .get_user_by_email(&body.email)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .get_user_by_email(&email)
+        .map_err(ApiError::storage)?
         .is_some()
     {
-        return Err(StatusCode::CONFLICT);
+        return Err(ApiError::duplicate_email());
     }
 
-    // Hash password (spawn_blocking to avoid blocking the async runtime)
-    let pw = body.password.clone();
-    let password_hash =
-        tokio::task::spawn_blocking(move || bcrypt::hash(&pw, bcrypt::DEFAULT_COST))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let id = state
-        .tracker
-        .create_user(&body.email, &password_hash, &body.name, &body.role)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let user = state
-        .tracker
-        .get_user_by_id(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(UserResponse {
-            id: user.id,
-            email: user.email,
-            name: user.name,
-            role: user.role,
-            avatar_url: user.avatar_url,
-            created_at: user.created_at,
-            updated_at: user.updated_at,
-        }),
-    ))
-}
-
-/// PUT /api/users/{id}
-pub async fn update_user_handler(
-    _admin: AdminUser,
-    State(state): State<ApiState>,
-    Path(id): Path<i64>,
-    Json(body): Json<UpdateUserRequest>,
-) -> Result<Json<UserResponse>, StatusCode> {
-    if !check_api_rate_limit(_admin.0.id) {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    // Validate role if provided
-    if let Some(ref role) = body.role {
-        if role != "admin" && role != "viewer" {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
-
-    // Validate password length if provided (minimum 8, maximum 72 — bcrypt limit)
-    if let Some(ref pw) = body.password {
-        if pw.len() < 8 || pw.len() > 72 {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
-
-    // Hash password if provided (use spawn_blocking to avoid blocking the async runtime)
-    let password_hash = match &body.password {
-        Some(pw) => {
-            let pw = pw.clone();
-            Some(
-                tokio::task::spawn_blocking(move || bcrypt::hash(pw, bcrypt::DEFAULT_COST))
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-            )
+    let identities = match body.identities {
+        Some(update) => {
+            registry::reload(&state.registry, state.tracker.as_ref());
+            let plan = plan_update(&state.registry, None, &email, None, update)
+                .map_err(ApiError::invalid_identities)?;
+            let conflicts = find_conflicts(&state.registry, std::slice::from_ref(&plan));
+            if !conflicts.is_empty() {
+                return Err(ApiError::identity_conflict(conflicts));
+            }
+            Some(plan.write)
         }
         None => None,
     };
 
-    let updated = state
+    let user_ids = state
         .tracker
+        .save_directory(&[DirectoryWrite {
+            user: DirectoryUser::New {
+                email,
+                name: name.to_string(),
+                role,
+                password_hash,
+                status,
+            },
+            identities,
+            invite: invite.as_ref().map(|invite| invite.write.clone()),
+        }])
+        .map_err(ApiError::user_write)?;
+    registry::reload(&state.registry, state.tracker.as_ref());
+
+    let user_id = user_ids.first().copied().ok_or_else(ApiError::internal)?;
+    let user = find_user(&state, user_id)?;
+    let invite = invite.map(|invite| invite.response(&state.config));
+    let invite_expires_at = invite.as_ref().map(|invite| invite.expires_at.clone());
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedUserResponse {
+            user: UserResponse::new(user, invite_expires_at),
+            invite,
+        }),
+    ))
+}
+
+/// The columns an admin update changes, with the activation of an invited user.
+struct UserUpdate<'a> {
+    email: Option<&'a str>,
+    password_hash: Option<&'a str>,
+    name: Option<&'a str>,
+    role: Option<Role>,
+    activation_hash: Option<&'a str>,
+}
+
+/// Write the column changes before the activation: the column write is the one a login
+/// email taken in the meantime can fail, and it must fail before the user is activated.
+fn apply_user_update(
+    tracker: &dyn FixAttemptTracker,
+    id: i64,
+    update: &UserUpdate<'_>,
+) -> Result<(), ApiError> {
+    tracker
         .update_user(
             id,
-            body.email.as_deref(),
-            password_hash.as_deref(),
-            body.name.as_deref(),
-            body.role.as_deref(),
+            update.email,
+            update.password_hash,
+            update.name,
+            update.role,
             None,
         )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(ApiError::user_write)?;
+    if let Some(hash) = update.activation_hash {
+        tracker.activate_user(id, hash).map_err(ApiError::storage)?;
+    }
+    Ok(())
+}
 
-    if !updated {
-        return Err(StatusCode::NOT_FOUND);
+/// PUT /api/users/{id}
+///
+/// A password set on an invited user activates them and revokes their invite.
+pub async fn update_user_handler(
+    AdminUser(admin): AdminUser,
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+    body: Result<Json<UpdateUserRequest>, JsonRejection>,
+) -> Result<Json<UserResponse>, ApiError> {
+    if !state.limiters.api.allow(&admin.id) {
+        return Err(ApiError::rate_limited());
+    }
+    let Json(body) = body?;
+
+    let role = body.role.as_deref().map(parse_role).transpose()?;
+    let email = body.email.as_deref().map(normalize_login_email);
+    let name = body.name.as_deref().map(str::trim);
+    if let Some(email) = &email {
+        validate_login_email(email)?;
+    }
+    if let Some(name) = name {
+        validate_name(name)?;
+    }
+    validate_password(body.password.as_ref())?;
+
+    let password_hash = match body.password {
+        Some(password) => Some(hash_password(password).await?),
+        None => None,
+    };
+
+    let _writes = state.identity_writes.lock().await;
+    let user = find_user(&state, id)?;
+    let email = email.filter(|email| *email != user.email);
+    if let Some(email) = &email {
+        let holder = state
+            .tracker
+            .get_user_by_email(email)
+            .map_err(ApiError::storage)?;
+        if holder.is_some_and(|holder| holder.id != id) {
+            return Err(ApiError::duplicate_email());
+        }
     }
 
-    let user = state
-        .tracker
-        .get_user_by_id(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let activates = user.status == UserStatus::Invited && password_hash.is_some();
+    let (password_hash, activation_hash) = if activates {
+        (None, password_hash.as_deref())
+    } else {
+        (password_hash.as_deref(), None)
+    };
+    apply_user_update(
+        state.tracker.as_ref(),
+        id,
+        &UserUpdate {
+            email: email.as_deref(),
+            password_hash,
+            name,
+            role,
+            activation_hash,
+        },
+    )?;
+    if email.is_some() || activates {
+        registry::reload(&state.registry, state.tracker.as_ref());
+    }
 
-    Ok(Json(UserResponse {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        role: user.role,
-        avatar_url: user.avatar_url,
-        created_at: user.created_at,
-        updated_at: user.updated_at,
-    }))
+    let user = find_user(&state, id)?;
+    Ok(Json(user_response(&state, user)?))
 }
 
 /// DELETE /api/users/{id}
 pub async fn delete_user_handler(
-    admin: AdminUser,
+    AdminUser(admin): AdminUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
-) -> Result<Json<MessageResponse>, StatusCode> {
-    if !check_api_rate_limit(admin.0.id) {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+) -> Result<Json<MessageResponse>, ApiError> {
+    if !state.limiters.api.allow(&admin.id) {
+        return Err(ApiError::rate_limited());
     }
 
-    // Can't delete yourself
-    if admin.0.id == id {
-        return Err(StatusCode::BAD_REQUEST);
+    if admin.id == id {
+        return Err(ApiError::bad_request("You cannot delete yourself"));
     }
 
-    // Delete user sessions first
+    let _writes = state.identity_writes.lock().await;
     let _ = state.tracker.delete_user_sessions(id);
 
-    let deleted = state
-        .tracker
-        .delete_user(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let deleted = state.tracker.delete_user(id).map_err(ApiError::storage)?;
 
     if !deleted {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::user_not_found());
     }
+    registry::reload(&state.registry, state.tracker.as_ref());
 
     Ok(Json(MessageResponse {
         message: "User deleted".to_string(),
@@ -905,13 +907,14 @@ pub async fn delete_user_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::fixture;
     use crate::api::routes::create_api_router;
     use axum::body::Body;
     use axum::http::Request;
     use claudear_config::config::{
         AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, Config, DeployQaConfig,
-        IssuesConfig, LearningConfig, NotifiersConfig, PrioritisationConfig, RegressionConfig,
-        RetryConfig, ScmConfig,
+        IssuesConfig, LearningConfig, NotifiersConfig, PrDistributionConfig, PrioritisationConfig,
+        RegressionConfig, RetryConfig, ScmConfig,
     };
     use claudear_storage::SqliteTracker;
     use http_body_util::BodyExt;
@@ -941,6 +944,7 @@ mod tests {
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
             deploy_qa: DeployQaConfig::default(),
+            pr_distribution: PrDistributionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
@@ -966,9 +970,6 @@ mod tests {
         axum::Router,
         std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
     ) {
-        // Reset API rate limiter to prevent cross-test interference
-        reset_api_rate_limiter();
-
         let tracker: std::sync::Arc<dyn claudear_storage::FixAttemptTracker> =
             std::sync::Arc::new(SqliteTracker::in_memory().unwrap());
         let indexing_rx = tracker.subscribe_indexing_progress();
@@ -986,9 +987,9 @@ mod tests {
     fn seed_admin(
         tracker: &std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
     ) -> (i64, String) {
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let user_id = tracker
-            .create_user("admin@test.com", &password_hash, "Admin User", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin User", Role::Admin)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31 23:59:59")
@@ -1000,9 +1001,14 @@ mod tests {
     fn seed_viewer(
         tracker: &std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
     ) -> (i64, String) {
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let user_id = tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer User", "viewer")
+            .create_user(
+                "viewer@test.com",
+                &password_hash,
+                "Viewer User",
+                Role::Viewer,
+            )
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31 23:59:59")
@@ -1015,9 +1021,10 @@ mod tests {
         let (router, tracker) = create_test_app();
 
         // Seed a user (not via seed_admin, to test login flow directly)
-        let password_hash = bcrypt::hash("secret123", 4).unwrap();
+        let password = fixture::password();
+        let password_hash = bcrypt::hash(&password, 4).unwrap();
         tracker
-            .create_user("user@test.com", &password_hash, "Test User", "admin")
+            .create_user("user@test.com", &password_hash, "Test User", Role::Admin)
             .unwrap();
 
         let response = router
@@ -1027,7 +1034,8 @@ mod tests {
                     .uri("/api/auth/login")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"email":"user@test.com","password":"secret123"}"#,
+                        serde_json::json!({"email": "user@test.com", "password": password})
+                            .to_string(),
                     ))
                     .unwrap(),
             )
@@ -1056,9 +1064,9 @@ mod tests {
     async fn test_login_wrong_password() {
         let (router, tracker) = create_test_app();
 
-        let password_hash = bcrypt::hash("correct_password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
-            .create_user("user@test.com", &password_hash, "Test User", "admin")
+            .create_user("user@test.com", &password_hash, "Test User", Role::Admin)
             .unwrap();
 
         let response = router
@@ -1068,7 +1076,7 @@ mod tests {
                     .uri("/api/auth/login")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"email":"user@test.com","password":"wrong_password"}"#,
+                        serde_json::json!({"email": "user@test.com", "password": fixture::password()}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1089,7 +1097,7 @@ mod tests {
                     .uri("/api/auth/login")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"email":"nobody@test.com","password":"whatever"}"#,
+                        serde_json::json!({"email": "nobody@test.com", "password": fixture::password()}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1154,7 +1162,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"new@test.com","password":"newpass1!","name":"New User","role":"viewer"}"#,
+                        serde_json::json!({"email": "new@test.com", "password": fixture::password(), "name": "New User", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1183,7 +1191,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"new@test.com","password":"newpass1!","name":"New User","role":"viewer"}"#,
+                        serde_json::json!({"email": "new@test.com", "password": fixture::password(), "name": "New User", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1218,54 +1226,23 @@ mod tests {
         tracker: &std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
         email: &str,
     ) -> (i64, String) {
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        seed_admin_with_password(tracker, email, &fixture::password())
+    }
+
+    /// Seed an admin user who logs in with `password` and return (user_id, session_token).
+    fn seed_admin_with_password(
+        tracker: &std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
+        email: &str,
+        password: &str,
+    ) -> (i64, String) {
+        let password_hash = bcrypt::hash(password, 4).unwrap();
         let user_id = tracker
-            .create_user(email, &password_hash, "Admin User", "admin")
+            .create_user(email, &password_hash, "Admin User", Role::Admin)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31 23:59:59")
             .unwrap();
         (user_id, token)
-    }
-
-    #[test]
-    fn test_rate_limit_rejects_11th_attempt() {
-        // Use a unique email to avoid interference with other tests
-        let key = "ratelimit-11th@unique-test.com";
-        // First 10 attempts should succeed
-        for i in 0..LOGIN_RATE_LIMIT_MAX_ATTEMPTS {
-            assert!(
-                check_login_rate_limit(key),
-                "Attempt {} should be allowed",
-                i + 1
-            );
-        }
-        // 11th attempt should be rejected
-        assert!(
-            !check_login_rate_limit(key),
-            "11th attempt should be rejected"
-        );
-    }
-
-    #[test]
-    fn test_rate_limit_independent_keys() {
-        let key_a = "ratelimit-indep-a@unique-test.com";
-        let key_b = "ratelimit-indep-b@unique-test.com";
-
-        // Exhaust rate limit for key_a
-        for _ in 0..LOGIN_RATE_LIMIT_MAX_ATTEMPTS {
-            check_login_rate_limit(key_a);
-        }
-        assert!(
-            !check_login_rate_limit(key_a),
-            "key_a should be rate-limited"
-        );
-
-        // key_b should still be allowed
-        assert!(
-            check_login_rate_limit(key_b),
-            "key_b should NOT be rate-limited"
-        );
     }
 
     #[tokio::test]
@@ -1281,7 +1258,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"x@test.com","password":"longpassword","name":"X","role":"superuser"}"#,
+                        serde_json::json!({"email": "x@test.com", "password": fixture::password(), "name": "X", "role": "superuser"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1304,7 +1281,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"","password":"longpassword","name":"X","role":"viewer"}"#,
+                        serde_json::json!({"email": "", "password": fixture::password(), "name": "X", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1327,7 +1304,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"bademail","password":"longpassword","name":"X","role":"viewer"}"#,
+                        serde_json::json!({"email": "bademail", "password": fixture::password(), "name": "X", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1350,7 +1327,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"x@test.com","password":"short","name":"X","role":"viewer"}"#,
+                        serde_json::json!({"email": "x@test.com", "password": fixture::password_with_length(5), "name": "X", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1373,7 +1350,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"x@test.com","password":"longpassword","name":"","role":"viewer"}"#,
+                        serde_json::json!({"email": "x@test.com", "password": fixture::password(), "name": "", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1389,9 +1366,9 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-dup@test.com");
 
         // Create a user first
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
-            .create_user("dup@test.com", &hash, "Dup User", "viewer")
+            .create_user("dup@test.com", &hash, "Dup User", Role::Viewer)
             .unwrap();
 
         // Try to create another user with the same email
@@ -1403,7 +1380,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"dup@test.com","password":"longpassword","name":"Another","role":"viewer"}"#,
+                        serde_json::json!({"email": "dup@test.com", "password": fixture::password(), "name": "Another", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1419,9 +1396,9 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-role@test.com");
 
         // Create a target user to update
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
-            .create_user("target-update@test.com", &hash, "Target", "viewer")
+            .create_user("target-update@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1467,9 +1444,9 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-del-ok@test.com");
 
         // Create a target user to delete
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
-            .create_user("target-del@test.com", &hash, "Target", "viewer")
+            .create_user("target-del@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1517,9 +1494,9 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-list@test.com");
 
         // Create an additional user
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
-            .create_user("extra-list@test.com", &hash, "Extra User", "viewer")
+            .create_user("extra-list@test.com", &hash, "Extra User", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1552,9 +1529,9 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-getuser@test.com");
 
         // Create a target user
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
-            .create_user("target-get@test.com", &hash, "Target Get", "viewer")
+            .create_user("target-get@test.com", &hash, "Target Get", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1627,7 +1604,7 @@ mod tests {
             id: 42,
             email: "convert@test.com".to_string(),
             name: "Convert User".to_string(),
-            role: "admin".to_string(),
+            role: Role::Admin,
             avatar_url: None,
         };
 
@@ -1636,7 +1613,7 @@ mod tests {
         assert_eq!(response.id, 42);
         assert_eq!(response.email, "convert@test.com");
         assert_eq!(response.name, "Convert User");
-        assert_eq!(response.role, "admin");
+        assert_eq!(response.role, Role::Admin);
     }
 
     #[test]
@@ -1715,47 +1692,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ip_rate_limit_allows_within_limit() {
-        let ip = "ip-rate-test-allow-10.0.0.1";
-        for i in 0..10 {
-            assert!(
-                check_ip_rate_limit(ip),
-                "Attempt {} should be allowed",
-                i + 1
-            );
-        }
-    }
-
-    #[test]
-    fn test_ip_rate_limit_rejects_after_max() {
-        let ip = "ip-rate-test-reject-10.0.0.2";
-        for _ in 0..IP_RATE_LIMIT_MAX_ATTEMPTS {
-            check_ip_rate_limit(ip);
-        }
-        assert!(
-            !check_ip_rate_limit(ip),
-            "Should be rejected after max attempts"
-        );
-    }
-
-    #[test]
-    fn test_ip_rate_limit_independent_keys() {
-        let ip_a = "ip-rate-indep-a-10.0.0.3";
-        let ip_b = "ip-rate-indep-b-10.0.0.4";
-        for _ in 0..IP_RATE_LIMIT_MAX_ATTEMPTS {
-            check_ip_rate_limit(ip_a);
-        }
-        assert!(!check_ip_rate_limit(ip_a), "ip_a should be rate-limited");
-        assert!(check_ip_rate_limit(ip_b), "ip_b should NOT be rate-limited");
-    }
-
-    #[test]
     fn test_auth_user_response_from_auth_user_with_avatar() {
         let user = AuthUser {
             id: 99,
             email: "avatar@test.com".to_string(),
             name: "Avatar User".to_string(),
-            role: "viewer".to_string(),
+            role: Role::Viewer,
             avatar_url: Some("/avatars/99_abc.png".to_string()),
         };
 
@@ -1764,7 +1706,7 @@ mod tests {
         assert_eq!(response.id, 99);
         assert_eq!(response.email, "avatar@test.com");
         assert_eq!(response.name, "Avatar User");
-        assert_eq!(response.role, "viewer");
+        assert_eq!(response.role, Role::Viewer);
         assert_eq!(response.avatar_url.as_deref(), Some("/avatars/99_abc.png"));
     }
 
@@ -1792,9 +1734,9 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-shortpw@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
-            .create_user("target-update-pw@test.com", &hash, "Target", "viewer")
+            .create_user("target-update-pw@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1804,7 +1746,10 @@ mod tests {
                     .uri(format!("/api/users/{}", target_id))
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
-                    .body(Body::from(r#"{"password":"short"}"#))
+                    .body(Body::from(
+                        serde_json::json!({"password": fixture::password_with_length(5)})
+                            .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -1818,9 +1763,14 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-longpw@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
-            .create_user("target-update-longpw@test.com", &hash, "Target", "viewer")
+            .create_user(
+                "target-update-longpw@test.com",
+                &hash,
+                "Target",
+                Role::Viewer,
+            )
             .unwrap();
 
         let long_pw = "a".repeat(73);
@@ -1847,9 +1797,14 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-validpw@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
-            .create_user("target-update-validpw@test.com", &hash, "Target", "viewer")
+            .create_user(
+                "target-update-validpw@test.com",
+                &hash,
+                "Target",
+                Role::Viewer,
+            )
             .unwrap();
 
         let response = router
@@ -1859,7 +1814,9 @@ mod tests {
                     .uri(format!("/api/users/{}", target_id))
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
-                    .body(Body::from(r#"{"password":"newlongpassword123"}"#))
+                    .body(Body::from(
+                        serde_json::json!({"password": fixture::password()}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -1873,9 +1830,14 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-name@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
-            .create_user("target-name-upd@test.com", &hash, "Original Name", "viewer")
+            .create_user(
+                "target-name-upd@test.com",
+                &hash,
+                "Original Name",
+                Role::Viewer,
+            )
             .unwrap();
 
         let response = router
@@ -1902,9 +1864,9 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-role-to-admin@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
-            .create_user("target-role-upd@test.com", &hash, "Target", "viewer")
+            .create_user("target-role-upd@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -1968,7 +1930,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"x@test.com","password":"longpassword","name":"   ","role":"viewer"}"#,
+                        serde_json::json!({"email": "x@test.com", "password": fixture::password(), "name": "   ", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1981,9 +1943,10 @@ mod tests {
     #[tokio::test]
     async fn test_login_sends_x_forwarded_for_ip() {
         let (router, tracker) = create_test_app();
-        let password_hash = bcrypt::hash("secret123", 4).unwrap();
+        let password = fixture::password();
+        let password_hash = bcrypt::hash(&password, 4).unwrap();
         tracker
-            .create_user("iptest@test.com", &password_hash, "IP User", "admin")
+            .create_user("iptest@test.com", &password_hash, "IP User", Role::Admin)
             .unwrap();
 
         let response = router
@@ -1994,7 +1957,8 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("x-forwarded-for", "1.2.3.4")
                     .body(Body::from(
-                        r#"{"email":"iptest@test.com","password":"secret123"}"#,
+                        serde_json::json!({"email": "iptest@test.com", "password": password})
+                            .to_string(),
                     ))
                     .unwrap(),
             )
@@ -2053,7 +2017,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_profile_password_too_short() {
         let (router, tracker) = create_test_app();
-        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-profile-shortpw@test.com");
+        let password = fixture::password();
+        let (_admin_id, token) =
+            seed_admin_with_password(&tracker, "admin-profile-shortpw@test.com", &password);
 
         let response = router
             .oneshot(
@@ -2063,7 +2029,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"password":"short","current_password":"password"}"#,
+                        serde_json::json!({"password": fixture::password_with_length(5), "current_password": password}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2076,12 +2042,14 @@ mod tests {
     #[tokio::test]
     async fn test_update_profile_password_too_long() {
         let (router, tracker) = create_test_app();
-        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-profile-longpw@test.com");
+        let password = fixture::password();
+        let (_admin_id, token) =
+            seed_admin_with_password(&tracker, "admin-profile-longpw@test.com", &password);
 
-        let long_pw = "c".repeat(73);
+        let long_pw = fixture::password_with_length(73);
         let body = serde_json::json!({
             "password": long_pw,
-            "current_password": "password"
+            "current_password": password
         });
 
         let response = router
@@ -2112,7 +2080,9 @@ mod tests {
                     .uri("/api/auth/profile")
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
-                    .body(Body::from(r#"{"password":"newpassword123"}"#))
+                    .body(Body::from(
+                        serde_json::json!({"password": fixture::password()}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2135,7 +2105,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"password":"newpassword123","current_password":"wrongpassword"}"#,
+                        serde_json::json!({"password": fixture::password(), "current_password": fixture::password()}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2148,8 +2118,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_profile_password_success() {
         let (router, tracker) = create_test_app();
+        let password = fixture::password();
         let (_admin_id, token) =
-            seed_admin_with_email(&tracker, "admin-profile-pwsuccess@test.com");
+            seed_admin_with_password(&tracker, "admin-profile-pwsuccess@test.com", &password);
 
         let response = router
             .oneshot(
@@ -2159,7 +2130,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"password":"newpassword123","current_password":"password"}"#,
+                        serde_json::json!({"password": fixture::password(), "current_password": password}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2295,7 +2266,7 @@ mod tests {
                     .uri("/api/users")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"email":"x@test.com","password":"longpassword","name":"X","role":"viewer"}"#,
+                        serde_json::json!({"email": "x@test.com", "password": fixture::password(), "name": "X", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2336,7 +2307,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"newadmin@test.com","password":"longpassword","name":"New Admin","role":"admin"}"#,
+                        serde_json::json!({"email": "newadmin@test.com", "password": fixture::password(), "name": "New Admin", "role": "admin"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2352,9 +2323,15 @@ mod tests {
     #[tokio::test]
     async fn test_login_response_body_structure() {
         let (router, tracker) = create_test_app();
-        let password_hash = bcrypt::hash("testpass1", 4).unwrap();
+        let password = fixture::password();
+        let password_hash = bcrypt::hash(&password, 4).unwrap();
         tracker
-            .create_user("struct@test.com", &password_hash, "Struct User", "viewer")
+            .create_user(
+                "struct@test.com",
+                &password_hash,
+                "Struct User",
+                Role::Viewer,
+            )
             .unwrap();
 
         let response = router
@@ -2364,7 +2341,8 @@ mod tests {
                     .uri("/api/auth/login")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"email":"struct@test.com","password":"testpass1"}"#,
+                        serde_json::json!({"email": "struct@test.com", "password": password})
+                            .to_string(),
                     ))
                     .unwrap(),
             )
@@ -2386,9 +2364,9 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-email@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
-            .create_user("original-email@test.com", &hash, "Email User", "viewer")
+            .create_user("original-email@test.com", &hash, "Email User", Role::Viewer)
             .unwrap();
 
         let response = router
@@ -2441,7 +2419,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_with_valid_png() {
-        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2453,9 +2430,14 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
-            .create_user("avatar@test.com", &password_hash, "Avatar User", "admin")
+            .create_user(
+                "avatar@test.com",
+                &password_hash,
+                "Avatar User",
+                Role::Admin,
+            )
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2510,7 +2492,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_invalid_content_type() {
-        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2522,9 +2503,14 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
-            .create_user("avatar2@test.com", &password_hash, "Avatar User", "admin")
+            .create_user(
+                "avatar2@test.com",
+                &password_hash,
+                "Avatar User",
+                Role::Admin,
+            )
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2564,7 +2550,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_wrong_magic_bytes() {
-        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2576,9 +2561,14 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
-            .create_user("avatar3@test.com", &password_hash, "Avatar User", "admin")
+            .create_user(
+                "avatar3@test.com",
+                &password_hash,
+                "Avatar User",
+                Role::Admin,
+            )
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2624,7 +2614,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_no_avatar_field() {
-        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2636,9 +2625,14 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
-            .create_user("avatar4@test.com", &password_hash, "Avatar User", "admin")
+            .create_user(
+                "avatar4@test.com",
+                &password_hash,
+                "Avatar User",
+                Role::Admin,
+            )
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2679,7 +2673,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_valid_jpeg() {
-        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2691,9 +2684,14 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
-            .create_user("avatar5@test.com", &password_hash, "Avatar User", "admin")
+            .create_user(
+                "avatar5@test.com",
+                &password_hash,
+                "Avatar User",
+                Role::Admin,
+            )
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2741,8 +2739,6 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(resp["avatar_url"].as_str().unwrap().ends_with(".jpg"));
     }
-
-    // --- API token authorization boundaries ---------------------------------
 
     fn session_cookie(token: &str) -> String {
         format!("claudear_session={token}")
@@ -2886,5 +2882,439 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    mod directory_writes {
+        use super::super::*;
+        use crate::api::create_api_router_with_dashboard;
+        use crate::api::fixture;
+        use axum::body::Body;
+        use axum::http::Request;
+        use claudear_config::config::{Config, UserConfig};
+        use claudear_config::users::UserRegistry;
+        use claudear_storage::{FixAttemptTracker, SqliteTracker, UserStore};
+        use http_body_util::BodyExt;
+        use serde_json::{json, Value};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+        use tower_cookies::CookieManagerLayer;
+
+        struct TestApp {
+            router: axum::Router,
+            tracker: Arc<dyn FixAttemptTracker>,
+            registry: UserRegistry,
+            admin_token: String,
+        }
+
+        fn test_app() -> TestApp {
+            test_app_on(Arc::new(
+                SqliteTracker::in_memory().expect("in-memory tracker"),
+            ))
+        }
+
+        fn test_app_on(tracker: Arc<dyn FixAttemptTracker>) -> TestApp {
+            let admin = tracker
+                .create_user(
+                    "writes-admin@example.com",
+                    "unused-hash",
+                    "Admin",
+                    Role::Admin,
+                )
+                .expect("create admin");
+            let admin_token = tracker
+                .create_session(admin, "2099-12-31 23:59:59")
+                .expect("create session");
+            let config = Config {
+                users: HashMap::from([(
+                    "dana".to_string(),
+                    UserConfig {
+                        github_usernames: vec!["dana-gh".to_string()],
+                        email: Some("writes-dana@example.com".to_string()),
+                        ..UserConfig::default()
+                    },
+                )]),
+                storage_dir: std::env::temp_dir().join("claudear-auth-writes-tests"),
+                ..Config::default()
+            };
+            let registry = UserRegistry::new(config.users.clone());
+            let router = create_api_router_with_dashboard(
+                config,
+                tracker.clone(),
+                std::path::PathBuf::from("claudear.toml"),
+                tracker.subscribe_indexing_progress(),
+                None,
+                registry.clone(),
+            )
+            .layer(CookieManagerLayer::new());
+            TestApp {
+                router,
+                tracker,
+                registry,
+                admin_token,
+            }
+        }
+
+        async fn send(
+            app: &TestApp,
+            method: &str,
+            uri: &str,
+            session: Option<&str>,
+            body: Value,
+        ) -> (StatusCode, Vec<u8>) {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json");
+            if let Some(session) = session {
+                builder = builder.header("cookie", format!("claudear_session={session}"));
+            }
+            let response = app
+                .router
+                .clone()
+                .oneshot(builder.body(Body::from(body.to_string())).expect("request"))
+                .await
+                .expect("response");
+            let status = response.status();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+                .to_vec();
+            (status, bytes)
+        }
+
+        fn json(bytes: &[u8]) -> Value {
+            serde_json::from_slice(bytes).expect("json body")
+        }
+
+        #[tokio::test]
+        async fn create_email_change_and_delete_keep_the_registry_live() {
+            let app = test_app();
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/users",
+                Some(&app.admin_token),
+                json!({"email": "writes-erin@example.com", "name": "Erin", "role": "viewer",
+                       "identities": {"github_usernames": ["erin-gh"]}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            let created = json(&body);
+            assert_eq!(created["status"], "invited");
+            let user_id = created["id"].as_i64().expect("user id");
+            let console_key = format!("console-{user_id}");
+            assert_eq!(
+                app.registry
+                    .resolve("github", "erin-gh")
+                    .map(|person| person.slug),
+                Some(console_key.clone())
+            );
+            assert!(app.registry.users().contains_key(&console_key));
+
+            let (status, body) = send(
+                &app,
+                "PUT",
+                &format!("/api/users/{user_id}"),
+                Some(&app.admin_token),
+                json!({"email": "writes-dana@example.com"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json(&body)["status"], "invited");
+            assert_eq!(
+                app.registry
+                    .resolve("github", "erin-gh")
+                    .map(|person| person.slug),
+                Some("dana".to_string()),
+                "the new login email links the console user to the config entry"
+            );
+
+            let (status, _) = send(
+                &app,
+                "DELETE",
+                &format!("/api/users/{user_id}"),
+                Some(&app.admin_token),
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(app.registry.resolve("github", "erin-gh").is_none());
+            assert_eq!(
+                app.registry
+                    .resolve("github", "dana-gh")
+                    .map(|person| person.slug),
+                Some("dana".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn a_handle_another_process_claimed_creates_no_user_and_is_a_409() {
+            let database = fixture::SharedDatabase::new();
+            let app = test_app_on(database.tracker());
+            let users = app.tracker.list_users().expect("list");
+            database.claim_handle(
+                users[0].id,
+                claudear_core::identity::IdentityField::GithubUsernames,
+                "claimed-gh",
+            );
+            let before = users.len();
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/users",
+                Some(&app.admin_token),
+                json!({"email": "writes-claim@example.com", "name": "Claim", "role": "viewer",
+                       "identities": {"github_usernames": ["claimed-gh"]}}),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                json(&body),
+                json!({"error": "Identities already belong to another person"})
+            );
+            assert_eq!(app.tracker.list_users().expect("list").len(), before);
+        }
+
+        #[tokio::test]
+        async fn create_user_rejects_bad_input_without_writing() {
+            let app = test_app();
+            let before = app.tracker.list_users().expect("list").len();
+
+            for body in [
+                json!({"email": "writes-x@example.com", "name": "X", "role": "owner"}),
+                json!({"email": "not-an-email", "name": "X", "role": "viewer"}),
+                json!({"email": "writes-x@example.com", "name": " ", "role": "viewer"}),
+                json!({"email": "writes-x@example.com", "name": "X", "role": "viewer",
+                       "password": fixture::password_with_length(5)}),
+            ] {
+                let (status, _) =
+                    send(&app, "POST", "/api/users", Some(&app.admin_token), body).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/users",
+                Some(&app.admin_token),
+                json!({"email": "writes-x@example.com", "name": "X", "role": "viewer",
+                       "identities": {"github_usernames": ["dana-gh"]}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(json(&body)["violations"][0]["field"], "github_usernames");
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/users",
+                Some(&app.admin_token),
+                json!({"email": "writes-x@example.com", "name": "X", "role": "viewer",
+                       "identities": {"discord_id": "1"}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(json(&body)["violations"][0]["field"], "discord_id");
+
+            assert_eq!(app.tracker.list_users().expect("list").len(), before);
+        }
+
+        #[tokio::test]
+        async fn create_user_errors_are_json_and_emails_are_case_insensitive() {
+            let app = test_app();
+            let before = app.tracker.list_users().expect("list").len();
+
+            for (body, error) in [
+                (
+                    json!({"email": "writes-y@example.com", "name": "Y", "role": "owner"}),
+                    "Invalid role",
+                ),
+                (
+                    json!({"email": "writes-y@example.com", "name": "Y", "role": "viewer",
+                           "password": fixture::password_with_length(5)}),
+                    "Password must be 8-72 bytes",
+                ),
+                (
+                    json!({"email": "not-an-email", "name": "Y", "role": "viewer"}),
+                    "Email must be a valid email address",
+                ),
+                (
+                    json!({"email": "writes-y@example.com", "name": " ", "role": "viewer"}),
+                    "Name must not be empty",
+                ),
+                (
+                    json!({"email": "writes-y@example.com"}),
+                    "Invalid request body",
+                ),
+            ] {
+                let (status, response) =
+                    send(&app, "POST", "/api/users", Some(&app.admin_token), body).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+                assert_eq!(json(&response), json!({"error": error}));
+            }
+
+            let password = fixture::password();
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/users",
+                Some(&app.admin_token),
+                json!({"email": " Writes-Amy@Example.com ", "name": "Amy", "role": "viewer",
+                       "password": password}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(json(&body)["email"], "writes-amy@example.com");
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/users",
+                Some(&app.admin_token),
+                json!({"email": "writes-amy@example.com", "name": "Twin", "role": "viewer"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                json(&body),
+                json!({"error": "A user with this email already exists"})
+            );
+            assert_eq!(app.tracker.list_users().expect("list").len(), before + 1);
+
+            let (status, _) = send(
+                &app,
+                "POST",
+                "/api/auth/login",
+                None,
+                json!({"email": "WRITES-AMY@example.com", "password": password}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "login matches the email case-insensitively"
+            );
+        }
+
+        #[tokio::test]
+        async fn update_user_rejects_a_taken_email_in_any_case() {
+            let app = test_app();
+            let holder = app
+                .tracker
+                .create_user(
+                    "writes-holder@example.com",
+                    "unused-hash",
+                    "Holder",
+                    Role::Viewer,
+                )
+                .expect("create holder");
+            let mover = app
+                .tracker
+                .create_user(
+                    "writes-mover@example.com",
+                    "unused-hash",
+                    "Mover",
+                    Role::Viewer,
+                )
+                .expect("create mover");
+
+            let (status, body) = send(
+                &app,
+                "PUT",
+                &format!("/api/users/{mover}"),
+                Some(&app.admin_token),
+                json!({"email": "Writes-Holder@Example.com"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                json(&body),
+                json!({"error": "A user with this email already exists"})
+            );
+
+            let (status, body) = send(
+                &app,
+                "PUT",
+                &format!("/api/users/{holder}"),
+                Some(&app.admin_token),
+                json!({"role": "owner"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(json(&body), json!({"error": "Invalid role"}));
+
+            let (status, body) = send(
+                &app,
+                "PUT",
+                "/api/users/999999",
+                Some(&app.admin_token),
+                json!({"name": "Nobody"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(json(&body), json!({"error": "User not found"}));
+        }
+
+        #[test]
+        fn a_taken_email_fails_the_update_before_the_invited_user_is_activated() {
+            let tracker = SqliteTracker::in_memory().expect("in-memory tracker");
+            tracker
+                .create_user(
+                    "writes-taken@example.com",
+                    "unused-hash",
+                    "Taken",
+                    Role::Viewer,
+                )
+                .expect("create holder");
+            let invited = tracker
+                .save_directory(&[DirectoryWrite {
+                    user: DirectoryUser::New {
+                        email: "writes-invited@example.com".to_string(),
+                        name: "Invited".to_string(),
+                        role: Role::Viewer,
+                        password_hash: "unused-hash".to_string(),
+                        status: UserStatus::Invited,
+                    },
+                    identities: None,
+                    invite: Some(claudear_storage::InviteWrite {
+                        token_hash: "invite-hash".to_string(),
+                        expires_at: "2099-12-31 23:59:59".to_string(),
+                        created_by: 1,
+                    }),
+                }])
+                .expect("create invited user")[0];
+
+            let error = apply_user_update(
+                &tracker,
+                invited,
+                &UserUpdate {
+                    email: Some("writes-taken@example.com"),
+                    password_hash: None,
+                    name: None,
+                    role: None,
+                    activation_hash: Some("new-hash"),
+                },
+            )
+            .expect_err("the email is taken");
+
+            assert_eq!(error.status(), StatusCode::CONFLICT);
+            let user = tracker
+                .get_user_by_id(invited)
+                .expect("lookup")
+                .expect("user exists");
+            assert_eq!(user.status, UserStatus::Invited);
+            assert_eq!(user.password_hash, "unused-hash");
+            assert!(tracker
+                .get_open_invite_for_user(invited)
+                .expect("lookup")
+                .is_some());
+        }
     }
 }

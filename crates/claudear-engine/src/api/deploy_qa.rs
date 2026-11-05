@@ -9,7 +9,7 @@
 //! large a `limit` it is asked for, and [`DEFAULT_TIPS_LIMIT`] without one;
 //! `limit=0` returns none.
 
-use super::auth::{check_api_rate_limit, AdminUser, AuthUser};
+use super::auth::{AdminUser, AuthUser};
 use super::config_file::{self, ConfigFile, ConfigFileError};
 use super::routes::ApiState;
 use axum::{
@@ -484,7 +484,7 @@ pub(super) async fn put_config_handler(
     State(state): State<ApiState>,
     body: Result<Json<DeployQaConfigUpdate>, JsonRejection>,
 ) -> Response {
-    if !check_api_rate_limit(admin.0.id) {
+    if !state.limiters.api.allow(&admin.0.id) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({ "error": "Rate limit exceeded" })),
@@ -532,11 +532,11 @@ async fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::auth::reset_api_rate_limiter;
     use crate::api::create_api_router;
     use axum::body::Body;
     use axum::http::Request;
     use claudear_config::config::Config;
+    use claudear_core::identity::Role;
     use claudear_storage::{FixAttemptTracker, SqliteTracker};
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
@@ -579,14 +579,13 @@ mod tests {
         _directory: tempfile::TempDir,
     }
 
-    fn app(role: &str) -> TestApp {
-        reset_api_rate_limiter();
+    fn app(role: Role) -> TestApp {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("claudear.toml");
         std::fs::write(&path, disk_content()).unwrap();
 
         let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         let user_id = tracker
             .create_user("deploy-qa@example.com", &password_hash, "Deploy QA", role)
             .unwrap();
@@ -735,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn viewer_reads_status_and_tips_but_not_config() {
-        let app = app("viewer");
+        let app = app(Role::Viewer);
 
         assert_eq!(app.get("/api/deploy-qa").await.0, StatusCode::OK);
         assert_eq!(app.get("/api/deploy-qa/tips").await.0, StatusCode::OK);
@@ -753,7 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_requests_are_rejected() {
-        let app = app("admin");
+        let app = app(Role::Admin);
         for (method, uri) in [
             ("GET", "/api/deploy-qa"),
             ("GET", "/api/deploy-qa/tips"),
@@ -778,7 +777,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_running_tracks_with_last_seen_tip() {
-        let app = app("viewer");
+        let app = app(Role::Viewer);
         let mut tip = DeployQaTip::new("cloud", "acme/cloud", "1.2.0");
         tip.published_at = Some("2026-03-01T00:00:00Z".to_string());
         tip.release_body = Some("SECRET-RELEASE-BODY".to_string());
@@ -806,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn tips_are_newest_first_with_links_and_without_release_body() {
-        let app = app("viewer");
+        let app = app(Role::Viewer);
         for (track, tag, published_at) in [
             ("cloud", "1.0.0", "2026-01-01T00:00:00Z"),
             ("edge", "2.0.0", "2026-02-01T00:00:00Z"),
@@ -877,7 +876,7 @@ mod tests {
 
     #[tokio::test]
     async fn tips_pages_are_bounded_however_large_a_limit_is_asked_for() {
-        let app = app("viewer");
+        let app = app(Role::Viewer);
         for index in 0..MAX_TIPS_PAGE + 20 {
             let tip = DeployQaTip::new("cloud", "acme/cloud", format!("1.0.{index}"));
             app.tracker.upsert_deploy_qa_tip(&tip).unwrap();
@@ -932,7 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_reads_the_on_disk_section() {
-        let app = app("admin");
+        let app = app(Role::Admin);
 
         let (status, body) = app.get("/api/deploy-qa/config").await;
 
@@ -971,7 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_save_rewrites_the_section_and_requires_a_restart() {
-        let app = app("admin");
+        let app = app(Role::Admin);
         let (_, loaded) = app.get("/api/deploy-qa/config").await;
         let settings = settings_with_tracks(json!([
             { "name": "cloud", "repo": "acme/cloud", "tag_filter": "not_suffix:-db" },
@@ -1019,7 +1018,7 @@ mod tests {
 
     #[tokio::test]
     async fn saving_the_running_settings_needs_no_restart() {
-        let app = app("admin");
+        let app = app(Role::Admin);
         let (_, loaded) = app.get("/api/deploy-qa/config").await;
 
         let (status, saved) = app
@@ -1035,7 +1034,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_tracks_are_rejected_with_the_config_message() {
-        let app = app("admin");
+        let app = app(Role::Admin);
         let before = std::fs::read_to_string(&app.path).unwrap();
         let cases = [
             (
@@ -1078,7 +1077,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_settings_are_still_validated() {
-        let app = app("admin");
+        let app = app(Role::Admin);
         let mut settings = settings_with_tracks(json!([
             { "name": "", "repo": "acme/cloud", "tag_filter": "any" },
         ]));
@@ -1093,7 +1092,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_revision_is_rejected() {
-        let app = app("admin");
+        let app = app(Role::Admin);
         let before = std::fs::read_to_string(&app.path).unwrap();
 
         let (status, body) = app
@@ -1110,7 +1109,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_body_is_invalid() {
-        let app = app("admin");
+        let app = app(Role::Admin);
 
         let (status, body) = app
             .put(
@@ -1129,7 +1128,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unparseable_disk_file_is_reported_without_its_lines() {
-        let app = app("admin");
+        let app = app(Role::Admin);
         std::fs::write(&app.path, UNQUOTED_SECRET_FILE).unwrap();
 
         let (status, body) = app.get("/api/deploy-qa/config").await;
@@ -1156,7 +1155,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_disk_section_is_reported_without_its_values() {
-        let app = app("admin");
+        let app = app(Role::Admin);
         let content = disk_content().replace(
             "repo = \"acme/cloud\"\n",
             "repo = \"acme/cloud\"\ntag_filter = \"fake-secret-filter\"\n",
@@ -1186,7 +1185,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_read_waits_for_an_in_progress_write() {
-        let app = app("admin");
+        let app = app(Role::Admin);
         let held = config_file::HeldWriteLock::acquire();
 
         let request = tokio::spawn(
@@ -1210,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_keeps_a_change_written_while_it_waited() {
-        let app = app("admin");
+        let app = app(Role::Admin);
         let held = config_file::HeldWriteLock::acquire();
 
         let request = tokio::spawn(

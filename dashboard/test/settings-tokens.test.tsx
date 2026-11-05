@@ -37,6 +37,32 @@ function respond(status: number, body: unknown) {
   });
 }
 
+const viewerIdentities = {
+  user_id: 2,
+  name: "Viewer",
+  login_email: "viewer@test.com",
+  person_key: null,
+  slug: null,
+  origin: "unset",
+  status: "active",
+  redacted: false,
+  identities: {
+    linear_names: [],
+    github_usernames: [],
+    sentry_usernames: [],
+    jira_usernames: [],
+    gitlab_usernames: [],
+    discord_id: null,
+    slack_id: null,
+    email: null,
+    push_user_key: null,
+    sms_number: null,
+    whatsapp_number: null,
+    telegram_chat_id: null,
+  },
+  updated_at: null,
+};
+
 function createTokensHarness(initial: TokenRecord[]) {
   let tokens = [...initial];
   const calls: Call[] = [];
@@ -50,6 +76,10 @@ function createTokensHarness(initial: TokenRecord[]) {
 
     if (url.endsWith("/api/auth/me")) {
       return respond(200, { id: 2, email: "viewer@test.com", name: "Viewer", role: "viewer", avatar_url: null });
+    }
+
+    if (url.endsWith("/api/users/2/identities") && method === "GET") {
+      return respond(200, viewerIdentities);
     }
 
     if (url.endsWith("/api/tokens") && method === "GET") {

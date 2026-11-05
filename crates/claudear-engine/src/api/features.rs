@@ -45,6 +45,7 @@ const BUILDERS: &[fn(&Config) -> FeatureStatus] = &[
     evaluation,
     prioritisation,
     reports,
+    pr_distribution,
     learning,
     code_index,
     retrieval_eval,
@@ -828,6 +829,26 @@ fn reports(config: &Config) -> FeatureStatus {
     .setting("min_event_count", digest.min_event_count)
 }
 
+fn pr_distribution(config: &Config) -> FeatureStatus {
+    let distribution = &config.pr_distribution;
+    FeatureStatus::new(
+        "pr_distribution",
+        "PR distribution",
+        "Assigns open pull requests to developers fairly and sends each a digest.",
+        FeatureCategory::Automation,
+    )
+    .state(true, distribution.enabled)
+    .setting("notify_on_open", distribution.notify_on_open)
+    .setting("digest", distribution.digest)
+    .setting(
+        "digest_frequency",
+        String::from(distribution.digest_frequency),
+    )
+    .setting("digest_hour", distribution.digest_hour)
+    .setting("excluded", distribution.excluded.len())
+    .setting("tolerance", distribution.tolerance)
+}
+
 fn learning(config: &Config) -> FeatureStatus {
     let learning = &config.learning;
     FeatureStatus::new(
@@ -1016,6 +1037,7 @@ mod tests {
         GitHubCodeScanningConfig, GitLabConfig, HelpScoutConfig, HelpScoutMailboxConfig,
         JiraConfig, LinearConfig, McpServerConfig, SentryConfig, SlackSourceConfig, UserConfig,
     };
+    use claudear_core::identity::Role;
     use claudear_storage::{FixAttemptTracker, SqliteTracker};
     use http_body_util::BodyExt;
     use std::collections::BTreeSet;
@@ -1467,12 +1489,17 @@ mod tests {
         .layer(CookieManagerLayer::new())
     }
 
-    async fn read_features(role: &str) -> (StatusCode, String) {
+    async fn read_features(role: Role) -> (StatusCode, String) {
         let storage = tempfile::tempdir().unwrap();
         let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         let user_id = tracker
-            .create_user(&format!("{role}@example.com"), &password_hash, role, role)
+            .create_user(
+                &format!("{role}@example.com"),
+                &password_hash,
+                role.as_str(),
+                role,
+            )
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31 23:59:59")
@@ -1506,7 +1533,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_admins_see_admin_features() {
-        let (status, viewer) = read_features("viewer").await;
+        let (status, viewer) = read_features(Role::Viewer).await;
         assert_eq!(status, StatusCode::OK);
         let viewer_keys = reported_keys(&viewer);
         assert_eq!(viewer_keys.len(), BUILDERS.len() - ADMIN_FEATURES.len());
@@ -1517,7 +1544,7 @@ mod tests {
             );
         }
 
-        let (status, admin) = read_features("admin").await;
+        let (status, admin) = read_features(Role::Admin).await;
         assert_eq!(status, StatusCode::OK);
         assert!(!admin.contains("LEAKED-"), "response leaked a secret");
         let admin_keys = reported_keys(&admin);
@@ -1532,7 +1559,7 @@ mod tests {
 
     #[tokio::test]
     async fn viewer_can_read_features() {
-        let (status, text) = read_features("viewer").await;
+        let (status, text) = read_features(Role::Viewer).await;
 
         assert_eq!(status, StatusCode::OK);
         assert!(!text.contains("LEAKED-"), "response leaked a secret");

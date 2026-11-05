@@ -6,6 +6,7 @@ import {
   fetchIssues,
   fetchRepoLearning,
   getUser,
+  revokeToken,
   saveConfig,
   setOnUnauthorized,
   updateExperiment,
@@ -232,6 +233,7 @@ describe("additional api coverage", () => {
     );
     await expect(saveConfig("abc")).rejects.toThrow("server");
     await expect(deleteUser(1)).rejects.toThrow("server");
+    await expect(revokeToken("t1")).rejects.toThrow("server");
     await expect(uploadAvatar(new File(["x"], "a.png", { type: "image/png" }))).rejects.toThrow(
       "Failed to upload avatar: 500"
     );

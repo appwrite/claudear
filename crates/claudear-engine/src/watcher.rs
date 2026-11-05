@@ -19,7 +19,10 @@ use claudear_analysis::inference::{
 };
 use claudear_analysis::qa::build_correlation_id;
 use claudear_analysis::repo::{worktree_path, GitOps, RepoRelationships};
-use claudear_config::config::{Config, HELPSCOUT_SOURCE, MAILBOX_ID_METADATA_KEY};
+use claudear_config::config::Config;
+use claudear_config::config::DigestFrequency;
+use claudear_config::config::HELPSCOUT_SOURCE;
+use claudear_config::config::MAILBOX_ID_METADATA_KEY;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::security::{parse_security_fix_short_id, SECURITY_FIX_SOURCE};
@@ -28,6 +31,8 @@ use claudear_core::types::{
     FixAttempt, FixAttemptStats, FixAttemptStatus, Issue, IssueEmbedding, IssueType, MatchPriority,
     MatchResult, PrRecord, ProcessingMetric, RegressionWatch, ReplyKind, TimelineEventStatus,
 };
+use claudear_integrations::distribution::Distributor;
+use claudear_integrations::distribution::PullRequestHost;
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
 use claudear_integrations::reports::{ReportFrequency, ReportGenerator, ReportSchedule};
@@ -1492,6 +1497,12 @@ impl Watcher {
         self.dry_run
     }
 
+    /// Reload console identities into the shared user registry, picking up
+    /// edits made by a separate dashboard process on the same database.
+    pub fn refresh_user_directory(&self) -> bool {
+        crate::registry::reload(&self.user_registry, self.tracker.as_ref())
+    }
+
     /// Returns the configured periodic reindex interval, or `None` if disabled (0).
     pub fn reindex_interval(&self) -> Option<std::time::Duration> {
         let hours = self.config.code_index.reindex_interval_hours;
@@ -2638,6 +2649,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     cascade_issue.set_metadata("changelog", changelog.clone());
                 }
                 let _ = self.notifier.notify_success(&cascade_issue, pr_url).await;
+                self.assign_opened_pr(pr_url, &cascade_issue).await;
             } else {
                 // Cascade succeeded but no PR
                 let reason = if result.output.is_empty() {
@@ -2920,6 +2932,68 @@ Create a PR with your changes.{custom_instructions}"#,
             "Sending weekly repetitive-issues digest"
         );
         self.notifier.notify_repetitive_digest(&digest).await
+    }
+
+    /// The schedule of the PR distribution run, or `None` when
+    /// `[pr_distribution]` is disabled. The caller (housekeeping loop) owns
+    /// the returned schedule and its `last_sent_at` cadence state.
+    pub fn pr_distribution_schedule(&self) -> Option<ReportSchedule> {
+        let distribution = &self.config.pr_distribution;
+        if !distribution.enabled {
+            return None;
+        }
+        Some(ReportSchedule {
+            name: "pr-distribution".to_string(),
+            frequency: match distribution.digest_frequency {
+                DigestFrequency::Daily => ReportFrequency::Daily,
+                DigestFrequency::Weekly(day) => ReportFrequency::Weekly(day),
+                DigestFrequency::Monthly => ReportFrequency::Monthly,
+            },
+            hour: distribution.digest_hour,
+            enabled: true,
+            last_sent_at: None,
+        })
+    }
+
+    /// Reconcile every open Claudear PR with its assignee and send the PR
+    /// digest. No-ops when `[pr_distribution]` cannot run.
+    pub async fn distribute_pull_requests(&self) -> Result<()> {
+        let Some(distributor) = self.distributor() else {
+            return Ok(());
+        };
+        let outcome = distributor.distribute(Utc::now()).await?;
+        tracing::info!(
+            component = "pr_distribution",
+            assigned = outcome.assigned,
+            released = outcome.released,
+            closed = outcome.closed,
+            listed = outcome.listed,
+            "Distributed open PRs"
+        );
+        Ok(())
+    }
+
+    /// Assign a PR Claudear just opened for `issue`, logging any failure: the
+    /// scheduled run assigns it later instead.
+    async fn assign_opened_pr(&self, pr_url: &str, issue: &Issue) {
+        let Some(distributor) = self.distributor() else {
+            return;
+        };
+        if let Err(error) = distributor.assign_opened(pr_url, issue).await {
+            tracing::warn!(component = "pr_distribution", pr_url, error = %error, "Failed to assign opened PR");
+        }
+    }
+
+    fn distributor(&self) -> Option<Distributor> {
+        Distributor::from_config(
+            &self.config,
+            &self.user_registry,
+            self.tracker.clone(),
+            self.github_client
+                .clone()
+                .map(|client| client as Arc<dyn PullRequestHost>),
+            self.notifier.clone(),
+        )
     }
 
     /// Run housekeeping tasks: orphaned-attempt release, retries, cascades,
@@ -6471,6 +6545,7 @@ mod tests {
     use claudear_config::config::{
         CascadeRule, CascadeTrigger, DeployQaConfig, DeployQaTrackConfig,
     };
+    use claudear_core::identity::Role;
     use claudear_core::types::{IndexedRepo, IssuePriority, RepoIndex};
     use claudear_integrations::notifier::Notifier;
     use claudear_integrations::reports::Report;
@@ -6726,6 +6801,7 @@ mod tests {
             retry: claudear_config::config::RetryConfig::default(),
             regression: claudear_config::config::RegressionConfig::default(),
             deploy_qa: claudear_config::config::DeployQaConfig::default(),
+            pr_distribution: claudear_config::config::PrDistributionConfig::default(),
             cascade: claudear_config::config::CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: claudear_config::config::LearningConfig::default(),
@@ -6833,6 +6909,91 @@ mod tests {
         assert!(!watcher.dry_run);
         assert!(!watcher.is_running.load(Ordering::SeqCst));
         assert_eq!(watcher.active_processing.load(Ordering::SeqCst), 0);
+    }
+
+    fn watcher_with_pr_distribution(
+        change: impl FnOnce(&mut claudear_config::config::PrDistributionConfig),
+    ) -> Watcher {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut options = live_watcher_options(Arc::new(MockNotifier::new(true)), tracker, vec![]);
+        change(&mut options.config.pr_distribution);
+        Watcher::new(options)
+    }
+
+    #[test]
+    fn test_pr_distribution_schedule_follows_the_config() {
+        assert!(watcher_with_pr_distribution(|_| {})
+            .pr_distribution_schedule()
+            .is_none());
+
+        let schedule = watcher_with_pr_distribution(|distribution| {
+            distribution.enabled = true;
+            distribution.digest_frequency = DigestFrequency::Weekly(chrono::Weekday::Fri);
+            distribution.digest_hour = 16;
+        })
+        .pr_distribution_schedule()
+        .unwrap();
+        assert_eq!(
+            schedule.frequency,
+            ReportFrequency::Weekly(chrono::Weekday::Fri)
+        );
+        assert_eq!(schedule.hour, 16);
+        assert!(schedule.last_sent_at.is_none());
+
+        let monthly = watcher_with_pr_distribution(|distribution| {
+            distribution.enabled = true;
+            distribution.digest_frequency = DigestFrequency::Monthly;
+        })
+        .pr_distribution_schedule()
+        .unwrap();
+        assert_eq!(monthly.frequency, ReportFrequency::Monthly);
+    }
+
+    #[tokio::test]
+    async fn test_distribute_pull_requests_without_a_github_client_does_nothing() {
+        let watcher = watcher_with_pr_distribution(|distribution| distribution.enabled = true);
+        watcher.distribute_pull_requests().await.unwrap();
+    }
+
+    #[test]
+    fn refresh_user_directory_applies_stored_identities_to_the_shared_registry() {
+        use claudear_core::identity::Identities;
+        use claudear_storage::{DirectoryUser, DirectoryWrite, IdentityWrite, UserStore};
+
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let registry = UserRegistry::new(HashMap::new());
+        let watcher = Watcher::new(WatcherOptions {
+            user_registry: registry.clone(),
+            ..live_watcher_options(Arc::new(MockNotifier::new(true)), tracker.clone(), vec![])
+        });
+        let user_id = tracker
+            .create_user("amy@example.com", "unused-hash", "Amy", Role::Viewer)
+            .unwrap();
+        tracker
+            .save_directory(&[DirectoryWrite {
+                user: DirectoryUser::Existing {
+                    user_id,
+                    name: None,
+                    role: None,
+                },
+                identities: Some(IdentityWrite {
+                    slug: Some("amy".to_string()),
+                    identities: Identities {
+                        github_usernames: vec!["amy-gh".to_string()],
+                        ..Identities::default()
+                    },
+                }),
+                invite: None,
+            }])
+            .unwrap();
+        assert!(registry.resolve("github", "amy-gh").is_none());
+
+        assert!(watcher.refresh_user_directory());
+
+        let resolved = registry
+            .resolve("github", "amy-gh")
+            .expect("the watcher's refresh must reach every registry clone");
+        assert_eq!(resolved.slug, "amy");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! server. The secret is shown exactly once, at creation; only its SHA-256 hash
 //! is stored.
 
-use super::auth::{check_api_rate_limit, AdminUser, AuthUser};
+use super::auth::{AdminUser, AuthUser};
 use super::routes::ApiState;
 use axum::{
     extract::{Path, State},
@@ -44,7 +44,7 @@ fn generate_secret() -> String {
     format!("cldr_{}", hex::encode(bytes))
 }
 
-fn hash_secret(secret: &str) -> String {
+pub(crate) fn hash_secret(secret: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
     hex::encode(hasher.finalize())
@@ -74,7 +74,7 @@ pub async fn create_token_handler(
     State(state): State<ApiState>,
     Json(body): Json<CreateTokenRequest>,
 ) -> Result<(StatusCode, Json<CreatedTokenResponse>), StatusCode> {
-    if !check_api_rate_limit(user.id) {
+    if !state.limiters.api.allow(&user.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -118,7 +118,6 @@ pub async fn revoke_token_handler(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> StatusCode {
-    // Admins can revoke any token; everyone else is scoped to their own.
     let scope = if user.is_admin() { None } else { Some(user.id) };
     match state.tracker.delete_api_token(&id, scope) {
         Ok(true) => StatusCode::NO_CONTENT,
@@ -159,7 +158,7 @@ pub async fn create_user_token_handler(
     Path(user_id): Path<i64>,
     Json(body): Json<CreateTokenRequest>,
 ) -> Result<(StatusCode, Json<CreatedTokenResponse>), StatusCode> {
-    if !check_api_rate_limit(admin.0.id) {
+    if !state.limiters.api.allow(&admin.0.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 

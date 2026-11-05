@@ -121,8 +121,8 @@ mod tests {
     use super::*;
     use claudear_storage::{
         ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
-        EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
-        SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
+        EvaluationStore, ExperimentStore, KnowledgeStore, PrAssignmentStore, RegressionStore,
+        RepoStore, SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
     };
     use std::collections::HashMap;
 
@@ -237,6 +237,7 @@ mod tests {
     impl SimilarityStore for MockTracker {}
     impl DiscordStore for MockTracker {}
     impl DeployQaStore for MockTracker {}
+    impl PrAssignmentStore for MockTracker {}
     impl SecurityReportStore for MockTracker {}
 
     #[test]

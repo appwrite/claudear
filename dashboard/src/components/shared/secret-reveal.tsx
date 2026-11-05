@@ -3,7 +3,7 @@ import { Check, Copy } from 'lucide-react'
 
 type CopyState = 'idle' | 'copied' | 'failed'
 
-export function SecretReveal({ secret }: { secret: string }) {
+export function SecretReveal({ secret, noun = 'token' }: { secret: string; noun?: string }) {
   const [state, setState] = useState<CopyState>('idle')
 
   const handleCopy = async () => {
@@ -32,7 +32,7 @@ export function SecretReveal({ secret }: { secret: string }) {
       </div>
       {state === 'failed' && (
         <div className="text-xs text-destructive">
-          Couldn't access the clipboard. Select the token above and copy it manually.
+          Couldn't access the clipboard. Select the {noun} above and copy it manually.
         </div>
       )}
     </div>

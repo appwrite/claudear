@@ -2,8 +2,10 @@ import { useEffect, type JSX } from 'react'
 import { Router, RouterProvider } from './router'
 import { AppShell } from './components/layout/app-shell'
 import { AuthProvider, useAuth } from './lib/auth'
+import { isInvitePath } from './lib/invite-token'
 import { Sentry } from './lib/sentry'
 import LoginPage from './pages/login'
+import InvitePage from './pages/invite'
 import OverviewPage from './pages/overview'
 import AttemptsPage from './pages/attempts'
 import PrsPage from './pages/prs'
@@ -100,6 +102,14 @@ function AuthenticatedApp() {
 }
 
 function App() {
+  if (isInvitePath()) {
+    return (
+      <Sentry.ErrorBoundary fallback={<SentryFallback />}>
+        <InvitePage />
+      </Sentry.ErrorBoundary>
+    )
+  }
+
   return (
     <AuthProvider>
       <AuthenticatedApp />

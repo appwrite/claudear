@@ -15,6 +15,7 @@ pub mod llm_agent_runner;
 pub mod llm_analyzer;
 pub mod llm_classifier;
 pub mod processing;
+pub mod registry;
 pub mod repo_index;
 pub mod retry;
 pub mod security;

@@ -1,13 +1,17 @@
 //! Standalone housekeeping worker for periodic background tasks.
 //!
 //! Runs retries, PR merge cascades, release cascades, auto-close, reviews,
-//! learning, and regression monitoring on a timer — independently of the
+//! learning, regression monitoring, and PR distribution on a timer — independently of the
 //! polling loop in [`Watcher::start`].  Used by `Commands::Webhook` and
 //! `Commands::Start` (when polling is disabled) so that housekeeping runs
 //! regardless of how issues are ingested.
 
 use crate::watcher::Watcher;
+use chrono::DateTime;
 use chrono::Utc;
+use claudear_core::error::Result;
+use claudear_integrations::reports::ReportSchedule;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::time::{interval, Duration, Instant};
 
@@ -68,6 +72,7 @@ impl HousekeepingWorker {
         // exact hour + a 6-day window, so a duplicate is only possible if the
         // daemon restarts during the target hour on the target weekday.
         let mut digest_schedule = self.watcher.repetitive_digest_schedule();
+        let mut distribution_schedule = self.watcher.pr_distribution_schedule();
 
         while self.watcher.is_running() {
             timer.tick().await;
@@ -79,6 +84,7 @@ impl HousekeepingWorker {
             }
 
             cycle_count = cycle_count.wrapping_add(1);
+            self.watcher.refresh_user_directory();
 
             let cron_id = uuid::Uuid::new_v4().to_string();
             let cron_start = Instant::now();
@@ -153,12 +159,26 @@ impl HousekeepingWorker {
                 }
             };
 
-            let (_, _, housekeeping_ok, _, _) = tokio::join!(
+            let distribution_fut = async {
+                if !self.watcher.is_dry_run() {
+                    if let Some(schedule) = distribution_schedule.as_mut() {
+                        let run = run_when_due(schedule, Utc::now(), || {
+                            self.watcher.distribute_pull_requests()
+                        });
+                        if let Some(Err(e)) = run.await {
+                            tracing::error!(component = "pr_distribution", error = %e, "Error distributing open PRs; retrying next tick");
+                        }
+                    }
+                }
+            };
+
+            let (_, _, housekeeping_ok, _, _, _) = tokio::join!(
                 auto_close_fut,
                 reviews_fut,
                 housekeeping_fut,
                 learning_fut,
-                digest_fut
+                digest_fut,
+                distribution_fut
             );
 
             let duration_secs = cron_start.elapsed().as_secs_f64();
@@ -170,5 +190,99 @@ impl HousekeepingWorker {
                 self.interval_ms,
             );
         }
+    }
+}
+
+/// Run `job` when `schedule` is due at `now`, returning its result, or `None`
+/// when it is not due. The slot is marked used only when the job succeeds, so
+/// a run that fails is retried on the next tick instead of waiting for the
+/// next slot.
+async fn run_when_due<F, Fut>(
+    schedule: &mut ReportSchedule,
+    now: DateTime<Utc>,
+    job: F,
+) -> Option<Result<()>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    if !schedule.is_due(now) {
+        return None;
+    }
+    let result = job().await;
+    if result.is_ok() {
+        schedule.last_sent_at = Some(now);
+    }
+    Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use claudear_core::error::Error;
+
+    fn nine_am() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 4, 9, 0, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_leaves_the_slot_open_for_the_next_tick() {
+        let mut schedule = ReportSchedule::daily("pr-distribution", 9);
+
+        let failed = run_when_due(&mut schedule, nine_am(), || async {
+            Err(Error::Other("database is locked".to_string()))
+        })
+        .await;
+
+        assert!(matches!(failed, Some(Err(_))));
+        assert!(schedule.last_sent_at.is_none());
+
+        let retried = run_when_due(
+            &mut schedule,
+            nine_am() + chrono::Duration::minutes(5),
+            || async { Ok(()) },
+        )
+        .await;
+
+        assert!(matches!(retried, Some(Ok(()))));
+        assert_eq!(
+            schedule.last_sent_at,
+            Some(nine_am() + chrono::Duration::minutes(5))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_run_is_not_repeated_in_the_same_slot() {
+        let mut schedule = ReportSchedule::daily("pr-distribution", 9);
+        let mut runs = 0;
+
+        for minutes in [0, 5] {
+            run_when_due(
+                &mut schedule,
+                nine_am() + chrono::Duration::minutes(minutes),
+                || {
+                    runs += 1;
+                    async { Ok(()) }
+                },
+            )
+            .await;
+        }
+
+        assert_eq!(runs, 1);
+    }
+
+    #[tokio::test]
+    async fn nothing_runs_outside_the_slot() {
+        let mut schedule = ReportSchedule::daily("pr-distribution", 9);
+
+        let run = run_when_due(
+            &mut schedule,
+            nine_am() + chrono::Duration::hours(1),
+            || async { panic!("ran outside its hour") },
+        )
+        .await;
+
+        assert!(run.is_none());
     }
 }

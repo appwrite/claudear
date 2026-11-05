@@ -4,6 +4,7 @@ use super::Notifier;
 use abnegate_http::HttpResponse;
 use async_trait::async_trait;
 use claudear_config::config::SmsConfig;
+use claudear_config::users::NotificationChannel;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Error;
 use claudear_core::error::Result;
@@ -112,16 +113,15 @@ impl<H: SmsHttpClient> SmsNotifier<H> {
     }
 
     fn resolve_recipients(&self, issue: Option<&Issue>) -> Vec<String> {
-        if let Some(issue) = issue {
-            if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
-                if let Some(user) = self.user_registry.get_by_slug(&slug) {
-                    if let Some(ref number) = user.sms_number {
-                        return vec![number.clone()];
-                    }
-                }
-            }
-        }
-        self.config.to_numbers.clone()
+        issue
+            .and_then(|issue| issue.get_metadata::<String>("resolved_user"))
+            .and_then(|slug| self.user_registry.get_by_slug(&slug))
+            .and_then(|user| user.sms_number)
+            .map(|number| vec![number])
+            .unwrap_or_else(|| {
+                self.user_registry
+                    .resolve_references(NotificationChannel::Sms, &self.config.to_numbers)
+            })
     }
 
     async fn send_sms(&self, body: &str, issue: Option<&Issue>) -> Result<()> {
@@ -338,6 +338,7 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifier::test_support::{console_person, registry_with};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -1370,5 +1371,64 @@ mod tests {
         let calls = notifier.http.get_last_calls();
         let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
         assert!(!body.contains("Trigger:"));
+    }
+
+    fn sms_person(sms_number: Option<&str>) -> claudear_config::config::UserConfig {
+        claudear_config::config::UserConfig {
+            linear_names: vec!["Jake B".to_string()],
+            sms_number: sms_number.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn config_to(numbers: &[&str]) -> SmsConfig {
+        SmsConfig {
+            to_numbers: numbers.iter().map(|number| number.to_string()).collect(),
+            ..enabled_config()
+        }
+    }
+
+    #[test]
+    fn test_to_numbers_person_key_resolves_to_sms_number() {
+        let notifier = SmsNotifier::with_http_client_and_registry(
+            config_to(&["jake", "+19876543210"]),
+            MockSmsClient::success(),
+            registry_with("jake", sms_person(Some("+11234567890"))),
+        );
+        assert_eq!(
+            notifier.resolve_recipients(None),
+            vec!["+11234567890", "+19876543210"]
+        );
+    }
+
+    #[test]
+    fn test_to_numbers_person_without_number_stays_literal() {
+        let notifier = SmsNotifier::with_http_client_and_registry(
+            config_to(&["jake"]),
+            MockSmsClient::success(),
+            registry_with("jake", sms_person(None)),
+        );
+        assert_eq!(notifier.resolve_recipients(None), vec!["jake"]);
+    }
+
+    #[test]
+    fn test_to_numbers_follow_console_edit_without_rebuild() {
+        let registry = registry_with("jake", sms_person(Some("+11111111111")));
+        let notifier = SmsNotifier::with_http_client_and_registry(
+            config_to(&["jake"]),
+            MockSmsClient::success(),
+            registry.clone(),
+        );
+        assert_eq!(notifier.resolve_recipients(None), vec!["+11111111111"]);
+
+        registry.replace_console(vec![console_person(
+            "jake",
+            claudear_core::identity::Identities {
+                sms_number: Some("+12222222222".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        assert_eq!(notifier.resolve_recipients(None), vec!["+12222222222"]);
     }
 }

@@ -24,6 +24,8 @@ use claudear_core::types::{
     VerifyResult,
 };
 use claudear_integrations::discord::DiscordClient;
+use claudear_integrations::distribution::Distributor;
+use claudear_integrations::distribution::PullRequestHost;
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
 use claudear_integrations::runner::{self, AgentRunner};
@@ -2330,7 +2332,8 @@ impl IssueProcessor {
             if let Some(ref pr_url) = effective_pr_url {
                 tracing::info!(short_id = %issue.short_id, pr_url = %pr_url, "Success! PR created");
                 self.tracker.mark_success(source_name, &issue.id, pr_url)?;
-                if existing_pr_branch.is_some() || review_feedback.is_some() {
+                let is_pr_update = existing_pr_branch.is_some() || review_feedback.is_some();
+                if is_pr_update {
                     issue.set_metadata("is_pr_update", true);
                 }
                 record_notification_details(issue, &claude_result);
@@ -2379,6 +2382,10 @@ impl IssueProcessor {
                     if let Err(e) = self.tracker.upsert_pr(&pr_record) {
                         tracing::warn!(error = %e, "Failed to upsert PR record");
                     }
+                }
+
+                if !is_pr_update {
+                    self.assign_opened_pr(pr_url, issue).await;
                 }
 
                 // Post confidence comment on PR
@@ -3253,6 +3260,32 @@ impl IssueProcessor {
                 input.attempt_id,
             )
             .await
+        }
+    }
+
+    /// Make a developer responsible for the PR just opened for `issue`,
+    /// logging any failure: the scheduled `[pr_distribution]` run assigns it
+    /// later instead.
+    async fn assign_opened_pr(&self, pr_url: &str, issue: &Issue) {
+        let Some(distributor) = Distributor::from_config(
+            &self.config,
+            &self.user_registry,
+            self.tracker.clone(),
+            self.github_client
+                .clone()
+                .map(|client| client as Arc<dyn PullRequestHost>),
+            self.notifier.clone(),
+        ) else {
+            return;
+        };
+        if let Err(error) = distributor.assign_opened(pr_url, issue).await {
+            tracing::warn!(
+                component = "pr_distribution",
+                short_id = %issue.short_id,
+                pr_url,
+                error = %error,
+                "Failed to assign opened PR"
+            );
         }
     }
 

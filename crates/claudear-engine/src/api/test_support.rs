@@ -6,6 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use claudear_config::config::Config;
+use claudear_core::identity::Role;
 use claudear_storage::{FixAttemptTracker, SqliteTracker};
 use http_body_util::BodyExt;
 use std::path::PathBuf;
@@ -35,12 +36,12 @@ impl Harness {
     fn build(wrap: impl FnOnce(Router) -> Router) -> Self {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
-        let password_hash = bcrypt::hash("test-password", 4).expect("hash");
+        let password_hash = bcrypt::hash(super::fixture::password(), 4).expect("hash");
         let admin_id = tracker
-            .create_user(ADMIN_EMAIL, &password_hash, "Admin", "admin")
+            .create_user(ADMIN_EMAIL, &password_hash, "Admin", Role::Admin)
             .expect("admin user");
         let viewer_id = tracker
-            .create_user("viewer@example.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@example.com", &password_hash, "Viewer", Role::Viewer)
             .expect("viewer user");
         let admin = tracker
             .create_session(admin_id, SESSION_EXPIRY)

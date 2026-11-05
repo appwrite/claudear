@@ -1,5 +1,6 @@
 import { preload } from 'swr'
 import {
+  ADMIN_ROLE,
   fetchActivity,
   fetchAnalyticsSummary,
   fetchAttempts,
@@ -31,6 +32,7 @@ import {
   fetchTelemetryTimeseries,
   fetchUsers,
   getRetries,
+  type Role,
 } from './api'
 
 const prefetchedRoutes = new Set<string>()
@@ -138,13 +140,12 @@ const routePrefetchers: Record<string, () => void> = {
   },
 }
 
-const adminRole = 'admin'
 const adminRoutes = new Set<string>(['/config', '/users'])
 
-export function prefetchRouteData(path: string, role?: string) {
+export function prefetchRouteData(path: string, role?: Role) {
   const prefetch = routePrefetchers[path]
   if (!prefetch || prefetchedRoutes.has(path)) return
-  if (adminRoutes.has(path) && role !== adminRole) return
+  if (adminRoutes.has(path) && role !== ADMIN_ROLE) return
 
   prefetchedRoutes.add(path)
   prefetch()

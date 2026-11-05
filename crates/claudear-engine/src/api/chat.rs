@@ -152,10 +152,13 @@ fn forwarded_host(value: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::api::config_file::ConfigFile;
+    use crate::api::rate_limit::RateLimiters;
     use crate::api::{apply_dashboard_middleware, create_api_router_full};
     use axum::body::Body;
     use claudear_analysis::feedback::EmbeddingConfig;
     use claudear_config::config::{ChatConfig, LlmModelConfig};
+    use claudear_config::users::UserRegistry;
+    use claudear_core::identity::Role;
     use claudear_core::types::ChatSessionScope;
     use claudear_integrations::chat::{create_chat_router, CHAT_SESSION_NOT_FOUND};
     use claudear_storage::SqliteTracker;
@@ -179,9 +182,9 @@ mod tests {
     }
 
     fn session(tracker: &Arc<dyn FixAttemptTracker>) -> String {
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         let user_id = tracker
-            .create_user("viewer@example.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@example.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
         tracker
             .create_session(user_id, "2099-12-31 23:59:59")
@@ -205,6 +208,9 @@ mod tests {
             config_file: ConfigFile::new(Path::new("claudear.toml")),
             indexing_rx: tracker.subscribe_indexing_progress(),
             chat_service: None,
+            registry: UserRegistry::default(),
+            identity_writes: Arc::new(tokio::sync::Mutex::new(())),
+            limiters: Arc::new(RateLimiters::default()),
             startup_config: None,
         }
     }
@@ -363,6 +369,7 @@ mod tests {
                 tracker.subscribe_indexing_progress(),
                 None,
                 None,
+                UserRegistry::default(),
             ),
             false,
         );
@@ -603,6 +610,7 @@ mod tests {
                 tracker.subscribe_indexing_progress(),
                 None,
                 chat,
+                UserRegistry::default(),
             ),
             false,
         );
@@ -635,8 +643,8 @@ mod tests {
         cookie: String,
     }
 
-    fn sign_in(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: &str) -> SignedIn {
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+    fn sign_in(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: Role) -> SignedIn {
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         let id = tracker
             .create_user(email, &password_hash, "Chat User", role)
             .unwrap();
@@ -712,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn the_owner_lists_and_reads_their_own_chat_session() {
         let tracker = tracker();
-        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let owner = sign_in(&tracker, "owner@example.com", Role::Viewer);
         owned_session(&tracker, "mine", Some(owner.id));
         let router = chat_router(&tracker);
 
@@ -726,8 +734,8 @@ mod tests {
     #[tokio::test]
     async fn another_viewer_cannot_find_a_chat_session_they_do_not_own() {
         let tracker = tracker();
-        let owner = sign_in(&tracker, "owner@example.com", "viewer");
-        let other = sign_in(&tracker, "other@example.com", "viewer");
+        let owner = sign_in(&tracker, "owner@example.com", Role::Viewer);
+        let other = sign_in(&tracker, "other@example.com", Role::Viewer);
         owned_session(&tracker, "mine", Some(owner.id));
         let router = chat_router(&tracker);
 
@@ -754,8 +762,8 @@ mod tests {
     #[tokio::test]
     async fn an_admin_deletes_another_users_chat_session() {
         let tracker = tracker();
-        let owner = sign_in(&tracker, "owner@example.com", "viewer");
-        let admin = sign_in(&tracker, "admin@example.com", "admin");
+        let owner = sign_in(&tracker, "owner@example.com", Role::Viewer);
+        let admin = sign_in(&tracker, "admin@example.com", Role::Admin);
         owned_session(&tracker, "mine", Some(owner.id));
         let router = chat_router(&tracker);
 
@@ -770,8 +778,8 @@ mod tests {
     #[tokio::test]
     async fn an_admin_cannot_read_another_users_chat_history() {
         let tracker = tracker();
-        let owner = sign_in(&tracker, "owner@example.com", "viewer");
-        let admin = sign_in(&tracker, "admin@example.com", "admin");
+        let owner = sign_in(&tracker, "owner@example.com", Role::Viewer);
+        let admin = sign_in(&tracker, "admin@example.com", Role::Admin);
         owned_session(&tracker, "mine", Some(owner.id));
         let router = chat_router(&tracker);
 
@@ -784,8 +792,8 @@ mod tests {
     #[tokio::test]
     async fn an_ownerless_chat_session_is_visible_only_to_admins() {
         let tracker = tracker();
-        let viewer = sign_in(&tracker, "viewer@example.com", "viewer");
-        let admin = sign_in(&tracker, "admin@example.com", "admin");
+        let viewer = sign_in(&tracker, "viewer@example.com", Role::Viewer);
+        let admin = sign_in(&tracker, "admin@example.com", Role::Admin);
         owned_session(&tracker, "legacy", None);
         owned_session(&tracker, "admins-own", Some(admin.id));
         let router = chat_router(&tracker);
@@ -856,9 +864,9 @@ mod tests {
     #[tokio::test]
     async fn a_websocket_attach_to_another_users_chat_session_is_rejected() {
         let tracker = tracker();
-        let owner = sign_in(&tracker, "owner@example.com", "viewer");
-        let other = sign_in(&tracker, "other@example.com", "viewer");
-        let admin = sign_in(&tracker, "admin@example.com", "admin");
+        let owner = sign_in(&tracker, "owner@example.com", Role::Viewer);
+        let other = sign_in(&tracker, "other@example.com", Role::Viewer);
+        let admin = sign_in(&tracker, "admin@example.com", Role::Admin);
         owned_session(&tracker, "mine", Some(owner.id));
         let address = serve(chat_router(&tracker)).await;
 
@@ -890,7 +898,7 @@ mod tests {
     #[tokio::test]
     async fn a_websocket_creates_a_new_chat_session_owned_by_the_caller() {
         let tracker = tracker();
-        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let owner = sign_in(&tracker, "owner@example.com", Role::Viewer);
         let address = serve(chat_router(&tracker)).await;
 
         let reply = chat_over_websocket(address, &owner, None).await;
@@ -905,7 +913,7 @@ mod tests {
     #[tokio::test]
     async fn a_websocket_never_creates_a_session_under_a_client_chosen_id() {
         let tracker = tracker();
-        let owner = sign_in(&tracker, "owner@example.com", "viewer");
+        let owner = sign_in(&tracker, "owner@example.com", Role::Viewer);
         let address = serve(chat_router(&tracker)).await;
 
         let reply = chat_over_websocket(address, &owner, Some("named-by-client")).await;
@@ -924,8 +932,8 @@ mod tests {
     #[tokio::test]
     async fn a_missing_and_a_foreign_chat_session_get_identical_websocket_replies() {
         let tracker = tracker();
-        let owner = sign_in(&tracker, "owner@example.com", "viewer");
-        let other = sign_in(&tracker, "other@example.com", "viewer");
+        let owner = sign_in(&tracker, "owner@example.com", Role::Viewer);
+        let other = sign_in(&tracker, "other@example.com", Role::Viewer);
         owned_session(&tracker, "mine", Some(owner.id));
         let address = serve(chat_router(&tracker)).await;
 
@@ -945,8 +953,8 @@ mod tests {
     #[tokio::test]
     async fn a_delete_removes_only_a_session_in_the_callers_scope() {
         let tracker = tracker();
-        let owner = sign_in(&tracker, "owner@example.com", "viewer");
-        let other = sign_in(&tracker, "other@example.com", "viewer");
+        let owner = sign_in(&tracker, "owner@example.com", Role::Viewer);
+        let other = sign_in(&tracker, "other@example.com", Role::Viewer);
         owned_session(&tracker, "mine", Some(owner.id));
         let router = chat_router(&tracker);
 

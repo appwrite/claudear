@@ -32,6 +32,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
   - [Graceful Shutdown](#graceful-shutdown)
   - [Manual Triggers](#manual-triggers)
   - [PR Management](#pr-management)
+  - [PR Distribution](#pr-distribution-1)
   - [Retry Management](#retry-management)
   - [Dashboard](#dashboard)
   - [Scheduled Reports](#scheduled-reports)
@@ -173,6 +174,11 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Exponential backoff retries for failed or closed PRs (configurable max retries)
 - Full lifecycle tracking: Pending -> Success -> Merged -> Resolved (with retry paths)
 
+### PR Distribution
+- Makes one developer responsible for each open Claudear PR and pings them on Discord or Slack as soon as it opens
+- Scores ownership by who asked for the work, CODEOWNERS, and recent commits, then balances so nobody holds more than their fair share
+- Sticky assignments persisted in SQLite, plus a scheduled digest of the PRs still waiting on each assignee
+
 ### Regression Monitoring
 - Hourly checks for 24 hours after a fix deploys
 - Detects re-opened issues and error rate spikes on both Linear and Sentry
@@ -187,7 +193,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Durable last-seen watches for GitHub release tips (separate from regression inclusion tracking)
 - Tag filters (`any`, `suffix:-db`, `not_suffix:-db`, `prefix:apps/console/`) per track, so tracks can split one repo's tags, including a monorepo's app-namespaced bare tags
 - Live QA agent enqueue — runs real checks against the release from a private per-run directory, and is told never to open fix PRs for a release announcement
-- Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + mapped `@releaser`; a post of its own when nothing announced the tip
+- Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + `@releaser` from the user registry (`github-discord-map.json` as fallback); a post of its own when nothing announced the tip
 
 ### Notifications
 - **Discord**: Webhook messages + bot reply polling for Q&A, rich embeds, thread tracking
@@ -204,6 +210,8 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Map team members across Linear, GitHub, Sentry, Jira, GitLab, Discord, Slack, Email, SMS, Push, WhatsApp, Telegram
 - Route notifications to the person assigned to the issue
 - Per-user notification channel preferences
+- Everyone edits their own identities in the dashboard; admins edit anyone's, invite people who have no login yet, and bulk-load the directory over the API
+- Edits apply live, with no restart; `[users]` in config stays as seed and fallback
 
 ### Analytics Dashboard
 - Live web UI (React + TypeScript + Tailwind)
@@ -421,6 +429,7 @@ All config values can be overridden with environment variables, useful for keepi
 | `CLAUDEAR_TLS_HTTP_REDIRECT_PORT` | `tls.http_redirect_port` |
 | `CLAUDEAR_DISCORD_BOT_TOKEN` | `notifiers.discord.bot_token` |
 | `CLAUDEAR_SLACK_BOT_TOKEN` | `notifiers.slack.bot_token` |
+| `CLAUDEAR_DASHBOARD_PUBLIC_URL` | `dashboard.public_url` (empty means unset) |
 
 ### Minimal Configuration
 
@@ -469,14 +478,15 @@ api_key = "lin_api_xxxx"
 | `retry` | Max retries, base delay, max delay (exponential backoff) |
 | `regression` | Check interval, monitoring duration, event thresholds |
 | `deploy_qa` | Live release-tip watches (tracks, tag filters, Discord `#releases`) |
+| `pr_distribution` | Assign each open Claudear PR to one developer, ping on open, scheduled per-assignee digest |
 | `cascade` | Enable/disable cascading, max depth, per-dependency rules |
 | `learning` | Continuous learning: log extraction, diff analysis, Q&A promotion, repo knowledge |
 | `prioritisation` | Composite scoring weights, blast radius paths, clustering, suppression rules |
 | `code_index` | Tree-sitter code indexing: enable, file size limits, batch size |
 | `evaluation` | Self-evaluation: test/lint/coverage deltas, timeouts, custom commands |
-| `dashboard` | Dashboard display: cost estimation, engineer hourly rate |
+| `dashboard` | Dashboard display: cost estimation, engineer hourly rate, public URL for absolute invite links |
 | `tls` | Let's Encrypt TLS auto-provisioning: domains, ACME settings, HTTPS/redirect ports |
-| `users` | User registry mapping across services |
+| `users` | User registry mapping across services; seed and fallback for dashboard identities (see [User Registry](#user-registry-1)) |
 
 See [`claudear.example.toml`](claudear.example.toml) for a fully documented example with every option.
 
@@ -594,6 +604,38 @@ claudear prs monitor
 claudear prs monitor --continuous
 ```
 
+### PR Distribution
+
+Every open Claudear PR gets one developer responsible for getting it over the line. Developers come from the [user registry](#user-registry-1): everyone, console identities and `[users]` entries alike, who owns a GitHub login (a login two people list belongs to its registry owner), minus `excluded`. Mentions use the registry's Discord and Slack ids; the `[deploy_qa]` `github-discord-map.json` only fills in a missing Discord id and adds logins nobody in the registry owns. The roster is rebuilt for every PR and scheduled run, so console edits change assignments and mentions without a restart.
+
+```toml
+[pr_distribution]
+enabled = true
+digest_frequency = "daily"         # daily | weekly-monday .. weekly-sunday | monthly; anything else fails to load
+digest_hour = 9                    # UTC
+excluded = ["on-leave-login"]
+tolerance = 0                      # PRs above the fair share an owner may hold
+```
+
+**Ownership.** Each roster developer is scored for a PR, strongest signal first:
+
+| Signal | Points |
+|--------|--------|
+| Asked for the work: the issue's assignee as resolved by the user registry, a GitHub issue's assignee or author, or the Discord/Slack user who posted it | 100 for the closest, 100/n for the n-th |
+| CODEOWNERS (`.github/`, root or `docs/`) names them for the changed files | 40 × share of changed files |
+| Authored recent commits (last 30 per file) to the changed files | 20 × share of those commits |
+| Authored recent commits (last 100) to the repository | 5 × share of those commits |
+
+Team (`@org/team`) and email owners in CODEOWNERS are ignored.
+
+**Mentions.** Only the assignee is ever pinged. PR titles are external text, so every `@` in them is broken with a zero-width space (and Slack's `<`, `>` and `&` are escaped), and Discord messages carry `allowed_mentions` limited to the assignee's user id.
+
+**Balancing.** The fair share is the number of open PRs (already assigned plus waiting) divided by the roster size, rounded up, plus `tolerance`. PRs with the strongest ownership are placed first; each goes to its highest-scoring developer still under the fair share, otherwise to the least-loaded developer. Ties break by login, so the same inputs always give the same assignments.
+
+**Lifecycle.** When Claudear opens a PR it is assigned at once and the assignee is pinged (`notify_on_open`). On the schedule, Claudear reconciles every open Claudear PR: assignments of merged or closed PRs are closed, PRs whose assignee left the roster are handed to someone else, unowned PRs are assigned, and each assignee gets a digest of their PRs that still need them. Assignments are stored in `pr_assignments` and stay with their assignee until one of those happens. A PR is assigned before anyone is pinged, so only one person is ever pinged for it. An assignee counts as told only once a chat channel delivered their ping or their part of the digest; the console never counts, so with no chat notifier configured nothing is marked and everyone is told once one is. With `digest = false`, a ping that no chat channel delivered is sent again on later runs until it reaches the assignee. A digest that reached some assignees is not resent to them; the ones it missed stay untold, are listed again by the next digest, and are pinged if the digest is turned off.
+
+**Which PRs need someone.** A PR is listed (and an unowned one assigned) while it is open and not a draft, unless it is approved with auto-merge on, or its assignee has already reviewed its current head commit and has no outstanding review request. An approved PR without auto-merge is still listed: someone has to merge it.
+
 ### Retry Management
 
 ```bash
@@ -676,6 +718,8 @@ Console config edits are written to `claudear.toml` in normalised form and apply
 | `GET /api/features` | Integration and feature status |
 | `GET /api/telemetry/overview` | Telemetry overview |
 | `GET /api/telemetry/cost-analysis` | Cost analysis |
+
+Users, identities, invites and the bulk directory load are covered in the [Identity API](#identity-api).
 
 #### Reverse proxy
 
@@ -808,7 +852,7 @@ On a new tip Claudear:
 4. Classifies the agent's report, records the tip as `verified`, `unverified` or `failed`, and posts the outcome under the release announcement in Discord `#releases` (the agent never posts itself):
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
    - **Unverified** — nothing failed, but a PR is `LIVE BLOCKED`, the footer is `DEPLOY_QA_VERDICT: UNVERIFIED`, or the footer is missing: reply, no @, so blocked checks never page the releaser but are never reported as verified either.
-   - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser via `github-discord-map.json` (reusing the announcement's existing thread when it already has one).
+   - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser (reusing the announcement's existing thread when it already has one). The releaser's GitHub login is looked up in the [user registry](#user-registry-1) first, console identities and `[users]` entries alike, so invited users count too; `github-discord-map.json` is consulted only when the person who owns that login in the registry has no `discord_id`, or no person owns it. A releaser found in neither gets no mention.
    - **No announcement found** — when none of the last 50 `#releases` messages announces the tip, the outcome is posted as a message of its own naming the repo and tag, so it is never dropped. This should be rare: a release whose announcement scrolled away, or a bare tag (no GitHub release, so the release feed never posts it). FAIL still `@`s the releaser when the tip has one; a bare tag has no release author, so it posts without the mention.
 
    Announcements are matched by the release URL first, so a release whose name differs from its tag (`Console 1.2.141` for `apps/console/1.2.141`) is still found, and otherwise by a title naming both the repo and the whole tag, where `console/0.3.0` never matches `apps/console/0.3.0`.
@@ -889,11 +933,11 @@ claudear dry-run
 
 ### User Registry
 
-Map team members across services so notifications go to the right person.
+The user registry maps each person to their handles across services, so assignee matching, mentions and notifications reach the right person. It merges two sources: identities saved on dashboard users ("console identities") and `[users.<key>]` entries in `claudear.toml`.
 
 ```toml
 [users.jake]
-linear_names = "Jake Barnwell"
+linear_names = "Jake Barnby"
 github_usernames = "jakebarnby"
 sentry_usernames = "jake"
 jira_usernames = "jake.barnby"
@@ -908,6 +952,257 @@ telegram_chat_id = "123456789"
 ```
 
 When an issue is assigned to a user, Claudear routes notifications to their configured channels.
+
+#### Console identities
+
+Every logged-in user sees **Users** in the dashboard sidebar:
+
+- **Admins** see every user with an Identities column and edit anyone's identities, person key included, from the user's edit panel.
+- **Everyone else** sees **My identities** there, and the same form under **Settings > My Identities**. They edit only their own handles and cannot change their person key.
+
+The form groups the person key, source handles (Linear, GitHub, Sentry, Jira, GitLab), chat (Discord ID, Slack ID) and notification targets (email, Pushover user key, SMS, WhatsApp, Telegram chat ID). Admins edit the slug the person key comes from; everyone else sees their effective person key read-only. A badge shows where the values come from: **Console**, **From config (key)** or **Not set**. **Revert to config** drops the console identities so the person falls back to their `[users]` entry. When a non-admin reverts, a slug an admin set to anything other than the config key their login email matches is kept, and only the identities are cleared. Otherwise the row is removed and their person key falls back to config: the `[users]` key their login email matches, or none (**Not set**) when no unclaimed config entry matches, so a `console-<user id>` key does not survive.
+
+#### Precedence
+
+1. A console user's identities replace the `[users.<key>]` entry with the same person key, in full: a field set only in config does not survive the override.
+2. `[users]` entries without a console override stay active, as seed and fallback.
+3. `github-discord-map.json` is consulted only when the person who owns that GitHub login in the registry has no `discord_id`, or no person owns the login.
+
+A console user's person key is, in order:
+
+1. the slug an admin set on them;
+2. otherwise the `[users.<key>]` entry whose `email` matches their **login** email, case-insensitively, unless an admin-set slug already claims that key;
+3. otherwise `console-<user id>`.
+
+Login emails are compared case-insensitively everywhere (login, user creation, the bulk load and config matching) and stored trimmed and lowercased, so `Amy@Example.com` and `amy@example.com` are one user. The identity `email` field never links a console user to a config entry, because users edit it themselves; only the login email (which only admins change) or an admin-set slug does. `console-<user id>` always stays an alias, so issues resolved to it earlier keep resolving after a slug is added. The first time someone saves identities for a person who comes from config, the config values are the starting point and the config key becomes their slug, so saving one field never drops the others.
+
+When a handle is claimed twice, console users win over config entries, then lower user ids and keys win. GitHub and GitLab logins match case-insensitively; every other handle matches exactly.
+
+Edits apply without a restart: instantly in the process that served the write, and within one housekeeping cycle in any other process sharing the database, such as a standalone `claudear dashboard`.
+
+Global notifier references, such as `[notifiers.discord] user_id = "jake"`, `[notifiers.slack] user_id`, `[notifiers.email] to_addresses`, `[notifiers.push] user_key` and `[notifiers.sms] to_numbers`, are resolved to a person's handle each time a notification is sent rather than once at startup, so console edits apply to them too. A value that names no person is used as-is. The weekly repetitive digest's on-call mention resolves through the registry the same way.
+
+#### Who can do what
+
+| Action | Admin | Any other logged-in user (viewers included) |
+|--------|-------|---------------------------------------------|
+| Read the directory (`GET /api/identities`) | Everyone, in full | Everyone; other users redacted |
+| Read one user's identities | Anyone, in full | Self in full; others redacted |
+| Edit identities or revert to config | Anyone | Self only (403 otherwise); reverting keeps an admin-set slug |
+| Set a person key (`slug`) | Yes | No (403) |
+| Create users, issue or revoke invites | Yes | No (403) |
+| Bulk load (`PUT /api/directory`) | Yes, by session or Bearer API token | No (403) |
+
+A handle (any GitHub, GitLab, Linear, Sentry or Jira entry, `discord_id`, `slack_id`) or slug that already belongs to another person, console or config, is rejected with 409 for every role, so nobody can redirect someone else's mentions. The 409 never names the other person. Notification targets (`email`, `sms_number`, `whatsapp_number`, `push_user_key`, `telegram_chat_id`) may be shared between people, for example a team inbox, and are never conflicts.
+
+**Sensitive fields.** `email`, `push_user_key`, `sms_number`, `whatsapp_number` and `telegram_chat_id` are sensitive. When a non-admin reads another user, those fields and the user's login `email` are `null` and the response has `redacted: true`. Claudear never logs identity values or request bodies.
+
+**Formats.** Writes are trimmed and de-duplicated; a leading `@` is stripped from GitHub and GitLab logins. Then:
+
+| Field | Accepted |
+|-------|----------|
+| `discord_id` | 17-20 digits (a Discord user ID) |
+| `github_usernames` | 1-39 letters, digits or `-`; no leading, trailing or double `-` |
+| `gitlab_usernames` | 1-255 characters; a letter or digit, then letters, digits, `_`, `.` or `-` |
+| `slack_id` | `U` or `W`, then 8-20 uppercase letters or digits (`U0123456789`) |
+| `email` | A single address, at most 254 characters |
+| `sms_number`, `whatsapp_number` | E.164: `+`, then 7-15 digits, the first not `0` (`+14155550123`) |
+| `telegram_chat_id` | A numeric chat ID, optionally negative |
+| `push_user_key` | A 30-character Pushover user key |
+| `linear_names`, `sentry_usernames`, `jira_usernames` | Non-empty, at most 255 characters, no control characters |
+| `slug` | A lowercase letter or digit, then up to 62 of `a-z`, `0-9`, `.`, `_`, `-`; must not start with `console-` |
+
+These rules apply to dashboard and API writes only. `[users]` entries in TOML are not validated, so existing configs keep loading.
+
+#### Invited users
+
+An admin can add a person who has no password yet: leave the password blank under **Users > Add User**, call `POST /api/users` without `password`, or include an unknown email in `PUT /api/directory`. The user is created with `status: "invited"`:
+
+- Their identities are live in the registry at once, so assignee matching, mentions and the deploy-QA `@releaser` reach them before they ever log in.
+- They cannot log in, and their sessions and API tokens are ignored, until they accept. A login attempt gets the same 401 as a wrong password.
+
+The invite link is `/invite#cldi_...`. It is single-use, expires after 7 days, and is shown only when issued: **Copy invite link** on the user's row issues a new one, which invalidates the previous link, so the dashboard asks first while that link is still open; **Revoke invite** cancels it. The secret sits in the URL fragment, which browsers never send to the server, so it stays out of access logs, Sentry and `Referer` headers; the invite page also strips it from the address bar. The person opens the link, sets a password (8-72 bytes of UTF-8, so fewer characters for non-ASCII passwords), then signs in normally; accepting does not log them in and removes the secret from the page's history entry.
+
+Setting a password any other way also activates an invited user and revokes their open invite: an admin setting `password` with `PUT /api/users/{id}`, or `claudear users seed` for that email.
+
+Set `[dashboard] public_url` (or `CLAUDEAR_DASHBOARD_PUBLIC_URL`) to the address people use to reach the dashboard and the API returns absolute links in `invite_url`. It must be the dashboard's origin (scheme, host and optional port) with no sub-path: the dashboard is served from `/`, so a link under a sub-path such as `https://example.com/claudear/invite#...` does not open the invite page. Without it `invite_url` is `null`; prefix `invite_link` with your dashboard's address (the dashboard does this for you with the address in your browser).
+
+```toml
+[dashboard]
+public_url = "https://claudear.example.com"
+```
+
+#### Identity API
+
+Unless noted, these endpoints need a dashboard session cookie and return 401 without one. Every `POST`, `PUT` and `DELETE` also needs an `x-csrf-token` header matching the `claudear_csrf` cookie, which the dashboard sets on every response. The one exception is `PUT /api/directory` sent with an `Authorization: Bearer` API token: it is the only dashboard endpoint that accepts Bearer, and with Bearer it needs no CSRF header. Writes are rate-limited per user and return 429 over the limit.
+
+Every non-2xx response from the users, identities, invite and directory endpoints, including 401 and 403 rejections, is JSON with a human-readable `error`, plus `violations` when specific fields are at fault (most 400 and 409 responses):
+
+```json
+{ "error": "A user with this email already exists" }
+{ "error": "Invalid identities", "violations": [{ "field": "discord_id", "message": "Discord ID must be a 17-20 digit Discord user ID" }] }
+```
+
+Typical messages are `"Not authenticated"`, `"Invalid or expired token"` (a bad Bearer token), `"Admin access required"`, `"Invalid role"`, `"Password must be 8-72 bytes"`, `"A user with this email already exists"`, `"User not found"`, `"You can only change your own identities"` and `"Only an admin can change the person key"`. `POST /api/auth/login` keeps its own 401 body.
+
+| Endpoint | Who | Result |
+|----------|-----|--------|
+| `GET /api/identities` | Any logged-in user | `UserIdentities[]` for every user; non-admins get others redacted |
+| `GET /api/users/{id}/identities` | Any logged-in user | `UserIdentities`; redacted for a non-admin reading someone else. 404 if the user does not exist |
+| `PUT /api/users/{id}/identities` | Admin, or self | Sparse update; returns `UserIdentities`. 400 invalid values, 403 not admin and not self or a non-admin sending `slug`, 404 no such user, 409 a handle or slug belongs to another person |
+| `DELETE /api/users/{id}/identities` | Admin, or self | Drops the console identities (revert to config); returns the now-effective `UserIdentities`. An admin removes the row entirely. A non-admin whose row has an admin-set `slug` other than the config key their login email matches keeps that slug and loses only the identities; otherwise their row is removed too, which keeps the same person key. 403, 404 as above |
+| `POST /api/users` | Admin | Creates a user; returns 201 `CreatedUserResponse`. `password` (8-72 bytes) is optional: without it the user is invited and `invite` is set. Optional `identities` takes an update body. 409 if the email exists, compared case-insensitively |
+| `POST /api/users/{id}/invite` | Admin | Issues or re-issues an invite; the previous link stops working. Returns `UserInvite`. 404 no such user, 409 `{"error": "User is already active"}` |
+| `DELETE /api/users/{id}/invite` | Admin | Revokes the open invite; returns `{"message": "Invite revoked"}`. 404 if there is none |
+| `POST /api/auth/invite/inspect` | Anyone with the link | Body `{"token": "cldi_..."}`; returns `{"name", "email", "expires_at"}` |
+| `POST /api/auth/invite/accept` | Anyone with the link | Body `{"token": "cldi_...", "password": "..."}`; returns `{"message": "Invite accepted"}`. 400 if the password is not 8-72 bytes |
+| `PUT /api/directory` | Admin, by session or Bearer | Bulk create-or-update by email, all or nothing |
+
+The two invite endpoints need no session but still need the CSRF header, which the invite page sends. Any invalid, expired, used or revoked token gets the same 404 `{"error": "This invite link is invalid or has expired"}`. They are rate-limited per IP in a bucket of their own, separate from login, and return 429 over the limit.
+
+`GET /api/users` and `GET /api/users/{id}` stay admin-only; their user objects now include `status` (`"active"` or `"invited"`) and `invite_expires_at` (the open invite's expiry, or `null`).
+
+`UserIdentities`:
+
+```json
+{
+  "user_id": 3,
+  "name": "Jake",
+  "login_email": "jake@example.com",
+  "status": "active",
+  "person_key": "jake",
+  "slug": "jake",
+  "origin": "console",
+  "redacted": false,
+  "identities": {
+    "linear_names": [],
+    "github_usernames": ["jakebarnby"],
+    "sentry_usernames": [],
+    "jira_usernames": [],
+    "gitlab_usernames": [],
+    "discord_id": "452316113016193024",
+    "slack_id": null,
+    "email": null,
+    "push_user_key": null,
+    "sms_number": null,
+    "whatsapp_number": null,
+    "telegram_chat_id": null
+  },
+  "updated_at": "2026-11-04 10:00:00"
+}
+```
+
+- `login_email` is the user's console login email, `null` when `redacted`. It is not the identity `email` under `identities`, which is a notification target.
+- `person_key` is the effective registry key: the admin-set slug, the matching `[users.<key>]` key, or `console-<user id>`. It is `null` only when `origin` is `"unset"`.
+- `slug` is the slug an admin set explicitly, or `null`. It is what an update's `slug` field writes, and it is always `null` when `origin` is `"config"`.
+- `origin` is `"console"` when the user has saved identities, `"config"` when they have none but their login email matches a `[users.<key>]` entry (identities come from config and `person_key` is that key), and `"unset"` otherwise (identities are empty).
+- `updated_at` is `null` unless `origin` is `"console"`.
+
+An update body names only the fields to change; every field is optional and unknown fields are rejected:
+
+```json
+{ "slug": "jake", "github_usernames": ["jakebarnby"], "discord_id": "452316113016193024", "sms_number": "" }
+```
+
+An absent field is left as it is; `""` clears a single value and `[]` clears a list.
+
+`UserInvite`, returned by invite issue, user creation and the bulk load:
+
+```json
+{
+  "invite_link": "/invite#cldi_...",
+  "invite_url": "https://claudear.example.com/invite#cldi_...",
+  "expires_at": "2026-11-11 10:00:00"
+}
+```
+
+`CreatedUserResponse` is the user object (with `status` and `invite_expires_at`) plus `"invite": UserInvite | null`.
+
+Validation errors (400):
+
+```json
+{
+  "error": "Invalid identities",
+  "violations": [{ "field": "discord_id", "message": "Discord ID must be a 17-20 digit Discord user ID" }]
+}
+```
+
+#### Bulk population
+
+`PUT /api/directory` creates or updates many people at once, matched by login email. An unknown email creates an invited user with an invite and needs `name` and `role` (`admin` or `viewer`). A known email gets a sparse update of its identities and, optionally, its `name` and `role`. Every entry is validated before anything is written, including duplicate emails in the batch and handle conflicts within the batch and against the registry. One bad entry writes nothing.
+
+To load a directory with curl:
+
+1. As an admin, open **Users**, edit your own user and create an API token under **API Tokens**. Copy the `cldr_...` secret; it is shown once.
+2. Write `people.json`:
+
+   ```json
+   {
+     "users": [
+       {
+         "email": "amy@example.com",
+         "name": "Amy",
+         "role": "viewer",
+         "identities": {
+           "linear_names": ["Amy Chen"],
+           "github_usernames": ["amychen"],
+           "discord_id": "452316113016193024",
+           "slack_id": "U04ABCD1234"
+         }
+       },
+       {
+         "email": "ben@example.com",
+         "name": "Ben",
+         "role": "admin",
+         "identities": {
+           "github_usernames": ["ben-dev"],
+           "gitlab_usernames": ["ben"],
+           "discord_id": "381947520183746561"
+         }
+       },
+       {
+         "email": "jake@example.com",
+         "identities": { "linear_names": ["Jake Barnby"], "sentry_usernames": ["jake"] }
+       }
+     ]
+   }
+   ```
+
+3. Send it:
+
+   ```bash
+   BASE=https://claudear.example.com
+   CLAUDEAR_TOKEN=cldr_...
+   curl -sS -X PUT "$BASE/api/directory" \
+     -H "Authorization: Bearer $CLAUDEAR_TOKEN" -H 'content-type: application/json' \
+     -d @people.json | jq '.users[] | {email, created, link: (.invite.invite_url // .invite.invite_link)}'
+   ```
+
+4. Send each new person their link, then revoke the token under **API Tokens**.
+
+A Bearer request ignores cookies. A bad, expired or revoked token gets 401, and so does a token whose owner is still invited, because invited users' tokens are ignored until they accept; an active viewer's token gets 403. Any admin API token, including one minted for MCP, can call this endpoint, so use a dedicated token for the load and revoke it afterwards.
+
+The response lists each entry in request order:
+
+```jsonc
+{
+  "users": [
+    { "user_id": 7, "email": "amy@example.com", "created": true, "status": "invited",
+      "identities": /* UserIdentities */, "invite": /* UserInvite */ },
+    { "user_id": 1, "email": "jake@example.com", "created": false, "status": "active",
+      "identities": /* UserIdentities */, "invite": null }
+  ]
+}
+```
+
+Failures use the same error shape as the other identity endpoints, with the entry's `email` on each violation and `field` one of `email`, `name`, `role` or an identity field: 400 `{"error": "Invalid directory entries", "violations": [{"email": "amy@example.com", "field": "discord_id", "message": "..."}]}` for invalid entries, and 409 in the same shape for handle or slug conflicts. Each result row's `identities` is a `UserIdentities`.
+
+#### Known limitations
+
+Handle and slug conflicts are checked against the registry as it was before the write, so two changes that are only consistent once both apply are rejected with 409. Make them in two steps:
+
+- **Relinking a config-matched user to a different slug.** While a user's identities still come from config (`origin: "config"`), the config handles copied into the write still belong to that `[users.<key>]` entry, so setting a new `slug` in the same request conflicts with it. Save their identities first, which makes them a console user with that key as their slug, then change the slug. The old `[users.<key>]` entry is no longer overridden after the relink and becomes active again; remove it from `claudear.toml` if it is no longer needed.
+- **Moving a handle between two people in one `PUT /api/directory` batch.** Remove the handle from the first person in one request, then add it to the second in another.
 
 ---
 
