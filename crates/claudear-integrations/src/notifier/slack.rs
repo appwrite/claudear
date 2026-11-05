@@ -1,6 +1,8 @@
 //! Slack notifier with Block Kit formatting and Q&A support.
 
 use super::get_source_emoji;
+use super::Delivery;
+use super::DigestDelivery;
 use super::Notifier;
 use crate::reports::Report;
 use abnegate_http::HttpResponse;
@@ -1272,15 +1274,19 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
         self.send(build_report_message(report)).await
     }
 
-    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
-        self.send(build_pr_assignment_message(notice)).await
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<Delivery> {
+        self.send(build_pr_assignment_message(notice)).await?;
+        Ok(Delivery::Delivered)
     }
 
-    async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
-        super::send_each(self.name(), build_pr_digest_messages(digest), |message| {
-            self.send(message)
-        })
-        .await
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<DigestDelivery> {
+        let groups = digest
+            .groups
+            .iter()
+            .zip(build_pr_digest_messages(digest))
+            .map(|(group, message)| (group, vec![message]))
+            .collect();
+        super::send_each(self.name(), groups, |message| self.send(message)).await
     }
 
     async fn ask_question(
@@ -2133,10 +2139,19 @@ mod tests {
             MockSlackHttpClient::success().failing_on(1),
         );
 
-        notifier
+        let delivery = notifier
             .notify_pr_digest(&two_group_digest())
             .await
             .expect("a digest that reached one assignee must not be resent");
+
+        assert!(
+            delivery.contains("https://github.com/org/repo/pull/2"),
+            "bob was reached"
+        );
+        assert!(
+            !delivery.contains("https://github.com/org/repo/pull/1"),
+            "amy was not reached, so her PR must not count as delivered"
+        );
 
         assert_eq!(notifier.http.get_call_count(), 2);
         let (_, body, _) = notifier.http.get_last_post_call().unwrap();

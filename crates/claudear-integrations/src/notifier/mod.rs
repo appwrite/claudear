@@ -47,6 +47,7 @@
 
 pub mod ask_orchestrator;
 mod console;
+mod delivery;
 mod discord;
 mod email;
 mod html;
@@ -60,6 +61,8 @@ mod whatsapp;
 
 pub use ask_orchestrator::send_to_all_and_wait_first_reply;
 pub use console::ConsoleNotifier;
+pub use delivery::Delivery;
+pub use delivery::DigestDelivery;
 pub use discord::DiscordNotifier;
 pub use email::EmailNotifier;
 pub use push::PushNotifier;
@@ -73,6 +76,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_analysis::distribution::AssignmentNotice;
 use claudear_analysis::distribution::Digest;
+use claudear_analysis::distribution::DigestGroup;
 use claudear_core::error::Error;
 use claudear_core::error::Result;
 use claudear_core::types::{AskDelivery, AskReply, AskRequest, Issue};
@@ -92,25 +96,41 @@ pub(crate) fn get_source_emoji(source: &str) -> &'static str {
     }
 }
 
-/// Send each message of a PR digest in turn, carrying on past one that fails
-/// so the assignees after it still get theirs. Fails only when none was
-/// delivered: failing once some were would have the scheduler resend those.
-pub(crate) async fn send_each<M, F, Fut>(channel: &str, messages: Vec<M>, send: F) -> Result<()>
+/// Send each assignee of a PR digest their messages in turn, carrying on past
+/// one that fails so the assignees after it still get theirs. An assignee is
+/// delivered only when every one of their messages was. Fails only when no
+/// assignee was delivered: failing once some were would have the scheduler
+/// resend theirs.
+pub(crate) async fn send_each<M, F, Fut>(
+    channel: &str,
+    groups: Vec<(&DigestGroup, Vec<M>)>,
+    send: F,
+) -> Result<DigestDelivery>
 where
     F: Fn(M) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let total = messages.len();
+    let total = groups.len();
+    let mut delivery = DigestDelivery::default();
     let mut failed = 0;
     let mut last = None;
-    for message in messages {
-        if let Err(error) = send(message).await {
+    for (group, messages) in groups {
+        let mut sent = true;
+        for message in messages {
+            if let Err(error) = send(message).await {
+                sent = false;
+                last = Some(error);
+                break;
+            }
+        }
+        if sent {
+            delivery.add(group);
+        } else {
             failed += 1;
-            last = Some(error);
         }
     }
     let Some(error) = last else {
-        return Ok(());
+        return Ok(delivery);
     };
     if failed == total {
         return Err(error);
@@ -122,7 +142,7 @@ where
         error = %error,
         "Some PR digest messages were not delivered"
     );
-    Ok(())
+    Ok(delivery)
 }
 
 /// Trait for notification services.
@@ -196,16 +216,19 @@ pub trait Notifier: Send + Sync {
     ///
     /// The default sends plain text naming the developer's GitHub login;
     /// channels with native mentions override it to ping the developer.
-    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
-        self.notify_status(&notice.format_text()).await
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<Delivery> {
+        self.notify_status(&notice.format_text()).await?;
+        Ok(Delivery::accepted(self.is_local()))
     }
 
     /// Send every assignee the open Claudear PRs still waiting on them.
     ///
-    /// The default sends plain text naming each assignee's GitHub login;
-    /// channels with native mentions override it to ping each assignee.
-    async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
-        self.notify_status(&digest.format_text()).await
+    /// Returns the PRs whose assignee was sent their part. The default sends
+    /// plain text naming each assignee's GitHub login; channels with native
+    /// mentions override it to ping each assignee.
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<DigestDelivery> {
+        self.notify_status(&digest.format_text()).await?;
+        Ok(DigestDelivery::accepted(digest, self.is_local()))
     }
 
     /// Send a blocking question through this channel.
@@ -297,13 +320,14 @@ impl CompositeNotifier {
         }
     }
 
-    /// Send to every channel like [`Self::broadcast`], but fail when no
-    /// channel that reaches a person accepted the message, so the caller can
-    /// send it again later. Local channels never count as a delivery.
-    async fn deliver<F, Fut>(&self, f: F) -> Result<()>
+    /// Send to every channel like [`Self::broadcast`], returning what each
+    /// channel that reaches a person accepted, or failing when every one of
+    /// them failed, so the caller can send it again later. Local channels
+    /// never count, so with no other channel nothing is returned.
+    async fn deliver<T, F, Fut>(&self, f: F) -> Result<Vec<T>>
     where
         F: Fn(Arc<dyn Notifier>) -> Fut,
-        Fut: std::future::Future<Output = Result<()>>,
+        Fut: std::future::Future<Output = Result<T>>,
     {
         let futures: Vec<_> = self
             .notifiers
@@ -311,7 +335,7 @@ impl CompositeNotifier {
             .map(|notifier| f(Arc::clone(notifier)))
             .collect();
 
-        let mut attempted = 0;
+        let mut accepted = Vec::new();
         let mut failed: Vec<&str> = Vec::new();
         for (notifier, result) in self
             .notifiers
@@ -319,24 +343,25 @@ impl CompositeNotifier {
             .zip(futures::future::join_all(futures).await)
         {
             let remote = !notifier.is_local();
-            if remote {
-                attempted += 1;
-            }
-            if let Err(error) = result {
-                tracing::error!(notifier = notifier.name(), error = %error, "Notification error");
-                if remote {
-                    failed.push(notifier.name());
+            match result {
+                Ok(value) if remote => accepted.push(value),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(notifier = notifier.name(), error = %error, "Notification error");
+                    if remote {
+                        failed.push(notifier.name());
+                    }
                 }
             }
         }
 
-        if attempted > 0 && failed.len() == attempted {
+        if accepted.is_empty() && !failed.is_empty() {
             return Err(Error::Notifier {
                 notifier: self.name().to_string(),
                 message: format!("no channel delivered the message: {}", failed.join(", ")),
             });
         }
-        Ok(())
+        Ok(accepted)
     }
 }
 
@@ -490,22 +515,35 @@ impl Notifier for CompositeNotifier {
         Ok(())
     }
 
-    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<Delivery> {
         let notice = notice.clone();
-        self.deliver(|n| {
-            let notice = notice.clone();
-            async move { n.notify_pr_assignment(&notice).await }
+        let accepted = self
+            .deliver(|n| {
+                let notice = notice.clone();
+                async move { n.notify_pr_assignment(&notice).await }
+            })
+            .await?;
+        Ok(if accepted.contains(&Delivery::Delivered) {
+            Delivery::Delivered
+        } else {
+            Delivery::Local
         })
-        .await
     }
 
-    async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<DigestDelivery> {
         let digest = digest.clone();
-        self.deliver(|n| {
-            let digest = digest.clone();
-            async move { n.notify_pr_digest(&digest).await }
-        })
-        .await
+        let accepted = self
+            .deliver(|n| {
+                let digest = digest.clone();
+                async move { n.notify_pr_digest(&digest).await }
+            })
+            .await?;
+        Ok(accepted
+            .into_iter()
+            .fold(DigestDelivery::default(), |mut delivery, accepted| {
+                delivery.merge(accepted);
+                delivery
+            }))
     }
 
     async fn ask_question(
@@ -2038,17 +2076,163 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_composite_pr_notifications_with_only_local_channels_succeed() {
+    async fn test_composite_pr_notifications_with_only_local_channels_deliver_nothing() {
         let mut composite = CompositeNotifier::new();
         composite.add(crate::telemetry::InstrumentedNotifier::wrap(Arc::new(
             ConsoleNotifier::new(),
         )));
 
         assert!(composite.is_local());
-        composite
-            .notify_pr_assignment(&assignment_notice())
+        assert_eq!(
+            composite
+                .notify_pr_assignment(&assignment_notice())
+                .await
+                .unwrap(),
+            Delivery::Local,
+            "a ping only the console printed reached nobody"
+        );
+        assert!(
+            composite
+                .notify_pr_digest(&pr_digest())
+                .await
+                .unwrap()
+                .is_empty(),
+            "a digest only the console printed reached nobody"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_composite_pr_notifications_with_no_channels_deliver_nothing() {
+        let composite = CompositeNotifier::new();
+
+        assert_eq!(
+            composite
+                .notify_pr_assignment(&assignment_notice())
+                .await
+                .unwrap(),
+            Delivery::Local
+        );
+        assert!(composite
+            .notify_pr_digest(&pr_digest())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_composite_pr_notifications_report_delivery_from_a_remote_channel() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(crate::telemetry::InstrumentedNotifier::wrap(Arc::new(
+            ConsoleNotifier::new(),
+        )));
+        composite.add(crate::telemetry::InstrumentedNotifier::wrap(Arc::new(
+            MockNotifier::new("discord", true),
+        )));
+
+        assert_eq!(
+            composite
+                .notify_pr_assignment(&assignment_notice())
+                .await
+                .unwrap(),
+            Delivery::Delivered
+        );
+        assert!(composite
+            .notify_pr_digest(&pr_digest())
+            .await
+            .unwrap()
+            .contains(&assignment_notice().pull_request.url));
+    }
+
+    /// A channel that, like Slack and Discord, sends a digest one assignee at
+    /// a time, and reaches only `reachable`.
+    struct ReachingNotifier {
+        name: &'static str,
+        reachable: &'static str,
+    }
+
+    #[async_trait]
+    impl Notifier for ReachingNotifier {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        async fn notify_start(&self, _issue: &Issue) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_success(&self, _issue: &Issue, _pr_url: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_completed(&self, _issue: &Issue) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_failed(&self, _issue: &Issue, _error: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_status(&self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_urgent_issues(&self, _issues: &[Issue]) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_pr_digest(&self, digest: &Digest) -> Result<DigestDelivery> {
+            let groups = digest
+                .groups
+                .iter()
+                .map(|group| (group, vec![group.developer.login.clone()]))
+                .collect();
+            send_each(self.name, groups, |login| {
+                std::future::ready(if login == self.reachable {
+                    Ok(())
+                } else {
+                    Err(Error::Other("unreachable".to_string()))
+                })
+            })
+            .await
+        }
+    }
+
+    fn two_group_digest() -> Digest {
+        let mut digest = pr_digest();
+        let mut bob = digest.groups[0].clone();
+        bob.developer.login = "bob".to_string();
+        bob.pull_requests[0].url = "https://github.com/org/repo/pull/8".to_string();
+        digest.groups.push(bob);
+        digest
+    }
+
+    #[tokio::test]
+    async fn test_composite_pr_digest_delivers_only_the_assignees_some_channel_reached() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(ReachingNotifier {
+            name: "discord",
+            reachable: "amy",
+        }));
+        let delivery = composite
+            .notify_pr_digest(&two_group_digest())
             .await
             .unwrap();
-        composite.notify_pr_digest(&pr_digest()).await.unwrap();
+
+        assert!(delivery.contains("https://github.com/org/repo/pull/7"));
+        assert!(
+            !delivery.contains("https://github.com/org/repo/pull/8"),
+            "bob was not reached, so his PR must not count as delivered"
+        );
+
+        composite.add(Arc::new(ReachingNotifier {
+            name: "slack",
+            reachable: "bob",
+        }));
+        let delivery = composite
+            .notify_pr_digest(&two_group_digest())
+            .await
+            .unwrap();
+
+        assert!(delivery.contains("https://github.com/org/repo/pull/7"));
+        assert!(
+            delivery.contains("https://github.com/org/repo/pull/8"),
+            "an assignee any channel reached is delivered"
+        );
     }
 }

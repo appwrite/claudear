@@ -4,6 +4,8 @@
 //! - `tracing::info!` on success with structured fields
 //! - `tracing::warn!` on error, then propagates the `Err`
 
+use crate::notifier::Delivery;
+use crate::notifier::DigestDelivery;
 use crate::notifier::Notifier;
 use crate::reports::RepetitiveDigest;
 use crate::reports::Report;
@@ -301,7 +303,7 @@ impl Notifier for InstrumentedNotifier {
         }
     }
 
-    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<Delivery> {
         match self.inner.notify_pr_assignment(notice).await {
             Ok(v) => {
                 tracing::info!(
@@ -318,7 +320,7 @@ impl Notifier for InstrumentedNotifier {
         }
     }
 
-    async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<DigestDelivery> {
         match self.inner.notify_pr_digest(digest).await {
             Ok(v) => {
                 tracing::info!(
@@ -669,11 +671,13 @@ mod tests {
         async fn notify_repetitive_digest(&self, _digest: &RepetitiveDigest) -> Result<()> {
             self.record("repetitive_digest")
         }
-        async fn notify_pr_assignment(&self, _notice: &AssignmentNotice) -> Result<()> {
-            self.record("pr_assignment")
+        async fn notify_pr_assignment(&self, _notice: &AssignmentNotice) -> Result<Delivery> {
+            self.record("pr_assignment")?;
+            Ok(Delivery::Delivered)
         }
-        async fn notify_pr_digest(&self, _digest: &Digest) -> Result<()> {
-            self.record("pr_digest")
+        async fn notify_pr_digest(&self, digest: &Digest) -> Result<DigestDelivery> {
+            self.record("pr_digest")?;
+            Ok(DigestDelivery::accepted(digest, false))
         }
     }
 

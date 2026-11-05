@@ -1,6 +1,7 @@
 //! Assigning open Claudear PRs and telling their assignees.
 
 use crate::distribution::PullRequestHost;
+use crate::notifier::Delivery;
 use crate::notifier::Notifier;
 use chrono::DateTime;
 use chrono::Utc;
@@ -8,6 +9,7 @@ use claudear_analysis::deploy_qa::GitHubDiscordMap;
 use claudear_analysis::distribution::AssignmentNotice;
 use claudear_analysis::distribution::Balancer;
 use claudear_analysis::distribution::CodeOwners;
+use claudear_analysis::distribution::Developer;
 use claudear_analysis::distribution::Digest;
 use claudear_analysis::distribution::DigestGroup;
 use claudear_analysis::distribution::Evidence;
@@ -28,7 +30,6 @@ use claudear_storage::FixAttemptTracker;
 use futures::StreamExt;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Host requests in flight at once while reading a PR's file history. GitHub
@@ -146,8 +147,8 @@ impl Distributor {
     /// open is turned off, the PR is not a GitHub PR, or it does not need
     /// anyone yet; the scheduled run picks those up later. Only the caller
     /// whose assignment is recorded pings, so concurrent callers never ping
-    /// two people for one PR; a ping that fails leaves the assignment
-    /// unnotified for the scheduled run to ping again.
+    /// two people for one PR; a ping that fails or reaches no remote channel
+    /// leaves the assignment unnotified for the scheduled run to ping again.
     pub async fn assign_opened(&self, pr_url: &str, issue: &Issue) -> Result<Option<PrAssignment>> {
         if !self.notify_on_open {
             return Ok(None);
@@ -200,13 +201,21 @@ impl Distributor {
         let Some(stored) = self.store.record_pr_assignment(&assignment)? else {
             return self.store.active_pr_assignment(pr_url);
         };
-        if let Err(error) = self.ping(&pull_request, &stored).await {
-            tracing::warn!(
-                component = "pr_distribution",
-                pr_url,
-                error = %error,
-                "Failed to ping the new assignee; the scheduled run pings them again"
-            );
+        if let Some(developer) = self.roster.find(&stored.assignee) {
+            match self.ping(developer, &pull_request, &stored).await {
+                Ok(Delivery::Delivered) => {}
+                Ok(Delivery::Local) => tracing::info!(
+                    component = "pr_distribution",
+                    pr_url,
+                    "No remote notifier is configured; the scheduled run pings the new assignee once one is"
+                ),
+                Err(error) => tracing::warn!(
+                    component = "pr_distribution",
+                    pr_url,
+                    error = %error,
+                    "Failed to ping the new assignee; the scheduled run pings them again"
+                ),
+            }
         }
         self.store.active_pr_assignment(pr_url)
     }
@@ -221,10 +230,19 @@ impl Distributor {
     /// assigns every PR still needing someone that has no assignee. With the
     /// digest on, every assignee is then sent the PRs still waiting on them;
     /// with it off, each assignee no ping has reached yet is pinged instead.
-    /// Every PR is reconciled and pinged before a digest or ping that no
-    /// channel delivered fails the run, so the scheduler retries it; an
-    /// assignee who stays unreachable keeps their assignments and is pinged
-    /// again on each retry and scheduled run until a ping reaches them.
+    /// An assignment is marked notified only once a remote channel delivered
+    /// its ping or its assignee's digest message, so one that only reached
+    /// the console, or no channel at all, is sent again later.
+    ///
+    /// Every PR is reconciled and pinged before a ping that no channel
+    /// delivered fails the run, so the scheduler retries it; an assignee who
+    /// stays unreachable keeps their assignments and is pinged again on each
+    /// retry and scheduled run until a ping reaches them. A digest fails the
+    /// run only when it reached no assignee, since a retry would resend it to
+    /// everyone it reached; the assignees it missed are listed again by the
+    /// next scheduled digest. With no remote channel configured the run
+    /// succeeds and marks nothing, so the scheduler does not retry it on
+    /// every tick.
     pub async fn distribute(&self, now: DateTime<Utc>) -> Result<Outcome> {
         let mut outcome = Outcome::default();
 
@@ -353,15 +371,13 @@ impl Distributor {
             if digest.is_empty() {
                 return Ok(outcome);
             }
-            self.notifier.notify_pr_digest(&digest).await?;
-            let listed: HashSet<&str> = digest
-                .groups
-                .iter()
-                .flat_map(|group| group.pull_requests.iter())
-                .map(|summary| summary.url.as_str())
-                .collect();
+            let delivery = self.notifier.notify_pr_digest(&digest).await?;
+            if delivery.is_empty() {
+                Self::unreached(digest.count());
+                return Ok(outcome);
+            }
             for (_, assignment) in current {
-                if assignment.notified_at.is_none() && listed.contains(assignment.pr_url.as_str()) {
+                if assignment.notified_at.is_none() && delivery.contains(&assignment.pr_url) {
                     self.store.mark_pr_assignment_notified(assignment.id)?;
                 }
             }
@@ -369,19 +385,30 @@ impl Distributor {
         }
 
         let mut undelivered = 0;
+        let mut local = 0;
         for (pull_request, assignment) in current {
             if assignment.notified_at.is_some() {
                 continue;
             }
-            if let Err(error) = self.ping(pull_request, assignment).await {
-                tracing::warn!(
-                    component = "pr_distribution",
-                    pr_url = %assignment.pr_url,
-                    error = %error,
-                    "Failed to ping the assignee; pinging them again on the next run"
-                );
-                undelivered += 1;
+            let Some(developer) = self.roster.find(&assignment.assignee) else {
+                continue;
+            };
+            match self.ping(developer, pull_request, assignment).await {
+                Ok(Delivery::Delivered) => {}
+                Ok(Delivery::Local) => local += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        component = "pr_distribution",
+                        pr_url = %assignment.pr_url,
+                        error = %error,
+                        "Failed to ping the assignee; pinging them again on the next run"
+                    );
+                    undelivered += 1;
+                }
             }
+        }
+        if local > 0 {
+            Self::unreached(local);
         }
         if undelivered > 0 {
             return Err(Error::Notifier {
@@ -451,15 +478,19 @@ impl Distributor {
         }
     }
 
-    /// Tell `assignment`'s assignee they own `pull_request`, then record that
-    /// they were told so later runs stop pinging them.
-    async fn ping(&self, pull_request: &PullRequest, assignment: &PrAssignment) -> Result<()> {
-        let Some(developer) = self.roster.find(&assignment.assignee) else {
-            return Ok(());
-        };
+    /// Tell `developer`, `assignment`'s assignee, they own `pull_request`,
+    /// then record that they were told so later runs stop pinging them. A
+    /// ping that reached only local channels is not recorded.
+    async fn ping(
+        &self,
+        developer: &Developer,
+        pull_request: &PullRequest,
+        assignment: &PrAssignment,
+    ) -> Result<Delivery> {
         let mut summary = PullRequestSummary::from(pull_request);
         summary.url = assignment.pr_url.clone();
-        self.notifier
+        let delivery = self
+            .notifier
             .notify_pr_assignment(&AssignmentNotice {
                 developer: developer.clone(),
                 pull_request: summary,
@@ -467,8 +498,20 @@ impl Distributor {
                 previous: assignment.previous.clone(),
             })
             .await?;
-        self.store.mark_pr_assignment_notified(assignment.id)?;
-        Ok(())
+        if delivery == Delivery::Delivered {
+            self.store.mark_pr_assignment_notified(assignment.id)?;
+        }
+        Ok(delivery)
+    }
+
+    /// Report, once per run, that `count` PRs reached no remote channel and
+    /// so stay unnotified until one is configured.
+    fn unreached(count: usize) {
+        tracing::warn!(
+            component = "pr_distribution",
+            count,
+            "No remote notifier is configured; PR assignees stay unnotified until one is"
+        );
     }
 
     /// The digest of assigned PRs still waiting on their assignee, one group
@@ -577,15 +620,16 @@ mod tests {
     use super::*;
     use crate::notifier::CompositeNotifier;
     use crate::notifier::ConsoleNotifier;
+    use crate::notifier::DigestDelivery;
     use async_trait::async_trait;
     use chrono::TimeZone;
-    use claudear_analysis::distribution::Developer;
     use claudear_analysis::distribution::PullRequestState;
     use claudear_analysis::distribution::Review;
     use claudear_analysis::distribution::Verdict;
     use claudear_core::types::AssignmentReason;
     use claudear_storage::AttemptTracker;
     use claudear_storage::SqliteTracker;
+    use std::collections::HashSet;
     use std::sync::Mutex;
 
     const REPO: &str = "org/repo";
@@ -712,14 +756,19 @@ mod tests {
         async fn notify_urgent_issues(&self, _issues: &[Issue]) -> Result<()> {
             Ok(())
         }
-        async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
+        async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<Delivery> {
             self.refuse(&notice.developer)?;
             self.notices.lock().unwrap().push(notice.clone());
-            Ok(())
+            Ok(Delivery::Delivered)
         }
-        async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
+        async fn notify_pr_digest(&self, digest: &Digest) -> Result<DigestDelivery> {
             let delivered = Mutex::new(Vec::new());
-            let result = crate::notifier::send_each(self.name(), digest.groups.clone(), |group| {
+            let groups = digest
+                .groups
+                .iter()
+                .map(|group| (group, vec![group.clone()]))
+                .collect();
+            let result = crate::notifier::send_each(self.name(), groups, |group| {
                 let sent = self.refuse(&group.developer);
                 if sent.is_ok() {
                     delivered.lock().unwrap().push(group);
@@ -785,6 +834,26 @@ mod tests {
             logins: &[&str],
             config: PrDistributionConfig,
         ) -> Distributor {
+            self.distributor_through(self.notifier.clone(), host, logins, config)
+        }
+
+        /// A distributor over the same store and host whose only channel is
+        /// the console, as when no remote notifier is configured.
+        fn console_only(&self, logins: &[&str], config: PrDistributionConfig) -> Distributor {
+            let mut console = CompositeNotifier::new();
+            console.add(crate::telemetry::InstrumentedNotifier::wrap(Arc::new(
+                ConsoleNotifier::new(),
+            )));
+            self.distributor_through(Arc::new(console), self.host.clone(), logins, config)
+        }
+
+        fn distributor_through(
+            &self,
+            notifier: Arc<dyn Notifier>,
+            host: Arc<dyn PullRequestHost>,
+            logins: &[&str],
+            config: PrDistributionConfig,
+        ) -> Distributor {
             let roster = Roster::from_developers(
                 logins
                     .iter()
@@ -795,13 +864,7 @@ mod tests {
                     })
                     .collect(),
             );
-            Distributor::new(
-                &config,
-                roster,
-                self.store.clone(),
-                host,
-                self.notifier.clone(),
-            )
+            Distributor::new(&config, roster, self.store.clone(), host, notifier)
         }
 
         fn active(&self, number: i64) -> PrAssignment {
@@ -1295,8 +1358,20 @@ mod tests {
         assert_eq!(digests[0].groups[0].pull_requests[0].url, url(1));
     }
 
+    fn digested(harness: &Harness) -> Vec<String> {
+        harness
+            .recorder
+            .digests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|digest| digest.groups.iter())
+            .map(|group| group.developer.login.clone())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn a_digest_that_reached_some_assignees_is_not_resent_to_them() {
+    async fn a_digest_that_reached_some_assignees_marks_only_them_and_resends_to_no_one() {
         let harness = Harness::new(FakeHost::with([open(1), open(2)]));
         harness.opened(1);
         harness.opened(2);
@@ -1311,13 +1386,110 @@ mod tests {
             }
         }
 
-        let digests = harness.recorder.digests.lock().unwrap();
-        let delivered: Vec<&str> = digests
-            .iter()
-            .flat_map(|digest| digest.groups.iter())
-            .map(|group| group.developer.login.as_str())
-            .collect();
-        assert_eq!(delivered, vec!["amy"], "amy's digest must be sent once");
+        assert_eq!(
+            harness.assignees(),
+            vec![(1, "amy".to_string()), (2, "bob".to_string())]
+        );
+        assert_eq!(
+            digested(&harness),
+            vec!["amy"],
+            "amy's digest must be sent once"
+        );
+        assert!(harness.active(1).notified_at.is_some());
+        assert!(
+            harness.active(2).notified_at.is_none(),
+            "bob was not reached, so his assignment must stay unnotified"
+        );
+
+        harness.unreachable(&[]);
+        let tomorrow = slot + chrono::Duration::days(1);
+        assert!(schedule.is_due(tomorrow));
+        distributor.distribute(tomorrow).await.unwrap();
+
+        assert_eq!(digested(&harness), vec!["amy", "amy", "bob"]);
+        assert!(harness.active(2).notified_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_missed_digest_assignee_is_pinged_once_the_digest_is_turned_off() {
+        let harness = Harness::new(FakeHost::with([open(1), open(2)]));
+        harness.opened(1);
+        harness.opened(2);
+
+        harness.unreachable(&["bob"]);
+        harness
+            .distributor(&["amy", "bob"], config())
+            .distribute(Utc::now())
+            .await
+            .unwrap();
+        harness.unreachable(&[]);
+        harness
+            .distributor(&["amy", "bob"], pings())
+            .distribute(Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(harness.pinged(), vec![(url(2), "bob".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_digest_with_no_remote_channel_marks_nothing_and_is_sent_once_one_is() {
+        let harness = Harness::new(FakeHost::with([open(1)]));
+        harness.opened(1);
+
+        let outcome = harness
+            .console_only(&["amy"], config())
+            .distribute(Utc::now())
+            .await
+            .expect("a run with no remote channel must not fail and be retried every tick");
+
+        assert_eq!(outcome.listed, 1);
+        assert!(harness.active(1).notified_at.is_none());
+
+        harness
+            .distributor(&["amy"], config())
+            .distribute(Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(digested(&harness), vec!["amy"]);
+        assert!(harness.active(1).notified_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_ping_with_no_remote_channel_marks_nothing_and_is_sent_once_one_is() {
+        let harness = Harness::new(FakeHost::with([open(1), open(2)]));
+        harness.opened(1);
+        harness.opened(2);
+        let console = harness.console_only(&["amy", "bob"], pings());
+
+        console
+            .assign_opened(&url(1), &requested_by("amy"))
+            .await
+            .unwrap();
+        console
+            .distribute(Utc::now())
+            .await
+            .expect("a run with no remote channel must not fail and be retried every tick");
+
+        assert_eq!(harness.assignees().len(), 2);
+        assert!(harness.active(1).notified_at.is_none());
+        assert!(harness.active(2).notified_at.is_none());
+
+        harness
+            .distributor(&["amy", "bob"], pings())
+            .distribute(Utc::now())
+            .await
+            .unwrap();
+
+        let mut pinged = harness.pinged();
+        pinged.sort();
+        assert_eq!(
+            pinged,
+            vec![(url(1), "amy".to_string()), (url(2), "bob".to_string())]
+        );
+        assert!(harness.active(1).notified_at.is_some());
+        assert!(harness.active(2).notified_at.is_some());
     }
 
     #[tokio::test]

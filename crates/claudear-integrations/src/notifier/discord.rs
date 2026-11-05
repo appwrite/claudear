@@ -1,5 +1,7 @@
 //! Discord webhook notifier.
 
+use super::Delivery;
+use super::DigestDelivery;
 use super::Notifier;
 use crate::ask_reply_inbox;
 use crate::discord::AllowedMentions;
@@ -15,6 +17,7 @@ use chrono::Utc;
 use claudear_analysis::distribution::AssignmentNotice;
 use claudear_analysis::distribution::Developer;
 use claudear_analysis::distribution::Digest;
+use claudear_analysis::distribution::DigestGroup;
 use claudear_analysis::distribution::Markup;
 use claudear_analysis::distribution::PlainText;
 use claudear_config::config::DiscordConfig;
@@ -1283,25 +1286,34 @@ pub(crate) fn build_pr_assignment_message(
 /// may ping: the title, then each assignee's PRs, split to fit Discord's
 /// content limit with the mention on the first page. Empty when no PR needs
 /// anyone.
-pub(crate) fn build_pr_digest_messages(digest: &Digest) -> Vec<(DiscordMessage, AllowedMentions)> {
-    if digest.is_empty() {
-        return Vec::new();
-    }
-    let message = |content: String| DiscordMessage {
-        content: Some(content),
-        embeds: None,
-    };
-    std::iter::once((
-        message(Digest::TITLE.to_string()),
+fn build_pr_digest_title() -> (DiscordMessage, AllowedMentions) {
+    (
+        DiscordMessage {
+            content: Some(Digest::TITLE.to_string()),
+            embeds: None,
+        },
         pr_allowed_mentions(None),
-    ))
-    .chain(digest.groups.iter().flat_map(|group| {
-        group
-            .pages(&DiscordMarkup, digest.generated_at, MESSAGE_CHARACTER_LIMIT)
-            .into_iter()
-            .map(|page| (message(page), pr_allowed_mentions(Some(&group.developer))))
-    }))
-    .collect()
+    )
+}
+
+/// The messages that tell one assignee of a PR digest what waits on them.
+fn build_pr_digest_group_messages(
+    group: &DigestGroup,
+    generated_at: DateTime<Utc>,
+) -> Vec<(DiscordMessage, AllowedMentions)> {
+    group
+        .pages(&DiscordMarkup, generated_at, MESSAGE_CHARACTER_LIMIT)
+        .into_iter()
+        .map(|page| {
+            (
+                DiscordMessage {
+                    content: Some(page),
+                    embeds: None,
+                },
+                pr_allowed_mentions(Some(&group.developer)),
+            )
+        })
+        .collect()
 }
 
 /// Build the Discord message for a human-in-the-loop question.
@@ -1501,21 +1513,31 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         Ok(())
     }
 
-    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<Delivery> {
         let (message, allowed_mentions) = build_pr_assignment_message(notice);
         let _ = self.send_allowing(message, Some(allowed_mentions)).await?;
-        Ok(())
+        Ok(Delivery::Delivered)
     }
 
-    async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
-        let mut messages = build_pr_digest_messages(digest).into_iter();
-        let Some((title, allowed_mentions)) = messages.next() else {
-            return Ok(());
-        };
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<DigestDelivery> {
+        if digest.is_empty() {
+            return Ok(DigestDelivery::default());
+        }
+        let (title, allowed_mentions) = build_pr_digest_title();
         self.send_allowing(title, Some(allowed_mentions)).await?;
+        let groups = digest
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group,
+                    build_pr_digest_group_messages(group, digest.generated_at),
+                )
+            })
+            .collect();
         super::send_each(
             self.name(),
-            messages.collect(),
+            groups,
             |(message, allowed_mentions)| async move {
                 self.send_allowing(message, Some(allowed_mentions))
                     .await
@@ -4257,6 +4279,17 @@ mod tests {
         assert_eq!(allowed_mentions, AllowedMentions::users([]));
     }
 
+    fn digest_messages(digest: &Digest) -> Vec<(DiscordMessage, AllowedMentions)> {
+        std::iter::once(build_pr_digest_title())
+            .chain(
+                digest
+                    .groups
+                    .iter()
+                    .flat_map(|group| build_pr_digest_group_messages(group, digest.generated_at)),
+            )
+            .collect()
+    }
+
     #[test]
     fn test_pr_digest_messages_mention_each_assignee() {
         let digest = Digest {
@@ -4273,7 +4306,7 @@ mod tests {
             generated_at: Utc::now(),
         };
 
-        let messages = build_pr_digest_messages(&digest);
+        let messages = digest_messages(&digest);
         let contents: Vec<String> = messages
             .iter()
             .map(|(message, _)| message.content.clone().unwrap())
@@ -4304,7 +4337,7 @@ mod tests {
             generated_at: Utc::now(),
         };
 
-        let messages = build_pr_digest_messages(&digest);
+        let messages = digest_messages(&digest);
 
         assert!(messages.len() > 2);
         assert!(messages.iter().all(|(message, _)| message
@@ -4322,13 +4355,19 @@ mod tests {
             .starts_with("<@1> 100 Claudear PRs"));
     }
 
-    #[test]
-    fn test_pr_digest_messages_empty_digest_sends_nothing() {
+    #[tokio::test]
+    async fn test_notify_pr_digest_empty_digest_sends_nothing() {
+        let notifier = DiscordNotifier::with_http_client(
+            enabled_config(),
+            MockDiscordWebhookClient::success(),
+        );
         let digest = Digest {
             groups: Vec::new(),
             generated_at: Utc::now(),
         };
-        assert!(build_pr_digest_messages(&digest).is_empty());
+
+        assert!(notifier.notify_pr_digest(&digest).await.unwrap().is_empty());
+        assert_eq!(notifier.http.get_call_count(), 0);
     }
 
     fn two_group_digest() -> Digest {
@@ -4354,10 +4393,19 @@ mod tests {
             MockDiscordWebhookClient::success().failing_on(2),
         );
 
-        notifier
+        let delivery = notifier
             .notify_pr_digest(&two_group_digest())
             .await
             .expect("a digest that reached one assignee must not be resent");
+
+        assert!(
+            delivery.contains("https://github.com/org/repo/pull/2"),
+            "bob was reached"
+        );
+        assert!(
+            !delivery.contains("https://github.com/org/repo/pull/1"),
+            "amy was not reached, so her PR must not count as delivered"
+        );
 
         assert_eq!(notifier.http.get_call_count(), 3);
         let (_, body) = notifier.http.get_last_call().unwrap();
