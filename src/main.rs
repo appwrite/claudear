@@ -3551,13 +3551,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     .map_err(|error| anyhow::anyhow!("Failed to hash password: {}", error))?;
 
                 match seed_admin(&db_tracker, &email, &hash, name)? {
-                    SeededAdmin::Updated(id) => println!(
-                        "Updated existing user '{}' (id={}) with new password and admin role",
-                        email, id
-                    ),
-                    SeededAdmin::Created(id) => {
-                        println!("Created admin user '{}' (id={})", email, id)
+                    SeededAdmin::Updated(_) => {
+                        println!("Updated the existing user with a new password and admin role")
                     }
+                    SeededAdmin::Created(_) => println!("Created the admin user"),
                 }
             }
         }

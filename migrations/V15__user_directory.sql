@@ -21,6 +21,23 @@ CREATE TABLE IF NOT EXISTS user_identities (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_identities_slug ON user_identities(slug) WHERE slug IS NOT NULL;
 
+-- One row per exclusive handle (source logins, Discord and Slack ids) a console person
+-- claims, so the database itself refuses a handle another person holds, even when two
+-- processes write at once. Values are stored in comparison form: GitHub and GitLab
+-- logins lowercased, everything else exact. Notification targets may be shared and are
+-- never claimed here.
+CREATE TABLE IF NOT EXISTS user_handles (
+    user_id INTEGER NOT NULL,
+    field TEXT NOT NULL CHECK (field IN (
+        'linear_names', 'github_usernames', 'sentry_usernames', 'jira_usernames',
+        'gitlab_usernames', 'discord_id', 'slack_id'
+    )),
+    value TEXT NOT NULL,
+    PRIMARY KEY (field, value),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_user_handles_user ON user_handles(user_id);
+
 -- Invited users keep a non-null (unusable) password hash and are told apart by
 -- status, because dropping NOT NULL would need a users table rebuild that
 -- cascade-deletes sessions and api_tokens.

@@ -71,7 +71,7 @@ impl Identities {
                     let normalized: Vec<String> = std::mem::take(values)
                         .iter()
                         .filter_map(|value| normalize_value(field, value))
-                        .filter(|value| seen.insert(deduplication_key(field, value)))
+                        .filter(|value| seen.insert(field.comparison_key(value)))
                         .collect();
                     *values = normalized;
                 }
@@ -116,6 +116,11 @@ impl Identities {
             }
         }
         redacted
+    }
+
+    /// Every value of `field`, in stored order; empty for [`IdentityField::Slug`].
+    pub fn values(&self, field: IdentityField) -> Vec<&str> {
+        self.slot(field).map_or_else(Vec::new, |slot| slot.values())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -174,14 +179,6 @@ fn normalize_value(field: IdentityField, value: &str) -> Option<String> {
     (!handle.is_empty()).then(|| handle.to_string())
 }
 
-fn deduplication_key(field: IdentityField, value: &str) -> String {
-    if field.is_case_insensitive() {
-        value.to_lowercase()
-    } else {
-        value.to_string()
-    }
-}
-
 impl fmt::Debug for Identities {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("Identities");
@@ -231,6 +228,26 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn values_reads_lists_and_scalars_and_nothing_for_slug() {
+        let identities = Identities {
+            github_usernames: strings(&["jakebarnby", "jake-alt"]),
+            ..complete()
+        };
+        assert_eq!(
+            identities.values(IdentityField::GithubUsernames),
+            vec!["jakebarnby", "jake-alt"]
+        );
+        assert_eq!(
+            identities.values(IdentityField::SlackId),
+            vec!["U0123456789"]
+        );
+        assert!(identities.values(IdentityField::Slug).is_empty());
+        assert!(Identities::default()
+            .values(IdentityField::DiscordId)
+            .is_empty());
     }
 
     #[test]

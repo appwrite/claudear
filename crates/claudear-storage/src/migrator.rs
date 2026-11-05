@@ -353,6 +353,8 @@ mod tests {
         assert!(column_exists(&connection, "fix_attempts", "heartbeat_at"));
         assert!(table_exists(&connection, "user_identities"));
         assert!(index_exists(&connection, "idx_user_identities_slug"));
+        assert!(table_exists(&connection, "user_handles"));
+        assert!(index_exists(&connection, "idx_user_handles_user"));
         assert!(column_exists(&connection, "users", "status"));
         assert!(table_exists(&connection, "user_invites"));
         assert!(index_exists(&connection, "idx_user_invites_open"));
@@ -519,6 +521,32 @@ mod tests {
     }
 
     #[test]
+    fn test_user_handles_allow_one_owner_per_handle_and_only_exclusive_fields() {
+        let connection = migrated_connection();
+        let first = insert_user(&connection, "first@example.com");
+        let second = insert_user(&connection, "second@example.com");
+        let insert_handle = |user_id: i64, field: &str, value: &str| {
+            connection.execute(
+                "INSERT INTO user_handles (user_id, field, value) VALUES (?1, ?2, ?3)",
+                rusqlite::params![user_id, field, value],
+            )
+        };
+
+        insert_handle(first, "github_usernames", "jakebarnby").unwrap();
+        insert_handle(second, "gitlab_usernames", "jakebarnby").unwrap();
+        let duplicate = insert_handle(second, "github_usernames", "jakebarnby")
+            .expect_err("a handle may belong to only one user");
+        assert!(duplicate.to_string().contains(crate::DUPLICATE_HANDLE));
+        insert_handle(first, "email", "team@example.com")
+            .expect_err("CHECK must reject a notification target");
+
+        connection
+            .execute("DELETE FROM users WHERE id = ?1", [first])
+            .unwrap();
+        assert_eq!(row_count(&connection, "user_handles"), 1);
+    }
+
+    #[test]
     fn test_user_invites_allow_one_open_invite_per_user() {
         let connection = migrated_connection();
         let user = insert_user(&connection, "amy@example.com");
@@ -682,6 +710,7 @@ mod tests {
             "issue_recurrence",
             "retrieval_usage",
             "user_identities",
+            "user_handles",
             "user_invites",
             "pr_assignments",
         ];

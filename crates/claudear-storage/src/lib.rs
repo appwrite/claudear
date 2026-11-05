@@ -38,6 +38,11 @@ use claudear_core::types::{
 };
 use claudear_core::types::{CrossRepoCorrelation, FixOutcome};
 use std::collections::{HashMap, HashSet};
+
+/// Contained in the [`claudear_core::error::Error::Database`] message of an identity write
+/// that would give a person a source login, Discord id or Slack id another person already
+/// claims; the whole write is rolled back.
+pub const DUPLICATE_HANDLE: &str = "UNIQUE constraint failed: user_handles";
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -1881,8 +1886,8 @@ pub trait UserStore: Send + Sync {
         Ok(None)
     }
 
-    /// Remove a user's identities so the person falls back to config. Returns
-    /// whether a row was deleted.
+    /// Remove a user's identities, freeing their handles, so the person falls back to
+    /// config. Returns whether a row was deleted.
     fn delete_user_identities(&self, _user_id: i64) -> Result<bool> {
         Ok(false)
     }
@@ -1891,7 +1896,8 @@ pub trait UserStore: Send + Sync {
     /// each user, replace their identities and issue their invite. Returns the
     /// user id of each entry, in order. An `Active` new user with an invite is
     /// rejected, and a new user's login email is normalized and must not match an
-    /// existing (or earlier in the batch) user's case-insensitively.
+    /// existing (or earlier in the batch) user's case-insensitively. A handle another
+    /// person keeps after the batch fails it with [`DUPLICATE_HANDLE`].
     fn save_directory(&self, _writes: &[DirectoryWrite]) -> Result<Vec<i64>> {
         Err(claudear_core::error::Error::Other(
             "save_directory not supported".to_string(),

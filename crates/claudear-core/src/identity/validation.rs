@@ -1,8 +1,9 @@
 use super::field::IdentityField;
 use super::violation::IdentityViolation;
 
-/// Reserved for the `console-<user_id>` alias every console person keeps.
-const RESERVED_SLUG_PREFIX: &str = "console-";
+/// Reserved for the `console-<user_id>` alias every console person keeps, so no slug or
+/// `[users.<key>]` config key may start with it.
+pub const CONSOLE_KEY_PREFIX: &str = "console-";
 const MAXIMUM_SLUG_LENGTH: usize = 63;
 const MAXIMUM_TEXT_LENGTH: usize = 255;
 const MAXIMUM_GITHUB_LENGTH: usize = 39;
@@ -18,7 +19,7 @@ const INVALID_SLUG_MESSAGE: &str =
 
 /// Validate an admin-set person key: `[a-z0-9]` followed by up to 62 of `[a-z0-9._-]`.
 pub fn validate_slug(slug: &str) -> Result<(), IdentityViolation> {
-    if slug.starts_with(RESERVED_SLUG_PREFIX) {
+    if slug.starts_with(CONSOLE_KEY_PREFIX) {
         return Err(IdentityViolation::new(
             IdentityField::Slug,
             "slug must not start with 'console-', which is reserved",

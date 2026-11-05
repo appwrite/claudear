@@ -17,5 +17,5 @@ pub use origin::IdentityOrigin;
 pub use record::ConsoleIdentity;
 pub use role::Role;
 pub use status::UserStatus;
-pub use validation::validate_slug;
+pub use validation::{validate_slug, CONSOLE_KEY_PREFIX};
 pub use violation::IdentityViolation;

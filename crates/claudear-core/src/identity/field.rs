@@ -37,6 +37,18 @@ impl IdentityField {
         Self::TelegramChatId,
     ];
 
+    /// Handles that identify exactly one person. Notification targets (email, phone numbers,
+    /// push keys, chat ids) may be shared, for example by a team inbox, so they are not here.
+    pub const EXCLUSIVE: [IdentityField; 7] = [
+        Self::LinearNames,
+        Self::GithubUsernames,
+        Self::SentryUsernames,
+        Self::JiraUsernames,
+        Self::GitlabUsernames,
+        Self::DiscordId,
+        Self::SlackId,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Slug => "slug",
@@ -70,6 +82,16 @@ impl IdentityField {
     /// GitHub and GitLab logins compare without regard to case.
     pub fn is_case_insensitive(self) -> bool {
         matches!(self, Self::GithubUsernames | Self::GitlabUsernames)
+    }
+
+    /// The form two values of this field are compared in: lowercase for GitHub and GitLab,
+    /// unchanged otherwise.
+    pub fn comparison_key(self, value: &str) -> String {
+        if self.is_case_insensitive() {
+            value.to_lowercase()
+        } else {
+            value.to_string()
+        }
     }
 }
 
@@ -117,6 +139,34 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(sensitive, expected);
+    }
+
+    #[test]
+    fn exclusive_set_is_every_handle_but_notification_targets() {
+        let exclusive: HashSet<IdentityField> = IdentityField::EXCLUSIVE.into_iter().collect();
+        let expected: HashSet<IdentityField> = IdentityField::ALL
+            .into_iter()
+            .filter(|field| *field != IdentityField::Slug && !field.is_sensitive())
+            .collect();
+        assert_eq!(exclusive, expected);
+        assert_eq!(exclusive.len(), IdentityField::EXCLUSIVE.len());
+    }
+
+    #[test]
+    fn comparison_key_lowercases_only_case_insensitive_fields() {
+        assert_eq!(
+            IdentityField::GithubUsernames.comparison_key("JakeBarnby"),
+            "jakebarnby"
+        );
+        assert_eq!(
+            IdentityField::GitlabUsernames.comparison_key("Jake.Gitlab"),
+            "jake.gitlab"
+        );
+        assert_eq!(
+            IdentityField::LinearNames.comparison_key("Jake Barnby"),
+            "Jake Barnby"
+        );
+        assert_eq!(IdentityField::SlackId.comparison_key("U0ABC"), "U0ABC");
     }
 
     #[test]
