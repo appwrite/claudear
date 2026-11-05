@@ -518,7 +518,7 @@ fn save_identities(state: &ApiState, user_id: i64, write: IdentityWrite) -> Resu
             identities: Some(write),
             invite: None,
         }])
-        .map_err(ApiError::storage)?;
+        .map_err(ApiError::user_write)?;
     Ok(())
 }
 
@@ -568,6 +568,7 @@ fn console_entry(state: &ApiState, user_id: i64) -> Result<Option<ConsoleIdentit
 mod tests {
     use super::*;
     use crate::api::create_api_router_with_dashboard;
+    use crate::api::fixture;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::response::Response;
@@ -1006,8 +1007,12 @@ mod tests {
     }
 
     fn test_app() -> TestApp {
-        let tracker: Arc<dyn FixAttemptTracker> =
-            Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
+        test_app_on(Arc::new(
+            SqliteTracker::in_memory().expect("in-memory tracker"),
+        ))
+    }
+
+    fn test_app_on(tracker: Arc<dyn FixAttemptTracker>) -> TestApp {
         let admin = session(&tracker, "jake@example.com", Role::Admin);
         let viewer = session(&tracker, "viewer@example.com", Role::Viewer);
         let config = Config {
@@ -1192,6 +1197,31 @@ mod tests {
                 .map(|person| person.slug),
             Some("alice".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn a_handle_storage_refuses_is_a_conflict_that_names_no_one() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let app = test_app_on(fixture::tracker_refusing_handle_claims(directory.path()));
+
+        let (status, body) = send(
+            &app,
+            request(
+                "PUT",
+                &format!("/api/users/{}/identities", app.viewer.id),
+                Some(&app.viewer.token),
+                Some(json!({"github_usernames": ["viewer-gh"]})),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            json!({"error": "Identities already belong to another person"})
+        );
+        assert!(app.tracker.list_user_identities().expect("list").is_empty());
+        assert!(app.registry.resolve("github", "viewer-gh").is_none());
     }
 
     #[tokio::test]

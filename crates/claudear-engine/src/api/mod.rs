@@ -10,6 +10,8 @@ mod directory;
 pub(crate) mod embedded;
 pub mod error;
 mod features;
+#[cfg(test)]
+pub(crate) mod fixture;
 mod identities;
 mod invites;
 mod rate_limit;

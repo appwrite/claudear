@@ -2879,8 +2879,12 @@ mod tests {
         }
 
         fn test_app() -> TestApp {
-            let tracker: Arc<dyn FixAttemptTracker> =
-                Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
+            test_app_on(Arc::new(
+                SqliteTracker::in_memory().expect("in-memory tracker"),
+            ))
+        }
+
+        fn test_app_on(tracker: Arc<dyn FixAttemptTracker>) -> TestApp {
             let admin = tracker
                 .create_user(
                     "writes-admin@example.com",
@@ -3017,6 +3021,32 @@ mod tests {
                     .map(|person| person.slug),
                 Some("dana".to_string())
             );
+        }
+
+        #[tokio::test]
+        async fn a_handle_storage_refuses_creates_no_user_and_is_a_409() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let app = test_app_on(crate::api::fixture::tracker_refusing_handle_claims(
+                directory.path(),
+            ));
+            let before = app.tracker.list_users().expect("list").len();
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/users",
+                Some(&app.admin_token),
+                json!({"email": "writes-claim@example.com", "name": "Claim", "role": "viewer",
+                       "identities": {"github_usernames": ["claimed-gh"]}}),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                json(&body),
+                json!({"error": "Identities already belong to another person"})
+            );
+            assert_eq!(app.tracker.list_users().expect("list").len(), before);
         }
 
         #[tokio::test]

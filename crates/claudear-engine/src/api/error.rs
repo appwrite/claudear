@@ -15,6 +15,12 @@ use std::borrow::Cow;
 /// How SQLite reports a second user with the same login email.
 const DUPLICATE_EMAIL_CONSTRAINT: &str = "UNIQUE constraint failed: users.email";
 
+/// How storage reports a handle another user already claims, which only a writer in
+/// another process can cause once the up-front registry check has passed.
+const DUPLICATE_HANDLE_CONSTRAINT: &str = "UNIQUE constraint failed: user_handles";
+
+const IDENTITY_CONFLICT: &str = "Identities already belong to another person";
+
 /// Per-field problems attached to a 400 or 409.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
@@ -114,14 +120,26 @@ impl ApiError {
         Self::internal()
     }
 
-    /// A failed write to the users table: a login email another user already holds is a
-    /// 409, which a concurrent writer can cause after the up-front duplicate check passed.
+    /// A handle the store refused because another person holds it; the body never names
+    /// the owner or the value.
+    pub(crate) fn duplicate_handle() -> Self {
+        Self::conflict(IDENTITY_CONFLICT)
+    }
+
+    /// A failed write of users or identities: a login email or handle another user
+    /// already holds is a 409, which a concurrent writer can cause after the up-front
+    /// checks passed.
     pub(crate) fn user_write(error: claudear_core::error::Error) -> Self {
         match &error {
             claudear_core::error::Error::Database(message)
                 if message.contains(DUPLICATE_EMAIL_CONSTRAINT) =>
             {
                 Self::duplicate_email()
+            }
+            claudear_core::error::Error::Database(message)
+                if message.contains(DUPLICATE_HANDLE_CONSTRAINT) =>
+            {
+                Self::duplicate_handle()
             }
             _ => Self::storage(error),
         }
@@ -138,7 +156,7 @@ impl ApiError {
     pub(crate) fn identity_conflict(violations: Vec<IdentityViolation>) -> Self {
         Self::with_violations(
             StatusCode::CONFLICT,
-            "Identities already belong to another person",
+            IDENTITY_CONFLICT,
             Violations::Identity(violations),
         )
     }
@@ -154,7 +172,7 @@ impl ApiError {
     pub(crate) fn directory_conflict(violations: Vec<DirectoryViolation>) -> Self {
         Self::with_violations(
             StatusCode::CONFLICT,
-            "Identities already belong to another person",
+            IDENTITY_CONFLICT,
             Violations::Directory(violations),
         )
     }
@@ -248,5 +266,20 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body, json!({"error": "Internal server error"}));
+    }
+
+    #[tokio::test]
+    async fn a_handle_storage_refuses_is_a_conflict_that_names_no_one() {
+        let error = claudear_core::error::Error::Database(format!(
+            "{DUPLICATE_HANDLE_CONSTRAINT}.field, user_handles.value"
+        ));
+
+        let (status, body) = render(ApiError::user_write(error)).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            json!({"error": "Identities already belong to another person"})
+        );
     }
 }
