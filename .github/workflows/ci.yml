@@ -26,6 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
       - name: Install system dependencies
         run: sudo apt-get install -y mold
 
@@ -74,6 +77,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
       - name: Install system dependencies
         run: sudo apt-get install -y mold
 
@@ -104,6 +110,7 @@ jobs:
     name: Test (${{ matrix.crate }})
     needs: [compile]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -117,6 +124,9 @@ jobs:
           - claudear
     steps:
       - uses: actions/checkout@v7
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
 
       - name: Install system dependencies
         run: sudo apt-get install -y mold
@@ -166,7 +176,7 @@ jobs:
       # the prebuilt .so from the vectorlite-py wheel and point the loader at it
       # so the semantic-search tests exercise real, populated results.
       - name: Install vectorlite extension
-        if: matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
+        if: matrix.crate == 'claudear-storage' || matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
         run: |
           python3 -m pip install -q vectorlite-py
           # vectorlite_path() returns the path without a file extension, but the

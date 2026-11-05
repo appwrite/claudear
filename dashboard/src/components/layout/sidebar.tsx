@@ -7,7 +7,7 @@ import {
   BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
   Users, LogOut, Gauge, Settings, Sun, Moon, Ticket, GraduationCap, BookOpen,
-  MessageSquareCode, Package, Hash,
+  MessageSquareCode, Package, Hash, Rocket, Plug,
 } from 'lucide-react'
 import { setSentryColorScheme } from '../../lib/sentry'
 
@@ -36,6 +36,7 @@ const navGroups: NavGroup[] = [
       { path: '/analytics', label: 'Analytics', icon: BarChart3 },
       { path: '/errors', label: 'Errors', icon: AlertTriangle },
       { path: '/regressions', label: 'Regressions', icon: Shield },
+      { path: '/deploy-qa', label: 'Deploy QA', icon: Rocket },
       { path: '/feedback', label: 'Feedback', icon: MessageSquare },
     ],
   },
@@ -46,6 +47,7 @@ const navGroups: NavGroup[] = [
       { path: '/inference', label: 'Inference', icon: Brain },
       { path: '/repos', label: 'Repos', icon: FolderGit2 },
       { path: '/channels', label: 'Channels', icon: Hash },
+      { path: '/integrations', label: 'Integrations', icon: Plug },
       { path: '/learning', label: 'Learning', icon: GraduationCap },
     ],
   },
@@ -71,7 +73,7 @@ export function Sidebar() {
   const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'))
 
   const handlePrefetch = (nextPath: string) => {
-    prefetchRouteData(nextPath)
+    prefetchRouteData(nextPath, user?.role)
   }
 
   useEffect(() => {

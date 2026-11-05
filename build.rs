@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     let dashboard_dist = Path::new("dashboard/dist");
@@ -16,4 +17,23 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=dashboard/dist");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        link_clang_runtime();
+    }
+}
+
+// onnxruntime's CoreML provider calls `@available`, which resolves to
+// `__isPlatformVersionAtLeast` in clang's builtins. rustc links with
+// `-nodefaultlibs`, so the builtins archive has to be named explicitly.
+fn link_clang_runtime() {
+    let Ok(output) = Command::new("clang").arg("--print-runtime-dir").output() else {
+        return;
+    };
+    let directory = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || !Path::new(&directory).join("libclang_rt.osx.a").exists() {
+        return;
+    }
+    println!("cargo:rustc-link-search=native={directory}");
+    println!("cargo:rustc-link-lib=static=clang_rt.osx");
 }

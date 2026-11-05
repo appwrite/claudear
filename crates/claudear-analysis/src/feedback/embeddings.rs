@@ -2,13 +2,14 @@
 //!
 //! Uses the Nomic Embed Text model for generating embeddings.
 
+use claudear_config::config::EmbeddingModelConfig;
 use claudear_core::error::{Error, Result};
-use fastembed::{EmbeddingModel, ExecutionProviderDispatch, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, ExecutionProviderDispatch, TextEmbedding, TextInitOptions};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Configuration for the embedding service.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EmbeddingConfig {
     /// Model to use for embeddings.
     pub model: EmbeddingModel,
@@ -27,6 +28,25 @@ pub struct EmbeddingConfig {
 }
 
 const DEFAULT_POOL_SIZE: usize = 1;
+
+impl std::fmt::Debug for EmbeddingConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let providers: Vec<&str> = self
+            .execution_providers
+            .iter()
+            .map(ExecutionProviderDispatch::name)
+            .collect();
+        formatter
+            .debug_struct("EmbeddingConfig")
+            .field("model", &self.model)
+            .field("show_download_progress", &self.show_download_progress)
+            .field("cache_dir", &self.cache_dir)
+            .field("pool_size", &self.pool_size)
+            .field("execution_providers", &providers)
+            .field("sub_batch_size", &self.sub_batch_size)
+            .finish()
+    }
+}
 
 impl Default for EmbeddingConfig {
     fn default() -> Self {
@@ -69,6 +89,42 @@ impl EmbeddingConfig {
             pool_size,
             execution_providers: Vec::new(),
             sub_batch_size: 0,
+        }
+    }
+
+    /// Build from the `[embedding]` config section.
+    pub fn from_settings(settings: &EmbeddingModelConfig) -> Self {
+        #[allow(unused_mut)]
+        let mut execution_providers = Vec::new();
+        if settings.gpu {
+            #[cfg(feature = "cuda")]
+            {
+                execution_providers.push(
+                    ort::ep::CUDA::default()
+                        .with_device_id(settings.device_id)
+                        .build(),
+                );
+                tracing::info!(
+                    device_id = settings.device_id,
+                    "CUDA execution provider configured for embeddings"
+                );
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                tracing::warn!(
+                    "embedding.gpu = true but binary was compiled without --features cuda; falling back to CPU"
+                );
+            }
+        }
+
+        Self {
+            pool_size: match settings.pool_size {
+                0 => DEFAULT_POOL_SIZE,
+                size => size as usize,
+            },
+            execution_providers,
+            sub_batch_size: settings.sub_batch_size as usize,
+            ..Self::default()
         }
     }
 
@@ -123,10 +179,7 @@ impl EmbeddingClient {
         let model_name = format!("{:?}", config.model);
         let desired_pool_size = config.pool_size.max(1);
 
-        // --- Load first instance and measure its memory footprint -----------
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let mem_before = sys.available_memory();
+        let mem_before = Self::available_memory();
 
         let has_gpu_providers = !config.execution_providers.is_empty();
 
@@ -136,8 +189,7 @@ impl EmbeddingClient {
         // covers inference buffers, not just model weights.
         let _ = first_model.embed(vec!["warmup"], None);
 
-        sys.refresh_memory();
-        let mem_after = sys.available_memory();
+        let mem_after = Self::available_memory();
         let per_instance_loaded = mem_before.saturating_sub(mem_after);
 
         // Inference memory grows with batch_size × sequence_length²
@@ -146,7 +198,6 @@ impl EmbeddingClient {
         // workloads (batch=8-32 texts of 1000-2000 tokens each).
         let per_instance_bytes = per_instance_loaded.saturating_mul(3);
 
-        // --- Pool size: min(desired, RAM budget) ----------------------------
         // Budget: 60% of the memory that was available *before* we loaded
         // the first instance (so the first instance counts against it).
         let budget = mem_before * 6 / 10;
@@ -171,7 +222,6 @@ impl EmbeddingClient {
             desired_pool_size
         };
 
-        // --- Load remaining instances ---------------------------------------
         let mut pool = Vec::with_capacity(pool_size);
         pool.push(Arc::new(Mutex::new(first_model)));
 
@@ -205,7 +255,7 @@ impl EmbeddingClient {
     }
 
     fn load_model(config: &EmbeddingConfig) -> Result<TextEmbedding> {
-        let mut init_options = InitOptions::new(config.model.clone())
+        let mut init_options = TextInitOptions::new(config.model.clone())
             .with_show_download_progress(config.show_download_progress)
             .with_execution_providers(Self::execution_providers(config));
         if let Some(ref cache_dir) = config.cache_dir {
@@ -226,10 +276,37 @@ impl EmbeddingClient {
         vec![ort::ep::CPU::default().with_arena_allocator(false).build()]
     }
 
+    fn available_memory() -> u64 {
+        sysinfo::System::new()
+            .map(|mut system| {
+                system.refresh_memory();
+                system.available_memory()
+            })
+            .unwrap_or(0)
+    }
+
+    /// A client with no model loaded, whose every embedding fails, for tests
+    /// that need an `EmbeddingClient` but never embed text successfully.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unloaded() -> Self {
+        Self {
+            pool: Vec::new(),
+            next: AtomicUsize::new(0),
+            dimension: 768,
+            model_name: "unloaded".to_string(),
+            sub_batch_override: 0,
+            gpu: false,
+        }
+    }
+
     /// Round-robin acquire a model instance from the pool.
-    fn acquire(&self) -> Arc<Mutex<TextEmbedding>> {
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
-        self.pool[idx].clone()
+    fn acquire(&self) -> Result<Arc<Mutex<TextEmbedding>>> {
+        let index = self
+            .next
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_rem(self.pool.len())
+            .ok_or_else(|| Error::Other("No embedding model is loaded".to_string()))?;
+        Ok(self.pool[index].clone())
     }
 
     /// Compute sub-batch size based on available system memory.
@@ -247,9 +324,7 @@ impl EmbeddingClient {
             return val;
         }
 
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let available_mb = sys.available_memory() / (1024 * 1024);
+        let available_mb = Self::available_memory() / (1024 * 1024);
 
         if available_mb == 0 {
             return 32;
@@ -291,7 +366,7 @@ impl EmbeddingClient {
     /// Uses `spawn_blocking` because ONNX inference is CPU-bound and would
     /// otherwise block a tokio worker thread.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let model = self.acquire();
+        let model = self.acquire()?;
         let text = text.to_string();
 
         tokio::task::spawn_blocking(move || {
@@ -327,7 +402,7 @@ impl EmbeddingClient {
         let mut handles = Vec::new();
 
         for sub in texts.chunks(sub_batch) {
-            let model = self.acquire();
+            let model = self.acquire()?;
             let sub_owned: Vec<String> = sub.iter().map(|s| s.to_string()).collect();
 
             handles.push(tokio::task::spawn_blocking(move || {
@@ -430,6 +505,32 @@ mod tests {
         if let Err(e) = EmbeddingClient::warmup() {
             eprintln!("Embedding warmup failed (model may be unavailable): {e}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_unloaded_client_fails_to_embed_instead_of_panicking() {
+        let client = EmbeddingClient::unloaded();
+        assert!(client.embed("text").await.is_err());
+        assert!(client.embed_batch(&["text"]).await.is_err());
+    }
+
+    #[test]
+    fn from_settings_defaults_to_one_instance_and_auto_sub_batch() {
+        let config = EmbeddingConfig::from_settings(&EmbeddingModelConfig::default());
+        assert_eq!(config.pool_size, DEFAULT_POOL_SIZE);
+        assert_eq!(config.sub_batch_size, 0);
+        assert!(config.execution_providers.is_empty());
+    }
+
+    #[test]
+    fn from_settings_applies_overrides() {
+        let config = EmbeddingConfig::from_settings(&EmbeddingModelConfig {
+            pool_size: 3,
+            sub_batch_size: 64,
+            ..EmbeddingModelConfig::default()
+        });
+        assert_eq!(config.pool_size, 3);
+        assert_eq!(config.sub_batch_size, 64);
     }
 
     #[test]
@@ -738,16 +839,12 @@ mod tests {
         assert_eq!(cloned.text, Some("test".to_string()));
     }
 
-    // === Coverage tests for EmbeddingConfig::from_env ===
-
     #[test]
     fn test_embedding_config_from_env_returns_valid_config() {
         // from_env always returns a valid config regardless of env state
         let config = EmbeddingConfig::from_env();
         assert!(config.pool_size >= 1);
     }
-
-    // === Coverage tests for compute_sub_batch ===
 
     #[test]
     fn test_compute_sub_batch_without_env_high_dim() {
@@ -784,9 +881,9 @@ mod tests {
     fn test_cpu_sessions_register_the_cpu_provider() {
         let providers = EmbeddingClient::execution_providers(&EmbeddingConfig::default());
         assert_eq!(providers.len(), 1);
-        let provider = format!("{:?}", providers[0]);
-        assert!(
-            provider.starts_with("CPUExecutionProvider"),
+        let provider = providers[0].name();
+        assert_eq!(
+            provider, "CPUExecutionProvider",
             "expected the CPU provider that disables the memory arena, got {provider}"
         );
     }

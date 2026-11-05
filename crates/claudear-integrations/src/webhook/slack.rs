@@ -7,7 +7,7 @@ use claudear_config::config::SlackSourceConfig;
 use claudear_core::error::Result;
 use claudear_core::secret::OptionalSecretExt;
 use claudear_core::types::{Issue, MatchPriority, MatchResult};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;

@@ -7,10 +7,13 @@ use super::types::{
     StoredRepository, UserRow,
 };
 use super::{
-    is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
-    DeployQaStore, DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
-    RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
+    ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
+    EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore, SimilarityStore,
+    UserStore, WebhookStore,
 };
+use crate::vector_index::catalog::Catalog;
+use crate::vector_index::progress::Progress;
+use crate::vector_index::{embedding_blob, embedding_from_blob, REBUILD_BATCH_SIZE};
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::types::{
@@ -19,46 +22,36 @@ use claudear_core::types::{
     IssueEmbedding, IssueTimeline, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment,
     QaKnowledgeEntry, QaMatch, RetrievalUsageRecord, SimilarIssue, SourceStats, TimelineEvent,
 };
+use parking_lot::{Mutex, MutexGuard};
 use rand::RngExt;
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod vector_index_rebuilder;
+
+pub use vector_index_rebuilder::VectorIndexRebuilder;
 
 const DEFAULT_LOG_DIR: &str = "./logs";
 const AUDIT_LOG_SUBDIR: &str = "audit";
-const QA_VECTOR_TABLE: &str = "qa_question_embeddings";
 const QA_VECTOR_EF_SEARCH: usize = 200;
 const QA_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const ISSUE_VECTOR_TABLE: &str = "issue_embedding_vectors";
 const ISSUE_VECTOR_EF_SEARCH: usize = 200;
 const ISSUE_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const OUTCOME_VECTOR_TABLE: &str = "outcome_embedding_vectors";
 const OUTCOME_VECTOR_EF_SEARCH: usize = 200;
 const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
 const CODE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const DISCORD_MESSAGE_CHUNK_VECTOR_TABLE: &str = "discord_message_chunk_vectors";
 const DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
-/// Maximum allowed embedding dimension to prevent malformed data from generating
-/// unbounded DDL strings. Covers all common embedding models (up to 8192-dim).
-const MAX_EMBEDDING_DIMENSION: usize = 16384;
-
-/// Validate that an embedding dimension is within safe bounds for SQL DDL interpolation.
-fn validate_dimension(dimension: usize) -> Result<()> {
-    if dimension == 0 || dimension > MAX_EMBEDDING_DIMENSION {
-        return Err(claudear_core::error::Error::storage(format!(
-            "Embedding dimension {} is out of valid range (1..={})",
-            dimension, MAX_EMBEDDING_DIMENSION
-        )));
-    }
-    Ok(())
-}
+/// `chat_sessions` rows within a `ChatSessionScope` bound as
+/// `:owner_user_id`, `:include_ownerless` and `:include_other_owners`.
+const CHAT_SESSION_IN_SCOPE: &str = "(owner_user_id = :owner_user_id \
+     OR (:include_ownerless AND owner_user_id IS NULL) \
+     OR (:include_other_owners AND owner_user_id IS NOT NULL))";
 
 impl UserRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -108,7 +101,7 @@ fn generate_token_id() -> String {
 ///
 /// # Async Safety
 ///
-/// This implementation uses `std::sync::Mutex` which is appropriate for:
+/// This implementation uses `parking_lot::Mutex` which is appropriate for:
 /// - Short-duration locks (SQLite in-process operations are typically fast)
 /// - Operations that don't hold the lock across `.await` points
 ///
@@ -116,18 +109,20 @@ fn generate_token_id() -> String {
 /// from async contexts without risking thread starvation. The mutex is never
 /// held across await points since all trait methods are synchronous.
 pub struct SqliteTracker {
-    conn: Mutex<Connection>,
-    indexing_tx: tokio::sync::watch::Sender<IndexingProgress>,
+    connection: Mutex<Connection>,
+    indexing_sender: tokio::sync::watch::Sender<IndexingProgress>,
+    vector_indexes: Catalog,
 }
 
 impl SqliteTracker {
     /// Create a new SQLite tracker with the given database path.
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
-        let (indexing_tx, _) = tokio::sync::watch::channel(IndexingProgress::default());
+        let connection = Connection::open(db_path)?;
+        let (indexing_sender, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
-            conn: Mutex::new(conn),
-            indexing_tx,
+            connection: Mutex::new(connection),
+            indexing_sender,
+            vector_indexes: Catalog::new(),
         };
         tracker.init()?;
         Ok(tracker)
@@ -135,11 +130,12 @@ impl SqliteTracker {
 
     /// Create an in-memory SQLite tracker (for testing).
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let (indexing_tx, _) = tokio::sync::watch::channel(IndexingProgress::default());
+        let connection = Connection::open_in_memory()?;
+        let (indexing_sender, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
-            conn: Mutex::new(conn),
-            indexing_tx,
+            connection: Mutex::new(connection),
+            indexing_sender,
+            vector_indexes: Catalog::new(),
         };
         tracker.init()?;
         Ok(tracker)
@@ -147,7 +143,7 @@ impl SqliteTracker {
 
     /// Subscribe to real-time indexing progress updates.
     pub fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
-        self.indexing_tx.subscribe()
+        self.indexing_sender.subscribe()
     }
 
     /// Whether the vectorlite extension can be loaded for this tracker (and, as a
@@ -155,26 +151,99 @@ impl SqliteTracker {
     /// results without it, so callers/tests can gate on this.
     pub fn vectorlite_available(&self) -> bool {
         match self.acquire_lock() {
-            Ok(conn) => try_load_vectorlite(&conn).unwrap_or(false),
+            Ok(connection) => self.vector_indexes.load_extension(&connection),
             Err(_) => false,
         }
     }
 
-    /// Acquire a lock on the database connection, handling poisoned mutex gracefully.
-    fn acquire_lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|e| {
-            claudear_core::error::Error::Storage(format!("Failed to acquire database lock: {}", e))
-        })
+    /// Rebuild every vector index on this connection from its embedding table, handing the
+    /// connection lock to any waiting thread between bounded batches so other database work
+    /// interleaves instead of stalling behind the whole rebuild.
+    pub fn rebuild_vector_indexes(&self) {
+        for index in self.vector_indexes.all() {
+            let started = Instant::now();
+            let mut batches: usize = 0;
+            let mut rows: usize = 0;
+            loop {
+                if self.vector_indexes.is_stopped() {
+                    return;
+                }
+                let connection = match self.acquire_lock() {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to lock the database to rebuild vector indexes");
+                        return;
+                    }
+                };
+                let step = index.rebuild_step(&connection, REBUILD_BATCH_SIZE);
+                MutexGuard::unlock_fair(connection);
+                batches += 1;
+                match step {
+                    Ok(Progress::Pending { rows: batch }) => {
+                        rows += batch;
+                    }
+                    Ok(Progress::Complete { rows: batch }) => {
+                        rows += batch;
+                        tracing::info!(
+                            table = index.table(),
+                            rows,
+                            batches,
+                            batch_size = REBUILD_BATCH_SIZE,
+                            elapsed = ?started.elapsed(),
+                            "Rebuilt vector index"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Skipped) => {
+                        tracing::debug!(
+                            table = index.table(),
+                            "Skipped vector index rebuild; no usable embeddings"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Deferred) => {
+                        tracing::debug!(
+                            table = index.table(),
+                            "Deferred vector index rebuild; it rebuilds on next use"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Unavailable) => {
+                        tracing::debug!(
+                            table = index.table(),
+                            "Skipped vector index rebuild; the index is unavailable on this connection"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Current) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            table = index.table(),
+                            rows,
+                            batches,
+                            elapsed = ?started.elapsed(),
+                            %error,
+                            "Failed to rebuild vector index; it rebuilds on next use"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn acquire_lock(&self) -> Result<MutexGuard<'_, Connection>> {
+        Ok(self.connection.lock())
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
         // These settings optimize SQLite for better throughput in our use case:
         // - Concurrent reads/writes from webhook server and watcher
         // - Moderate write workload with analytics/metrics
         // - BLOB storage for embeddings
-        conn.execute_batch(
+        connection.execute_batch(
             r#"
             -- WAL mode: biggest win for concurrent reads + writes
             -- Note: In-memory DBs will stay in "memory" mode which is fine
@@ -201,16 +270,16 @@ impl SqliteTracker {
         )?;
 
         // Run versioned SQL migrations (tracked in schema_migrations table).
-        super::migrator::run(&conn).map_err(claudear_core::error::Error::Database)?;
+        super::migrator::run(&connection).map_err(claudear_core::error::Error::Database)?;
 
         // Reset any stuck "running" indexing progress rows from a previous crash
-        conn.execute(
+        connection.execute(
             "UPDATE indexing_progress SET status = 'idle' WHERE status = 'running'",
             [],
         )?;
 
         // Update query planner statistics after schema creation
-        conn.execute("ANALYZE", [])?;
+        connection.execute("ANALYZE", [])?;
 
         Ok(())
     }
@@ -239,22 +308,13 @@ impl SqliteTracker {
         match bytes {
             None => Ok(None),
             Some(b) if b.is_empty() => Ok(None),
-            Some(b) => {
-                if b.len() % 4 != 0 {
-                    return Err(rusqlite::Error::InvalidColumnType(
-                        col,
-                        "embedding".to_string(),
-                        rusqlite::types::Type::Blob,
-                    ));
-                }
-                let embedding: Vec<f32> = b
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|chunk| f32::from_le_bytes(*chunk))
-                    .collect();
-                Ok(Some(embedding))
-            }
+            Some(b) => embedding_from_blob(&b).map(Some).ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(
+                    col,
+                    "embedding".to_string(),
+                    rusqlite::types::Type::Blob,
+                )
+            }),
         }
     }
 
@@ -376,305 +436,36 @@ impl SqliteTracker {
     }
 
     fn embedding_to_blob(embedding: Option<&[f32]>) -> Option<Vec<u8>> {
-        embedding.map(|values| {
-            let mut blob = Vec::with_capacity(values.len() * 4);
-            for f in values {
-                blob.extend_from_slice(&f.to_le_bytes());
-            }
-            blob
-        })
+        embedding.map(embedding_blob)
     }
 
     fn blob_to_embedding(blob: Option<Vec<u8>>) -> Option<Vec<f32>> {
-        let blob = blob?;
-        if !blob.len().is_multiple_of(4) {
-            return None;
-        }
-        Some(
-            blob.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
-                .collect(),
-        )
-    }
-
-    fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
-        let exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1 LIMIT 1",
-                params![table_name],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(exists.is_some())
-    }
-
-    fn ensure_qa_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite extension for Q&A search");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, QA_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=10000, ef_construction=200, M=16)
-            )
-            "#,
-            table = QA_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                let backfill_sql = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, question_embedding
-                    FROM qa_knowledge
-                    WHERE question_embedding IS NOT NULL
-                      AND length(question_embedding) = ?1
-                    "#,
-                    table = QA_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill Q&A vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create Q&A vector table");
-                Ok(false)
-            }
-        }
-    }
-
-    fn upsert_qa_vector_embedding(conn: &Connection, qa_id: i64, embedding: &[f32]) -> Result<()> {
-        if embedding.is_empty() {
-            return Ok(());
-        }
-
-        if !Self::ensure_qa_vector_table(conn, embedding.len())? {
-            return Ok(());
-        }
-
-        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", QA_VECTOR_TABLE);
-        let insert_sql = format!(
-            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-            QA_VECTOR_TABLE
-        );
-
-        conn.execute(&delete_sql, params![qa_id])?;
-        conn.execute(&insert_sql, params![qa_id, vector_blob])?;
-        Ok(())
-    }
-
-    /// Ensure the HNSW vector table for issue embeddings exists.
-    /// Returns `true` if the table is available, `false` if vectorlite is not installed.
-    fn ensure_issue_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite extension for issue embeddings");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, ISSUE_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=10000, ef_construction=200, M=16)
-            )
-            "#,
-            table = ISSUE_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                let backfill_sql = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM issues
-                    WHERE embedding IS NOT NULL
-                      AND length(embedding) = ?1
-                    "#,
-                    table = ISSUE_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill issue vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create issue vector table");
-                Ok(false)
-            }
-        }
-    }
-
-    /// Upsert an issue embedding into the HNSW vector table.
-    fn upsert_issue_vector_embedding(
-        conn: &Connection,
-        issue_emb_id: i64,
-        embedding: &[f32],
-    ) -> Result<()> {
-        if embedding.is_empty() {
-            return Ok(());
-        }
-
-        if !Self::ensure_issue_vector_table(conn, embedding.len())? {
-            return Ok(());
-        }
-
-        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", ISSUE_VECTOR_TABLE);
-        let insert_sql = format!(
-            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-            ISSUE_VECTOR_TABLE
-        );
-
-        conn.execute(&delete_sql, params![issue_emb_id])?;
-        conn.execute(&insert_sql, params![issue_emb_id, vector_blob])?;
-        Ok(())
-    }
-
-    /// Ensure the HNSW vector table for outcome embeddings exists.
-    fn ensure_outcome_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite extension for outcome embeddings");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, OUTCOME_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=10000, ef_construction=200, M=16)
-            )
-            "#,
-            table = OUTCOME_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                let backfill_sql = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM feedback_outcomes
-                    WHERE embedding IS NOT NULL
-                      AND length(embedding) = ?1
-                    "#,
-                    table = OUTCOME_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill outcome vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create outcome vector table");
-                Ok(false)
-            }
-        }
-    }
-
-    /// Upsert an outcome embedding into the HNSW vector table.
-    fn upsert_outcome_vector_embedding(
-        conn: &Connection,
-        outcome_id: i64,
-        embedding: &[f32],
-    ) -> Result<()> {
-        if embedding.is_empty() {
-            return Ok(());
-        }
-
-        if !Self::ensure_outcome_vector_table(conn, embedding.len())? {
-            return Ok(());
-        }
-
-        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", OUTCOME_VECTOR_TABLE);
-        let insert_sql = format!(
-            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-            OUTCOME_VECTOR_TABLE
-        );
-
-        conn.execute(&delete_sql, params![outcome_id])?;
-        conn.execute(&insert_sql, params![outcome_id, vector_blob])?;
-        Ok(())
+        embedding_from_blob(&blob?)
     }
 
     fn query_qa_matches_vector_scoped(
-        conn: &Connection,
+        &self,
+        connection: &Connection,
         source: &str,
         repo: Option<&str>,
         question_embedding: &[f32],
         threshold: f64,
         limit: usize,
-        candidate_limit: usize,
     ) -> Result<Option<Vec<QaMatch>>> {
-        if question_embedding.is_empty() || limit == 0 || candidate_limit == 0 {
+        if question_embedding.is_empty() || limit == 0 {
             return Ok(Some(Vec::new()));
         }
 
-        if !Self::ensure_qa_vector_table(conn, question_embedding.len())? {
+        if !self
+            .vector_indexes
+            .qa
+            .prepare_search(connection, question_embedding.len())?
+        {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = question_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(question_embedding);
+        let candidate_limit = limit.saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER);
 
         let sql = format!(
             r#"
@@ -719,18 +510,18 @@ impl SqliteTracker {
             ORDER BY final_score DESC, answered_at DESC
             LIMIT ?7
             "#,
-            table = QA_VECTOR_TABLE
+            table = self.vector_indexes.qa.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare scoped Q&A vector ranking query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare scoped Q&A vector ranking query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -743,8 +534,8 @@ impl SqliteTracker {
             Self::row_to_qa_match,
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Scoped Q&A vector ranking query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Scoped Q&A vector ranking query failed");
                 return Ok(None);
             }
         };
@@ -752,8 +543,8 @@ impl SqliteTracker {
         let mut matches = Vec::new();
         for row in rows {
             match row {
-                Ok(m) => matches.push(m),
-                Err(e) => tracing::debug!(error = %e, "Failed to read scoped Q&A vector row"),
+                Ok(qa_match) => matches.push(qa_match),
+                Err(error) => tracing::debug!(%error, "Failed to read scoped Q&A vector row"),
             }
         }
 
@@ -761,24 +552,26 @@ impl SqliteTracker {
     }
 
     fn query_qa_matches_vector_global(
-        conn: &Connection,
+        &self,
+        connection: &Connection,
         question_embedding: &[f32],
         threshold: f64,
         limit: usize,
-        candidate_limit: usize,
     ) -> Result<Option<Vec<QaMatch>>> {
-        if question_embedding.is_empty() || limit == 0 || candidate_limit == 0 {
+        if question_embedding.is_empty() || limit == 0 {
             return Ok(Some(Vec::new()));
         }
 
-        if !Self::ensure_qa_vector_table(conn, question_embedding.len())? {
+        if !self
+            .vector_indexes
+            .qa
+            .prepare_search(connection, question_embedding.len())?
+        {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = question_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(question_embedding);
+        let candidate_limit = limit.saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER);
 
         let sql = format!(
             r#"
@@ -821,18 +614,18 @@ impl SqliteTracker {
             ORDER BY final_score DESC, answered_at DESC
             LIMIT ?5
             "#,
-            table = QA_VECTOR_TABLE
+            table = self.vector_indexes.qa.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare global Q&A vector ranking query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare global Q&A vector ranking query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -843,8 +636,8 @@ impl SqliteTracker {
             Self::row_to_qa_match,
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Global Q&A vector ranking query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Global Q&A vector ranking query failed");
                 return Ok(None);
             }
         };
@@ -852,8 +645,8 @@ impl SqliteTracker {
         let mut matches = Vec::new();
         for row in rows {
             match row {
-                Ok(m) => matches.push(m),
-                Err(e) => tracing::debug!(error = %e, "Failed to read global Q&A vector row"),
+                Ok(qa_match) => matches.push(qa_match),
+                Err(error) => tracing::debug!(%error, "Failed to read global Q&A vector row"),
             }
         }
 
@@ -3229,8 +3022,6 @@ impl ActivityStore for SqliteTracker {
             events: rows.into_iter().map(TimelineEvent::from).collect(),
         })
     }
-
-    // --- Code Indexing ---
 }
 
 impl KnowledgeStore for SqliteTracker {
@@ -3525,22 +3316,15 @@ impl EmbeddingStore for SqliteTracker {
 
     /// Store an issue embedding.
     fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
-        // Serialize the embedding vector to bytes if present
-        let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|emb| {
-            let mut bytes = Vec::with_capacity(emb.len() * 4);
-            for f in emb {
-                bytes.extend_from_slice(&f.to_le_bytes());
-            }
-            bytes
-        });
+        let embedding_bytes = embedding.embedding.as_deref().map(embedding_blob);
 
-        let updated_at_str = embedding
+        let updated_at = embedding
             .updated_at
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+            .map(|date| date.format("%Y-%m-%d %H:%M:%S").to_string());
 
-        conn.execute(
+        connection.execute(
             r#"
             INSERT INTO issues (source, issue_id, short_id, title, description, url, priority, status, labels, embedding, embedding_model, created_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -3569,20 +3353,19 @@ impl EmbeddingStore for SqliteTracker {
                 embedding_bytes,
                 embedding.embedding_model,
                 embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                updated_at_str,
+                updated_at,
             ],
         )?;
 
-        // Dual-write: upsert into HNSW vector table (get row ID reliably via SELECT)
-        let row_id: i64 = conn.query_row(
+        let row_id: i64 = connection.query_row(
             "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
             params![embedding.source, embedding.issue_id],
             |row| row.get(0),
         )?;
-        if let Some(ref emb) = embedding.embedding {
-            if let Err(e) = Self::upsert_issue_vector_embedding(&conn, row_id, emb) {
-                tracing::debug!(error = %e, "Failed to upsert issue vector embedding");
-            }
+        if let Some(values) = &embedding.embedding {
+            self.vector_indexes
+                .issue
+                .upsert(&connection, row_id, values);
         }
 
         Ok(row_id)
@@ -3596,11 +3379,12 @@ impl EmbeddingStore for SqliteTracker {
         if embeddings.is_empty() {
             return Ok(());
         }
-        let mut conn = self.acquire_lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut vectors: Vec<(i64, &[f32])> = Vec::new();
 
         {
-            let mut stmt = tx.prepare_cached(
+            let mut statement = transaction.prepare_cached(
                 r#"
                 INSERT INTO issues (source, issue_id, short_id, title, description, url, priority, status, labels, embedding, embedding_model, created_at, updated_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -3619,19 +3403,13 @@ impl EmbeddingStore for SqliteTracker {
             )?;
 
             for embedding in embeddings {
-                let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|emb| {
-                    let mut bytes = Vec::with_capacity(emb.len() * 4);
-                    for f in emb {
-                        bytes.extend_from_slice(&f.to_le_bytes());
-                    }
-                    bytes
-                });
+                let embedding_bytes = embedding.embedding.as_deref().map(embedding_blob);
 
-                let updated_at_str = embedding
+                let updated_at = embedding
                     .updated_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                    .map(|date| date.format("%Y-%m-%d %H:%M:%S").to_string());
 
-                stmt.execute(params![
+                statement.execute(params![
                     embedding.source,
                     embedding.issue_id,
                     embedding.short_id,
@@ -3644,24 +3422,26 @@ impl EmbeddingStore for SqliteTracker {
                     embedding_bytes,
                     embedding.embedding_model,
                     embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    updated_at_str,
+                    updated_at,
                 ])?;
 
-                // Dual-write: upsert into HNSW vector table
-                let row_id: i64 = tx.query_row(
-                    "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
-                    params![embedding.source, embedding.issue_id],
-                    |row| row.get(0),
-                )?;
-                if let Some(ref emb) = embedding.embedding {
-                    if let Err(e) = Self::upsert_issue_vector_embedding(&tx, row_id, emb) {
-                        tracing::debug!(error = %e, "Failed to upsert issue vector embedding in batch");
-                    }
+                if let Some(values) = &embedding.embedding {
+                    let row_id: i64 = transaction.query_row(
+                        "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
+                        params![embedding.source, embedding.issue_id],
+                        |row| row.get(0),
+                    )?;
+                    vectors.push((row_id, values));
                 }
             }
         }
 
-        tx.commit()?;
+        transaction.commit()?;
+        for (row_id, values) in vectors {
+            self.vector_indexes
+                .issue
+                .upsert(&connection, row_id, values);
+        }
         Ok(())
     }
 
@@ -3768,16 +3548,14 @@ impl EmbeddingStore for SqliteTracker {
             return Ok(Some(Vec::new()));
         }
 
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.issue;
 
-        if !Self::ensure_issue_vector_table(&conn, query_embedding.len())? {
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * ISSUE_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
@@ -3799,18 +3577,18 @@ impl EmbeddingStore for SqliteTracker {
             ORDER BY c.similarity DESC
             LIMIT ?7
             "#,
-            table = ISSUE_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare issue vector search query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare issue vector search query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -3821,14 +3599,14 @@ impl EmbeddingStore for SqliteTracker {
                 limit as i64
             ],
             |row| {
-                let ie = Self::row_to_issue_embedding(row, 9)?;
+                let issue = Self::row_to_issue_embedding(row, 9)?;
                 let similarity: f64 = row.get(8)?;
-                Ok((ie, similarity))
+                Ok((issue, similarity))
             },
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Issue vector search query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Issue vector search query failed");
                 return Ok(None);
             }
         };
@@ -3836,8 +3614,8 @@ impl EmbeddingStore for SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read issue vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read issue vector row"),
             }
         }
 
@@ -3858,16 +3636,14 @@ impl EmbeddingStore for SqliteTracker {
             return Ok(Some(Vec::new()));
         }
 
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.outcome;
 
-        if !Self::ensure_outcome_vector_table(&conn, query_embedding.len())? {
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * OUTCOME_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
@@ -3887,18 +3663,18 @@ impl EmbeddingStore for SqliteTracker {
             ORDER BY c.similarity DESC
             LIMIT ?5
             "#,
-            table = OUTCOME_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare outcome vector search query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare outcome vector search query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -3907,48 +3683,36 @@ impl EmbeddingStore for SqliteTracker {
                 limit as i64
             ],
             |row| {
-                let outcome_str: String = row.get(6)?;
-                let keywords_str: Option<String> = row.get(9)?;
-                let created_at_str: String = row.get(10)?;
+                let outcome: String = row.get(6)?;
+                let keywords: Option<String> = row.get(9)?;
+                let created_at: String = row.get(10)?;
 
-                // Deserialize embedding BLOB if present
-                let embedding_blob: Option<Vec<u8>> = row.get(11)?;
-                let embedding = embedding_blob.and_then(|blob| {
-                    if blob.len() % 4 != 0 {
-                        return None;
-                    }
-                    Some(
-                        blob.as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|chunk| f32::from_le_bytes(*chunk))
-                            .collect(),
-                    )
-                });
+                let blob: Option<Vec<u8>> = row.get(11)?;
+                let embedding = blob.as_deref().and_then(embedding_from_blob);
 
-                let fo = FixOutcome {
+                let fix_outcome = FixOutcome {
                     id: row.get(0)?,
                     attempt_id: row.get(1)?,
                     source: row.get(2)?,
                     issue_id: row.get(3)?,
                     issue_text: row.get(4)?,
                     prompt_used: row.get(5)?,
-                    outcome: Outcome::parse(&outcome_str).unwrap_or(Outcome::Failed),
+                    outcome: Outcome::parse(&outcome).unwrap_or(Outcome::Failed),
                     error_type: row.get(7)?,
                     learnings: row.get(8)?,
-                    keywords: keywords_str
-                        .and_then(|s| serde_json::from_str(&s).ok())
+                    keywords: keywords
+                        .and_then(|keywords| serde_json::from_str(&keywords).ok())
                         .unwrap_or_default(),
                     embedding,
-                    created_at: Self::parse_datetime(&created_at_str)?,
+                    created_at: Self::parse_datetime(&created_at)?,
                 };
                 let similarity: f64 = row.get(12)?;
-                Ok((fo, similarity))
+                Ok((fix_outcome, similarity))
             },
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Outcome vector search query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Outcome vector search query failed");
                 return Ok(None);
             }
         };
@@ -3956,8 +3720,8 @@ impl EmbeddingStore for SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read outcome vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read outcome vector row"),
             }
         }
 
@@ -4282,8 +4046,6 @@ impl RepoStore for SqliteTracker {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
-
-    // --- Analytics ---
 
     fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
         SqliteTracker::get_or_create_repo_id(self, name)
@@ -4688,6 +4450,14 @@ impl DeployQaStore for SqliteTracker {
         SqliteTracker::get_last_seen_deploy_qa_tip(self, track)
     }
 
+    fn list_deploy_qa_tips(
+        &self,
+        track: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::list_deploy_qa_tips(self, track, limit)
+    }
+
     fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
         SqliteTracker::list_pending_deploy_qa_tips(self)
     }
@@ -4730,34 +4500,56 @@ impl DeployQaStore for SqliteTracker {
 }
 
 impl ChatStore for SqliteTracker {
-    fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
-        SqliteTracker::create_chat_session(self, id, repo_id)
+    fn create_chat_session(
+        &self,
+        id: &str,
+        repo_id: Option<i64>,
+        owner_user_id: Option<i64>,
+    ) -> Result<()> {
+        SqliteTracker::create_chat_session(self, id, repo_id, owner_user_id)
+    }
+
+    fn get_chat_session(
+        &self,
+        id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Option<claudear_core::types::ChatSession>> {
+        SqliteTracker::get_chat_session(self, id, scope)
     }
 
     fn save_chat_message(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         role: &str,
         content: &str,
         sources_json: Option<&str>,
-    ) -> Result<i64> {
-        SqliteTracker::save_chat_message(self, session_id, role, content, sources_json)
+    ) -> Result<Option<i64>> {
+        SqliteTracker::save_chat_message(self, session_id, scope, role, content, sources_json)
     }
 
     fn get_chat_history(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         limit: usize,
     ) -> Result<Vec<claudear_core::types::ChatMessage>> {
-        SqliteTracker::get_chat_history(self, session_id, limit)
+        SqliteTracker::get_chat_history(self, session_id, scope, limit)
     }
 
-    fn list_chat_sessions(&self) -> Result<Vec<claudear_core::types::ChatSession>> {
-        SqliteTracker::list_chat_sessions(self)
+    fn list_chat_sessions(
+        &self,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Vec<claudear_core::types::ChatSession>> {
+        SqliteTracker::list_chat_sessions(self, scope)
     }
 
-    fn delete_chat_session(&self, session_id: &str) -> Result<()> {
-        SqliteTracker::delete_chat_session(self, session_id)
+    fn delete_chat_session(
+        &self,
+        session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<bool> {
+        SqliteTracker::delete_chat_session(self, session_id, scope)
     }
 
     fn cleanup_expired_chat_sessions(&self, max_age_days: u32) -> Result<usize> {
@@ -5738,16 +5530,12 @@ impl SqliteTracker {
 
     /// Store a feedback outcome to the database.
     pub fn store_feedback_outcome(&self, outcome: &FixOutcome) -> Result<i64> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         let keywords_json = serde_json::to_string(&outcome.keywords).unwrap_or_default();
 
-        // Serialize embedding to BLOB if present
-        let embedding_blob: Option<Vec<u8>> = outcome
-            .embedding
-            .as_ref()
-            .map(|emb| emb.iter().flat_map(|f| f.to_le_bytes()).collect());
+        let blob = outcome.embedding.as_deref().map(embedding_blob);
 
-        conn.execute(
+        connection.execute(
             r#"
             INSERT INTO feedback_outcomes (attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at, embedding)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -5763,16 +5551,15 @@ impl SqliteTracker {
                 outcome.learnings,
                 keywords_json,
                 outcome.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                embedding_blob,
+                blob,
             ],
         )?;
-        let row_id = conn.last_insert_rowid();
+        let row_id = connection.last_insert_rowid();
 
-        // Dual-write: upsert into HNSW vector table if embedding is present
-        if let Some(ref emb) = outcome.embedding {
-            if let Err(e) = Self::upsert_outcome_vector_embedding(&conn, row_id, emb) {
-                tracing::debug!(error = %e, "Failed to upsert outcome vector embedding");
-            }
+        if let Some(values) = &outcome.embedding {
+            self.vector_indexes
+                .outcome
+                .upsert(&connection, row_id, values);
         }
 
         Ok(row_id)
@@ -5838,9 +5625,9 @@ impl SqliteTracker {
 
     /// Store a Q&A knowledge entry.
     pub fn store_qa_knowledge(&self, entry: &QaKnowledgeEntry) -> Result<i64> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
-        conn.execute(
+        connection.execute(
             r#"
             INSERT INTO qa_knowledge (
                 source, repo, issue_id, short_id, question_text, question_norm, question_embedding,
@@ -5868,21 +5655,17 @@ impl SqliteTracker {
                 entry.failure_count,
                 entry
                     .last_used_at
-                    .map(|v| v.format("%Y-%m-%d %H:%M:%S").to_string()),
-                entry.metadata.as_ref().map(|m| m.to_string()),
+                    .map(|date| date.format("%Y-%m-%d %H:%M:%S").to_string()),
+                entry.metadata.as_ref().map(|metadata| metadata.to_string()),
             ],
         )?;
 
-        let qa_id = conn.last_insert_rowid();
+        let qa_id = connection.last_insert_rowid();
 
         if let Some(question_embedding) = entry.question_embedding.as_deref() {
-            if let Err(e) = Self::upsert_qa_vector_embedding(&conn, qa_id, question_embedding) {
-                tracing::debug!(
-                    qa_id = qa_id,
-                    error = %e,
-                    "Failed to sync Q&A vector embedding; falling back to SQL ranking"
-                );
-            }
+            self.vector_indexes
+                .qa
+                .upsert(&connection, qa_id, question_embedding);
         }
 
         Ok(qa_id)
@@ -5898,20 +5681,16 @@ impl SqliteTracker {
         threshold: f64,
         limit: usize,
     ) -> Result<Vec<QaMatch>> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
         if let Some(query_embedding) = question_embedding {
-            let candidate_limit = limit
-                .saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER)
-                .max(limit);
-            if let Some(vector_matches) = Self::query_qa_matches_vector_scoped(
-                &conn,
+            if let Some(vector_matches) = self.query_qa_matches_vector_scoped(
+                &connection,
                 source,
                 repo,
                 query_embedding,
                 threshold,
                 limit,
-                candidate_limit,
             )? {
                 if !vector_matches.is_empty() {
                     return Ok(vector_matches);
@@ -5919,7 +5698,14 @@ impl SqliteTracker {
             }
         }
 
-        Self::query_qa_matches_exact_scoped(&conn, source, repo, question_norm, threshold, limit)
+        Self::query_qa_matches_exact_scoped(
+            &connection,
+            source,
+            repo,
+            question_norm,
+            threshold,
+            limit,
+        )
     }
 
     /// Find semantically similar Q&A entries globally.
@@ -5930,26 +5716,19 @@ impl SqliteTracker {
         threshold: f64,
         limit: usize,
     ) -> Result<Vec<QaMatch>> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
         if let Some(query_embedding) = question_embedding {
-            let candidate_limit = limit
-                .saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER)
-                .max(limit);
-            if let Some(vector_matches) = Self::query_qa_matches_vector_global(
-                &conn,
-                query_embedding,
-                threshold,
-                limit,
-                candidate_limit,
-            )? {
+            if let Some(vector_matches) =
+                self.query_qa_matches_vector_global(&connection, query_embedding, threshold, limit)?
+            {
                 if !vector_matches.is_empty() {
                     return Ok(vector_matches);
                 }
             }
         }
 
-        Self::query_qa_matches_exact_global(&conn, question_norm, threshold, limit)
+        Self::query_qa_matches_exact_global(&connection, question_norm, threshold, limit)
     }
 
     /// Record usage of a Q&A entry for an attempt.
@@ -6186,20 +5965,8 @@ impl SqliteTracker {
         let keywords_str: Option<String> = row.get(9)?;
         let created_at_str: String = row.get(10)?;
 
-        // Deserialize embedding BLOB if present (column 11)
-        let embedding_blob: Option<Vec<u8>> = row.get(11).unwrap_or(None);
-        let embedding = embedding_blob.and_then(|blob| {
-            if blob.len() % 4 != 0 {
-                return None;
-            }
-            Some(
-                blob.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|chunk| f32::from_le_bytes(*chunk))
-                    .collect(),
-            )
-        });
+        let blob: Option<Vec<u8>> = row.get(11).unwrap_or(None);
+        let embedding = blob.as_deref().and_then(embedding_from_blob);
 
         Ok(FixOutcome {
             id: row.get(0)?,
@@ -6651,13 +6418,14 @@ impl SqliteTracker {
 
     /// Clear all repositories and dependencies from the database.
     pub fn clear_repositories(&self) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute_batch(
+        let connection = self.acquire_lock()?;
+        connection.execute_batch(
             r#"
             DELETE FROM repository_dependencies;
             DELETE FROM repositories;
             "#,
         )?;
+        self.vector_indexes.code_chunk.reset(&connection);
         Ok(())
     }
 
@@ -6903,8 +6671,8 @@ impl SqliteTracker {
     /// Start indexing progress tracking.
     pub fn start_indexing_progress(&self, total_repos: usize) -> Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let conn = self.acquire_lock()?;
-        conn.execute(
+        let connection = self.acquire_lock()?;
+        connection.execute(
             r#"
             UPDATE indexing_progress SET
                 status = 'running',
@@ -6919,7 +6687,7 @@ impl SqliteTracker {
             "#,
             params![total_repos as i64, &now],
         )?;
-        drop(conn);
+        drop(connection);
         let new_value = IndexingProgress {
             status: "running".to_string(),
             total_repos,
@@ -6927,7 +6695,7 @@ impl SqliteTracker {
             updated_at: Some(now),
             ..Default::default()
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -6947,15 +6715,15 @@ impl SqliteTracker {
         total_files_indexed: usize,
     ) -> Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         // Read total_repos and started_at from DB (avoid borrowing the watch channel
-        // while the conn lock is held).
-        let (db_total_repos, db_started_at): (i64, Option<String>) = conn.query_row(
+        // while the connection lock is held).
+        let (db_total_repos, db_started_at): (i64, Option<String>) = connection.query_row(
             "SELECT total_repos, started_at FROM indexing_progress WHERE id = 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        conn.execute(
+        connection.execute(
             r#"
             UPDATE indexing_progress SET
                 indexed_repos = ?1,
@@ -6973,7 +6741,7 @@ impl SqliteTracker {
                 &now,
             ],
         )?;
-        drop(conn);
+        drop(connection);
         let new_value = IndexingProgress {
             status: "running".to_string(),
             total_repos: db_total_repos as usize,
@@ -6984,7 +6752,7 @@ impl SqliteTracker {
             started_at: db_started_at,
             updated_at: Some(now),
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -6998,15 +6766,15 @@ impl SqliteTracker {
     /// Mark indexing as complete.
     pub fn finish_indexing_progress(&self) -> Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         // Read values from DB before the UPDATE (avoid borrowing the watch channel
-        // while the conn lock is held).
-        let db_total_repos: i64 = conn.query_row(
+        // while the connection lock is held).
+        let db_total_repos: i64 = connection.query_row(
             "SELECT total_repos FROM indexing_progress WHERE id = 1",
             [],
             |row| row.get(0),
         )?;
-        conn.execute(
+        connection.execute(
             r#"
             UPDATE indexing_progress SET
                 status = 'idle',
@@ -7020,7 +6788,7 @@ impl SqliteTracker {
             "#,
             params![&now],
         )?;
-        drop(conn);
+        drop(connection);
         let new_value = IndexingProgress {
             status: "idle".to_string(),
             total_repos: db_total_repos as usize,
@@ -7029,7 +6797,7 @@ impl SqliteTracker {
             updated_at: Some(now),
             ..Default::default()
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -8209,6 +7977,33 @@ impl SqliteTracker {
             .optional()?)
     }
 
+    /// Most recent tips first, across every track or only `track`, at most
+    /// `limit` of them.
+    pub fn list_deploy_qa_tips(
+        &self,
+        track: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE (?1 IS NULL OR track = ?1)
+            ORDER BY CAST(COALESCE(strftime('%s', published_at), strftime('%s', created_at)) AS INTEGER) DESC,
+                     id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let tips = stmt
+            .query_map(params![track, limit], Self::row_to_deploy_qa_tip)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tips)
+    }
+
     /// Tips waiting to be picked up by the `deploy_qa` source.
     pub fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
         use claudear_core::types::DeployQaTipStatus;
@@ -9265,18 +9060,21 @@ impl SqliteTracker {
 
     /// Delete all code symbols, chunks, and embeddings for a specific file.
     pub fn delete_code_data_for_file(&self, repo_id: i64, file_path: &str) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Embeddings are CASCADE-deleted via code_chunks FK.
-        tx.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids = Self::code_chunk_embedding_ids(&transaction, repo_id, Some(file_path))?;
+        transaction.execute(
             "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
             params![repo_id, file_path],
         )?;
-        tx.execute(
+        transaction.execute(
             "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
             params![repo_id, file_path],
         )?;
-        tx.commit()?;
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
@@ -9285,75 +9083,119 @@ impl SqliteTracker {
         if chunk_ids.is_empty() {
             return Ok(());
         }
-        let conn = self.acquire_lock()?;
-        let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
-        let sql = format!(
-            "DELETE FROM code_chunks WHERE id IN ({})",
-            placeholders.join(", ")
-        );
-        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        conn.execute(&sql, params.as_slice())?;
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids = Self::code_chunk_embedding_ids_for_chunks(&transaction, chunk_ids)?;
+        {
+            let mut statement =
+                transaction.prepare_cached("DELETE FROM code_chunks WHERE id = ?1")?;
+            for chunk_id in chunk_ids {
+                statement.execute(params![chunk_id])?;
+            }
+        }
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
     /// Remove code data for files that no longer exist in the repository.
     pub fn cleanup_stale_code_data(&self, repo_id: i64, current_paths: &[String]) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-
         if current_paths.is_empty() {
-            // No source files found — delete ALL code data for this repo.
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "DELETE FROM code_symbols WHERE repo_id = ?1",
-                params![repo_id],
-            )?;
-            tx.execute(
-                "DELETE FROM code_chunks WHERE repo_id = ?1",
-                params![repo_id],
-            )?;
-            tx.commit()?;
+            return self.delete_all_code_data_for_repo(repo_id);
+        }
+
+        let current: HashSet<&str> = current_paths.iter().map(String::as_str).collect();
+        let mut connection = self.acquire_lock()?;
+        if Self::stale_code_file_paths(&connection, repo_id, &current)?.is_empty() {
             return Ok(());
         }
 
-        // Get all file paths we have indexed for this repo.
-        // code_chunks is the primary artifact; stale symbols are cleaned up
-        // via delete_code_data_for_file which deletes both tables.
-        let indexed_paths: Vec<String> = {
-            let mut stmt =
-                conn.prepare("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
-            let rows: Vec<String> = stmt
-                .query_map(params![repo_id], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        };
-
-        let current_set: std::collections::HashSet<&str> =
-            current_paths.iter().map(|s| s.as_str()).collect();
-
-        let stale_paths: Vec<&String> = indexed_paths
-            .iter()
-            .filter(|p| !current_set.contains(p.as_str()))
-            .collect();
-
-        if !stale_paths.is_empty() {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_paths = Self::stale_code_file_paths(&transaction, repo_id, &current)?;
+        let mut embedding_ids = Vec::new();
+        {
+            let mut delete_symbols = transaction
+                .prepare_cached("DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2")?;
+            let mut delete_chunks = transaction
+                .prepare_cached("DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2")?;
             for path in &stale_paths {
-                tx.execute(
-                    "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
-                    params![repo_id, path],
-                )?;
-                tx.execute(
-                    "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
-                    params![repo_id, path],
-                )?;
+                embedding_ids.extend(Self::code_chunk_embedding_ids(
+                    &transaction,
+                    repo_id,
+                    Some(path),
+                )?);
+                delete_symbols.execute(params![repo_id, path])?;
+                delete_chunks.execute(params![repo_id, path])?;
             }
-            tx.commit()?;
         }
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
+    }
+
+    fn stale_code_file_paths(
+        connection: &Connection,
+        repository_id: i64,
+        current_paths: &HashSet<&str>,
+    ) -> Result<Vec<String>> {
+        let mut statement = connection
+            .prepare_cached("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
+        let mut stale = Vec::new();
+        for path in statement.query_map(params![repository_id], |row| row.get::<_, String>(0))? {
+            let path = path?;
+            if !current_paths.contains(path.as_str()) {
+                stale.push(path);
+            }
+        }
+        Ok(stale)
+    }
+
+    fn code_chunk_embedding_ids(
+        connection: &Connection,
+        repository_id: i64,
+        file_path: Option<&str>,
+    ) -> Result<Vec<i64>> {
+        let (sql, parameters) = match file_path {
+            Some(_) => (
+                "SELECT e.id FROM code_chunk_embeddings e
+                 JOIN code_chunks c ON c.id = e.chunk_id
+                 WHERE c.repo_id = ?1 AND c.file_path = ?2",
+                params![repository_id, file_path],
+            ),
+            None => (
+                "SELECT e.id FROM code_chunk_embeddings e
+                 JOIN code_chunks c ON c.id = e.chunk_id
+                 WHERE c.repo_id = ?1",
+                params![repository_id],
+            ),
+        };
+        let ids = connection
+            .prepare_cached(sql)?
+            .query_map(parameters, |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
+
+    fn code_chunk_embedding_ids_for_chunks(
+        connection: &Connection,
+        chunk_ids: &[i64],
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection
+            .prepare_cached("SELECT id FROM code_chunk_embeddings WHERE chunk_id = ?1")?;
+        let mut ids = Vec::with_capacity(chunk_ids.len());
+        for chunk_id in chunk_ids {
+            if let Some(id) = statement
+                .query_row(params![chunk_id], |row| row.get(0))
+                .optional()?
+            {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     /// Batch-save extracted code symbols.
@@ -9434,99 +9276,26 @@ impl SqliteTracker {
             return Ok(());
         }
 
-        let mut conn = self.acquire_lock()?;
-
-        let dimension = pairs[0].1.len();
-        let _ = Self::ensure_code_chunk_vector_table(&conn, dimension);
-
-        let has_vector_table = Self::table_exists(&conn, CODE_CHUNK_VECTOR_TABLE)?;
-
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut embedding_ids = Vec::with_capacity(pairs.len());
         {
-            let mut stmt = tx.prepare(
+            let mut statement = transaction.prepare(
                 "INSERT INTO code_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
             )?;
-
             for &(chunk_id, embedding) in pairs {
-                let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-                stmt.execute(params![chunk_id, blob, model_name])?;
-
-                if has_vector_table {
-                    let emb_id = tx.last_insert_rowid();
-                    let insert_sql = format!(
-                        "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-                        CODE_CHUNK_VECTOR_TABLE
-                    );
-                    if let Err(e) = tx.execute(&insert_sql, params![emb_id, blob]) {
-                        tracing::warn!(error = %e, chunk_id, "Failed to insert into code chunk vector table — aborting batch");
-                        // Drop tx without commit to roll back the entire batch,
-                        // so embeddings and vector index stay consistent.
-                        return Err(e.into());
-                    }
-                }
+                statement.execute(params![chunk_id, embedding_blob(embedding), model_name])?;
+                embedding_ids.push(transaction.last_insert_rowid());
             }
         }
+        transaction.commit()?;
 
-        tx.commit()?;
+        for (embedding_id, &(_, embedding)) in embedding_ids.into_iter().zip(pairs) {
+            self.vector_indexes
+                .code_chunk
+                .upsert(&connection, embedding_id, embedding);
+        }
         Ok(())
-    }
-
-    /// Lazily create the HNSW vector table for code chunk embeddings.
-    fn ensure_code_chunk_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite for code chunk search");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, CODE_CHUNK_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=100000, ef_construction=200, M=16)
-            )
-            "#,
-            table = CODE_CHUNK_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                // Backfill existing embeddings.
-                let backfill = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM code_chunk_embeddings
-                    WHERE length(embedding) = ?1
-                    "#,
-                    table = CODE_CHUNK_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill code chunk vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create code chunk vector table");
-                Ok(false)
-            }
-        }
     }
 
     /// Search code chunks by vector similarity using HNSW index.
@@ -9545,23 +9314,20 @@ impl SqliteTracker {
         // Clamp limit to prevent excessive memory usage from the HNSW candidate multiplier.
         let limit = limit.min(1000);
 
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.code_chunk;
 
-        if !Self::ensure_code_chunk_vector_table(&conn, query_embedding.len())? {
-            // Vectorlite unavailable — fall back to empty results.
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(Vec::new());
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
             r#"
             WITH candidates AS (
-                SELECT rowid AS emb_id,
+                SELECT rowid AS embedding_id,
                        MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
                 FROM {table}
                 WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
@@ -9571,24 +9337,24 @@ impl SqliteTracker {
                    ch.language, ch.start_line, ch.end_line, ch.chunk_text,
                    ch.context_text, ch.file_hash
             FROM candidates c
-            JOIN code_chunk_embeddings e ON e.id = c.emb_id
+            JOIN code_chunk_embeddings e ON e.id = c.embedding_id
             JOIN code_chunks ch ON ch.id = e.chunk_id
             WHERE (?4 IS NULL OR ch.repo_id = ?4)
             ORDER BY c.similarity DESC
             LIMIT ?5
             "#,
-            table = CODE_CHUNK_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare code chunk vector search");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare code chunk vector search");
                 return Ok(Vec::new());
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -9598,7 +9364,7 @@ impl SqliteTracker {
             ],
             |row| {
                 let similarity: f64 = row.get(0)?;
-                let lang_str: String = row.get(6)?;
+                let language: String = row.get(6)?;
                 let chunk_text: String = row.get(9)?;
                 let stored_prefix: String = row.get(10)?;
                 // Reconstruct full context_text from stored prefix + chunk_text.
@@ -9611,7 +9377,7 @@ impl SqliteTracker {
                         file_path: row.get(3)?,
                         chunk_type: row.get(4)?,
                         symbol_name: row.get(5)?,
-                        language: parse_language(&lang_str),
+                        language: parse_language(&language),
                         start_line: row.get::<_, i64>(7)? as usize,
                         end_line: row.get::<_, i64>(8)? as usize,
                         chunk_text,
@@ -9623,9 +9389,9 @@ impl SqliteTracker {
                 })
             },
         ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(error = %e, "Code chunk vector search failed");
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(%error, "Code chunk vector search failed");
                 return Ok(Vec::new());
             }
         };
@@ -9633,8 +9399,8 @@ impl SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read code chunk vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read code chunk vector row"),
             }
         }
 
@@ -9692,124 +9458,58 @@ impl SqliteTracker {
             return Ok(());
         }
 
-        let mut conn = self.acquire_lock()?;
-
-        let dimension = pairs[0].1.len();
-        let _ = Self::ensure_discord_chunk_vector_table(&conn, dimension);
-
-        let has_vector_table = Self::table_exists(&conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)?;
-
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut saved = Vec::with_capacity(pairs.len());
         {
-            let mut stmt = tx.prepare(
+            let mut statement = transaction.prepare(
                 "INSERT INTO discord_message_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
             )?;
-
             for &(chunk_id, embedding) in pairs {
-                let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-                stmt.execute(params![chunk_id, blob, model_name])?;
-
-                if has_vector_table {
-                    let emb_id = tx.last_insert_rowid();
-                    let insert_sql = format!(
-                        "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-                        DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-                    );
-                    if let Err(e) = tx.execute(&insert_sql, params![emb_id, blob]) {
-                        tracing::warn!(error = %e, chunk_id, "Failed to insert into discord chunk vector table — aborting batch");
-                        // Drop tx without commit to roll back the entire batch,
-                        // so embeddings and vector index stay consistent.
-                        return Err(e.into());
-                    }
-                }
+                statement.execute(params![chunk_id, embedding_blob(embedding), model_name])?;
+                saved.push((transaction.last_insert_rowid(), embedding));
             }
         }
+        transaction.commit()?;
 
-        tx.commit()?;
+        for (embedding_id, embedding) in saved {
+            self.vector_indexes
+                .discord_message_chunk
+                .upsert(&connection, embedding_id, embedding);
+        }
         Ok(())
     }
 
-    /// Lazily create the HNSW vector table for Discord message chunk embeddings.
-    fn ensure_discord_chunk_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
+    fn discord_message_chunk_embedding_ids_for_channel(
+        connection: &Connection,
+        channel_id: &str,
+    ) -> Result<Vec<i64>> {
+        let ids = connection
+            .prepare_cached(
+                "SELECT e.id FROM discord_message_chunk_embeddings e JOIN discord_message_chunks c ON c.id = e.chunk_id WHERE c.channel_id = ?1",
+            )?
+            .query_map(params![channel_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
 
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite for discord chunk search");
-                    return Ok(false);
-                }
+    fn discord_message_chunk_embedding_ids_for_chunks(
+        connection: &Connection,
+        chunk_ids: &[i64],
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection.prepare_cached(
+            "SELECT id FROM discord_message_chunk_embeddings WHERE chunk_id = ?1",
+        )?;
+        let mut ids = Vec::with_capacity(chunk_ids.len());
+        for chunk_id in chunk_ids {
+            if let Some(id) = statement
+                .query_row(params![chunk_id], |row| row.get(0))
+                .optional()?
+            {
+                ids.push(id);
             }
         }
-
-        if Self::table_exists(conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)? {
-            // Reuse the existing table only if its declared dimension matches.
-            // After an embedding-model upgrade the vector length can change, so a
-            // stale `float32[N]` table must be dropped and recreated — otherwise
-            // inserts of the new blobs fail and searches see stale vectors.
-            let existing_sql: Option<String> = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    params![DISCORD_MESSAGE_CHUNK_VECTOR_TABLE],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            let matches = existing_sql
-                .as_deref()
-                .map(|sql| sql.contains(&format!("float32[{}]", dimension)))
-                .unwrap_or(false);
-            if matches {
-                return Ok(true);
-            }
-            tracing::info!(
-                dimension,
-                "Discord chunk vector table dimension changed — recreating"
-            );
-            conn.execute_batch(&format!(
-                "DROP TABLE IF EXISTS {}",
-                DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-            ))?;
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=100000, ef_construction=200, M=16)
-            )
-            "#,
-            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                // Backfill existing embeddings.
-                let backfill = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM discord_message_chunk_embeddings
-                    WHERE length(embedding) = ?1
-                    "#,
-                    table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill discord chunk vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create discord chunk vector table");
-                Ok(false)
-            }
-        }
+        Ok(ids)
     }
 
     /// Search Discord message chunks by vector similarity using the HNSW index.
@@ -9828,23 +9528,19 @@ impl SqliteTracker {
         // Clamp limit to prevent excessive memory usage from the HNSW candidate multiplier.
         let limit = limit.min(1000);
 
-        let conn = self.acquire_lock()?;
-
-        if !Self::ensure_discord_chunk_vector_table(&conn, query_embedding.len())? {
-            // Vectorlite unavailable — fall back to empty results.
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.discord_message_chunk;
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(Vec::new());
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
             r#"
             WITH candidates AS (
-                SELECT rowid AS emb_id,
+                SELECT rowid AS embedding_id,
                        MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
                 FROM {table}
                 WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
@@ -9855,24 +9551,24 @@ impl SqliteTracker {
                    ch.start_message_time, ch.end_message_time,
                    ch.chunk_text, ch.context_text, ch.content_hash
             FROM candidates c
-            JOIN discord_message_chunk_embeddings e ON e.id = c.emb_id
+            JOIN discord_message_chunk_embeddings e ON e.id = c.embedding_id
             JOIN discord_message_chunks ch ON ch.id = e.chunk_id
             WHERE (?4 IS NULL OR ch.channel_id = ?4)
             ORDER BY c.similarity DESC
             LIMIT ?5
             "#,
-            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare discord chunk vector search");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare discord chunk vector search");
                 return Ok(Vec::new());
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -9882,19 +9578,20 @@ impl SqliteTracker {
             ],
             |row| {
                 let similarity: f64 = row.get(0)?;
-                let kind_int: i64 = row.get(4)?;
+                let kind: i64 = row.get(4)?;
                 let participants: Option<String> = row.get(7)?;
                 Ok(DiscordSearchResult {
                     chunk: DiscordMessageChunk {
                         id: row.get(1)?,
                         guild_id: row.get(2)?,
                         channel_id: row.get(3)?,
-                        channel_kind: DiscordChannelKind::from_i64(kind_int),
+                        channel_kind: DiscordChannelKind::from_i64(kind),
                         start_message_id: row.get(5)?,
                         end_message_id: row.get(6)?,
-                        participant_ids: participants.map(|s| {
-                            s.split(',')
-                                .filter(|x| !x.is_empty())
+                        participant_ids: participants.map(|participants| {
+                            participants
+                                .split(',')
+                                .filter(|participant| !participant.is_empty())
                                 .map(String::from)
                                 .collect()
                         }),
@@ -9908,9 +9605,9 @@ impl SqliteTracker {
                 })
             },
         ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(error = %e, "Discord chunk vector search failed");
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(%error, "Discord chunk vector search failed");
                 return Ok(Vec::new());
             }
         };
@@ -9918,8 +9615,8 @@ impl SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read discord chunk vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read discord chunk vector row"),
             }
         }
 
@@ -9945,13 +9642,19 @@ impl SqliteTracker {
 
     /// Delete all indexed chunks (and CASCADE-deleted embeddings) for a channel/thread.
     pub fn delete_discord_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-
-        // embeddings will be deleted via the cascade delete
-        conn.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids =
+            Self::discord_message_chunk_embedding_ids_for_channel(&transaction, channel_id)?;
+        transaction.execute(
             "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        transaction.commit()?;
+
+        self.vector_indexes
+            .discord_message_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
@@ -9959,19 +9662,23 @@ impl SqliteTracker {
     pub fn delete_discord_message_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
         if chunk_ids.is_empty() {
             return Ok(());
-        };
-        let conn = self.acquire_lock()?;
-        let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
-        let sql = format!(
-            "DELETE FROM discord_message_chunks WHERE id IN ({})",
-            placeholders.join(", ")
-        );
-        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        // embeddings will be deleted via the cascade delete
-        conn.execute(&sql, params.as_slice())?;
+        }
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids =
+            Self::discord_message_chunk_embedding_ids_for_chunks(&transaction, chunk_ids)?;
+        {
+            let mut statement =
+                transaction.prepare_cached("DELETE FROM discord_message_chunks WHERE id = ?1")?;
+            for chunk_id in chunk_ids {
+                statement.execute(params![chunk_id])?;
+            }
+        }
+        transaction.commit()?;
+
+        self.vector_indexes
+            .discord_message_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
@@ -9981,67 +9688,65 @@ impl SqliteTracker {
         channel_id: &str,
         current_hashes: &[String],
     ) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-
         if current_hashes.is_empty() {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
-                params![channel_id],
-            )?;
-            tx.commit()?;
+            return self.delete_discord_message_data_for_channel(channel_id);
+        }
+
+        let current: HashSet<&str> = current_hashes.iter().map(String::as_str).collect();
+        let mut connection = self.acquire_lock()?;
+        if Self::stale_discord_message_chunk_ids(&connection, channel_id, &current)?.is_empty() {
             return Ok(());
         }
 
-        let indexed: Vec<(i64, Option<String>)> = {
-            let mut stmt = conn.prepare(
-                "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
-            )?;
-            let rows: Vec<(i64, Option<String>)> = stmt
-                .query_map(params![channel_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        };
-
-        let current_set: std::collections::HashSet<&str> =
-            current_hashes.iter().map(|s| s.as_str()).collect();
-
-        let stale_ids: Vec<i64> = indexed
-            .into_iter()
-            .filter_map(|(id, hash)| match hash {
-                Some(h) if !current_set.contains(h.as_str()) => Some(id),
-                _ => None,
-            })
-            .collect();
-
-        if !stale_ids.is_empty() {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_ids = Self::stale_discord_message_chunk_ids(&transaction, channel_id, &current)?;
+        let embedding_ids =
+            Self::discord_message_chunk_embedding_ids_for_chunks(&transaction, &stale_ids)?;
+        {
+            let mut statement =
+                transaction.prepare_cached("DELETE FROM discord_message_chunks WHERE id = ?1")?;
             for id in &stale_ids {
-                tx.execute(
-                    "DELETE FROM discord_message_chunks WHERE id = ?1",
-                    params![id],
-                )?;
+                statement.execute(params![id])?;
             }
-            tx.commit()?;
         }
+        transaction.commit()?;
+
+        self.vector_indexes
+            .discord_message_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
+    fn stale_discord_message_chunk_ids(
+        connection: &Connection,
+        channel_id: &str,
+        current_hashes: &HashSet<&str>,
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection.prepare_cached(
+            "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
+        )?;
+        let mut stale = Vec::new();
+        for row in statement.query_map(params![channel_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })? {
+            let (id, hash) = row?;
+            if hash.is_some_and(|hash| !current_hashes.contains(hash.as_str())) {
+                stale.push(id);
+            }
+        }
+        Ok(stale)
+    }
+
     pub fn delete_all_discord_message_data(&self) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        // Embeddings CASCADE via the discord_message_chunks FK.
-        conn.execute("DELETE FROM discord_message_chunks", [])?;
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM discord_message_chunks", [])?;
         // Reset the channel registry/cursors so a forced full re-index re-backfills
         // history instead of resuming incrementally from a now-stale cursor.
-        conn.execute("DELETE FROM discord_channels", [])?;
-        // Drop the HNSW vector table so it is recreated fresh — clears stale vectors
-        // and lets a new embedding model's dimension take effect. Best-effort: it may
-        // not exist, or vectorlite may be unavailable on this connection.
-        let _ = conn.execute_batch(&format!(
-            "DROP TABLE IF EXISTS {}",
-            DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-        ));
+        transaction.execute("DELETE FROM discord_channels", [])?;
+        transaction.commit()?;
+
+        self.vector_indexes.discord_message_chunk.reset(&connection);
         Ok(())
     }
 
@@ -10399,133 +10104,214 @@ impl SqliteTracker {
 
     /// Delete all code data (symbols, chunks, embeddings) for a repo.
     pub fn delete_all_code_data_for_repo(&self, repo_id: i64) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids = Self::code_chunk_embedding_ids(&transaction, repo_id, None)?;
+        transaction.execute(
             "DELETE FROM code_symbols WHERE repo_id = ?1",
             params![repo_id],
         )?;
-        // Embeddings are CASCADE-deleted via code_chunks FK.
-        tx.execute(
+        transaction.execute(
             "DELETE FROM code_chunks WHERE repo_id = ?1",
             params![repo_id],
         )?;
-        tx.commit()?;
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
-    // --- Chat Session Store ---
-
-    /// Create a new chat session.
-    pub fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
+    /// Create a new chat session belonging to `owner_user_id`.
+    pub fn create_chat_session(
+        &self,
+        id: &str,
+        repo_id: Option<i64>,
+        owner_user_id: Option<i64>,
+    ) -> Result<()> {
         let conn = self.acquire_lock()?;
         conn.execute(
-            "INSERT INTO chat_sessions (id, repo_id) VALUES (?1, ?2)",
-            params![id, repo_id],
+            "INSERT INTO chat_sessions (id, repo_id, owner_user_id) VALUES (?1, ?2, ?3)",
+            params![id, repo_id, owner_user_id],
         )?;
         Ok(())
     }
 
-    /// Save a chat message to a session.
+    /// The chat session `id`, with its owner and without its messages, if it
+    /// is in `scope`.
+    pub fn get_chat_session(
+        &self,
+        id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Option<claudear_core::types::ChatSession>> {
+        let conn = self.acquire_lock()?;
+        let session = conn
+            .query_row(
+                &format!(
+                    "SELECT id, repo_id, owner_user_id, created_at, updated_at
+                     FROM chat_sessions
+                     WHERE id = :id AND {CHAT_SESSION_IN_SCOPE}"
+                ),
+                rusqlite::named_params! {
+                    ":id": id,
+                    ":owner_user_id": scope.owner_user_id,
+                    ":include_ownerless": scope.include_ownerless,
+                    ":include_other_owners": scope.include_other_owners,
+                },
+                Self::row_to_chat_session,
+            )
+            .optional()?;
+        Ok(session)
+    }
+
+    /// Append a message to the session, checked to be in `scope` by the same
+    /// statement; `None` when no such session is in scope.
     pub fn save_chat_message(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         role: &str,
         content: &str,
         sources_json: Option<&str>,
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
         let conn = self.acquire_lock()?;
-        conn.execute(
-            "INSERT INTO chat_messages (session_id, role, content, sources_json) VALUES (?1, ?2, ?3, ?4)",
-            params![session_id, role, content, sources_json],
+        let inserted = conn.execute(
+            &format!(
+                "INSERT INTO chat_messages (session_id, role, content, sources_json)
+                 SELECT id, :role, :content, :sources_json
+                 FROM chat_sessions
+                 WHERE id = :id AND {CHAT_SESSION_IN_SCOPE}"
+            ),
+            rusqlite::named_params! {
+                ":role": role,
+                ":content": content,
+                ":sources_json": sources_json,
+                ":id": session_id,
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+            },
         )?;
+        if inserted == 0 {
+            return Ok(None);
+        }
         let id = conn.last_insert_rowid();
-        // Update session's updated_at
         conn.execute(
             "UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?1",
             params![session_id],
         )?;
-        Ok(id)
+        Ok(Some(id))
     }
 
-    /// Get chat message history for a session (most recent N messages).
+    /// The most recent `limit` messages of the session, oldest first, if it is
+    /// in `scope`.
     pub fn get_chat_history(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         limit: usize,
     ) -> Result<Vec<claudear_core::types::ChatMessage>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, role, content, sources_json, created_at
+        let mut stmt = conn.prepare(&format!(
+            "SELECT chat_messages.id, role, content, sources_json, chat_messages.created_at
              FROM chat_messages
-             WHERE session_id = ?1
-             ORDER BY created_at DESC
-             LIMIT ?2",
+             JOIN chat_sessions ON chat_sessions.id = chat_messages.session_id
+             WHERE chat_messages.session_id = :id AND {CHAT_SESSION_IN_SCOPE}
+             ORDER BY chat_messages.created_at DESC, chat_messages.id DESC
+             LIMIT :limit"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::named_params! {
+                ":id": session_id,
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+                ":limit": i64::try_from(limit).unwrap_or(i64::MAX),
+            },
+            |row| {
+                let role_str: String = row.get(1)?;
+                let created_str: String = row.get(4)?;
+                Ok(claudear_core::types::ChatMessage {
+                    id: Some(row.get(0)?),
+                    role: claudear_core::types::ChatRole::parse(&role_str)
+                        .unwrap_or(claudear_core::types::ChatRole::User),
+                    content: row.get(2)?,
+                    sources_json: row.get(3)?,
+                    created_at: chrono::NaiveDateTime::parse_from_str(
+                        &created_str,
+                        "%Y-%m-%d %H:%M:%S",
+                    )
+                    .map(|dt| dt.and_utc())
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                })
+            },
         )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-            let role_str: String = row.get(1)?;
-            let created_str: String = row.get(4)?;
-            Ok(claudear_core::types::ChatMessage {
-                id: Some(row.get(0)?),
-                role: claudear_core::types::ChatRole::parse(&role_str)
-                    .unwrap_or(claudear_core::types::ChatRole::User),
-                content: row.get(2)?,
-                sources_json: row.get(3)?,
-                created_at: chrono::NaiveDateTime::parse_from_str(
-                    &created_str,
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .map(|dt| dt.and_utc())
-                .unwrap_or_else(|_| chrono::Utc::now()),
-            })
-        })?;
 
         let mut messages: Vec<_> = rows.filter_map(|r| r.ok()).collect();
-        messages.reverse(); // Return in chronological order
+        messages.reverse();
         Ok(messages)
     }
 
-    /// List all chat sessions.
-    pub fn list_chat_sessions(&self) -> Result<Vec<claudear_core::types::ChatSession>> {
+    /// List the chat sessions in `scope`, most recently updated first.
+    pub fn list_chat_sessions(
+        &self,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Vec<claudear_core::types::ChatSession>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, repo_id, created_at, updated_at
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, repo_id, owner_user_id, created_at, updated_at
              FROM chat_sessions
-             ORDER BY updated_at DESC",
+             WHERE {CHAT_SESSION_IN_SCOPE}
+             ORDER BY updated_at DESC"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::named_params! {
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+            },
+            Self::row_to_chat_session,
         )?;
-        let rows = stmt.query_map([], |row| {
-            let created_str: String = row.get(2)?;
-            let updated_str: String = row.get(3)?;
-            Ok(claudear_core::types::ChatSession {
-                id: row.get(0)?,
-                repo_id: row.get(1)?,
-                created_at: chrono::NaiveDateTime::parse_from_str(
-                    &created_str,
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .map(|dt| dt.and_utc())
-                .unwrap_or_else(|_| chrono::Utc::now()),
-                updated_at: chrono::NaiveDateTime::parse_from_str(
-                    &updated_str,
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .map(|dt| dt.and_utc())
-                .unwrap_or_else(|_| chrono::Utc::now()),
-                messages: Vec::new(),
-            })
-        })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Delete a chat session and all its messages.
-    pub fn delete_chat_session(&self, session_id: &str) -> Result<()> {
+    fn row_to_chat_session(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<claudear_core::types::ChatSession> {
+        let created_str: String = row.get(3)?;
+        let updated_str: String = row.get(4)?;
+        Ok(claudear_core::types::ChatSession {
+            id: row.get(0)?,
+            repo_id: row.get(1)?,
+            owner_user_id: row.get(2)?,
+            created_at: chrono::NaiveDateTime::parse_from_str(&created_str, "%Y-%m-%d %H:%M:%S")
+                .map(|dt| dt.and_utc())
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: chrono::NaiveDateTime::parse_from_str(&updated_str, "%Y-%m-%d %H:%M:%S")
+                .map(|dt| dt.and_utc())
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            messages: Vec::new(),
+        })
+    }
+
+    /// Delete the session and its messages (by cascade) if it is in `scope`,
+    /// returning whether it was.
+    pub fn delete_chat_session(
+        &self,
+        session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<bool> {
         let conn = self.acquire_lock()?;
-        // Messages are CASCADE-deleted via FK.
-        conn.execute(
-            "DELETE FROM chat_sessions WHERE id = ?1",
-            params![session_id],
+        let deleted = conn.execute(
+            &format!("DELETE FROM chat_sessions WHERE id = :id AND {CHAT_SESSION_IN_SCOPE}"),
+            rusqlite::named_params! {
+                ":id": session_id,
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+            },
         )?;
-        Ok(())
+        Ok(deleted > 0)
     }
 
     /// Cleanup expired chat sessions older than max_age_days. Returns count deleted.
@@ -11817,6 +11603,86 @@ mod tests {
     }
 
     #[test]
+    fn test_list_deploy_qa_tips_newest_first_with_track_filter_and_limit() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for (track, tag, published_at) in [
+            ("cloud", "1.0.0", "2026-01-01T00:00:00Z"),
+            ("edge", "2.0.0", "2026-02-01T00:00:00Z"),
+            ("cloud", "1.1.0", "2026-03-01T00:00:00Z"),
+        ] {
+            let mut tip = DeployQaTip::new(track, format!("acme/{track}"), tag);
+            tip.published_at = Some(published_at.into());
+            tracker.upsert_deploy_qa_tip(&tip).unwrap();
+        }
+
+        let tags = |tips: Vec<DeployQaTip>| -> Vec<String> {
+            tips.into_iter().map(|tip| tip.tag).collect()
+        };
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(None, 10).unwrap()),
+            ["1.1.0", "2.0.0", "1.0.0"]
+        );
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(Some("cloud"), 10).unwrap()),
+            ["1.1.0", "1.0.0"]
+        );
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(None, 2).unwrap()),
+            ["1.1.0", "2.0.0"]
+        );
+        assert_eq!(
+            tags(
+                tracker
+                    .list_deploy_qa_tips(Some("edge"), usize::MAX)
+                    .unwrap()
+            ),
+            ["2.0.0"]
+        );
+        assert!(tracker
+            .list_deploy_qa_tips(Some("missing"), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_list_deploy_qa_tips_orders_unpublished_tips_by_created_at_epoch() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut published = DeployQaTip::new("cloud", "acme/cloud", "1.0.0");
+        published.published_at = Some("2026-03-01T08:00:00Z".into());
+        tracker.upsert_deploy_qa_tip(&published).unwrap();
+
+        let unpublished = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "acme/cloud", "1.1.0"))
+            .unwrap();
+        assert_eq!(unpublished.published_at, None);
+
+        let mut offset = DeployQaTip::new("cloud", "acme/cloud", "0.9.0");
+        offset.published_at = Some("2026-03-01T10:30:00+05:00".into());
+        tracker.upsert_deploy_qa_tip(&offset).unwrap();
+
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE deploy_qa_tips SET created_at = '2026-03-01 09:00:00' WHERE id = ?1",
+                params![unpublished.id],
+            )
+            .unwrap();
+
+        let tags: Vec<String> = tracker
+            .list_deploy_qa_tips(Some("cloud"), 10)
+            .unwrap()
+            .into_iter()
+            .map(|tip| tip.tag)
+            .collect();
+        assert_eq!(tags, ["1.1.0", "1.0.0", "0.9.0"]);
+    }
+
+    #[test]
     fn test_deploy_qa_tip_unknown_status_is_an_error() {
         use claudear_core::types::DeployQaTip;
 
@@ -12496,8 +12362,8 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init - verify by trying to query
-        let conn = tracker.conn.lock().unwrap();
-        let result = conn.execute("SELECT 1 FROM regression_watches LIMIT 1", []);
+        let connection = tracker.connection.lock();
+        let result = connection.execute("SELECT 1 FROM regression_watches LIMIT 1", []);
         // Should succeed (table exists) or return empty result, not error
         assert!(result.is_ok() || result.is_err());
     }
@@ -12507,8 +12373,8 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init
-        let conn = tracker.conn.lock().unwrap();
-        let result = conn.execute("SELECT 1 FROM release_tracking LIMIT 1", []);
+        let connection = tracker.connection.lock();
+        let result = connection.execute("SELECT 1 FROM release_tracking LIMIT 1", []);
         assert!(result.is_ok() || result.is_err());
     }
 
@@ -12517,8 +12383,8 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init
-        let conn = tracker.conn.lock().unwrap();
-        let result = conn.execute("SELECT 1 FROM regression_checks LIMIT 1", []);
+        let connection = tracker.connection.lock();
+        let result = connection.execute("SELECT 1 FROM regression_checks LIMIT 1", []);
         assert!(result.is_ok() || result.is_err());
     }
 
@@ -20044,6 +19910,69 @@ mod tests {
         assert_eq!(keep_count, 1);
     }
 
+    fn hold_write_lock(path: &Path, tracker: &SqliteTracker) -> Connection {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        let writer = Connection::open(path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writer
+    }
+
+    #[test]
+    fn test_cleanup_stale_discord_message_data_without_stale_chunks_skips_the_write_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let tracker = SqliteTracker::new(&path).unwrap();
+        tracker
+            .save_discord_chunks(&[
+                sample_discord_chunk("100", "1001"),
+                sample_discord_chunk("100", "1002"),
+            ])
+            .unwrap();
+        let _writer = hold_write_lock(&path, &tracker);
+
+        tracker
+            .cleanup_stale_discord_message_data(
+                "100",
+                &["hash-1001".to_string(), "hash-1002".to_string()],
+            )
+            .expect("a cleanup with nothing stale must not wait on another writer");
+    }
+
+    #[test]
+    fn test_cleanup_stale_code_data_without_stale_files_skips_the_write_lock() {
+        use claudear_core::types::Language;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let tracker = SqliteTracker::new(&path).unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+        tracker
+            .save_code_chunks(&[claudear_core::types::CodeChunk {
+                id: None,
+                repo_id,
+                file_path: "keep.rs".to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: None,
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 5,
+                chunk_text: "fn keep() {}".to_string(),
+                context_text: "".to_string(),
+                file_hash: "h1".to_string(),
+                content_hash: None,
+            }])
+            .unwrap();
+        let _writer = hold_write_lock(&path, &tracker);
+
+        tracker
+            .cleanup_stale_code_data(repo_id, &["keep.rs".to_string()])
+            .expect("a cleanup with nothing stale must not wait on another writer");
+    }
+
     #[test]
     fn test_get_repo_knowledge_all() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -20527,8 +20456,6 @@ mod tests {
         tracker.save_code_chunk_embeddings(&[], "test").unwrap();
     }
 
-    // --- Discord message chunks (vectorlite) ---
-
     fn sample_discord_chunk(
         channel_id: &str,
         start_id: &str,
@@ -20871,29 +20798,6 @@ mod tests {
         assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
     }
 
-    // =========================================================
-    // Tests for previously uncovered code paths
-    // =========================================================
-
-    #[test]
-    fn test_validate_dimension_zero() {
-        let result = validate_dimension(0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_dimension_too_large() {
-        let result = validate_dimension(MAX_EMBEDDING_DIMENSION + 1);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_dimension_valid() {
-        assert!(validate_dimension(1).is_ok());
-        assert!(validate_dimension(128).is_ok());
-        assert!(validate_dimension(MAX_EMBEDDING_DIMENSION).is_ok());
-    }
-
     #[test]
     fn test_blob_to_embedding_none() {
         assert!(SqliteTracker::blob_to_embedding(None).is_none());
@@ -20920,21 +20824,6 @@ mod tests {
         let blob = SqliteTracker::embedding_to_blob(Some(&original));
         let restored = SqliteTracker::blob_to_embedding(blob);
         assert_eq!(restored, Some(original));
-    }
-
-    #[test]
-    fn test_table_exists_true() {
-        let tracker = SqliteTracker::in_memory().unwrap();
-        let conn = tracker.acquire_lock().unwrap();
-        // fix_attempts is created by migrations
-        assert!(SqliteTracker::table_exists(&conn, "fix_attempts").unwrap());
-    }
-
-    #[test]
-    fn test_table_exists_false() {
-        let tracker = SqliteTracker::in_memory().unwrap();
-        let conn = tracker.acquire_lock().unwrap();
-        assert!(!SqliteTracker::table_exists(&conn, "nonexistent_table_xyz").unwrap());
     }
 
     #[test]
@@ -21037,14 +20926,30 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // --- Chat Store Tests ---
+    const OWNERLESS_CHAT_SESSIONS: claudear_core::types::ChatSessionScope =
+        claudear_core::types::ChatSessionScope::OWNERLESS;
+
+    const EVERY_CHAT_SESSION: claudear_core::types::ChatSessionScope =
+        claudear_core::types::ChatSessionScope {
+            owner_user_id: None,
+            include_ownerless: true,
+            include_other_owners: true,
+        };
+
+    fn chat_owner(tracker: &SqliteTracker, email: &str) -> i64 {
+        tracker
+            .create_user(email, "hash", "Chat Owner", "viewer")
+            .unwrap()
+    }
 
     #[test]
     fn test_create_chat_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "sess-1");
         assert!(sessions[0].repo_id.is_none());
@@ -21055,10 +20960,12 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
         let repo_id = tracker.get_or_create_repo_id("my-repo").unwrap();
         tracker
-            .create_chat_session("sess-2", Some(repo_id))
+            .create_chat_session("sess-2", Some(repo_id), None)
             .unwrap();
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].repo_id, Some(repo_id));
     }
@@ -21066,24 +20973,29 @@ mod tests {
     #[test]
     fn test_save_and_get_chat_messages() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
         let id1 = tracker
-            .save_chat_message("sess-1", "user", "Hello!", None)
+            .save_chat_message("sess-1", &EVERY_CHAT_SESSION, "user", "Hello!", None)
+            .unwrap()
             .unwrap();
         assert!(id1 > 0);
 
         let id2 = tracker
             .save_chat_message(
                 "sess-1",
+                &EVERY_CHAT_SESSION,
                 "assistant",
                 "Hi there!",
                 Some(r#"{"docs":["a.rs"]}"#),
             )
+            .unwrap()
             .unwrap();
         assert!(id2 > id1);
 
-        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 10)
+            .unwrap();
         assert_eq!(history.len(), 2);
         // Should be in chronological order
         assert_eq!(history[0].content, "Hello!");
@@ -21097,15 +21009,23 @@ mod tests {
     #[test]
     fn test_get_chat_history_respects_limit() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
         for i in 0..5 {
             tracker
-                .save_chat_message("sess-1", "user", &format!("msg {}", i), None)
+                .save_chat_message(
+                    "sess-1",
+                    &EVERY_CHAT_SESSION,
+                    "user",
+                    &format!("msg {}", i),
+                    None,
+                )
                 .unwrap();
         }
 
-        let history = tracker.get_chat_history("sess-1", 3).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 3)
+            .unwrap();
         assert_eq!(history.len(), 3);
         // Should return the 3 most recent in chronological order
         assert_eq!(history[0].content, "msg 2");
@@ -21116,59 +21036,72 @@ mod tests {
     #[test]
     fn test_get_chat_history_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
-        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 10)
+            .unwrap();
         assert!(history.is_empty());
     }
 
     #[test]
     fn test_list_chat_sessions_multiple() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-a", None).unwrap();
-        tracker.create_chat_session("sess-b", None).unwrap();
-        tracker.create_chat_session("sess-c", None).unwrap();
+        tracker.create_chat_session("sess-a", None, None).unwrap();
+        tracker.create_chat_session("sess-b", None, None).unwrap();
+        tracker.create_chat_session("sess-c", None, None).unwrap();
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 3);
     }
 
     #[test]
     fn test_list_chat_sessions_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert!(sessions.is_empty());
     }
 
     #[test]
     fn test_delete_chat_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
         tracker
-            .save_chat_message("sess-1", "user", "hello", None)
+            .save_chat_message("sess-1", &EVERY_CHAT_SESSION, "user", "hello", None)
             .unwrap();
 
-        tracker.delete_chat_session("sess-1").unwrap();
+        assert!(tracker
+            .delete_chat_session("sess-1", &EVERY_CHAT_SESSION)
+            .unwrap());
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert!(sessions.is_empty());
 
         // Messages should also be gone (CASCADE delete)
-        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 10)
+            .unwrap();
         assert!(history.is_empty());
     }
 
     #[test]
     fn test_delete_chat_session_nonexistent() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        // Should not error even if session doesn't exist
-        tracker.delete_chat_session("nonexistent").unwrap();
+        assert!(!tracker
+            .delete_chat_session("nonexistent", &EVERY_CHAT_SESSION)
+            .unwrap());
     }
 
     #[test]
     fn test_cleanup_expired_chat_sessions() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-old", None).unwrap();
-        tracker.create_chat_session("sess-new", None).unwrap();
+        tracker.create_chat_session("sess-old", None, None).unwrap();
+        tracker.create_chat_session("sess-new", None, None).unwrap();
 
         // Manually age one session via direct SQL
         {
@@ -21183,7 +21116,9 @@ mod tests {
         let deleted = tracker.cleanup_expired_chat_sessions(30).unwrap();
         assert_eq!(deleted, 1);
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "sess-new");
     }
@@ -21191,16 +21126,216 @@ mod tests {
     #[test]
     fn test_cleanup_expired_chat_sessions_none_expired() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
         let deleted = tracker.cleanup_expired_chat_sessions(30).unwrap();
         assert_eq!(deleted, 0);
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
     }
 
-    // --- Code Index Meta Tests ---
+    #[test]
+    fn test_chat_session_records_its_owner() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let owner = chat_owner(&tracker, "owner@example.com");
+        tracker
+            .create_chat_session("owned", None, Some(owner))
+            .unwrap();
+        tracker.create_chat_session("legacy", None, None).unwrap();
+
+        let owned = tracker
+            .get_chat_session("owned", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(owned.id, "owned");
+        assert_eq!(owned.owner_user_id, Some(owner));
+        let legacy = tracker
+            .get_chat_session("legacy", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.owner_user_id, None);
+        assert!(tracker
+            .get_chat_session("missing", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_list_chat_sessions_is_scoped_to_the_owner() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let owner = chat_owner(&tracker, "owner@example.com");
+        let other = chat_owner(&tracker, "other@example.com");
+        tracker
+            .create_chat_session("mine", None, Some(owner))
+            .unwrap();
+        tracker
+            .create_chat_session("theirs", None, Some(other))
+            .unwrap();
+        tracker.create_chat_session("legacy", None, None).unwrap();
+
+        let ids = |include_ownerless: bool| {
+            let scope = claudear_core::types::ChatSessionScope {
+                owner_user_id: Some(owner),
+                include_ownerless,
+                include_other_owners: false,
+            };
+            let mut ids: Vec<String> = tracker
+                .list_chat_sessions(&scope)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(ids(false), ["mine"]);
+        assert_eq!(ids(true), ["legacy", "mine"]);
+    }
+
+    #[test]
+    fn test_deleting_a_user_deletes_their_chat_sessions() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let owner = chat_owner(&tracker, "owner@example.com");
+        tracker
+            .create_chat_session("owned", None, Some(owner))
+            .unwrap();
+        tracker
+            .save_chat_message("owned", &EVERY_CHAT_SESSION, "user", "hello", None)
+            .unwrap();
+
+        assert!(tracker.delete_user(owner).unwrap());
+
+        assert!(tracker
+            .get_chat_session("owned", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_none());
+        assert!(tracker
+            .get_chat_history("owned", &EVERY_CHAT_SESSION, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    fn scoped_chat_sessions(tracker: &SqliteTracker) -> (i64, i64, i64) {
+        let owner = chat_owner(tracker, "owner@example.com");
+        let other = chat_owner(tracker, "other@example.com");
+        let admin = chat_owner(tracker, "admin@example.com");
+        for (id, owner_user_id) in [
+            ("mine", Some(owner)),
+            ("theirs", Some(other)),
+            ("legacy", None),
+        ] {
+            tracker
+                .create_chat_session(id, None, owner_user_id)
+                .unwrap();
+            tracker
+                .save_chat_message(id, &EVERY_CHAT_SESSION, "user", "seed", None)
+                .unwrap()
+                .unwrap();
+        }
+        (owner, other, admin)
+    }
+
+    fn chat_scopes(owner: i64, admin: i64) -> [claudear_core::types::ChatSessionScope; 4] {
+        let viewer = claudear_core::types::ChatViewer {
+            user_id: owner,
+            is_admin: false,
+        };
+        let administrator = claudear_core::types::ChatViewer {
+            user_id: admin,
+            is_admin: true,
+        };
+        [
+            viewer.scope(),
+            administrator.scope(),
+            administrator.delete_scope(),
+            OWNERLESS_CHAT_SESSIONS,
+        ]
+    }
+
+    #[test]
+    fn test_chat_reads_and_appends_are_confined_to_the_scope() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let (owner, _, admin) = scoped_chat_sessions(&tracker);
+
+        for scope in chat_scopes(owner, admin) {
+            let mut listed: Vec<String> = tracker
+                .list_chat_sessions(&scope)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            listed.sort();
+            let mut expected = Vec::new();
+            for id in ["legacy", "mine", "theirs"] {
+                let session = tracker
+                    .get_chat_session(id, &EVERY_CHAT_SESSION)
+                    .unwrap()
+                    .unwrap();
+                let included = scope.includes(&session);
+                if included {
+                    expected.push(id.to_string());
+                }
+                assert_eq!(
+                    tracker.get_chat_session(id, &scope).unwrap().is_some(),
+                    included,
+                    "get {id} in {scope:?}"
+                );
+                assert_eq!(
+                    !tracker.get_chat_history(id, &scope, 10).unwrap().is_empty(),
+                    included,
+                    "history of {id} in {scope:?}"
+                );
+                assert_eq!(
+                    tracker
+                        .save_chat_message(id, &scope, "user", "appended", None)
+                        .unwrap()
+                        .is_some(),
+                    included,
+                    "append to {id} in {scope:?}"
+                );
+            }
+            assert_eq!(listed, expected, "list in {scope:?}");
+        }
+
+        assert!(tracker
+            .save_chat_message("missing", &EVERY_CHAT_SESSION, "user", "lost", None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_chat_session_delete_is_confined_to_the_scope() {
+        for id in ["legacy", "mine", "theirs"] {
+            for index in 0..4 {
+                let tracker = SqliteTracker::in_memory().unwrap();
+                let (owner, _, admin) = scoped_chat_sessions(&tracker);
+                let scope = chat_scopes(owner, admin)[index];
+                let session = tracker
+                    .get_chat_session(id, &EVERY_CHAT_SESSION)
+                    .unwrap()
+                    .unwrap();
+                let included = scope.includes(&session);
+
+                assert_eq!(
+                    tracker.delete_chat_session(id, &scope).unwrap(),
+                    included,
+                    "delete {id} in {scope:?}"
+                );
+                assert_eq!(
+                    tracker
+                        .get_chat_session(id, &EVERY_CHAT_SESSION)
+                        .unwrap()
+                        .is_none(),
+                    included,
+                    "{id} after a delete in {scope:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_get_set_code_index_meta() {
@@ -21296,8 +21431,6 @@ mod tests {
         assert_eq!(model.as_deref(), Some("test-model-v1"));
     }
 
-    // --- Delete All Code Data ---
-
     #[test]
     fn test_delete_all_code_data_for_repo() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21353,8 +21486,6 @@ mod tests {
         tracker.delete_all_code_data_for_repo(repo_id).unwrap();
     }
 
-    // --- Indexing Progress ---
-
     #[test]
     fn test_get_indexing_progress_default() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21364,8 +21495,6 @@ mod tests {
         assert_eq!(progress.total_repos, 0);
         assert_eq!(progress.indexed_repos, 0);
     }
-
-    // --- Update user with no fields ---
 
     #[test]
     fn test_update_user_no_fields() {
@@ -21426,8 +21555,6 @@ mod tests {
         );
     }
 
-    // --- get_activities_for_issue (isolation) ---
-
     #[test]
     fn test_get_activities_for_issue_filters_by_source_and_id() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21484,8 +21611,6 @@ mod tests {
         assert!(activities.is_empty());
     }
 
-    // --- find_similar_issues_vector (without vectorlite) ---
-
     #[test]
     fn test_find_similar_issues_vector_empty_embedding() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21507,8 +21632,6 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    // --- find_similar_outcomes_vector (without vectorlite) ---
-
     #[test]
     fn test_find_similar_outcomes_vector_empty_embedding() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21527,8 +21650,6 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    // --- generate_session_token ---
-
     #[test]
     fn test_generate_session_token_length_and_uniqueness() {
         let t1 = generate_session_token();
@@ -21541,8 +21662,6 @@ mod tests {
         // Should be valid hex
         assert!(t1.chars().all(|c| c.is_ascii_hexdigit()));
     }
-
-    // --- record_release_tracking (edge case: no released_at) ---
 
     #[test]
     fn test_record_release_tracking_no_released_at() {
@@ -21576,8 +21695,6 @@ mod tests {
         let id = tracker.record_release_tracking(&tracking).unwrap();
         assert!(id > 0);
     }
-
-    // --- store_embeddings_batch with actual data ---
 
     #[test]
     fn test_store_embeddings_batch_with_embeddings() {
@@ -21625,16 +21742,12 @@ mod tests {
         assert_eq!(e2.description.as_deref(), Some("Desc"));
     }
 
-    // --- list_issues (tested indirectly but let's test count_issues with source) ---
-
     #[test]
     fn test_count_issues_no_data() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let count = tracker.count_issues(None).unwrap();
         assert_eq!(count, 0);
     }
-
-    // --- get_success_rate with mixed outcomes ---
 
     #[test]
     fn test_get_success_rate_with_data() {
@@ -21658,8 +21771,6 @@ mod tests {
         assert!((rate - 1.0 / 3.0).abs() < 0.01);
     }
 
-    // --- record_metrics_batch edge case ---
-
     #[test]
     fn test_record_metrics_batch_with_tags() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21675,8 +21786,6 @@ mod tests {
         let count = tracker.record_metrics_batch(&[metric]).unwrap();
         assert_eq!(count, 1);
     }
-
-    // --- subscribe_indexing_progress ---
 
     #[test]
     fn test_subscribe_indexing_progress_returns_receiver() {
@@ -21930,5 +22039,1056 @@ mod tests {
         // Verify regression data is gone
         let watches = tracker.get_all_regression_watches().unwrap();
         assert!(watches.is_empty());
+    }
+
+    mod vector_index_rebuild {
+        use super::*;
+        use crate::vectorlite::require_vectorlite_for_tests;
+        use claudear_core::types::{CodeChunk, Language};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        const MODEL: &str = "test-model";
+        const TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+        fn sample_code_chunk(repository_id: i64, index: usize) -> CodeChunk {
+            CodeChunk {
+                id: None,
+                repo_id: repository_id,
+                file_path: format!("src/file_{index}.rs"),
+                chunk_type: "function".to_string(),
+                symbol_name: Some(format!("function_{index}")),
+                language: Language::Rust,
+                start_line: index + 1,
+                end_line: index + 2,
+                chunk_text: format!("fn function_{index}() {{}}"),
+                context_text: String::new(),
+                file_hash: format!("hash-{index}"),
+                content_hash: None,
+            }
+        }
+
+        fn sample_embedding(index: usize) -> Vec<f32> {
+            vec![1.0, index as f32, 0.5, 0.25]
+        }
+
+        fn save_code_chunk_embeddings(path: &Path, count: usize) -> bool {
+            let writer = SqliteTracker::new(path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return false;
+            }
+            let repository_id = writer.get_or_create_repo_id("org/repo").unwrap();
+            let chunks: Vec<CodeChunk> = (0..count)
+                .map(|index| sample_code_chunk(repository_id, index))
+                .collect();
+            let chunk_ids = writer.save_code_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..count).map(sample_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            writer.save_code_chunk_embeddings(&pairs, MODEL).unwrap();
+            true
+        }
+
+        fn is_indexed(connection: &Connection, rowid: i64) -> bool {
+            connection
+                .prepare_cached("SELECT rowid FROM code_chunk_vectors WHERE rowid = ?1")
+                .unwrap()
+                .query_row(params![rowid], |row| row.get::<_, i64>(0))
+                .optional()
+                .unwrap()
+                .is_some()
+        }
+
+        #[cfg(unix)]
+        fn thread_cpu_time() -> Duration {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `time` is a valid, writable timespec for the duration of the call.
+            let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+            assert_eq!(
+                result,
+                0,
+                "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            Duration::new(
+                u64::try_from(time.tv_sec).unwrap(),
+                u32::try_from(time.tv_nsec).unwrap(),
+            )
+        }
+
+        #[test]
+        fn test_rebuild_vector_indexes_restores_every_code_chunk_vector_after_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let count = 3 * REBUILD_BATCH_SIZE + 1;
+
+            if !save_code_chunk_embeddings(&path, count) {
+                return;
+            }
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            assert!(require_vectorlite_for_tests(
+                &reader.acquire_lock().unwrap()
+            ));
+            reader.rebuild_vector_indexes();
+
+            let connection = reader.acquire_lock().unwrap();
+            let embedding_ids: Vec<i64> = connection
+                .prepare("SELECT id FROM code_chunk_embeddings ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(embedding_ids.len(), count);
+            let mut lookup = connection
+                .prepare("SELECT rowid FROM code_chunk_vectors WHERE rowid = ?1")
+                .unwrap();
+            let missing: Vec<i64> = embedding_ids
+                .into_iter()
+                .filter(|embedding_id| {
+                    lookup
+                        .query_row(params![embedding_id], |row| row.get::<_, i64>(0))
+                        .optional()
+                        .unwrap()
+                        .is_none()
+                })
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "rebuild_vector_indexes left {} of {count} embeddings out of code_chunk_vectors, starting with {:?}",
+                missing.len(),
+                missing.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn test_rebuild_vector_indexes_releases_the_lock_between_batches() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let batches = 64;
+            let count = batches * REBUILD_BATCH_SIZE;
+
+            if !save_code_chunk_embeddings(&path, count) {
+                return;
+            }
+
+            let tracker = Arc::new(SqliteTracker::new(&path).unwrap());
+            let first: i64 = {
+                let connection = tracker.acquire_lock().unwrap();
+                assert!(require_vectorlite_for_tests(&connection));
+                connection
+                    .query_row("SELECT min(id) FROM code_chunk_embeddings", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            };
+            let batch_size = i64::try_from(REBUILD_BATCH_SIZE).unwrap();
+            let indexed_batches = |connection: &Connection| {
+                let (mut low, mut high) = (0, batches);
+                while low < high {
+                    let middle = (low + high) / 2;
+                    let rowid = first + i64::try_from(middle).unwrap() * batch_size;
+                    if is_indexed(connection, rowid) {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                low
+            };
+
+            let rebuilding = Arc::clone(&tracker);
+            let rebuild = std::thread::spawn(move || rebuilding.rebuild_vector_indexes());
+            let mut observed = 0;
+            let mut advances = Vec::new();
+            let mut observe = || {
+                let (connection, queued) = match tracker.connection.try_lock() {
+                    Some(connection) => (connection, false),
+                    None => (tracker.connection.lock(), true),
+                };
+                let indexed = indexed_batches(&connection);
+                if indexed > observed {
+                    if queued {
+                        advances.push(indexed - observed);
+                    }
+                    observed = indexed;
+                }
+            };
+            while !rebuild.is_finished() {
+                observe();
+            }
+            rebuild.join().unwrap();
+            observe();
+
+            assert_eq!(observed, batches, "the rebuild left batches unindexed");
+            assert!(
+                advances.len() >= batches / 2,
+                "a thread waiting on the connection lock got it only {} times across {batches} rebuild batches, so the rebuild held the lock across batches; batches indexed between its acquisitions: {advances:?}",
+                advances.len()
+            );
+            let single_batch = advances.iter().filter(|&&advance| advance == 1).count();
+            assert!(
+                single_batch > 0,
+                "a waiting thread never got the lock after a single rebuild batch in {} acquisitions, so the rebuild holds the lock across batches; batches indexed between its acquisitions: {advances:?}",
+                advances.len()
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn test_rebuild_vector_indexes_sleeps_while_another_thread_holds_the_lock() {
+            const HOLD: Duration = Duration::from_millis(500);
+            const QUEUE: Duration = Duration::from_millis(50);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let count = 4 * REBUILD_BATCH_SIZE;
+            if !save_code_chunk_embeddings(&path, count) {
+                return;
+            }
+
+            let tracker = Arc::new(SqliteTracker::new(&path).unwrap());
+            let blocking = tracker.acquire_lock().unwrap();
+            assert!(require_vectorlite_for_tests(&blocking));
+            let last: i64 = blocking
+                .query_row("SELECT max(id) FROM code_chunk_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+
+            let rebuilding = Arc::clone(&tracker);
+            let rebuild = std::thread::spawn(move || {
+                let started = thread_cpu_time();
+                rebuilding.rebuild_vector_indexes();
+                thread_cpu_time() - started
+            });
+            let held = Arc::new(AtomicBool::new(false));
+            let holds_while_pending = Arc::new(AtomicUsize::new(0));
+            let hold = {
+                let held = Arc::clone(&held);
+                let holds_while_pending = Arc::clone(&holds_while_pending);
+                move |connection: MutexGuard<'_, Connection>| {
+                    held.store(true, Ordering::SeqCst);
+                    if !is_indexed(&connection, last) {
+                        holds_while_pending.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(HOLD);
+                }
+            };
+            std::thread::sleep(QUEUE);
+            let requesting = Arc::new(AtomicBool::new(false));
+            let queued = {
+                let tracker = Arc::clone(&tracker);
+                let requesting = Arc::clone(&requesting);
+                let hold = hold.clone();
+                std::thread::spawn(move || {
+                    requesting.store(true, Ordering::SeqCst);
+                    hold(tracker.acquire_lock().unwrap());
+                })
+            };
+            while !requesting.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(QUEUE);
+            MutexGuard::unlock_fair(blocking);
+            while !tracker.connection.is_locked() {
+                std::hint::spin_loop();
+            }
+            let barging = {
+                let tracker = Arc::clone(&tracker);
+                std::thread::spawn(move || {
+                    let connection = loop {
+                        if let Some(connection) = tracker.connection.try_lock() {
+                            break connection;
+                        }
+                        if held.load(Ordering::SeqCst) {
+                            break tracker.acquire_lock().unwrap();
+                        }
+                        std::hint::spin_loop();
+                    };
+                    hold(connection);
+                })
+            };
+            queued.join().unwrap();
+            barging.join().unwrap();
+            let rebuild_cpu = rebuild.join().unwrap();
+
+            assert!(
+                is_indexed(&tracker.acquire_lock().unwrap(), last),
+                "the rebuild stopped before indexing every batch"
+            );
+            assert!(
+                holds_while_pending.load(Ordering::SeqCst) > 0,
+                "the rebuild finished before another thread held the lock, so it never had to wait"
+            );
+            assert!(
+                rebuild_cpu < HOLD / 2,
+                "the rebuild thread burned {rebuild_cpu:?} of CPU while other threads held the connection lock for {HOLD:?} each; it must sleep until the lock is handed back"
+            );
+        }
+
+        #[test]
+        fn test_rebuild_vector_indexes_terminates_when_a_vector_table_name_is_taken() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let chunk_ids = tracker
+                .save_code_chunks(&[sample_code_chunk(repository_id, 0)])
+                .unwrap();
+            {
+                let connection = tracker.acquire_lock().unwrap();
+                connection
+                    .execute_batch("CREATE TABLE code_chunk_vectors(x)")
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO code_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
+                        params![chunk_ids[0], embedding_blob(&sample_embedding(0)), MODEL],
+                    )
+                    .unwrap();
+            }
+
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                tracker.rebuild_vector_indexes();
+                let _ = sender.send(());
+            });
+
+            receiver.recv_timeout(TERMINATION_TIMEOUT).expect(
+                "rebuild_vector_indexes must terminate when an ordinary table holds a vector index name",
+            );
+        }
+    }
+
+    mod vector_index_regression {
+        use super::*;
+        use crate::vectorlite::require_vectorlite_for_tests;
+        use claudear_core::types::{CodeChunk, Language};
+
+        const CODE_CHUNK_VECTORS: &str = "code_chunk_vectors";
+        const DISCORD_MESSAGE_CHUNK_VECTORS: &str = "discord_message_chunk_vectors";
+        const MODEL: &str = "test-model";
+
+        fn vector_exists(tracker: &SqliteTracker, table: &str, rowid: i64) -> bool {
+            let connection = tracker.acquire_lock().unwrap();
+            let lookup = connection
+                .query_row(
+                    &format!("SELECT rowid FROM {table} WHERE rowid = ?1"),
+                    params![rowid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional();
+            match lookup {
+                Ok(found) => found.is_some(),
+                Err(error) if error.to_string().contains("no such table") => false,
+                Err(error) => panic!("looking up rowid {rowid} in {table} failed: {error}"),
+            }
+        }
+
+        fn axis_embedding(axis: usize) -> Vec<f32> {
+            let mut embedding = vec![0.0f32; 4];
+            embedding[axis % 4] = 1.0;
+            embedding
+        }
+
+        fn spread_embedding(index: usize) -> Vec<f32> {
+            vec![1.0, index as f32, 0.5, 0.25]
+        }
+
+        fn database_path(directory: &tempfile::TempDir) -> PathBuf {
+            directory.path().join("claudear.db")
+        }
+
+        fn legacy_vector_table(table: &str) -> String {
+            format!(
+                "CREATE VIRTUAL TABLE {table} USING vectorlite(embedding float32[4] cosine, hnsw(max_elements=4, ef_construction=200, M=16))"
+            )
+        }
+
+        fn sample_code_chunk(repository_id: i64, file_path: &str, start_line: usize) -> CodeChunk {
+            CodeChunk {
+                id: None,
+                repo_id: repository_id,
+                file_path: file_path.to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: Some(format!("function_{start_line}")),
+                language: Language::Rust,
+                start_line,
+                end_line: start_line + 1,
+                chunk_text: format!("fn function_{start_line}() {{}}"),
+                context_text: String::new(),
+                file_hash: format!("hash-{file_path}"),
+                content_hash: None,
+            }
+        }
+
+        fn embedding_ids(tracker: &SqliteTracker, table: &str, chunk_ids: &[i64]) -> Vec<i64> {
+            let connection = tracker.acquire_lock().unwrap();
+            chunk_ids
+                .iter()
+                .map(|chunk_id| {
+                    connection
+                        .query_row(
+                            &format!("SELECT id FROM {table} WHERE chunk_id = ?1"),
+                            params![chunk_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        fn assert_indexed(tracker: &SqliteTracker, table: &str, embedding_ids: &[i64]) {
+            for &embedding_id in embedding_ids {
+                assert!(
+                    vector_exists(tracker, table, embedding_id),
+                    "embedding {embedding_id} must be in {table} before the operation under test"
+                );
+            }
+        }
+
+        fn assert_removed(tracker: &SqliteTracker, table: &str, embedding_ids: &[i64]) {
+            for &embedding_id in embedding_ids {
+                assert!(
+                    !vector_exists(tracker, table, embedding_id),
+                    "the vector for deleted embedding {embedding_id} is still in {table}"
+                );
+            }
+        }
+
+        fn index_code_chunks(
+            tracker: &SqliteTracker,
+            repository_id: i64,
+            file_paths: &[&str],
+        ) -> (Vec<i64>, Vec<i64>) {
+            let chunks: Vec<CodeChunk> = file_paths
+                .iter()
+                .enumerate()
+                .map(|(index, file_path)| sample_code_chunk(repository_id, file_path, index + 1))
+                .collect();
+            let chunk_ids = tracker.save_code_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(axis_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker.save_code_chunk_embeddings(&pairs, MODEL).unwrap();
+            let embedding_ids = embedding_ids(tracker, "code_chunk_embeddings", &chunk_ids);
+            assert_indexed(tracker, CODE_CHUNK_VECTORS, &embedding_ids);
+            (chunk_ids, embedding_ids)
+        }
+
+        fn index_discord_chunks(
+            tracker: &SqliteTracker,
+            chunks: &[(&str, &str)],
+        ) -> (Vec<i64>, Vec<i64>) {
+            let chunks: Vec<claudear_core::types::DiscordMessageChunk> = chunks
+                .iter()
+                .map(|(channel_id, start_id)| sample_discord_chunk(channel_id, start_id))
+                .collect();
+            let chunk_ids = tracker.save_discord_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(axis_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker
+                .save_discord_chunk_embeddings(&pairs, MODEL)
+                .unwrap();
+            let embedding_ids =
+                embedding_ids(tracker, "discord_message_chunk_embeddings", &chunk_ids);
+            assert_indexed(tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids);
+            (chunk_ids, embedding_ids)
+        }
+
+        #[test]
+        fn test_code_chunk_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = writer.get_or_create_repo_id("org/repo").unwrap();
+            let (chunk_ids, _) =
+                index_code_chunks(&writer, repository_id, &["src/a.rs", "src/b.rs"]);
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let results = reader
+                .search_code_chunks(&[0.9, 0.1, 0.0, 0.0], None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_ids[0]),
+                "a reopened tracker must search vectors written before it opened; got {} results",
+                results.len()
+            );
+        }
+
+        #[test]
+        fn test_discord_message_chunk_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let (chunk_ids, _) = index_discord_chunks(&writer, &[("100", "1001"), ("200", "2001")]);
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let results = reader
+                .search_discord_message_chunks(&[0.9, 0.1, 0.0, 0.0], None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_ids[0]),
+                "a reopened tracker must search vectors written before it opened; got {} results",
+                results.len()
+            );
+        }
+
+        #[test]
+        fn test_qa_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let mut entry = make_qa_entry(
+                "linear",
+                Some("org/repo"),
+                "issue-1",
+                "How do I reset my password?",
+                "Use the reset link on the sign-in page.",
+                "correlation-1",
+            );
+            entry.question_embedding = Some(axis_embedding(0));
+            let qa_id = writer.store_qa_knowledge(&entry).unwrap();
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let matches = reader
+                .find_similar_qa_global(
+                    "a question sharing no normalized text with any entry",
+                    Some(&axis_embedding(0)),
+                    0.5,
+                    5,
+                )
+                .unwrap();
+            assert_eq!(
+                matches.first().map(|found| found.entry.id),
+                Some(qa_id),
+                "a reopened tracker must search Q&A vectors written before it opened; got {} matches",
+                matches.len()
+            );
+        }
+
+        #[test]
+        fn test_issue_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let issue = IssueEmbedding {
+                id: 0,
+                source: "linear".to_string(),
+                issue_id: "issue-1".to_string(),
+                short_id: Some("LIN-1".to_string()),
+                title: Some("Login fails after password reset".to_string()),
+                description: None,
+                url: None,
+                priority: None,
+                status: None,
+                labels: None,
+                embedding: Some(axis_embedding(0)),
+                embedding_model: Some(MODEL.to_string()),
+                created_at: Utc::now(),
+                updated_at: None,
+            };
+            let issue_row_id = writer.store_embedding(&issue).unwrap();
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let similar = reader
+                .find_similar_issues_vector(&axis_embedding(0), "linear", None, 0.5, 5)
+                .unwrap()
+                .expect("vectorlite is loaded, so the vector search must run");
+            assert_eq!(
+                similar.first().map(|(found, _)| found.id),
+                Some(issue_row_id),
+                "a reopened tracker must search issue vectors written before it opened; got {} results",
+                similar.len()
+            );
+        }
+
+        #[test]
+        fn test_outcome_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            writer.record_attempt("linear", "issue-1", "LIN-1").unwrap();
+            let attempt = writer.get_attempt("linear", "issue-1").unwrap().unwrap();
+            let outcome = FixOutcome {
+                id: 0,
+                attempt_id: attempt.id,
+                source: "linear".to_string(),
+                issue_id: "issue-1".to_string(),
+                issue_text: "Null pointer in handler".to_string(),
+                prompt_used: "Fix the null pointer".to_string(),
+                outcome: Outcome::CannotFix,
+                error_type: Some("null_reference".to_string()),
+                learnings: None,
+                keywords: vec!["null".to_string()],
+                embedding: Some(axis_embedding(0)),
+                created_at: Utc::now(),
+            };
+            let outcome_id = writer.store_feedback_outcome(&outcome).unwrap();
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let similar = reader
+                .find_similar_outcomes_vector(&axis_embedding(0), 0.5, 5)
+                .unwrap()
+                .expect("vectorlite is loaded, so the vector search must run");
+            assert_eq!(
+                similar.first().map(|(found, _)| found.id),
+                Some(outcome_id),
+                "a reopened tracker must search outcome vectors written before it opened; got {} results",
+                similar.len()
+            );
+        }
+
+        #[test]
+        fn test_code_chunk_embeddings_retry_after_rolled_back_batch() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let chunk = sample_code_chunk(repository_id, "src/a.rs", 1);
+            let chunk_id = tracker
+                .save_code_chunks(std::slice::from_ref(&chunk))
+                .unwrap()[0];
+            let embedding = axis_embedding(0);
+            let missing_chunk_id = chunk_id + 1_000;
+
+            assert!(
+                tracker
+                    .save_code_chunk_embeddings(
+                        &[
+                            (chunk_id, embedding.as_slice()),
+                            (missing_chunk_id, embedding.as_slice()),
+                        ],
+                        MODEL,
+                    )
+                    .is_err(),
+                "an embedding for a missing chunk must fail and roll back the whole batch"
+            );
+            tracker
+                .save_code_chunk_embeddings(&[(chunk_id, embedding.as_slice())], MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("retrying the rolled-back embedding must succeed: {error}")
+                });
+
+            let results = tracker.search_code_chunks(&embedding, None, 5).unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_id),
+                "the retried embedding must be searchable"
+            );
+            assert!(
+                tracker
+                    .code_chunk_hash_matches(repository_id, &chunk.file_path, &chunk.file_hash)
+                    .unwrap(),
+                "the retried chunk must count as fully embedded"
+            );
+        }
+
+        #[test]
+        fn test_discord_message_chunk_embeddings_retry_after_rolled_back_batch() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let chunk = sample_discord_chunk("100", "1001");
+            let chunk_id = tracker
+                .save_discord_chunks(std::slice::from_ref(&chunk))
+                .unwrap()[0];
+            let embedding = axis_embedding(0);
+            let missing_chunk_id = chunk_id + 1_000;
+
+            assert!(
+                tracker
+                    .save_discord_chunk_embeddings(
+                        &[
+                            (chunk_id, embedding.as_slice()),
+                            (missing_chunk_id, embedding.as_slice()),
+                        ],
+                        MODEL,
+                    )
+                    .is_err(),
+                "an embedding for a missing chunk must fail and roll back the whole batch"
+            );
+            tracker
+                .save_discord_chunk_embeddings(&[(chunk_id, embedding.as_slice())], MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("retrying the rolled-back embedding must succeed: {error}")
+                });
+
+            let results = tracker
+                .search_discord_message_chunks(&embedding, None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_id),
+                "the retried embedding must be searchable"
+            );
+            let content_hash = chunk.content_hash.as_deref().unwrap();
+            assert!(
+                tracker
+                    .discord_chunk_hash_matches(&chunk.channel_id, content_hash)
+                    .unwrap(),
+                "the retried chunk must count as fully embedded"
+            );
+        }
+
+        #[test]
+        fn test_code_chunk_vectors_outgrow_legacy_capacity() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            drop(SqliteTracker::new(&path).unwrap());
+            {
+                let connection = Connection::open(&path).unwrap();
+                if !require_vectorlite_for_tests(&connection) {
+                    return;
+                }
+                connection
+                    .execute_batch(&legacy_vector_table(CODE_CHUNK_VECTORS))
+                    .unwrap();
+            }
+
+            let tracker = SqliteTracker::new(&path).unwrap();
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let chunks: Vec<CodeChunk> = (1..=10)
+                .map(|line| sample_code_chunk(repository_id, "src/a.rs", line))
+                .collect();
+            let chunk_ids = tracker.save_code_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(spread_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker
+                .save_code_chunk_embeddings(&pairs, MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("ten embeddings must fit despite a legacy max_elements=4 table: {error}")
+                });
+
+            let results = tracker
+                .search_code_chunks(&embeddings[0], None, 10)
+                .unwrap();
+            assert_eq!(results.len(), 10, "every embedding must be searchable");
+            assert!(
+                tracker
+                    .code_chunk_hash_matches(repository_id, "src/a.rs", &chunks[0].file_hash)
+                    .unwrap(),
+                "every chunk must count as fully embedded"
+            );
+        }
+
+        #[test]
+        fn test_discord_message_chunk_vectors_outgrow_legacy_capacity() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            drop(SqliteTracker::new(&path).unwrap());
+            {
+                let connection = Connection::open(&path).unwrap();
+                if !require_vectorlite_for_tests(&connection) {
+                    return;
+                }
+                connection
+                    .execute_batch(&legacy_vector_table(DISCORD_MESSAGE_CHUNK_VECTORS))
+                    .unwrap();
+            }
+
+            let tracker = SqliteTracker::new(&path).unwrap();
+            let chunks: Vec<claudear_core::types::DiscordMessageChunk> = (1..=10)
+                .map(|index| sample_discord_chunk("100", &format!("{}", 1000 + index)))
+                .collect();
+            let chunk_ids = tracker.save_discord_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(spread_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker
+                .save_discord_chunk_embeddings(&pairs, MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("ten embeddings must fit despite a legacy max_elements=4 table: {error}")
+                });
+
+            let results = tracker
+                .search_discord_message_chunks(&embeddings[0], None, 10)
+                .unwrap();
+            assert_eq!(results.len(), 10, "every embedding must be searchable");
+            for chunk in &chunks {
+                let content_hash = chunk.content_hash.as_deref().unwrap();
+                assert!(
+                    tracker
+                        .discord_chunk_hash_matches("100", content_hash)
+                        .unwrap(),
+                    "chunk {content_hash} must count as fully embedded"
+                );
+            }
+        }
+
+        #[test]
+        fn test_delete_code_chunks_by_ids_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (chunk_ids, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker.delete_code_chunks_by_ids(&chunk_ids[..1]).unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_delete_code_data_for_file_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker
+                .delete_code_data_for_file(repository_id, "src/a.rs")
+                .unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_code_data_removes_vectors_for_stale_paths() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/stale.rs", "src/kept.rs"]);
+
+            tracker
+                .cleanup_stale_code_data(repository_id, &["src/kept.rs".to_string()])
+                .unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_code_data_removes_all_vectors_when_no_paths_remain() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker.cleanup_stale_code_data(repository_id, &[]).unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids);
+        }
+
+        #[test]
+        fn test_delete_all_code_data_for_repo_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let deleted_repository_id = tracker.get_or_create_repo_id("org/deleted").unwrap();
+            let kept_repository_id = tracker.get_or_create_repo_id("org/kept").unwrap();
+            let (_, deleted_embedding_ids) =
+                index_code_chunks(&tracker, deleted_repository_id, &["src/a.rs", "src/b.rs"]);
+            let (_, kept_embedding_ids) =
+                index_code_chunks(&tracker, kept_repository_id, &["src/a.rs"]);
+
+            tracker
+                .delete_all_code_data_for_repo(deleted_repository_id)
+                .unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &deleted_embedding_ids);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &kept_embedding_ids);
+        }
+
+        #[test]
+        fn test_clear_repositories_removes_code_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker.clear_repositories().unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids);
+        }
+
+        #[test]
+        fn test_clear_repositories_without_extension_keeps_code_vector_table() {
+            let directory = tempfile::tempdir().unwrap();
+            {
+                let tracker = SqliteTracker::new(database_path(&directory)).unwrap();
+                if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                    return;
+                }
+                let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+                index_code_chunks(&tracker, repository_id, &["src/a.rs"]);
+            }
+
+            let tracker = SqliteTracker::new(database_path(&directory)).unwrap();
+            tracker
+                .clear_repositories()
+                .expect("clearing repositories must not need the vectorlite extension");
+
+            let connection = tracker.acquire_lock().unwrap();
+            let vector_tables: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    params![CODE_CHUNK_VECTORS],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                vector_tables, 1,
+                "a tracker that never loaded vectorlite must leave {CODE_CHUNK_VECTORS} in place"
+            );
+            let embeddings: i64 = connection
+                .query_row("SELECT COUNT(*) FROM code_chunk_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                embeddings, 0,
+                "clearing repositories must cascade to embeddings"
+            );
+        }
+
+        #[test]
+        fn test_delete_discord_message_chunks_by_ids_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (chunk_ids, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("100", "1002")]);
+
+            tracker
+                .delete_discord_message_chunks_by_ids(&chunk_ids[..1])
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_delete_discord_message_data_for_channel_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (_, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("200", "2001")]);
+
+            tracker
+                .delete_discord_message_data_for_channel("100")
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_discord_message_data_removes_stale_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (_, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("100", "1002")]);
+
+            tracker
+                .cleanup_stale_discord_message_data("100", &["hash-1002".to_string()])
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_discord_message_data_removes_all_vectors_when_no_hashes_remain() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (_, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("100", "1002")]);
+
+            tracker
+                .cleanup_stale_discord_message_data("100", &[])
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids);
+        }
+
+        #[test]
+        fn test_discord_message_chunk_vectors_work_after_delete_all_discord_message_data() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            index_discord_chunks(&tracker, &[("100", "1001")]);
+
+            tracker.delete_all_discord_message_data().unwrap();
+
+            let (chunk_ids, _) = index_discord_chunks(&tracker, &[("200", "2001")]);
+            let results = tracker
+                .search_discord_message_chunks(&axis_embedding(0), None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_ids[0]),
+                "embeddings saved after a full delete must be searchable"
+            );
+        }
     }
 }

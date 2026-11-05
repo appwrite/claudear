@@ -15,8 +15,10 @@ use crate::intent::{
 };
 use async_trait::async_trait;
 use claudear_analysis::inference::{ClassificationRequest, RepoClassifier};
+use claudear_core::error::Error;
 use claudear_core::types::Issue;
 use claudear_integrations::runner::AgentRunner;
+use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -320,10 +322,6 @@ impl IntentClassifier for AgentIntentClassifier {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Retrieval-quality relevance judge (agent backend)
-// ---------------------------------------------------------------------------
-
 /// JSON schema constraining the agent's relevance judgment to a single number.
 const RELEVANCE_SCHEMA: &str = r#"{
     "type": "object",
@@ -354,32 +352,69 @@ pub fn build_relevance_context(issue_summary: &str, chunk_text: &str) -> String 
 }
 
 /// Score chunk relevance (0.0-1.0) via the **coding agent** (external provider)
-/// using schema-constrained structured output. Used by the opt-in
-/// retrieval-quality judge when `agent.use_llm` is false. Returns `None` if the
-/// provider doesn't support structured output or the call fails.
+/// using schema-constrained structured output. `Ok(None)` when the reply
+/// carries no usable score; `Err` when the agent call itself failed.
 pub async fn score_chunk_relevance_via_agent(
     agent: &dyn AgentRunner,
     issue_summary: &str,
     chunk_text: &str,
-) -> Option<f64> {
+) -> claudear_core::error::Result<Option<f64>> {
     let prompt = format!(
         "{}\n\nSet `relevance` to a number between 0.0 and 1.0.",
         build_relevance_context(issue_summary, chunk_text)
     );
     let temp_dir = std::env::temp_dir();
-    match agent
+    let value = agent
         .structured_query(&prompt, RELEVANCE_SCHEMA, &temp_dir)
-        .await
-    {
-        Ok(value) => value
-            .get("relevance")
-            .and_then(|v| v.as_f64())
-            .map(|v| v.clamp(0.0, 1.0)),
-        Err(e) => {
-            tracing::warn!(error = %e, "Agent retrieval relevance judge failed");
-            None
+        .await?;
+    Ok(value
+        .get("relevance")
+        .and_then(|v| v.as_f64())
+        .map(|v| v.clamp(0.0, 1.0)))
+}
+
+/// Relevance scores for a batch of chunks, keyed by the chunk's index.
+#[derive(Debug, Default)]
+pub struct RelevanceJudgment {
+    pub scores: Vec<(usize, f64)>,
+    /// The agent failure that stopped the batch, if any.
+    pub failure: Option<Error>,
+}
+
+/// Score `chunks` with at most `concurrency` agent calls in flight, used by the
+/// opt-in retrieval-quality judge when `agent.use_llm` is false.
+///
+/// The first agent failure stops the batch and cancels the calls in flight: a
+/// failure is almost always provider-wide (an exhausted usage limit, an expired
+/// login), so every remaining call would fail the same way.
+pub async fn judge_relevance_via_agent(
+    agent: &dyn AgentRunner,
+    issue_summary: &str,
+    chunks: &[&str],
+    concurrency: usize,
+) -> RelevanceJudgment {
+    let mut judgment = RelevanceJudgment::default();
+    let queries: Vec<_> = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| async move {
+            score_chunk_relevance_via_agent(agent, issue_summary, chunk)
+                .await
+                .map(|score| (index, score))
+        })
+        .collect();
+    let mut pending = futures::stream::iter(queries).buffer_unordered(concurrency.max(1));
+    while let Some(outcome) = pending.next().await {
+        match outcome {
+            Ok((index, Some(score))) => judgment.scores.push((index, score)),
+            Ok((_, None)) => {}
+            Err(error) => {
+                judgment.failure = Some(error);
+                break;
+            }
         }
     }
+    judgment
 }
 
 /// Build the intent-classification prompt for the coding agent (plain text; the
@@ -407,6 +442,7 @@ mod tests {
     use claudear_integrations::runner::ProviderCapabilities;
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockAgent {
         response: Result<AgentResult, String>,
@@ -605,9 +641,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_agent_classifier_uses_structured_output() {
-        let mock = StructuredMock {
-            response: Ok(serde_json::json!({ "repo": "utopia-php/database" })),
-        };
+        let mock = StructuredMock::new(Ok(serde_json::json!({ "repo": "utopia-php/database" })));
         let classifier = AgentRepoClassifier::new(Arc::new(mock));
         let result = classifier.classify(&sample_request());
         assert_eq!(result, Some(("utopia-php/database".to_string(), 1.0)));
@@ -615,18 +649,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_agent_classifier_structured_none_returns_none() {
-        let mock = StructuredMock {
-            response: Ok(serde_json::json!({ "repo": "NONE" })),
-        };
+        let mock = StructuredMock::new(Ok(serde_json::json!({ "repo": "NONE" })));
         let classifier = AgentRepoClassifier::new(Arc::new(mock));
         assert!(classifier.classify(&sample_request()).is_none());
     }
 
-    // --- Intent classifier ---
-
     /// Mock agent whose `structured_query` returns a fixed JSON value (or errors).
     struct StructuredMock {
         response: Result<serde_json::Value, String>,
+        calls: AtomicUsize,
+    }
+
+    impl StructuredMock {
+        fn new(response: Result<serde_json::Value, String>) -> Self {
+            Self {
+                response,
+                calls: AtomicUsize::new(0),
+            }
+        }
     }
 
     #[async_trait]
@@ -655,6 +695,7 @@ mod tests {
             _json_schema: &str,
             _project_dir: &Path,
         ) -> claudear_core::error::Result<serde_json::Value> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             match &self.response {
                 Ok(v) => Ok(v.clone()),
                 Err(e) => Err(claudear_core::error::Error::runner(e)),
@@ -719,9 +760,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_agent_intent_classifier_parses_structured_value() {
-        let classifier = AgentIntentClassifier::new(Arc::new(StructuredMock {
-            response: Ok(serde_json::json!({ "intent": "security" })),
-        }));
+        let classifier = AgentIntentClassifier::new(Arc::new(StructuredMock::new(Ok(
+            serde_json::json!({ "intent": "security" }),
+        ))));
         let issue = intent_issue("SQL injection in login", None);
         assert_eq!(
             classifier.classify_intent(&issue, None).await,
@@ -731,14 +772,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_agent_intent_classifier_error_returns_none() {
-        let classifier = AgentIntentClassifier::new(Arc::new(StructuredMock {
-            response: Err("not supported".to_string()),
-        }));
+        let classifier = AgentIntentClassifier::new(Arc::new(StructuredMock::new(Err(
+            "not supported".to_string(),
+        ))));
         let issue = intent_issue("anything", None);
         assert_eq!(classifier.classify_intent(&issue, None).await, None);
     }
-
-    // --- Retrieval relevance judge (agent backend) ---
 
     #[test]
     fn test_relevance_schema_is_valid_json_with_number() {
@@ -759,30 +798,68 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_score_chunk_relevance_via_agent() {
-        let agent = StructuredMock {
-            response: Ok(serde_json::json!({ "relevance": 0.73 })),
-        };
+        let agent = StructuredMock::new(Ok(serde_json::json!({ "relevance": 0.73 })));
         assert_eq!(
-            score_chunk_relevance_via_agent(&agent, "issue", "snippet").await,
+            score_chunk_relevance_via_agent(&agent, "issue", "snippet")
+                .await
+                .unwrap(),
             Some(0.73)
         );
 
-        // Out-of-range values are clamped.
-        let agent = StructuredMock {
-            response: Ok(serde_json::json!({ "relevance": 2.0 })),
-        };
+        let agent = StructuredMock::new(Ok(serde_json::json!({ "relevance": 2.0 })));
         assert_eq!(
-            score_chunk_relevance_via_agent(&agent, "i", "s").await,
-            Some(1.0)
+            score_chunk_relevance_via_agent(&agent, "i", "s")
+                .await
+                .unwrap(),
+            Some(1.0),
+            "out-of-range values are clamped"
         );
 
-        // Provider without structured output -> None (caller leaves score unset).
-        let agent = StructuredMock {
-            response: Err("not supported".to_string()),
-        };
+        let agent = StructuredMock::new(Ok(serde_json::json!({})));
         assert_eq!(
-            score_chunk_relevance_via_agent(&agent, "i", "s").await,
-            None
+            score_chunk_relevance_via_agent(&agent, "i", "s")
+                .await
+                .unwrap(),
+            None,
+            "a reply without a score leaves the score unset"
+        );
+
+        let agent = StructuredMock::new(Err("not supported".to_string()));
+        assert!(score_chunk_relevance_via_agent(&agent, "i", "s")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_judge_relevance_via_agent_scores_every_chunk() {
+        let agent = StructuredMock::new(Ok(serde_json::json!({ "relevance": 0.5 })));
+        let chunks = ["a", "b", "c"];
+
+        let mut judgment = judge_relevance_via_agent(&agent, "issue", &chunks, 2).await;
+        judgment.scores.sort_by_key(|(index, _)| *index);
+
+        assert!(judgment.failure.is_none());
+        assert_eq!(judgment.scores, vec![(0, 0.5), (1, 0.5), (2, 0.5)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_judge_relevance_via_agent_stops_at_the_first_agent_failure() {
+        let agent = StructuredMock::new(Err(
+            "Failed to authenticate: OAuth session expired and could not be refreshed".to_string(),
+        ));
+        let chunks = ["chunk"; 16];
+        let concurrency = 4;
+
+        let judgment = judge_relevance_via_agent(&agent, "issue", &chunks, concurrency).await;
+
+        assert!(judgment.scores.is_empty());
+        let failure = judgment.failure.expect("the agent failure is reported");
+        assert!(failure.to_string().contains("OAuth session expired"));
+        let calls = agent.calls.load(Ordering::SeqCst);
+        assert!(
+            calls <= concurrency,
+            "a provider-wide failure must not be retried for every chunk: {calls} calls for {} chunks",
+            chunks.len()
         );
     }
 }

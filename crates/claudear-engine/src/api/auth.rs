@@ -14,6 +14,7 @@ use tower_cookies::{Cookie, Cookies};
 use super::routes::ApiState;
 
 const SESSION_COOKIE: &str = "claudear_session";
+const ADMIN_ROLE: &str = "admin";
 const SESSION_MAX_AGE_DAYS: i64 = 7;
 
 /// Maximum number of login attempts per email within the rate limit window.
@@ -219,6 +220,12 @@ pub struct AuthUser {
     pub avatar_url: Option<String>,
 }
 
+impl AuthUser {
+    pub fn is_admin(&self) -> bool {
+        self.role == ADMIN_ROLE
+    }
+}
+
 impl FromRequestParts<ApiState> for AuthUser {
     type Rejection = StatusCode;
 
@@ -267,7 +274,7 @@ impl FromRequestParts<ApiState> for AuthUser {
     }
 }
 
-/// Admin user extractor — wraps AuthUser and checks role == "admin".
+/// Admin user extractor — wraps AuthUser and checks it is an admin.
 #[derive(Debug, Clone)]
 pub struct AdminUser(pub AuthUser);
 
@@ -279,7 +286,7 @@ impl FromRequestParts<ApiState> for AdminUser {
         state: &ApiState,
     ) -> Result<Self, Self::Rejection> {
         let user = AuthUser::from_request_parts(parts, state).await?;
-        if user.role != "admin" {
+        if !user.is_admin() {
             return Err(StatusCode::FORBIDDEN);
         }
         Ok(AdminUser(user))

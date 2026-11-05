@@ -706,17 +706,57 @@ export function getCsrfToken(): string {
   return match ? decodeURIComponent(match[1]) : ''
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url)
+export class ApiError extends Error {
+  readonly status: number
+  readonly code?: string
+
+  constructor(status: number, message: string, code?: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+  }
+}
+
+type ApiMethod = 'GET' | 'POST' | 'PUT' | 'DELETE'
+
+const failureVerbs: Record<ApiMethod, string> = {
+  GET: 'fetch',
+  POST: 'post',
+  PUT: 'put',
+  DELETE: 'delete',
+}
+
+async function readApiError(res: Response, url: string, method: ApiMethod): Promise<ApiError> {
+  let body: unknown
+  try {
+    body = await res.json()
+  } catch {
+    body = undefined
+  }
+  const payload = typeof body === 'object' && body !== null ? (body as { error?: unknown; code?: unknown }) : {}
+  const message = typeof payload.error === 'string'
+    ? payload.error
+    : `Failed to ${failureVerbs[method]} ${url}: ${res.status}`
+  const code = typeof payload.code === 'string' ? payload.code : undefined
+  return new ApiError(res.status, message, code)
+}
+
+async function ensureOk(res: Response, url: string, method: ApiMethod): Promise<void> {
   if (res.status === 401) {
     onUnauthorized?.()
     throw new Error('Unauthorized')
   }
   if (!res.ok) {
-    const err = new Error(`Failed to fetch ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'GET', 'api.status': String(res.status) } })
+    const err = await readApiError(res, url, method)
+    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': method, 'api.status': String(res.status) } })
     throw err
   }
+}
+
+export async function fetchJson<T>(url: string): Promise<T> {
+  const res = await fetch(url)
+  await ensureOk(res, url, 'GET')
   return res.json()
 }
 
@@ -730,15 +770,7 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
     },
     body: body ? JSON.stringify(body) : undefined,
   })
-  if (res.status === 401) {
-    onUnauthorized?.()
-    throw new Error('Unauthorized')
-  }
-  if (!res.ok) {
-    const err = new Error(`Failed to post ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'POST', 'api.status': String(res.status) } })
-    throw err
-  }
+  await ensureOk(res, url, 'POST')
   if (res.status === 204) return undefined as T
   return res.json()
 }
@@ -753,33 +785,17 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
     },
     body: JSON.stringify(body),
   })
-  if (res.status === 401) {
-    onUnauthorized?.()
-    throw new Error('Unauthorized')
-  }
-  if (!res.ok) {
-    const err = new Error(`Failed to put ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'PUT', 'api.status': String(res.status) } })
-    throw err
-  }
+  await ensureOk(res, url, 'PUT')
   return res.json()
 }
 
-async function deleteRequest(url: string): Promise<void> {
+export async function deleteRequest(url: string): Promise<void> {
   Sentry.addBreadcrumb({ category: 'api', message: `DELETE ${url}`, level: 'info' })
   const res = await fetch(url, {
     method: 'DELETE',
     headers: { 'x-csrf-token': getCsrfToken() },
   })
-  if (res.status === 401) {
-    onUnauthorized?.()
-    throw new Error('Unauthorized')
-  }
-  if (!res.ok) {
-    const err = new Error(`Failed to delete ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'DELETE', 'api.status': String(res.status) } })
-    throw err
-  }
+  await ensureOk(res, url, 'DELETE')
 }
 
 // Existing
@@ -1125,17 +1141,36 @@ export async function fetchRepoLearning(repo: string): Promise<RepoLearningRespo
 }
 
 
+export type ConfigErrorCode = 'invalid' | 'read_only' | 'revision_mismatch' | 'unreadable'
+
+export interface OptionalConfigSection {
+  key: string
+  template: string
+}
+
 export interface ConfigResponse {
   content: string
-  path: string
+  secret_paths: string[]
+  runtime_overrides: string[]
+  restart_required: boolean
+  writable: boolean
+  revision: string
+  optional_sections: OptionalConfigSection[]
+}
+
+export interface SaveConfigResponse {
+  ok: true
+  restart_required: boolean
+  revision: string
+  message: string
 }
 
 export async function fetchConfig(): Promise<ConfigResponse> {
   return fetchJson(`${API_BASE}/config`)
 }
 
-export async function saveConfig(content: string): Promise<{ ok: boolean; message: string }> {
-  return putJson(`${API_BASE}/config`, { content })
+export async function saveConfig(content: string, revision?: string): Promise<SaveConfigResponse> {
+  return putJson(`${API_BASE}/config`, revision === undefined ? { content } : { content, revision })
 }
 
 
@@ -1218,8 +1253,6 @@ export async function deleteUser(id: number): Promise<void> {
   return deleteRequest(`${API_BASE}/users/${id}`)
 }
 
-// --- Personal access tokens -------------------------------------------------
-
 /** A personal access token (never includes the secret after creation). */
 export interface ApiToken {
   id: string
@@ -1265,7 +1298,147 @@ export async function fetchMyTokens(): Promise<ApiToken[]> {
   return fetchJson(`${API_BASE}/tokens`)
 }
 
+/** Mint a token for the current user. `expires_at` is RFC3339; the secret is returned once. */
+export async function createMyToken(data: { name: string; expires_at?: string }): Promise<CreatedToken> {
+  return postJson(`${API_BASE}/tokens`, data)
+}
+
 /** Admin: every token with its owner. */
 export async function fetchAllTokens(): Promise<ApiTokenWithOwner[]> {
   return fetchJson(`${API_BASE}/tokens/all`)
+}
+
+export type DeployQaTipStatus = 'pending' | 'running' | 'verified' | 'unverified' | 'failed' | 'errored'
+
+export interface DeployQaTipView {
+  id: number
+  track: string
+  repo: string
+  tag: string
+  status: DeployQaTipStatus
+  published_at: string | null
+  release_url: string | null
+  author_login: string | null
+  attempt_id: number | null
+  discord_message_url: string | null
+  discord_thread_url: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface DeployQaTrackStatus {
+  name: string
+  repo: string
+  tag_filter: string
+  last_seen: DeployQaTipView | null
+  in_flight: boolean
+}
+
+export interface DeployQaStatus {
+  enabled: boolean
+  restart_required: boolean
+  poll_interval_ms: number
+  timeout_secs: number
+  skip_if_previous_running: boolean
+  discord_channel_id: string | null
+  tracks: DeployQaTrackStatus[]
+}
+
+export interface DeployQaTrackSettings {
+  name: string
+  repo: string
+  tag_filter: string
+}
+
+export interface DeployQaSettings {
+  enabled: boolean
+  poll_interval_ms: number
+  skip_if_previous_running: boolean
+  timeout_secs: number
+  discord_channel_id: string | null
+  github_discord_map_path: string | null
+  instructions_path: string | null
+  tracks: DeployQaTrackSettings[]
+}
+
+export interface DeployQaTagFilterKind {
+  kind: string
+  requires_value: boolean
+}
+
+export interface DeployQaConfigResponse {
+  settings: DeployQaSettings
+  tag_filter_kinds: DeployQaTagFilterKind[]
+  track_name_separator: string
+  restart_required: boolean
+  writable: boolean
+  revision: string
+}
+
+export interface DeployQaSaveResponse {
+  ok: true
+  restart_required: boolean
+  revision: string
+  message: string
+}
+
+export async function fetchDeployQaStatus(): Promise<DeployQaStatus> {
+  return fetchJson(`${API_BASE}/deploy-qa`)
+}
+
+export async function fetchDeployQaTips(track?: string): Promise<DeployQaTipView[]> {
+  const query = track ? `?${new URLSearchParams({ track })}` : ''
+  const response = await fetchJson<{ tips: DeployQaTipView[] }>(`${API_BASE}/deploy-qa/tips${query}`)
+  return response.tips
+}
+
+export async function fetchDeployQaConfig(): Promise<DeployQaConfigResponse> {
+  return fetchJson(`${API_BASE}/deploy-qa/config`)
+}
+
+export async function saveDeployQaConfig(
+  settings: DeployQaSettings,
+  revision: string,
+): Promise<DeployQaSaveResponse> {
+  return putJson(`${API_BASE}/deploy-qa/config`, { settings, revision })
+}
+
+export type FeatureCategory = 'source' | 'scm' | 'notifier' | 'automation' | 'intelligence' | 'platform'
+
+export type FeatureSettingValue =
+  | string
+  | number
+  | boolean
+  | null
+  | FeatureSettingValue[]
+  | { [name: string]: FeatureSettingValue }
+
+export interface FeatureSetting {
+  name: string
+  value: FeatureSettingValue
+}
+
+export interface FeatureSecret {
+  name: string
+  set: boolean
+}
+
+export interface FeatureStatus {
+  key: string
+  label: string
+  description: string
+  category: FeatureCategory
+  configured: boolean
+  enabled: boolean
+  settings: FeatureSetting[]
+  secrets: FeatureSecret[]
+}
+
+export interface FeaturesResponse {
+  features: FeatureStatus[]
+}
+
+export async function fetchFeatures(): Promise<FeatureStatus[]> {
+  const response = await fetchJson<FeaturesResponse>(`${API_BASE}/features`)
+  return response.features
 }
