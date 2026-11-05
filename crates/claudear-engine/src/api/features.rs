@@ -1380,7 +1380,7 @@ mod tests {
     async fn viewer_can_read_features() {
         let storage = tempfile::tempdir().unwrap();
         let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         let user_id = tracker
             .create_user("viewer@example.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();

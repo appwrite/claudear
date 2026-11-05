@@ -907,6 +907,7 @@ pub async fn delete_user_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::fixture;
     use crate::api::routes::create_api_router;
     use axum::body::Body;
     use axum::http::Request;
@@ -986,7 +987,7 @@ mod tests {
     fn seed_admin(
         tracker: &std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
     ) -> (i64, String) {
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let user_id = tracker
             .create_user("admin@test.com", &password_hash, "Admin User", Role::Admin)
             .unwrap();
@@ -1000,7 +1001,7 @@ mod tests {
     fn seed_viewer(
         tracker: &std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
     ) -> (i64, String) {
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let user_id = tracker
             .create_user(
                 "viewer@test.com",
@@ -1020,7 +1021,8 @@ mod tests {
         let (router, tracker) = create_test_app();
 
         // Seed a user (not via seed_admin, to test login flow directly)
-        let password_hash = bcrypt::hash("secret123", 4).unwrap();
+        let password = fixture::password();
+        let password_hash = bcrypt::hash(&password, 4).unwrap();
         tracker
             .create_user("user@test.com", &password_hash, "Test User", Role::Admin)
             .unwrap();
@@ -1032,7 +1034,8 @@ mod tests {
                     .uri("/api/auth/login")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"email":"user@test.com","password":"secret123"}"#,
+                        serde_json::json!({"email": "user@test.com", "password": password})
+                            .to_string(),
                     ))
                     .unwrap(),
             )
@@ -1061,7 +1064,7 @@ mod tests {
     async fn test_login_wrong_password() {
         let (router, tracker) = create_test_app();
 
-        let password_hash = bcrypt::hash("correct_password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
             .create_user("user@test.com", &password_hash, "Test User", Role::Admin)
             .unwrap();
@@ -1073,7 +1076,7 @@ mod tests {
                     .uri("/api/auth/login")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"email":"user@test.com","password":"wrong_password"}"#,
+                        serde_json::json!({"email": "user@test.com", "password": fixture::password()}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1094,7 +1097,7 @@ mod tests {
                     .uri("/api/auth/login")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"email":"nobody@test.com","password":"whatever"}"#,
+                        serde_json::json!({"email": "nobody@test.com", "password": fixture::password()}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1159,7 +1162,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"new@test.com","password":"newpass1!","name":"New User","role":"viewer"}"#,
+                        serde_json::json!({"email": "new@test.com", "password": fixture::password(), "name": "New User", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1188,7 +1191,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"new@test.com","password":"newpass1!","name":"New User","role":"viewer"}"#,
+                        serde_json::json!({"email": "new@test.com", "password": fixture::password(), "name": "New User", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1223,7 +1226,16 @@ mod tests {
         tracker: &std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
         email: &str,
     ) -> (i64, String) {
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        seed_admin_with_password(tracker, email, &fixture::password())
+    }
+
+    /// Seed an admin user who logs in with `password` and return (user_id, session_token).
+    fn seed_admin_with_password(
+        tracker: &std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
+        email: &str,
+        password: &str,
+    ) -> (i64, String) {
+        let password_hash = bcrypt::hash(password, 4).unwrap();
         let user_id = tracker
             .create_user(email, &password_hash, "Admin User", Role::Admin)
             .unwrap();
@@ -1246,7 +1258,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"x@test.com","password":"longpassword","name":"X","role":"superuser"}"#,
+                        serde_json::json!({"email": "x@test.com", "password": fixture::password(), "name": "X", "role": "superuser"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1269,7 +1281,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"","password":"longpassword","name":"X","role":"viewer"}"#,
+                        serde_json::json!({"email": "", "password": fixture::password(), "name": "X", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1292,7 +1304,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"bademail","password":"longpassword","name":"X","role":"viewer"}"#,
+                        serde_json::json!({"email": "bademail", "password": fixture::password(), "name": "X", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1315,7 +1327,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"x@test.com","password":"short","name":"X","role":"viewer"}"#,
+                        serde_json::json!({"email": "x@test.com", "password": fixture::password_with_length(5), "name": "X", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1338,7 +1350,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"x@test.com","password":"longpassword","name":"","role":"viewer"}"#,
+                        serde_json::json!({"email": "x@test.com", "password": fixture::password(), "name": "", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1354,7 +1366,7 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-dup@test.com");
 
         // Create a user first
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
             .create_user("dup@test.com", &hash, "Dup User", Role::Viewer)
             .unwrap();
@@ -1368,7 +1380,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"dup@test.com","password":"longpassword","name":"Another","role":"viewer"}"#,
+                        serde_json::json!({"email": "dup@test.com", "password": fixture::password(), "name": "Another", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1384,7 +1396,7 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-role@test.com");
 
         // Create a target user to update
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
             .create_user("target-update@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
@@ -1432,7 +1444,7 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-del-ok@test.com");
 
         // Create a target user to delete
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
             .create_user("target-del@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
@@ -1482,7 +1494,7 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-list@test.com");
 
         // Create an additional user
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
             .create_user("extra-list@test.com", &hash, "Extra User", Role::Viewer)
             .unwrap();
@@ -1517,7 +1529,7 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-getuser@test.com");
 
         // Create a target user
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
             .create_user("target-get@test.com", &hash, "Target Get", Role::Viewer)
             .unwrap();
@@ -1722,7 +1734,7 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-shortpw@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
             .create_user("target-update-pw@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
@@ -1734,7 +1746,10 @@ mod tests {
                     .uri(format!("/api/users/{}", target_id))
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
-                    .body(Body::from(r#"{"password":"short"}"#))
+                    .body(Body::from(
+                        serde_json::json!({"password": fixture::password_with_length(5)})
+                            .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -1748,7 +1763,7 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-longpw@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
             .create_user(
                 "target-update-longpw@test.com",
@@ -1782,7 +1797,7 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-validpw@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
             .create_user(
                 "target-update-validpw@test.com",
@@ -1799,7 +1814,9 @@ mod tests {
                     .uri(format!("/api/users/{}", target_id))
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
-                    .body(Body::from(r#"{"password":"newlongpassword123"}"#))
+                    .body(Body::from(
+                        serde_json::json!({"password": fixture::password()}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -1813,7 +1830,7 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-name@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
             .create_user(
                 "target-name-upd@test.com",
@@ -1847,7 +1864,7 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-role-to-admin@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
             .create_user("target-role-upd@test.com", &hash, "Target", Role::Viewer)
             .unwrap();
@@ -1913,7 +1930,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"x@test.com","password":"longpassword","name":"   ","role":"viewer"}"#,
+                        serde_json::json!({"email": "x@test.com", "password": fixture::password(), "name": "   ", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -1926,7 +1943,8 @@ mod tests {
     #[tokio::test]
     async fn test_login_sends_x_forwarded_for_ip() {
         let (router, tracker) = create_test_app();
-        let password_hash = bcrypt::hash("secret123", 4).unwrap();
+        let password = fixture::password();
+        let password_hash = bcrypt::hash(&password, 4).unwrap();
         tracker
             .create_user("iptest@test.com", &password_hash, "IP User", Role::Admin)
             .unwrap();
@@ -1939,7 +1957,8 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("x-forwarded-for", "1.2.3.4")
                     .body(Body::from(
-                        r#"{"email":"iptest@test.com","password":"secret123"}"#,
+                        serde_json::json!({"email": "iptest@test.com", "password": password})
+                            .to_string(),
                     ))
                     .unwrap(),
             )
@@ -1998,7 +2017,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_profile_password_too_short() {
         let (router, tracker) = create_test_app();
-        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-profile-shortpw@test.com");
+        let password = fixture::password();
+        let (_admin_id, token) =
+            seed_admin_with_password(&tracker, "admin-profile-shortpw@test.com", &password);
 
         let response = router
             .oneshot(
@@ -2008,7 +2029,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"password":"short","current_password":"password"}"#,
+                        serde_json::json!({"password": fixture::password_with_length(5), "current_password": password}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2021,12 +2042,14 @@ mod tests {
     #[tokio::test]
     async fn test_update_profile_password_too_long() {
         let (router, tracker) = create_test_app();
-        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-profile-longpw@test.com");
+        let password = fixture::password();
+        let (_admin_id, token) =
+            seed_admin_with_password(&tracker, "admin-profile-longpw@test.com", &password);
 
-        let long_pw = "c".repeat(73);
+        let long_pw = fixture::password_with_length(73);
         let body = serde_json::json!({
             "password": long_pw,
-            "current_password": "password"
+            "current_password": password
         });
 
         let response = router
@@ -2057,7 +2080,9 @@ mod tests {
                     .uri("/api/auth/profile")
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
-                    .body(Body::from(r#"{"password":"newpassword123"}"#))
+                    .body(Body::from(
+                        serde_json::json!({"password": fixture::password()}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2080,7 +2105,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"password":"newpassword123","current_password":"wrongpassword"}"#,
+                        serde_json::json!({"password": fixture::password(), "current_password": fixture::password()}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2093,8 +2118,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_profile_password_success() {
         let (router, tracker) = create_test_app();
+        let password = fixture::password();
         let (_admin_id, token) =
-            seed_admin_with_email(&tracker, "admin-profile-pwsuccess@test.com");
+            seed_admin_with_password(&tracker, "admin-profile-pwsuccess@test.com", &password);
 
         let response = router
             .oneshot(
@@ -2104,7 +2130,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"password":"newpassword123","current_password":"password"}"#,
+                        serde_json::json!({"password": fixture::password(), "current_password": password}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2240,7 +2266,7 @@ mod tests {
                     .uri("/api/users")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"email":"x@test.com","password":"longpassword","name":"X","role":"viewer"}"#,
+                        serde_json::json!({"email": "x@test.com", "password": fixture::password(), "name": "X", "role": "viewer"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2281,7 +2307,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"newadmin@test.com","password":"longpassword","name":"New Admin","role":"admin"}"#,
+                        serde_json::json!({"email": "newadmin@test.com", "password": fixture::password(), "name": "New Admin", "role": "admin"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2297,7 +2323,8 @@ mod tests {
     #[tokio::test]
     async fn test_login_response_body_structure() {
         let (router, tracker) = create_test_app();
-        let password_hash = bcrypt::hash("testpass1", 4).unwrap();
+        let password = fixture::password();
+        let password_hash = bcrypt::hash(&password, 4).unwrap();
         tracker
             .create_user(
                 "struct@test.com",
@@ -2314,7 +2341,8 @@ mod tests {
                     .uri("/api/auth/login")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"email":"struct@test.com","password":"testpass1"}"#,
+                        serde_json::json!({"email": "struct@test.com", "password": password})
+                            .to_string(),
                     ))
                     .unwrap(),
             )
@@ -2336,7 +2364,7 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-email@test.com");
 
-        let hash = bcrypt::hash("password", 4).unwrap();
+        let hash = bcrypt::hash(fixture::password(), 4).unwrap();
         let target_id = tracker
             .create_user("original-email@test.com", &hash, "Email User", Role::Viewer)
             .unwrap();
@@ -2402,7 +2430,7 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
             .create_user(
                 "avatar@test.com",
@@ -2475,7 +2503,7 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
             .create_user(
                 "avatar2@test.com",
@@ -2533,7 +2561,7 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
             .create_user(
                 "avatar3@test.com",
@@ -2597,7 +2625,7 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
             .create_user(
                 "avatar4@test.com",
@@ -2656,7 +2684,7 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let password_hash = bcrypt::hash(fixture::password(), 4).unwrap();
         tracker
             .create_user(
                 "avatar5@test.com",
@@ -2859,6 +2887,7 @@ mod tests {
     mod directory_writes {
         use super::super::*;
         use crate::api::create_api_router_with_dashboard;
+        use crate::api::fixture;
         use axum::body::Body;
         use axum::http::Request;
         use claudear_config::config::{Config, UserConfig};
@@ -3026,9 +3055,7 @@ mod tests {
         #[tokio::test]
         async fn a_handle_storage_refuses_creates_no_user_and_is_a_409() {
             let directory = tempfile::tempdir().expect("temporary directory");
-            let app = test_app_on(crate::api::fixture::tracker_refusing_handle_claims(
-                directory.path(),
-            ));
+            let app = test_app_on(fixture::tracker_refusing_handle_claims(directory.path()));
             let before = app.tracker.list_users().expect("list").len();
 
             let (status, body) = send(
@@ -3059,7 +3086,7 @@ mod tests {
                 json!({"email": "not-an-email", "name": "X", "role": "viewer"}),
                 json!({"email": "writes-x@example.com", "name": " ", "role": "viewer"}),
                 json!({"email": "writes-x@example.com", "name": "X", "role": "viewer",
-                       "password": "short"}),
+                       "password": fixture::password_with_length(5)}),
             ] {
                 let (status, _) =
                     send(&app, "POST", "/api/users", Some(&app.admin_token), body).await;
@@ -3105,7 +3132,7 @@ mod tests {
                 ),
                 (
                     json!({"email": "writes-y@example.com", "name": "Y", "role": "viewer",
-                           "password": "short"}),
+                           "password": fixture::password_with_length(5)}),
                     "Password must be 8-72 bytes",
                 ),
                 (
@@ -3127,13 +3154,14 @@ mod tests {
                 assert_eq!(json(&response), json!({"error": error}));
             }
 
+            let password = fixture::password();
             let (status, body) = send(
                 &app,
                 "POST",
                 "/api/users",
                 Some(&app.admin_token),
                 json!({"email": " Writes-Amy@Example.com ", "name": "Amy", "role": "viewer",
-                       "password": "correct-horse"}),
+                       "password": password}),
             )
             .await;
             assert_eq!(status, StatusCode::CREATED);
@@ -3159,7 +3187,7 @@ mod tests {
                 "POST",
                 "/api/auth/login",
                 None,
-                json!({"email": "WRITES-AMY@example.com", "password": "correct-horse"}),
+                json!({"email": "WRITES-AMY@example.com", "password": password}),
             )
             .await;
             assert_eq!(

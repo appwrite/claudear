@@ -585,7 +585,7 @@ mod tests {
         std::fs::write(&path, disk_content()).unwrap();
 
         let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         let user_id = tracker
             .create_user("deploy-qa@example.com", &password_hash, "Deploy QA", role)
             .unwrap();

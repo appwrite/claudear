@@ -182,7 +182,7 @@ mod tests {
     }
 
     fn session(tracker: &Arc<dyn FixAttemptTracker>) -> String {
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         let user_id = tracker
             .create_user("viewer@example.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
@@ -644,7 +644,7 @@ mod tests {
     }
 
     fn sign_in(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: Role) -> SignedIn {
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         let id = tracker
             .create_user(email, &password_hash, "Chat User", role)
             .unwrap();
