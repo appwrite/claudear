@@ -673,6 +673,55 @@ mod tests {
         }
     }
 
+    const CONFIGURATION_VIEWS: [&str; 4] = [
+        "/api/features",
+        "/api/deploy-qa",
+        "/api/deploy-qa/tips",
+        "/api/tokens",
+    ];
+
+    async fn configuration_views(harness: &Harness, session: &str) -> Vec<Value> {
+        let mut bodies = Vec::new();
+        for uri in CONFIGURATION_VIEWS {
+            let (status, body) = harness.get(uri, Some(session)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            bodies.push(without_volatile_fields(body));
+        }
+        bodies
+    }
+
+    fn feature_keys(body: &Value) -> Vec<String> {
+        body["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .filter_map(|feature| feature["key"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_security_fix_changes_no_non_admin_configuration_view() {
+        let harness = Harness::start();
+        seed_merged_fix(harness.tracker.as_ref(), OTHER_SOURCE, 1);
+        let before = configuration_views(&harness, &harness.viewer).await;
+
+        seed_security_fix(harness.tracker.as_ref());
+        let after = configuration_views(&harness, &harness.viewer).await;
+
+        for (index, uri) in CONFIGURATION_VIEWS.iter().enumerate() {
+            assert_eq!(
+                before[index], after[index],
+                "{uri} changed for a non-admin when a security fix landed"
+            );
+        }
+
+        let (_, viewer) = harness.get("/api/features", Some(&harness.viewer)).await;
+        let (_, admin) = harness.get("/api/features", Some(&harness.admin)).await;
+        let security_inbox = "issues.helpscout.security".to_string();
+        assert!(!feature_keys(&viewer).contains(&security_inbox), "{viewer}");
+        assert!(feature_keys(&admin).contains(&security_inbox), "{admin}");
+    }
+
     #[tokio::test]
     async fn non_admin_pull_requests_leave_out_those_of_security_attempts() {
         let harness = Harness::start();
