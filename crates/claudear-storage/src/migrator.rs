@@ -3,10 +3,14 @@
 //! SQL files are included at compile time from the `migrations/` directory.
 //! Each file must be named `V<N>__<description>.sql` (e.g. `V1__initial_schema.sql`).
 //! Migrations are applied in version order and tracked in a `schema_migrations` table.
+//! Every migration whose version is not recorded there is applied, so versions
+//! may have gaps and a lower version merged after a higher one still runs.
 
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use std::collections::HashSet;
 
 /// A single compiled-in migration.
+#[derive(Clone, Copy)]
 struct Migration {
     version: u32,
     name: &'static str,
@@ -96,12 +100,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "pr_assignments",
         sql: include_str!("../../../migrations/V16__pr_assignments.sql"),
     },
+    Migration {
+        version: 17,
+        name: "chat_session_owner",
+        sql: include_str!("../../../migrations/V17__chat_session_owner.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
 ///
 /// Creates the `schema_migrations` tracking table if it doesn't exist,
-/// then applies any migrations whose version exceeds the current maximum.
+/// then applies, in version order, every migration not yet recorded in it.
 pub fn run(connection: &Connection) -> Result<(), String> {
     run_migrations(connection, MIGRATIONS)
 }
@@ -117,29 +126,48 @@ fn run_migrations(connection: &Connection, migrations: &[Migration]) -> Result<(
         )
         .map_err(|error| format!("Failed to create schema_migrations table: {error}"))?;
 
-    let current = schema_version(connection)
-        .map_err(|error| format!("Failed to query schema version: {error}"))?;
+    let applied = applied_versions(connection)?;
 
-    migrations
+    let mut pending: Vec<&Migration> = migrations
         .iter()
-        .filter(|migration| migration.version > current)
+        .filter(|migration| !applied.contains(&migration.version))
+        .collect();
+    pending.sort_by_key(|migration| migration.version);
+
+    pending
+        .into_iter()
         .try_for_each(|migration| apply(connection, migration))
 }
 
-fn schema_version(connection: &Connection) -> rusqlite::Result<u32> {
-    connection.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        [],
-        |row| row.get(0),
-    )
+fn applied_versions(connection: &Connection) -> Result<HashSet<u32>, String> {
+    let mut statement = connection
+        .prepare("SELECT version FROM schema_migrations")
+        .map_err(|error| format!("Failed to query applied migrations: {error}"))?;
+    let versions = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|error| format!("Failed to query applied migrations: {error}"))?
+        .collect::<Result<HashSet<u32>, _>>()
+        .map_err(|error| format!("Failed to read applied migrations: {error}"))?;
+    Ok(versions)
+}
+
+fn is_recorded(connection: &Connection, version: u32) -> rusqlite::Result<bool> {
+    connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [version],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
 }
 
 /// Apply one migration and record its version atomically, so a failure or crash
 /// part-way never leaves a half-applied schema or a version that will re-run.
 ///
-/// The transaction takes the write lock before re-reading the version, so when two
-/// processes migrate one database at once the second waits and then skips what the
-/// first already applied instead of re-running it.
+/// The transaction takes the write lock before checking whether this version is
+/// recorded, so when two processes migrate one database at once the second waits
+/// and then skips what the first already applied instead of re-running it.
 fn apply(connection: &Connection, migration: &Migration) -> Result<(), String> {
     let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
         .map_err(|error| {
@@ -149,13 +177,13 @@ fn apply(connection: &Connection, migration: &Migration) -> Result<(), String> {
             )
         })?;
 
-    let current = schema_version(&transaction).map_err(|error| {
+    let recorded = is_recorded(&transaction, migration.version).map_err(|error| {
         format!(
-            "Failed to query schema version before V{}: {error}",
+            "Failed to check whether V{} is recorded: {error}",
             migration.version
         )
     })?;
-    if current >= migration.version {
+    if recorded {
         return Ok(());
     }
 
@@ -329,6 +357,7 @@ mod tests {
         assert!(table_exists(&connection, "user_invites"));
         assert!(index_exists(&connection, "idx_user_invites_open"));
         assert!(table_exists(&connection, "pr_assignments"));
+        assert!(column_exists(&connection, "chat_sessions", "owner_user_id"));
     }
 
     #[test]
@@ -339,6 +368,76 @@ mod tests {
 
         assert_eq!(applied_version(&connection), latest_version());
         assert_eq!(applied_count(&connection), MIGRATIONS.len());
+    }
+
+    #[test]
+    fn test_chat_sessions_record_their_owner() {
+        let connection = migrated_connection();
+
+        assert!(column_exists(&connection, "chat_sessions", "owner_user_id"));
+        let owner_foreign_key: (String, String, String) = connection
+            .query_row(
+                "SELECT \"table\", \"to\", on_delete FROM pragma_foreign_key_list('chat_sessions') WHERE \"from\" = 'owner_user_id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            owner_foreign_key,
+            ("users".to_string(), "id".to_string(), "CASCADE".to_string())
+        );
+        assert!(index_exists(&connection, "idx_chat_sessions_owner"));
+    }
+
+    #[test]
+    fn test_owner_migration_keeps_existing_sessions_ownerless() {
+        let connection = Connection::open_in_memory().unwrap();
+        let before_owner: Vec<Migration> = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 17)
+            .copied()
+            .collect();
+        run_migrations(&connection, &before_owner).unwrap();
+        connection
+            .execute("INSERT INTO chat_sessions (id) VALUES ('legacy')", [])
+            .unwrap();
+
+        run(&connection).unwrap();
+
+        let owner: Option<i64> = connection
+            .query_row(
+                "SELECT owner_user_id FROM chat_sessions WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, None);
+    }
+
+    #[test]
+    fn test_a_lower_version_added_after_a_higher_one_is_applied() {
+        let connection = Connection::open_in_memory().unwrap();
+        let first = Migration {
+            version: 1,
+            name: "first",
+            sql: "CREATE TABLE first (id INTEGER);",
+        };
+        let late = Migration {
+            version: 2,
+            name: "late",
+            sql: "CREATE TABLE late (id INTEGER);",
+        };
+        let third = Migration {
+            version: 3,
+            name: "third",
+            sql: "CREATE TABLE third (id INTEGER);",
+        };
+
+        run_migrations(&connection, &[first, third]).unwrap();
+        run_migrations(&connection, &[first, late, third]).unwrap();
+
+        assert!(table_exists(&connection, "late"));
+        assert_eq!(applied_count(&connection), 3);
     }
 
     #[test]

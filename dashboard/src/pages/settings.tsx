@@ -1,10 +1,11 @@
 import { useId, useRef, useState } from 'react'
 import { useAuth } from '../lib/auth'
-import { uploadAvatar } from '../lib/api'
+import { ADMIN_ROLE, uploadAvatar } from '../lib/api'
 import { getInitials } from '../lib/formatters'
 import { passwordLengthProblem } from '../lib/password'
 import { PageHeader } from '../components/layout/page-header'
 import { IdentityForm } from '../components/users/identity-form'
+import { PersonalTokensCard } from '../components/settings/personal-tokens'
 import { Camera, Check, Loader2 } from 'lucide-react'
 
 export default function SettingsPage() {
@@ -99,7 +100,7 @@ export default function SettingsPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Settings" description="Manage your profile and account settings" />
+      <PageHeader title="Settings" description="Manage your profile, account and access tokens" />
 
       <div className="border rounded-lg p-6 bg-card">
         <h3 className="font-medium mb-4">Profile Picture</h3>
@@ -224,8 +225,10 @@ export default function SettingsPage() {
         <p className="text-sm text-muted-foreground mb-4">
           The handles Claudear uses to recognise you across trackers and to reach you in chat.
         </p>
-        <IdentityForm userId={user.id} canEditSlug={user.role === 'admin'} />
+        <IdentityForm userId={user.id} canEditSlug={user.role === ADMIN_ROLE} />
       </div>
+
+      <PersonalTokensCard />
     </div>
   )
 }

@@ -632,3 +632,100 @@ export const users = [
   { id: 1, email: 'admin@acme.dev', name: 'Admin', role: 'admin', avatar_url: null, created_at: daysAgo(90), updated_at: daysAgo(1) },
   { id: 2, email: 'jake@acme.dev', name: 'Jake', role: 'viewer', avatar_url: null, created_at: daysAgo(60), updated_at: daysAgo(5) },
 ];
+
+const deployQaTip = (
+  id: number,
+  track: string,
+  repo: string,
+  tag: string,
+  status: 'pending' | 'running' | 'verified' | 'unverified' | 'failed' | 'errored',
+  hours: number,
+  attemptId: number | null,
+) => ({
+  id,
+  track,
+  repo,
+  tag,
+  status,
+  published_at: ago(hours),
+  release_url: `https://github.com/${repo}/releases/tag/${tag}`,
+  author_login: 'octocat',
+  attempt_id: attemptId,
+  discord_message_url: null,
+  discord_thread_url: null,
+  created_at: ago(hours),
+  updated_at: ago(Math.max(hours - 0.5, 0)),
+});
+
+export const deployQaTips = {
+  tips: [
+    deployQaTip(6, 'api', 'acme/api-gateway', '1.43.12', 'running', 0.2, 251),
+    deployQaTip(5, 'web', 'acme/web-console', '2.8.4', 'verified', 3, 249),
+    deployQaTip(4, 'api', 'acme/api-gateway', '1.43.11', 'verified', 26, 244),
+    deployQaTip(3, 'web', 'acme/web-console', '2.8.3', 'failed', 50, 238),
+    deployQaTip(2, 'api', 'acme/api-gateway', '1.43.10', 'unverified', 74, 231),
+  ],
+};
+
+export const deployQaStatus = {
+  enabled: true,
+  restart_required: false,
+  poll_interval_ms: 60_000,
+  timeout_secs: 1_800,
+  skip_if_previous_running: true,
+  discord_channel_id: '1203948576102938475',
+  tracks: [
+    { name: 'api', repo: 'acme/api-gateway', tag_filter: 'not_suffix:-rc', last_seen: deployQaTips.tips[0], in_flight: true },
+    { name: 'web', repo: 'acme/web-console', tag_filter: 'any', last_seen: deployQaTips.tips[1], in_flight: false },
+  ],
+};
+
+export const deployQaConfig = {
+  settings: {
+    enabled: true,
+    poll_interval_ms: 60_000,
+    skip_if_previous_running: true,
+    timeout_secs: 1_800,
+    discord_channel_id: '1203948576102938475',
+    github_discord_map_path: null,
+    instructions_path: 'qa/instructions.md',
+    tracks: [
+      { name: 'api', repo: 'acme/api-gateway', tag_filter: 'not_suffix:-rc' },
+      { name: 'web', repo: 'acme/web-console', tag_filter: 'any' },
+    ],
+  },
+  tag_filter_kinds: [
+    { kind: 'any', requires_value: false },
+    { kind: 'suffix', requires_value: true },
+    { kind: 'not_suffix', requires_value: true },
+  ],
+  track_name_separator: ':',
+  restart_required: false,
+  writable: true,
+  revision: 'a1b2c3d4',
+};
+
+const feature = (
+  key: string,
+  label: string,
+  description: string,
+  category: 'source' | 'scm' | 'notifier' | 'automation' | 'intelligence' | 'platform',
+  configured: boolean,
+  enabled: boolean,
+  settings: Array<{ name: string; value: string | number | boolean | null }> = [],
+  secrets: Array<{ name: string; set: boolean }> = [],
+) => ({ key, label, description, category, configured, enabled, settings, secrets });
+
+export const features = {
+  features: [
+    feature('issues.linear', 'Linear', 'Fix issues assigned in Linear', 'source', true, true, [{ name: 'team', value: 'ENG' }], [{ name: 'api_key', set: true }]),
+    feature('issues.sentry', 'Sentry', 'Fix new Sentry errors', 'source', true, true, [{ name: 'organization', value: 'acme' }], [{ name: 'auth_token', set: true }]),
+    feature('issues.jira', 'Jira', 'Fix issues assigned in Jira', 'source', false, false),
+    feature('scm.github', 'GitHub', 'Open and track pull requests', 'scm', true, true, [{ name: 'owner', value: 'acme' }], [{ name: 'token', set: true }]),
+    feature('notifiers.discord', 'Discord notifier', 'Post attempt updates to Discord', 'notifier', true, true, [], [{ name: 'bot_token', set: true }]),
+    feature('notifiers.slack', 'Slack notifier', 'Post attempt updates to Slack', 'notifier', false, false),
+    feature('deploy_qa', 'Deploy QA', 'QA every new release tag', 'automation', true, true, [{ name: 'tracks', value: 2 }]),
+    feature('llm', 'Local LLM', 'Local models for chat and triage', 'intelligence', true, false),
+    feature('mcp_server', 'MCP server', 'Expose claudear tools over MCP', 'platform', true, true),
+  ],
+};

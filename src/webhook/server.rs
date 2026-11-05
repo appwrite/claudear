@@ -409,12 +409,18 @@ impl WebhookServer {
         let dashboard_enabled = self.dashboard_config_path.is_some();
         let app = if let Some(config_path) = self.dashboard_config_path {
             let indexing_rx = state.tracker.subscribe_indexing_progress();
-            let dashboard_routes = claudear_engine::api::create_api_router_with_dashboard(
+            let chat = claudear_engine::api::chat_state(
+                &state.config,
+                state.tracker.clone(),
+                state.embedding_client.clone(),
+            );
+            let dashboard_routes = claudear_engine::api::create_api_router_full(
                 state.config.clone(),
                 state.tracker.clone(),
                 config_path,
                 indexing_rx,
                 None,
+                chat,
                 state.user_registry.clone(),
             );
             // Apply the dashboard middleware (cookies, CSRF, CORS, security

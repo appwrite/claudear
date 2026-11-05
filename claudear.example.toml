@@ -915,25 +915,34 @@ github_discord_map_path = "/etc/claudear/github-discord-map.json"
 # instructions_path = "/etc/claudear/deploy_qa.md"
 
 # Track names must be unique and must not contain ':'; repo is owner/name.
+# tag_filter: "any", "suffix:<text>", "not_suffix:<text>" or "prefix:<text>".
+# Tracks sharing a repo need filters that split its tags between them, or each
+# runs QA on the same tag. A prefix track reads the repo's tags under that
+# prefix (GitHub releases need not exist), takes the highest version after the
+# prefix, and names the change range since the previous tag in the prompt.
 [[deploy_qa.tracks]]
 name = "cloud"
 repo = "appwrite-labs/cloud"
 tag_filter = "any"
 
 [[deploy_qa.tracks]]
-name = "edge-db"
-repo = "appwrite-labs/edge"
-tag_filter = "suffix:-db"
-
-[[deploy_qa.tracks]]
-name = "edge-network"
+name = "edge"
 repo = "appwrite-labs/edge"
 tag_filter = "not_suffix:-db"
 
 [[deploy_qa.tracks]]
-name = "vibes"
-repo = "appwrite/vibes"
-tag_filter = "any"
+name = "edge-db"
+repo = "appwrite-labs/edge"
+tag_filter = "suffix:-db"
+
+# The console deploys from apps/console/<version> tags in the appwrite
+# monorepo. Its production workflow publishes each deploy's GitHub release
+# (never marked latest, since the repo's other releases are the server's),
+# which the poller uses; a tag without one is QA'd as a bare tag.
+[[deploy_qa.tracks]]
+name = "console"
+repo = "appwrite/appwrite"
+tag_filter = "prefix:apps/console/"
 
 # ============================================
 # PR Distribution
@@ -1406,10 +1415,8 @@ reindex_interval_hours = 6.0
 # frequently and posts them once a week to your notifier(s), mentioning
 # notifiers.discord.user_id on Discord so a human can act. Report-only: it does
 # not change the fix pipeline. Requires a configured Sentry source + Discord
-# webhook. The digest currently posts as plain text without the on-call
-# mention, because instrumented notifiers do not yet forward
-# notify_repetitive_digest; once they do, the mention resolves through the
-# registry like every other notifier reference.
+# webhook. The on-call mention resolves through the user registry like every
+# other notifier reference.
 
 # Enable the weekly digest (default: false)
 enabled = false

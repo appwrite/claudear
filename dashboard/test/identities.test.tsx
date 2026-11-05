@@ -454,6 +454,8 @@ describe("Users page identities", () => {
     const paths = calls.map((call) => new URL(call.url, "http://localhost").pathname);
     expect(paths).not.toContain("/api/users");
     expect(paths).not.toContain("/api/identities");
+    const viewerReadable = new Set(["/api/auth/me", "/api/users/3/identities"]);
+    expect(paths.filter((path) => !viewerReadable.has(path))).toEqual([]);
   });
 });
 

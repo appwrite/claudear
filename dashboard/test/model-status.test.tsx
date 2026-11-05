@@ -8,11 +8,11 @@ afterEach(() => {
 });
 
 function mockFetch(data: unknown, ok = true) {
-  globalThis.fetch = mock(() =>
+  globalThis.fetch = mock((url: string) =>
     Promise.resolve({
       ok,
       status: ok ? 200 : 500,
-      json: () => Promise.resolve(data),
+      json: () => Promise.resolve(url.endsWith("/api/chat/status") ? { enabled: true } : data),
     })
   ) as unknown as typeof fetch;
 }

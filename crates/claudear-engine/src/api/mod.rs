@@ -3,9 +3,13 @@
 //! Provides REST API for the analytics dashboard.
 
 pub mod auth;
+mod chat;
+mod config_file;
+mod deploy_qa;
 mod directory;
 pub(crate) mod embedded;
 pub mod error;
+mod features;
 mod identities;
 mod invites;
 mod rate_limit;
@@ -13,12 +17,14 @@ mod routes;
 mod security;
 mod tokens;
 
+pub use chat::chat_state;
 pub use routes::{create_api_router, create_api_router_full, create_api_router_with_dashboard};
 
 use axum::http;
 use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
+use claudear_integrations::chat::ChatState;
 use claudear_storage::FixAttemptTracker;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use std::path::PathBuf;
@@ -93,6 +99,7 @@ pub struct ApiServer {
     dashboard_dir: Option<PathBuf>,
     config_path: PathBuf,
     registry: UserRegistry,
+    chat: Option<ChatState>,
 }
 
 impl ApiServer {
@@ -106,6 +113,7 @@ impl ApiServer {
             port,
             dashboard_dir: None,
             config_path,
+            chat: None,
         }
     }
 
@@ -123,6 +131,7 @@ impl ApiServer {
             port,
             dashboard_dir: None,
             config_path,
+            chat: None,
         }
     }
 
@@ -141,6 +150,7 @@ impl ApiServer {
             port,
             dashboard_dir: Some(dashboard_dir),
             config_path,
+            chat: None,
         }
     }
 
@@ -151,13 +161,20 @@ impl ApiServer {
         self
     }
 
+    /// Serve the chat routes from `chat`; without it they are not mounted.
+    pub fn with_chat(mut self, chat: Option<ChatState>) -> Self {
+        self.chat = chat;
+        self
+    }
+
     fn router(&self) -> axum::Router {
-        create_api_router_with_dashboard(
+        create_api_router_full(
             self.config.clone(),
             self.tracker.clone(),
             self.config_path.clone(),
             self.tracker.subscribe_indexing_progress(),
             self.dashboard_dir.clone(),
+            self.chat.clone(),
             self.registry.clone(),
         )
     }

@@ -191,9 +191,9 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 
 ### Deploy QA
 - Durable last-seen watches for GitHub release tips (separate from regression inclusion tracking)
-- Tag filters (`any`, `suffix:-db`, `not_suffix:-db`) per track
+- Tag filters (`any`, `suffix:-db`, `not_suffix:-db`, `prefix:apps/console/`) per track, so tracks can split one repo's tags, including a monorepo's app-namespaced bare tags
 - Live QA agent enqueue — runs real checks against the release from a private per-run directory, and is told never to open fix PRs for a release announcement
-- Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + `@releaser` from the user registry (`github-discord-map.json` as fallback)
+- Discord `#releases` outcome from the report: verified or unverified reply (no @), FAIL thread + `@releaser` from the user registry (`github-discord-map.json` as fallback); a post of its own when nothing announced the tip
 
 ### Notifications
 - **Discord**: Webhook messages + bot reply polling for Q&A, rich embeds, thread tracking
@@ -667,6 +667,10 @@ claudear dashboard --dashboard-dir ./dashboard/dist
 - Source-by-source metrics (Linear, Sentry, Discord, GitHub)
 - Recent attempt history with direct PR links
 - Retryable issues with one-click retry
+- Deploy QA: per-track release tips and their QA results, with admin-editable track config
+- Integrations: every source, SCM, notifier and automation with its configured and enabled state
+
+Console config edits are written to `claudear.toml` in normalised form and apply after restart; secrets are write-only; read-only mounts disable saving.
 
 <p align="center">
   <img src="website/assets/screenshots/overview.png" alt="Dashboard overview" width="800" />
@@ -708,10 +712,28 @@ claudear dashboard --dashboard-dir ./dashboard/dist
 | `GET /api/repos/dependencies` | Dependency graph |
 | `GET /api/inference/stats` | Inference success rates |
 | `GET /api/regressions` | Regression checks |
+| `GET /api/deploy-qa` | Deploy QA status per track |
+| `GET /api/deploy-qa/tips` | Recent deploy QA tips (`?track=`) |
+| `GET/PUT /api/deploy-qa/config` | Deploy QA config (admin) |
+| `GET /api/features` | Integration and feature status |
 | `GET /api/telemetry/overview` | Telemetry overview |
 | `GET /api/telemetry/cost-analysis` | Cost analysis |
 
 Users, identities, invites and the bulk directory load are covered in the [Identity API](#identity-api).
+
+#### Reverse proxy
+
+The chat websocket (`/api/chat/ws`) only accepts an upgrade whose `Origin` matches the host the browser connected to. Behind a reverse proxy, either preserve the original `Host` header or send it in `X-Forwarded-Host` or `Forwarded: host=`, otherwise every upgrade is rejected with 403. For nginx:
+
+```nginx
+location /api/chat/ws {
+    proxy_pass http://127.0.0.1:3100;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+}
+```
 
 ### Scheduled Reports
 
@@ -796,7 +818,7 @@ claudear inference feedback 43 --actual-repo my-other-repo
 
 ### Deploy QA
 
-Durable driver for **new GitHub release tips** (Appwrite Labs cloud / edge / vibes). Separate from `[regression]` release tracking, which watches **bug-fix inclusion** after a merge.
+Durable driver for **new GitHub release tips** (Appwrite Labs cloud / edge / edge-db, and the console's tags in the `appwrite/appwrite` monorepo). Separate from `[regression]` release tracking, which watches **bug-fix inclusion** after a merge.
 
 Works in every daemon mode — `claudear start` (no `--poll` needed), `claudear webhook` and `claudear poll`. After each release poll, pending tips are dispatched to the QA agent, at most `qa.max_concurrent` at a time, once the daemon has finished warm start. That dispatch is the only path that runs tips inside the daemon: the `--poll` source loop and `claudear seed` leave `deploy_qa` tips to it, and a tip another process started or finished in the meantime is skipped.
 
@@ -812,8 +834,15 @@ github_discord_map_path = "/etc/claudear/github-discord-map.json"  # absolute: r
 [[deploy_qa.tracks]]
 name = "cloud"
 repo = "appwrite-labs/cloud"
-tag_filter = "any"                 # any | suffix:-db | not_suffix:-db
+tag_filter = "any"                 # any | suffix:-db | not_suffix:-db | prefix:apps/console/
+
+[[deploy_qa.tracks]]
+name = "console"
+repo = "appwrite/appwrite"
+tag_filter = "prefix:apps/console/"
 ```
+
+A track's newest tip is the first matching published release in GitHub's release order. A repo with no published releases falls back to its tags, newest by semantic version. A `prefix:` track always reads the tags under its prefix (`git/matching-refs`, so a monorepo's other tags never crowd them out), takes the highest semantic version after the prefix (`apps/console/1.2.141` beats `apps/console/1.2.99`), and skips prefixed tags that are not a version. It uses the tag's release when one is published and otherwise QAs the bare tag, giving the agent the compare range since the previous tag on the track and the version without its prefix. Tracks on one repo need filters that split its tags (`suffix:-db` / `not_suffix:-db`), or each runs QA on the same tag.
 
 On a new tip Claudear:
 
@@ -824,6 +853,9 @@ On a new tip Claudear:
    - **All verified** — the report ends in `DEPLOY_QA_VERDICT: ALL_VERIFIED` and no PR is `LIVE BLOCKED`: reply, no @.
    - **Unverified** — nothing failed, but a PR is `LIVE BLOCKED`, the footer is `DEPLOY_QA_VERDICT: UNVERIFIED`, or the footer is missing: reply, no @, so blocked checks never page the releaser but are never reported as verified either.
    - **FAIL** — any `LIVE FAIL` line or a `DEPLOY_QA_VERDICT: FAIL` footer: a thread under the announcement that `@`s the releaser (reusing the announcement's existing thread when it already has one). The releaser's GitHub login is looked up in the [user registry](#user-registry-1) first, console identities and `[users]` entries alike, so invited users count too; `github-discord-map.json` is consulted only when the person who owns that login in the registry has no `discord_id`, or no person owns it. A releaser found in neither gets no mention.
+   - **No announcement found** — when none of the last 50 `#releases` messages announces the tip, the outcome is posted as a message of its own naming the repo and tag, so it is never dropped. This should be rare: a release whose announcement scrolled away, or a bare tag (no GitHub release, so the release feed never posts it). FAIL still `@`s the releaser when the tip has one; a bare tag has no release author, so it posts without the mention.
+
+   Announcements are matched by the release URL first, so a release whose name differs from its tag (`Console 1.2.141` for `apps/console/1.2.141`) is still found, and otherwise by a title naming both the repo and the whole tag, where `console/0.3.0` never matches `apps/console/0.3.0`.
 
 See [`playbooks/deploy_qa.md`](playbooks/deploy_qa.md) and [`github-discord-map.example.json`](github-discord-map.example.json). Live host probes are agent-driven; CI uses a no-op probe seam and mocked GitHub/Discord HTTP.
 
@@ -948,7 +980,7 @@ When a handle is claimed twice, console users win over config entries, then lowe
 
 Edits apply without a restart: instantly in the process that served the write, and within one housekeeping cycle in any other process sharing the database, such as a standalone `claudear dashboard`.
 
-Global notifier references, such as `[notifiers.discord] user_id = "jake"`, `[notifiers.slack] user_id`, `[notifiers.email] to_addresses`, `[notifiers.push] user_key` and `[notifiers.sms] to_numbers`, are resolved to a person's handle each time a notification is sent rather than once at startup, so console edits apply to them too. A value that names no person is used as-is. The weekly repetitive digest currently posts as plain text without the on-call mention, because instrumented notifiers do not yet forward `notify_repetitive_digest`; once they do, the mention resolves through the registry like every other notifier reference.
+Global notifier references, such as `[notifiers.discord] user_id = "jake"`, `[notifiers.slack] user_id`, `[notifiers.email] to_addresses`, `[notifiers.push] user_key` and `[notifiers.sms] to_numbers`, are resolved to a person's handle each time a notification is sent rather than once at startup, so console edits apply to them too. A value that names no person is used as-is. The weekly repetitive digest's on-call mention resolves through the registry the same way.
 
 #### Who can do what
 

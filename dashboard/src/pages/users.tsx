@@ -1,6 +1,7 @@
 import { useId, useState } from 'react'
 import useSWR from 'swr'
 import {
+  ADMIN_ROLE,
   ApiError,
   createUser,
   createUserToken,
@@ -16,6 +17,7 @@ import {
   type ApiToken,
   type CreatedToken,
   type CreatedUser,
+  type Role,
   type UserIdentities,
   type UserInvite,
   type UserRecord,
@@ -24,11 +26,12 @@ import { formatDate, parseUTCDate } from '../lib/formatters'
 import { useAuth } from '../lib/auth'
 import { passwordLengthProblem } from '../lib/password'
 import { UsersTableSkeleton } from '../components/shared/page-skeletons'
+import { SecretReveal } from '../components/shared/secret-reveal'
 import { TimeAgo } from '../components/shared/time-ago'
 import { Badge } from '../components/ui/badge'
 import { IdentityForm, IDENTITIES_KEY } from '../components/users/identity-form'
 import { IdentitySummary } from '../components/users/identity-summary'
-import { Check, Copy, Fingerprint, KeyRound, Link2, Pencil, Plus, Trash2, Unlink, X } from 'lucide-react'
+import { Fingerprint, KeyRound, Link2, Pencil, Plus, Trash2, Unlink, X } from 'lucide-react'
 
 const MINUTE_MS = 60_000
 const HOUR_MS = 60 * MINUTE_MS
@@ -61,6 +64,17 @@ export function hasOpenInvite(user: UserRecord, now: number = Date.now()): boole
   return user.invite_expires_at !== null && parseUTCDate(user.invite_expires_at).getTime() > now
 }
 
+const VIEWER_ROLE: Role = 'viewer'
+
+const ROLE_LABELS: Record<Role, string> = {
+  admin: 'Admin',
+  viewer: 'Viewer',
+}
+
+function isRole(value: string): value is Role {
+  return Object.prototype.hasOwnProperty.call(ROLE_LABELS, value)
+}
+
 function failureMessage(error: unknown, fallback: string): string {
   return error instanceof ApiError && error.status < 500 ? error.message : fallback
 }
@@ -77,7 +91,7 @@ async function copyToClipboard(text: string): Promise<boolean> {
 export default function UsersPage() {
   const { user: currentUser } = useAuth()
   if (!currentUser) return null
-  if (currentUser.role !== 'admin') return <MyIdentities userId={currentUser.id} />
+  if (currentUser.role !== ADMIN_ROLE) return <MyIdentities userId={currentUser.id} />
   return <UserDirectory currentUserId={currentUser.id} />
 }
 
@@ -223,7 +237,7 @@ function UserDirectory({ currentUserId }: { currentUserId: number }) {
                   <td className="p-3 text-muted-foreground">{u.email}</td>
                   <td className="p-3">
                     <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
-                      u.role === 'admin' ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'
+                      u.role === ADMIN_ROLE ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'
                     }`}>{u.role}</span>
                   </td>
                   <td className="p-3"><IdentitySummary identities={identitiesByUser.get(u.id)} /></td>
@@ -327,7 +341,7 @@ function UserForm({
   const [email, setEmail] = useState(user?.email ?? '')
   const [name, setName] = useState(user?.name ?? '')
   const [password, setPassword] = useState('')
-  const [role, setRole] = useState(user?.role ?? 'viewer')
+  const [role, setRole] = useState<Role>(user?.role ?? VIEWER_ROLE)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
 
@@ -401,11 +415,12 @@ function UserForm({
           <label htmlFor={`${fieldId}-role`} className="text-sm font-medium">Role</label>
           <select
             id={`${fieldId}-role`}
-            value={role} onChange={(e) => setRole(e.target.value)}
+            value={role} onChange={(e) => { if (isRole(e.target.value)) setRole(e.target.value) }}
             className="w-full px-3 py-2 border rounded-md bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary"
           >
-            <option value="admin">Admin</option>
-            <option value="viewer">Viewer</option>
+            {Object.entries(ROLE_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
           </select>
         </div>
         <div className="col-span-2 flex justify-end gap-2">
@@ -560,41 +575,6 @@ function UserTokens({ userId }: { userId: number }) {
               ))}
             </tbody>
           </table>
-        </div>
-      )}
-    </div>
-  )
-}
-
-function SecretReveal({ secret, noun = 'token' }: { secret: string; noun?: string }) {
-  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle')
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(secret)
-      setState('copied')
-      setTimeout(() => setState('idle'), 2000)
-    } catch {
-      // Clipboard access can be denied; tell the user to copy manually rather
-      // than falsely reporting success (the secret is shown only once).
-      setState('failed')
-    }
-  }
-  return (
-    <div className="space-y-1">
-      <div className="flex items-center gap-2">
-        <code className="flex-1 px-2 py-1.5 bg-muted rounded font-mono text-xs break-all select-all">{secret}</code>
-        <button
-          onClick={handleCopy}
-          className="flex items-center gap-1 px-2 py-1.5 border rounded-md text-xs hover:bg-muted shrink-0"
-          title="Copy"
-        >
-          {state === 'copied' ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-          {state === 'copied' ? 'Copied' : 'Copy'}
-        </button>
-      </div>
-      {state === 'failed' && (
-        <div className="text-xs text-destructive">
-          Couldn't access the clipboard — select the {noun} above and copy it manually.
         </div>
       )}
     </div>

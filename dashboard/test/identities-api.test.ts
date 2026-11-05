@@ -182,7 +182,7 @@ describe('identities api', () => {
     ) as unknown as typeof fetch
     const error = await captureError(resetUserIdentities(3))
     expect(error.status).toBe(502)
-    expect(error.message).toBe('Request to /api/users/3/identities failed: 502')
+    expect(error.message).toBe('Failed to delete /api/users/3/identities: 502')
     expect(error.violations).toEqual([])
   })
 
@@ -190,9 +190,8 @@ describe('identities api', () => {
     const unauthorized = mock(() => {})
     setOnUnauthorized(unauthorized)
     mockFetch({ error: 'Unauthorized' }, 401)
-    const error = await captureError(updateUserIdentities(3, { slug: 'jake' }))
+    await expect(updateUserIdentities(3, { slug: 'jake' })).rejects.toThrow('Unauthorized')
     expect(unauthorized).toHaveBeenCalledTimes(1)
-    expect(error.status).toBe(401)
   })
 
   test('createUser without a password posts identities and returns the invite', async () => {

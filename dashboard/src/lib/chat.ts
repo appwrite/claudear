@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { getWsBase } from './api'
+import useSWR from 'swr'
+import { ApiError, deleteRequest, fetchJson, getWsBase } from './api'
 
 export interface ChatMessage {
   id?: number
@@ -20,6 +21,7 @@ export interface ChatSource {
 export interface ChatSession {
   id: string
   repo_id?: number
+  owner_user_id?: number
   created_at: string
   updated_at: string
   messages?: ChatMessage[]
@@ -53,7 +55,7 @@ interface UseChatReturn {
   clearMessages: () => void
 }
 
-export function useChat(repoId?: number): UseChatReturn {
+export function useChat(repoId?: number, enabled = true): UseChatReturn {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [isStreaming, setIsStreaming] = useState(false)
   const [isConnected, setIsConnected] = useState(false)
@@ -62,10 +64,15 @@ export function useChat(repoId?: number): UseChatReturn {
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
   const mountedRef = useRef(true)
+  const enabledRef = useRef(enabled)
   const streamingContentRef = useRef('')
 
+  useEffect(() => {
+    enabledRef.current = enabled
+  }, [enabled])
+
   const connect = useCallback(() => {
-    if (!mountedRef.current || wsRef.current?.readyState === WebSocket.OPEN) return
+    if (!enabledRef.current || !mountedRef.current || wsRef.current?.readyState === WebSocket.OPEN) return
 
     const ws = new WebSocket(`${getWsBase()}/api/chat/ws`)
     wsRef.current = ws
@@ -166,39 +173,71 @@ export function useChat(repoId?: number): UseChatReturn {
 
   useEffect(() => {
     mountedRef.current = true
+    if (!enabled) return
     connect()
     return () => {
       mountedRef.current = false
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
       wsRef.current?.close()
     }
-  }, [connect])
+  }, [connect, enabled])
 
   return { messages, sendMessage, stopStreaming, isStreaming, isConnected, error, sessionId, clearMessages }
 }
 
-// REST API helpers for session management
 const API_BASE = '/api'
 
+export interface ChatModel {
+  name: string
+  status: string
+  context_length: number
+  download_progress?: number
+}
+
+export interface ChatModelsResponse {
+  models: ChatModel[]
+}
+
+export interface ChatStatus {
+  enabled: boolean
+}
+
+export interface ChatAvailability {
+  enabled: boolean
+  disabled: boolean
+  error: unknown
+}
+
+export function isChatDisabled(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404
+}
+
+export async function fetchChatStatus(): Promise<ChatStatus> {
+  return fetchJson(`${API_BASE}/chat/status`)
+}
+
+export function useChatAvailability(): ChatAvailability {
+  const { data, error } = useSWR<ChatStatus>('chat-status', fetchChatStatus)
+  const missing = isChatDisabled(error)
+  return {
+    enabled: data?.enabled === true,
+    disabled: data?.enabled === false || missing,
+    error: missing ? undefined : error,
+  }
+}
+
 export async function fetchChatSessions(): Promise<ChatSession[]> {
-  const res = await fetch(`${API_BASE}/chat/sessions`)
-  if (!res.ok) throw new Error(`Failed to fetch sessions: ${res.statusText}`)
-  return res.json()
+  return fetchJson(`${API_BASE}/chat/sessions`)
 }
 
 export async function fetchChatSession(id: string): Promise<ChatSession> {
-  const res = await fetch(`${API_BASE}/chat/sessions/${id}`)
-  if (!res.ok) throw new Error(`Failed to fetch session: ${res.statusText}`)
-  return res.json()
+  return fetchJson(`${API_BASE}/chat/sessions/${encodeURIComponent(id)}`)
 }
 
 export async function deleteChatSession(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/chat/sessions/${id}`, { method: 'DELETE' })
-  if (!res.ok) throw new Error(`Failed to delete session: ${res.statusText}`)
+  return deleteRequest(`${API_BASE}/chat/sessions/${encodeURIComponent(id)}`)
 }
 
-export async function fetchChatModels(): Promise<{ models: Array<{ name: string; status: string; context_length: number; download_progress?: number }> }> {
-  const res = await fetch(`${API_BASE}/chat/models`)
-  if (!res.ok) throw new Error(`Failed to fetch models: ${res.statusText}`)
-  return res.json()
+export async function fetchChatModels(): Promise<ChatModelsResponse> {
+  return fetchJson(`${API_BASE}/chat/models`)
 }

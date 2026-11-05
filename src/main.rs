@@ -2,10 +2,10 @@
 
 use clap::{Parser, Subcommand};
 use claudear::{
-    api::ApiServer,
+    api::{chat_state, ApiServer},
     config::Config,
     deploy_qa::{DeployQaPollAction, DeployQaTracker},
-    feedback::{EmbeddingClient, IssueEmbeddingService},
+    feedback::{EmbeddingClient, EmbeddingConfig, IssueEmbeddingService},
     github::GitHubClient,
     housekeeping::HousekeepingWorker,
     ipc::{
@@ -910,6 +910,20 @@ fn build_issue_embedding_service(
             tracker.clone(),
         ))
     })
+}
+
+/// Build an embedding client for chat code search, only when chat can run.
+fn chat_embedding_client(config: &Config) -> Option<Arc<EmbeddingClient>> {
+    if !(config.chat.enabled && config.llm.enabled) {
+        return None;
+    }
+    match EmbeddingClient::new(EmbeddingConfig::from_settings(&config.embedding)) {
+        Ok(client) => Some(Arc::new(client)),
+        Err(error) => {
+            tracing::warn!(error = %error, "Failed to initialize the chat embedding client");
+            None
+        }
+    }
 }
 
 /// Common dependencies needed to construct a [`Watcher`].
@@ -2995,7 +3009,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
 
             ReposCommands::Reindex { repo } => {
-                use claudear::feedback::{EmbeddingClient, EmbeddingConfig};
                 use claudear::repo::build_repo_index;
                 use claudear::repo::code_index::CodeIndexer;
 
@@ -3005,45 +3018,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     );
                 }
 
-                // Build execution providers from config
-                #[allow(unused_mut)]
-                let mut execution_providers = Vec::new();
-                if config.embedding.gpu {
-                    #[cfg(feature = "cuda")]
-                    {
-                        let cuda_ep = ort::ep::CUDA::default()
-                            .with_device_id(config.embedding.device_id)
-                            .build();
-                        execution_providers.push(cuda_ep);
-                        tracing::info!(
-                            device_id = config.embedding.device_id,
-                            "CUDA execution provider configured for embeddings"
-                        );
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        tracing::warn!(
-                            "embedding.gpu = true but binary was compiled without --features cuda; falling back to CPU"
-                        );
-                    }
-                }
-
-                let emb_pool_size = if config.embedding.pool_size > 0 {
-                    config.embedding.pool_size as usize
-                } else if config.embedding.gpu {
-                    1
-                } else {
-                    EmbeddingConfig::default().pool_size
-                };
-
-                let emb_config = EmbeddingConfig {
-                    pool_size: emb_pool_size,
-                    execution_providers,
-                    sub_batch_size: config.embedding.sub_batch_size as usize,
-                    ..EmbeddingConfig::default()
-                };
-
-                let emb_client = Arc::new(EmbeddingClient::new(emb_config)?);
+                let emb_client = Arc::new(EmbeddingClient::new(EmbeddingConfig::from_settings(
+                    &config.embedding,
+                ))?);
                 let tracker: Arc<dyn claudear::storage::FixAttemptTracker> =
                     Arc::new(SqliteTracker::new(&config.db_path)?);
 
@@ -3706,8 +3683,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         if let Some(q) = question {
             // One-shot mode
-            let session_id = uuid::Uuid::new_v4().to_string();
-            match chat_service.chat(&session_id, q, repo_id, None).await {
+            match chat_service
+                .chat(
+                    claudear::chat::ChatActor::Operator,
+                    &mut claudear::chat::SessionTarget::fresh(),
+                    q,
+                    repo_id,
+                    None,
+                )
+                .await
+            {
                 Ok((tokens, sources)) => {
                     // Print streaming tokens
                     for token in &tokens {
@@ -3749,7 +3734,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
             println!();
 
-            let mut session_id = uuid::Uuid::new_v4().to_string();
+            let mut target = claudear::chat::SessionTarget::fresh();
             let stdin = std::io::stdin();
             let mut show_sources = true;
 
@@ -3771,7 +3756,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 match input {
                     "/quit" | "/exit" => break,
                     "/clear" => {
-                        session_id = uuid::Uuid::new_v4().to_string();
+                        target = claudear::chat::SessionTarget::fresh();
                         println!("Session cleared.");
                         continue;
                     }
@@ -3786,7 +3771,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     _ => {}
                 }
 
-                match chat_service.chat(&session_id, input, repo_id, None).await {
+                match chat_service
+                    .chat(
+                        claudear::chat::ChatActor::Operator,
+                        &mut target,
+                        input,
+                        repo_id,
+                        None,
+                    )
+                    .await
+                {
                     Ok((tokens, sources)) => {
                         println!();
                         for token in &tokens {
@@ -3826,6 +3820,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     {
         let tracker = create_tracker(&config);
         let rebuilder = tracker.spawn_vector_index_rebuilder()?;
+        let chat = chat_state(&config, tracker.clone(), chat_embedding_client(&config));
         let server = if let Some(dir) = dashboard_dir {
             ApiServer::with_dashboard(
                 config,
@@ -3841,7 +3836,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 port,
                 std::path::PathBuf::from(config_path.clone()),
             )
-        };
+        }
+        .with_chat(chat);
 
         let shutdown = async {
             tokio::signal::ctrl_c()
@@ -4055,8 +4051,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         server.start().await?;
                     }
                     HttpMode::Dashboard => {
+                        let chat = chat_state(&config, tracker.clone(), deps.embedding_client);
                         ApiServer::with_port(config, tracker, *port, config_path)
                             .with_registry(user_registry)
+                            .with_chat(chat)
                             .start()
                             .await?;
                     }
@@ -4853,7 +4851,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 notifier,
                 tracker,
                 inferrer,
-                embedding_client,
+                embedding_client: embedding_client.clone(),
                 review_watcher,
                 issue_embedding_service,
                 code_search_service,
@@ -4943,13 +4941,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             .map_err(anyhow::Error::from)
                     });
                     let http = (!no_dashboard).then(|| {
+                        let chat =
+                            chat_state(&config, tracker_for_api.clone(), embedding_client.clone());
                         let server = ApiServer::with_port(
                             config.clone(),
                             tracker_for_api.clone(),
                             port,
                             std::path::PathBuf::from(&config_path),
                         )
-                        .with_registry(user_registry.clone());
+                        .with_registry(user_registry.clone())
+                        .with_chat(chat);
                         Service::new(HTTP_SERVICE, async move {
                             server.start().await.map_err(anyhow::Error::from)
                         })

@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from '../../router'
 import { useAuth } from '../../lib/auth'
+import { ADMIN_ROLE, type Role } from '../../lib/api'
 import { getInitials } from '../../lib/formatters'
 import { prefetchRouteData } from '../../lib/route-prefetch'
 import {
   BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
   Users, LogOut, Gauge, Settings, Sun, Moon, Ticket, GraduationCap, BookOpen,
-  MessageSquareCode, Package, Hash,
+  MessageSquareCode, Package, Hash, Rocket, Plug,
 } from 'lucide-react'
 import { setSentryColorScheme } from '../../lib/sentry'
 
@@ -43,6 +44,7 @@ const navGroups: NavGroup[] = [
       { path: '/analytics', label: 'Analytics', icon: BarChart3 },
       { path: '/errors', label: 'Errors', icon: AlertTriangle },
       { path: '/regressions', label: 'Regressions', icon: Shield },
+      { path: '/deploy-qa', label: 'Deploy QA', icon: Rocket },
       { path: '/feedback', label: 'Feedback', icon: MessageSquare },
     ],
   },
@@ -53,6 +55,7 @@ const navGroups: NavGroup[] = [
       { path: '/inference', label: 'Inference', icon: Brain },
       { path: '/repos', label: 'Repos', icon: FolderGit2 },
       { path: '/channels', label: 'Channels', icon: Hash },
+      { path: '/integrations', label: 'Integrations', icon: Plug },
       { path: '/learning', label: 'Learning', icon: GraduationCap },
     ],
   },
@@ -76,7 +79,7 @@ export function Sidebar() {
   const { path, navigate } = useRouter()
   const { user, logout } = useAuth()
   const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'))
-  const isAdmin = user?.role === 'admin'
+  const isAdmin = user?.role === ADMIN_ROLE
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
@@ -121,6 +124,7 @@ export function Sidebar() {
                   key={item.path}
                   item={item}
                   active={path === item.path}
+                  role={user?.role}
                   onNavigate={navigate}
                 />
               ))}
@@ -132,8 +136,8 @@ export function Sidebar() {
         <div className="flex items-center justify-between">
           <button
             onClick={() => navigate('/settings')}
-            onMouseEnter={() => prefetchRouteData('/settings')}
-            onFocus={() => prefetchRouteData('/settings')}
+            onMouseEnter={() => prefetchRouteData('/settings', user?.role)}
+            onFocus={() => prefetchRouteData('/settings', user?.role)}
             className="flex items-center gap-2 min-w-0 hover:opacity-80 transition-opacity"
             title="Account settings"
           >
@@ -183,13 +187,15 @@ export function Sidebar() {
 function NavButton({
   item: { path, label, icon: Icon, prefetch = true },
   active,
+  role,
   onNavigate,
 }: {
   item: NavItem
   active: boolean
+  role?: Role
   onNavigate: (path: string) => void
 }) {
-  const handlePrefetch = prefetch ? () => prefetchRouteData(path) : undefined
+  const handlePrefetch = prefetch ? () => prefetchRouteData(path, role) : undefined
   return (
     <button
       onClick={() => onNavigate(path)}
