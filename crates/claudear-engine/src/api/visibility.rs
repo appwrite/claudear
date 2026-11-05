@@ -91,7 +91,7 @@ mod tests {
     use axum::http::StatusCode;
     use claudear_core::security::SECURITY_FIX_SOURCE;
     use claudear_core::types::{
-        ActivityLogEntry, AgentExecution, ErrorPattern, IssueEmbedding, PrRecord,
+        ActivityLogEntry, AgentExecution, ErrorPattern, Issue, IssueEmbedding, PrRecord,
     };
     use claudear_storage::FixAttemptTracker;
     use serde_json::Value;
@@ -513,7 +513,8 @@ mod tests {
             .is_some());
     }
 
-    const AGGREGATES: [&str; 13] = [
+    const AGGREGATES: [&str; 14] = [
+        "/api/activity",
         "/api/stats",
         "/api/stats/overview",
         "/api/attempts",
@@ -594,6 +595,18 @@ mod tests {
 
     fn seed_security_fix(tracker: &dyn FixAttemptTracker) {
         seed_merged_fix(tracker, SECURITY_FIX_SOURCE, 7);
+        let issue = Issue::new("security-7", "SEC-7", "Hardening", "", SECURITY_FIX_SOURCE);
+        tracker
+            .record_activity(
+                &ActivityLogEntry::new("claude_started", "Claude execution started for SEC-7")
+                    .attributed("claude", Some(&issue))
+                    .with_metadata(serde_json::json!({
+                        "component": "claude",
+                        "working_dir": "/worktrees/security-7",
+                        "label": "SEC-7",
+                    })),
+            )
+            .expect("runner activity");
         for (name, value) in [
             ("pr_status_merged", 1.0),
             ("pending_attempts", 9.0),

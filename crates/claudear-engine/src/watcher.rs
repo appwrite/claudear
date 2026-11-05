@@ -83,6 +83,9 @@ const DRAIN_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// shorter intervals cannot make it busy-loop.
 const MIN_SOURCE_POLL_PERIOD: Duration = Duration::from_secs(1);
 
+/// The source of the watcher's own activity, about work on no issue.
+const COMPONENT: &str = "watcher";
+
 /// Why a trigger is refused once [`Watcher::stop`] has been called.
 const STOPPING_REFUSAL: &str = "Watcher is stopping; not starting new runs";
 
@@ -3044,7 +3047,7 @@ Create a PR with your changes.{custom_instructions}"#,
         let ready = retry_manager.get_ready_retries()?;
         let ready_count = ready.len();
         self.record_source_decision(
-            "watcher",
+            COMPONENT,
             "ready_retry_scan",
             "Scanned for ready retries",
             json!({
@@ -5571,7 +5574,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 "watcher_resumed",
                 format!("Watcher resumed after {} rate-limit pause", provider),
             )
-            .with_source("watcher".to_string())
+            .with_source(COMPONENT)
             .with_metadata(json!({
                 "reason": "provider_rate_limit",
                 "provider": provider,
@@ -5639,9 +5642,9 @@ Create a PR with your changes.{custom_instructions}"#,
                     effective_until.to_rfc3339()
                 ),
             )
-            .with_source("watcher".to_string())
-            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .attributed(COMPONENT, Some(issue))
             .with_metadata(json!({
+                "component": COMPONENT,
                 "reason": "provider_rate_limit",
                 "provider": provider,
                 "pause_until": effective_until.to_rfc3339(),
@@ -13339,13 +13342,18 @@ mod tests {
                 .await;
         }
 
-        let pause_until = harness
+        let pause = harness
             .tracker
             .get_recent_activities(50, None)
             .unwrap()
             .into_iter()
             .find(|activity| activity.activity_type == "watcher_paused")
-            .and_then(|activity| activity.metadata)
+            .expect("the rate limit should be logged as a pause");
+        let issue = harness.issue();
+        assert_eq!(pause.source.as_deref(), Some(issue.source.as_str()));
+        assert_eq!(pause.short_id.as_deref(), Some(issue.short_id.as_str()));
+        let pause_until = pause
+            .metadata
             .and_then(|metadata| metadata["pause_until"].as_str().map(str::to_string))
             .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
             .expect("the rate limit should be logged as a pause")

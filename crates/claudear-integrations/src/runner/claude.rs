@@ -28,6 +28,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 
+/// The runner's name, and the source of activity from runs that work on no issue.
+const COMPONENT: &str = "claude";
 const DEFAULT_LOG_DIR: &str = "./logs";
 const CLAUDE_LOG_SUBDIR: &str = "claude";
 const EXECUTION_LOG_PREVIEW_LIMIT: usize = 2000;
@@ -601,6 +603,7 @@ impl ClaudeAgentRunner {
             issue_identifier,
             env,
             project_dir,
+            None,
             Some("linear"),
         )
         .await
@@ -912,6 +915,7 @@ The PR title should include the issue ID: {}
             label,
             env,
             project_dir,
+            issue,
             issue.map(|i| i.source.as_str()),
         )
         .await
@@ -923,6 +927,7 @@ The PR title should include the issue ID: {}
         label: &str,
         env: HashMap<String, String>,
         project_dir: &Path,
+        issue: Option<&Issue>,
         source: Option<&str>,
     ) -> Result<AgentResult> {
         self.execute_with_env_and_attempt(
@@ -932,6 +937,7 @@ The PR title should include the issue ID: {}
             None,
             project_dir,
             RunProfile::Fix,
+            issue,
             source,
         )
         .await
@@ -1281,6 +1287,7 @@ The PR title should include the issue ID: {}
                 None,
                 project_dir,
                 RunProfile::Reply,
+                Some(issue),
                 Some(issue.source.as_str()),
             )
             .await?;
@@ -1315,6 +1322,7 @@ The PR title should include the issue ID: {}
                 None,
                 project_dir,
                 profile,
+                Some(issue),
                 Some(issue.source.as_str()),
             )
             .await?;
@@ -1549,6 +1557,7 @@ The PR title should include the issue ID: {}
         attempt_id: Option<i64>,
         project_dir: &Path,
         profile: RunProfile,
+        issue: Option<&Issue>,
         source: Option<&str>,
     ) -> Result<RunOutcome> {
         let mut execution = AgentExecution::new();
@@ -1577,8 +1586,9 @@ The PR title should include the issue ID: {}
             "claude_started",
             format!("Claude execution started for {}", label),
         )
-        .with_source("claude".to_string())
+        .attributed(COMPONENT, issue)
         .with_metadata(json!({
+            "component": COMPONENT,
             "timeout_secs": timeout_secs,
             "working_dir": project_dir.display().to_string(),
             "label": label
@@ -2345,8 +2355,9 @@ The PR title should include the issue ID: {}
                     "claude_timed_out",
                     format!("Claude timed out for {}", label),
                 )
-                .with_source("claude".to_string())
+                .attributed(COMPONENT, issue)
                 .with_metadata(json!({
+                    "component": COMPONENT,
                     "timeout_secs": timeout_secs,
                     "label": label
                 }));
@@ -2660,8 +2671,9 @@ The PR title should include the issue ID: {}
                 "claude_completed",
                 format!("Claude completed for {}", label),
             )
-            .with_source("claude".to_string())
+            .attributed(COMPONENT, issue)
             .with_metadata(json!({
+                "component": COMPONENT,
                 "duration_secs": execution.duration_secs,
                 "exit_code": exit_code,
                 "has_pr": pr_url.is_some(),
@@ -2680,8 +2692,9 @@ The PR title should include the issue ID: {}
                     Self::truncate(&error_msg, 100)
                 ),
             )
-            .with_source("claude".to_string())
+            .attributed(COMPONENT, issue)
             .with_metadata(json!({
+                "component": COMPONENT,
                 "duration_secs": execution.duration_secs,
                 "exit_code": exit_code,
                 "error": Self::truncate(&error_msg, 500),
@@ -2694,8 +2707,9 @@ The PR title should include the issue ID: {}
                     "rate_limit_hit",
                     format!("Claude rate limit hit for {}", label),
                 )
-                .with_source("claude".to_string())
+                .attributed(COMPONENT, issue)
                 .with_metadata(json!({
+                    "component": COMPONENT,
                     "label": label,
                     "exit_code": exit_code,
                     "error": Self::truncate(&error_msg, 500),
@@ -2822,7 +2836,7 @@ The PR title should include the issue ID: {}
 #[async_trait]
 impl AgentRunner for ClaudeAgentRunner {
     fn name(&self) -> &str {
-        "claude"
+        COMPONENT
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -2854,6 +2868,7 @@ impl AgentRunner for ClaudeAgentRunner {
             attempt_id,
             project_dir,
             RunProfile::Fix,
+            issue,
             issue.map(|i| i.source.as_str()),
         )
         .await
@@ -9320,6 +9335,87 @@ more output"#;
                 .map(|a| &a.activity_type)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// The type, source and short id of every activity a run of a stub CLI
+    /// records for `issue`, the run failing on a rate limit when `rate_limited`.
+    #[cfg(all(unix, feature = "sqlite"))]
+    fn run_activities(
+        issue: Option<&Issue>,
+        rate_limited: bool,
+    ) -> Vec<(String, Option<String>, Option<String>)> {
+        let tracker = Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
+        let (setup, exit_code) = if rate_limited {
+            ("echo 'rate limit exceeded' >&2\n", 1)
+        } else {
+            ("", 0)
+        };
+        let cli = FakeCli::install(&fake_cli_script(
+            setup,
+            &[result_event("done", rate_limited)],
+            exit_code,
+        ));
+        let config = ClaudeRunnerConfig {
+            binary: cli.directory().join(FAKE_CLI_BINARY).display().to_string(),
+            ..ClaudeRunnerConfig::default()
+        };
+        let runner = ClaudeAgentRunner::new(config, tracker.clone());
+        block_on(runner.execute_with_attempt("fix", issue, None, cli.directory())).unwrap();
+        tracker
+            .get_recent_activities(50, None)
+            .unwrap()
+            .into_iter()
+            .map(|activity| {
+                assert_eq!(activity.metadata.as_ref().unwrap()["component"], COMPONENT);
+                (activity.activity_type, activity.source, activity.short_id)
+            })
+            .collect()
+    }
+
+    #[cfg(all(unix, feature = "sqlite"))]
+    #[test]
+    fn a_security_fix_run_records_its_activity_under_the_security_source() {
+        let issue = Issue::new(
+            "vulnerability-7",
+            "SEC-7",
+            "Hardening",
+            "",
+            SECURITY_FIX_SOURCE,
+        );
+        let mut types = Vec::new();
+        for rate_limited in [false, true] {
+            for (activity_type, source, short_id) in run_activities(Some(&issue), rate_limited) {
+                assert_eq!(
+                    source.as_deref(),
+                    Some(SECURITY_FIX_SOURCE),
+                    "{activity_type}"
+                );
+                assert_eq!(short_id.as_deref(), Some("SEC-7"), "{activity_type}");
+                types.push(activity_type);
+            }
+        }
+        types.sort();
+        assert_eq!(
+            types,
+            [
+                "claude_completed",
+                "claude_failed",
+                "claude_started",
+                "claude_started",
+                "rate_limit_hit"
+            ]
+        );
+    }
+
+    #[cfg(all(unix, feature = "sqlite"))]
+    #[test]
+    fn a_run_on_no_issue_records_its_activity_under_the_runner() {
+        let activities = run_activities(None, false);
+        assert_eq!(activities.len(), 2);
+        for (activity_type, source, short_id) in activities {
+            assert_eq!(source.as_deref(), Some(COMPONENT), "{activity_type}");
+            assert_eq!(short_id, None, "{activity_type}");
+        }
     }
 
     #[test]
