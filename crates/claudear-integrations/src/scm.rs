@@ -1069,8 +1069,9 @@ impl ReviewWatcher {
             // Log activity event for the review
             let message = format!("PR review from {}: {}", review.user.login, review.state);
             let activity = ActivityLogEntry::new("pr_review_received", &message)
-                .with_source(self.provider.name().to_string())
+                .with_source(state.source.clone())
                 .with_metadata(serde_json::json!({
+                    "provider": self.provider.name(),
                     "pr_url": state.pr_url,
                     "reviewer": review.user.login,
                     "review_state": review.state,
@@ -5934,7 +5935,7 @@ mod tests {
 
         struct MockTrackerWithRecording {
             review_calls: Arc<Mutex<Vec<String>>>,
-            activity_calls: Arc<Mutex<Vec<String>>>,
+            activity_calls: Arc<Mutex<Vec<ActivityLogEntry>>>,
             unhandled: Arc<Mutex<Vec<ReviewComment>>>,
             handled_calls: Arc<Mutex<Vec<String>>>,
             fail_record: Arc<Mutex<bool>>,
@@ -6054,10 +6055,7 @@ mod tests {
                 Ok(1)
             }
             fn record_activity(&self, entry: &ActivityLogEntry) -> Result<i64> {
-                self.activity_calls
-                    .lock()
-                    .unwrap()
-                    .push(entry.activity_type.clone());
+                self.activity_calls.lock().unwrap().push(entry.clone());
                 Ok(1)
             }
             fn record_pr_review_comment(
@@ -6178,7 +6176,12 @@ mod tests {
             // Verify record_activity was called
             let activity_calls = tracker.activity_calls.lock().unwrap();
             assert_eq!(activity_calls.len(), 1);
-            assert_eq!(activity_calls[0], "pr_review_received");
+            assert_eq!(activity_calls[0].activity_type, "pr_review_received");
+            assert_eq!(activity_calls[0].source.as_deref(), Some("linear"));
+            assert_eq!(
+                activity_calls[0].metadata.as_ref().unwrap()["provider"],
+                "github"
+            );
         }
 
         #[tokio::test]

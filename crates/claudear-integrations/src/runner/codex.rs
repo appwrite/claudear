@@ -16,6 +16,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
+/// The runner's name, and the source of activity from runs that work on no issue.
+const COMPONENT: &str = "codex";
+
 const OUTPUT_HELD_OPEN_MESSAGE: &str =
     "Stopped reading Codex output held open by a process outside its process group";
 
@@ -172,7 +175,7 @@ The PR title should include the issue ID: {}
 #[async_trait]
 impl AgentRunner for CodexAgentRunner {
     fn name(&self) -> &str {
-        "codex"
+        COMPONENT
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -218,8 +221,9 @@ impl AgentRunner for CodexAgentRunner {
             "agent_started",
             format!("Codex execution started for {}", label),
         )
-        .with_source("codex".to_string())
+        .attributed(COMPONENT, issue)
         .with_metadata(json!({
+            "component": COMPONENT,
             "timeout_secs": self.config.timeout_secs,
             "working_dir": project_dir.display().to_string(),
             "label": label
@@ -344,8 +348,9 @@ impl AgentRunner for CodexAgentRunner {
 
         let activity = if success {
             ActivityLogEntry::new("agent_completed", format!("Codex completed for {}", label))
-                .with_source("codex".to_string())
+                .attributed(COMPONENT, issue)
                 .with_metadata(json!({
+                    "component": COMPONENT,
                     "duration_secs": execution.duration_secs,
                     "exit_code": exit_code,
                     "has_pr": pr_url.is_some(),
@@ -356,8 +361,9 @@ impl AgentRunner for CodexAgentRunner {
                 "agent_failed",
                 format!("Codex failed for {} (exit {})", label, exit_code),
             )
-            .with_source("codex".to_string())
+            .attributed(COMPONENT, issue)
             .with_metadata(json!({
+                "component": COMPONENT,
                 "duration_secs": execution.duration_secs,
                 "exit_code": exit_code,
                 "label": label
@@ -636,6 +642,81 @@ mod tests {
             ..CodexRunnerConfig::default()
         };
         CodexAgentRunner::new(config, Arc::new(claudear_storage::NoopTracker))
+    }
+
+    /// The type, source and short id of every activity a run of a stub CLI
+    /// exiting with `exit_code` records for `issue`.
+    #[cfg(all(unix, feature = "sqlite"))]
+    async fn run_activities(
+        issue: Option<&Issue>,
+        exit_code: i32,
+    ) -> Vec<(String, Option<String>, Option<String>)> {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("codex");
+        install_stub(&binary, &format!("exit {exit_code}\n"));
+        let tracker = Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
+        let config = CodexRunnerConfig {
+            binary: binary.display().to_string(),
+            ..CodexRunnerConfig::default()
+        };
+        CodexAgentRunner::new(config, tracker.clone())
+            .execute_with_attempt("fix", issue, None, directory.path())
+            .await
+            .unwrap();
+        tracker
+            .get_recent_activities(50, None)
+            .unwrap()
+            .into_iter()
+            .map(|activity| {
+                assert_eq!(activity.metadata.as_ref().unwrap()["component"], COMPONENT);
+                (activity.activity_type, activity.source, activity.short_id)
+            })
+            .collect()
+    }
+
+    #[cfg(all(unix, feature = "sqlite"))]
+    #[tokio::test]
+    async fn a_security_fix_run_records_its_activity_under_the_security_source() {
+        let issue = Issue::new(
+            "vulnerability-7",
+            "SEC-7",
+            "Hardening",
+            "",
+            SECURITY_FIX_SOURCE,
+        );
+        let mut types = Vec::new();
+        for exit_code in [0, 1] {
+            for (activity_type, source, short_id) in run_activities(Some(&issue), exit_code).await {
+                assert_eq!(
+                    source.as_deref(),
+                    Some(SECURITY_FIX_SOURCE),
+                    "{activity_type}"
+                );
+                assert_eq!(short_id.as_deref(), Some("SEC-7"), "{activity_type}");
+                types.push(activity_type);
+            }
+        }
+        types.sort();
+        assert_eq!(
+            types,
+            [
+                "agent_completed",
+                "agent_failed",
+                "agent_started",
+                "agent_started"
+            ]
+        );
+    }
+
+    #[cfg(all(unix, feature = "sqlite"))]
+    #[tokio::test]
+    async fn a_run_on_no_issue_records_its_activity_under_the_runner() {
+        let activities = run_activities(None, 0).await;
+        assert_eq!(activities.len(), 2);
+        for (activity_type, source, short_id) in activities {
+            assert_eq!(source.as_deref(), Some(COMPONENT), "{activity_type}");
+            assert_eq!(short_id, None, "{activity_type}");
+        }
     }
 
     /// A stub `codex` binary that runs `setup`, then prints [`PR_URL`] and exits.

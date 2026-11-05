@@ -518,11 +518,12 @@ pub trait ActivityStore: Send + Sync {
         Ok(claudear_core::types::TimeSavings::default())
     }
 
-    /// List all PRs with optional status and limit filters.
+    /// The newest `limit` PRs within `scope`, optionally with `status`.
     fn list_prs(
         &self,
         _status: Option<&str>,
         _limit: usize,
+        _scope: AttemptScope,
     ) -> Result<Vec<claudear_core::types::PrRecord>> {
         Ok(Vec::new())
     }
@@ -2888,8 +2889,11 @@ mod tests {
         #[test]
         fn test_default_list_prs_returns_empty() {
             let t = MockActivity;
-            assert!(t.list_prs(None, 50).unwrap().is_empty());
-            assert!(t.list_prs(Some("open"), 10).unwrap().is_empty());
+            assert!(t.list_prs(None, 50, AttemptScope::All).unwrap().is_empty());
+            assert!(t
+                .list_prs(Some("open"), 10, AttemptScope::All)
+                .unwrap()
+                .is_empty());
         }
     }
 
