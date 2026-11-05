@@ -26,7 +26,13 @@ const NO_FIX_CHOICE: &str = "none";
 const MERGED_AT_DETAIL_KEY: &str = "merged_at";
 const FIXED_BY_COMMIT_DETAIL_KEY: &str = "fixed_by_commit";
 const NAMED_REPOSITORY_DETAIL_KEY: &str = "named_repository";
-const REPOSITORY_URL_PREFIXES: &[&str] = &["https://github.com/", "github.com/"];
+const URL_SCHEMES: &[&str] = &["https://", "http://", "ssh://", "git://"];
+const SSH_USER: &str = "git@";
+const WWW_SUBDOMAIN: &str = "www.";
+const GITHUB_HOST: &str = "github.com";
+const HOST_SEPARATORS: [char; 2] = ['/', ':'];
+const URL_SUFFIX_MARKERS: [char; 2] = ['?', '#'];
+const REMOTE_MARKERS: [char; 2] = [':', '@'];
 const REPOSITORY_SUFFIX: &str = ".git";
 
 /// The longest one assessment can legitimately hold a report in `Assessing`:
@@ -131,6 +137,9 @@ pub(crate) enum Verdict {
     /// The assessment placed the defect in a repository that is not indexed,
     /// so the checked repository's verdict cannot be trusted.
     UnindexedRepository(String),
+    /// The re-run in the repository the first run named placed the defect
+    /// somewhere else again, so neither run can be trusted.
+    ConflictingRepository(String),
 }
 
 impl Verdict {
@@ -139,6 +148,7 @@ impl Verdict {
             Self::NeedsHuman(reason) => Some(*reason),
             Self::FixedAfterReport(_) => Some(ReviewReason::FixFoundInHistory),
             Self::UnindexedRepository(_) => Some(ReviewReason::UnindexedRepository),
+            Self::ConflictingRepository(_) => Some(ReviewReason::AssessmentInconclusive),
             _ => None,
         }
     }
@@ -147,7 +157,7 @@ impl Verdict {
     pub(crate) fn record(&self, detail: &mut Value) {
         match self {
             Self::FixedAfterReport(merged) => merged.record(detail),
-            Self::UnindexedRepository(repository) => {
+            Self::UnindexedRepository(repository) | Self::ConflictingRepository(repository) => {
                 detail[NAMED_REPOSITORY_DETAIL_KEY] = scrub_internal(repository).into();
             }
             _ => {}
@@ -228,39 +238,102 @@ impl PhaseA {
         scrub_assessment(&mut assessment);
         assessment
     }
+
+    /// A result that places the defect in no repository, for an admin to
+    /// settle.
+    fn unresolved(&self, verdict: Verdict) -> AssessmentResult {
+        AssessmentResult {
+            assessment: self.assessment(),
+            verdict,
+            repository: None,
+        }
+    }
 }
 
-/// The repository Phase A placed the defect in, when it is a plausible
-/// `owner/name` other than the one it checked.
-fn redirected_repository<'a>(phase: &'a PhaseA, checkout: &Checkout) -> Option<&'a str> {
-    let affected = repository_name(&phase.affected_repository)?;
-    (!affected.eq_ignore_ascii_case(repository_name(&checkout.repository)?)).then_some(affected)
+/// The repository a Phase A run placed the defect in, relative to the
+/// repository it checked.
+#[derive(Debug, PartialEq, Eq)]
+enum NamedRepository<'a> {
+    Checked,
+    Other(&'a str),
+    Unrecognised(&'a str),
 }
 
-/// `owner/name` from an agent-supplied repository reference, tolerating a
-/// GitHub URL prefix, surrounding slashes and a `.git` suffix.
+impl<'a> NamedRepository<'a> {
+    fn of(phase: &'a PhaseA, checkout: &Checkout) -> Self {
+        let reference = phase.affected_repository.trim();
+        if reference.is_empty() || reference.eq_ignore_ascii_case(checkout.repository.trim()) {
+            return Self::Checked;
+        }
+        match repository_name(reference) {
+            Some(name) if is_same_repository(name, &checkout.repository) => Self::Checked,
+            Some(name) => Self::Other(name),
+            None => Self::Unrecognised(reference),
+        }
+    }
+
+    /// What the run named, when it is not the checked repository.
+    fn elsewhere(&self) -> Option<&'a str> {
+        match self {
+            Self::Checked => None,
+            Self::Other(reference) | Self::Unrecognised(reference) => Some(reference),
+        }
+    }
+}
+
+fn is_same_repository(name: &str, checked: &str) -> bool {
+    name.eq_ignore_ascii_case(repository_name(checked).unwrap_or_else(|| checked.trim()))
+}
+
+/// The repository name in an agent-supplied reference: `owner/name` from a
+/// GitHub URL or SSH remote, or a bare slash-separated name of at least two
+/// segments, without surrounding slashes or a `.git` suffix.
 fn repository_name(reference: &str) -> Option<&str> {
     let trimmed = reference.trim();
-    let unprefixed = REPOSITORY_URL_PREFIXES
-        .iter()
-        .find_map(|prefix| {
-            trimmed
-                .get(..prefix.len())
-                .filter(|head| head.eq_ignore_ascii_case(prefix))
-                .map(|_| &trimmed[prefix.len()..])
-        })
-        .unwrap_or(trimmed)
-        .trim_matches('/');
-    let name = unprefixed
-        .strip_suffix(REPOSITORY_SUFFIX)
-        .unwrap_or(unprefixed);
-    let plausible = name.split('/').count() == 2
-        && name.split('/').all(|part| !part.is_empty())
+    let name = match github_path(trimmed) {
+        Some(path) => github_repository(path)?,
+        None if trimmed.contains(REMOTE_MARKERS) => return None,
+        None => trimmed.trim_matches('/'),
+    };
+    let name = name.strip_suffix(REPOSITORY_SUFFIX).unwrap_or(name);
+    let plausible = name.split('/').count() >= 2
+        && name.split('/').all(|segment| !segment.is_empty())
         && name
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "-_./".contains(character))
         && !name.contains("..");
     plausible.then_some(name)
+}
+
+/// The path after the host when `reference` is a GitHub URL or SSH remote.
+fn github_path(reference: &str) -> Option<&str> {
+    let unschemed = URL_SCHEMES
+        .iter()
+        .find_map(|scheme| strip_prefix_ignoring_case(reference, scheme))
+        .unwrap_or(reference);
+    let host = strip_prefix_ignoring_case(unschemed, SSH_USER).unwrap_or(unschemed);
+    let host = strip_prefix_ignoring_case(host, WWW_SUBDOMAIN).unwrap_or(host);
+    strip_prefix_ignoring_case(host, GITHUB_HOST)?.strip_prefix(HOST_SEPARATORS)
+}
+
+/// `owner/name` from a GitHub path, ignoring anything below the repository
+/// such as `/tree/main/src`, a query or a fragment.
+fn github_repository(path: &str) -> Option<&str> {
+    let path = path
+        .split(URL_SUFFIX_MARKERS)
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    let mut segments = path.splitn(3, '/');
+    let owner = segments.next()?;
+    let name = segments.next()?;
+    path.get(..owner.len() + 1 + name.len())
+}
+
+fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &text[prefix.len()..])
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,16 +355,18 @@ impl SecurityInbox {
     ) -> Result<AssessmentResult> {
         let mut checkout = self.checkout(resolution).await?;
         let mut phase = self.phase_a(report, &checkout).await?;
-        if let Some(affected) = redirected_repository(&phase, &checkout) {
-            let Some(redirected) = self.indexed_resolution(affected)? else {
-                return Ok(AssessmentResult {
-                    assessment: phase.assessment(),
-                    verdict: Verdict::UnindexedRepository(affected.to_string()),
-                    repository: None,
-                });
+        let named = NamedRepository::of(&phase, &checkout);
+        if let Some(reference) = named.elsewhere() {
+            let Some(redirected) = self.redirection(&named)? else {
+                let verdict = Verdict::UnindexedRepository(scrub_internal(reference));
+                return Ok(phase.unresolved(verdict));
             };
             checkout = self.checkout(&redirected).await?;
             phase = self.phase_a(report, &checkout).await?;
+            if let Some(reference) = NamedRepository::of(&phase, &checkout).elsewhere() {
+                let verdict = Verdict::ConflictingRepository(scrub_internal(reference));
+                return Ok(phase.unresolved(verdict));
+            }
         }
         let assessment = phase.assessment();
         let verdict = match phase.outcome {
@@ -341,6 +416,14 @@ impl SecurityInbox {
             repository: repo_name.clone(),
             default_branch,
         })
+    }
+
+    /// The indexed repository a Phase A run named instead of the checked one.
+    fn redirection(&self, named: &NamedRepository<'_>) -> Result<Option<RepoResolution>> {
+        match named {
+            NamedRepository::Other(name) => self.indexed_resolution(name),
+            NamedRepository::Checked | NamedRepository::Unrecognised(_) => Ok(None),
+        }
     }
 
     /// The indexed repository named `repository`, ignoring case, or `None`
@@ -505,12 +588,13 @@ mod tests {
     }
 
     #[test]
-    fn repository_references_normalise_to_owner_and_name() {
+    fn repository_references_normalise_to_a_repository_name() {
         for (reference, expected) in [
             ("appwrite/console", Some("appwrite/console")),
             ("  Appwrite/Console  ", Some("Appwrite/Console")),
             ("/appwrite/console/", Some("appwrite/console")),
             ("appwrite/console.git", Some("appwrite/console")),
+            ("group/subgroup/project", Some("group/subgroup/project")),
             (
                 "https://github.com/appwrite/console",
                 Some("appwrite/console"),
@@ -519,51 +603,160 @@ mod tests {
                 "HTTPS://GitHub.com/appwrite/console.git",
                 Some("appwrite/console"),
             ),
+            (
+                "http://github.com/appwrite/console/",
+                Some("appwrite/console"),
+            ),
             ("github.com/appwrite/console", Some("appwrite/console")),
+            ("www.github.com/appwrite/console", Some("appwrite/console")),
+            (
+                "https://www.github.com/appwrite/console",
+                Some("appwrite/console"),
+            ),
+            (
+                "git@github.com:appwrite/console.git",
+                Some("appwrite/console"),
+            ),
+            ("git@github.com:appwrite/console", Some("appwrite/console")),
+            (
+                "ssh://git@github.com/appwrite/console.git",
+                Some("appwrite/console"),
+            ),
+            (
+                "git://github.com/appwrite/console.git",
+                Some("appwrite/console"),
+            ),
+            (
+                "https://github.com/appwrite/console/tree/main/src",
+                Some("appwrite/console"),
+            ),
+            (
+                "https://github.com/appwrite/console/blob/main/src/app.ts#L4",
+                Some("appwrite/console"),
+            ),
+            (
+                "https://github.com/appwrite/console?tab=readme",
+                Some("appwrite/console"),
+            ),
+            (
+                "https://github.com/appwrite/console#readme",
+                Some("appwrite/console"),
+            ),
             ("", None),
             ("   ", None),
-            ("appwrite", None),
-            ("appwrite/console/src", None),
+            ("console", None),
+            ("not a repository", None),
             ("appwrite/", None),
             ("/console", None),
+            ("appwrite//console", None),
             ("appwrite/../etc", None),
             ("appwrite/con sole", None),
+            ("https://github.com/appwrite", None),
+            ("https://github.com/", None),
+            ("https://github.company.com/appwrite/console", None),
             ("https://gitlab.com/appwrite/console", None),
+            ("git@gitlab.com:appwrite/console.git", None),
+            ("file:///srv/appwrite/console", None),
         ] {
             assert_eq!(repository_name(reference), expected, "{reference:?}");
         }
     }
 
-    #[test]
-    fn only_a_different_repository_redirects_the_assessment() {
-        let checkout = Checkout {
+    fn checkout(repository: &str) -> Checkout {
+        Checkout {
             project_dir: PathBuf::new(),
-            repository: "appwrite/appwrite".to_string(),
+            repository: repository.to_string(),
             default_branch: "main".to_string(),
-        };
-        let phase = |affected: &str| -> PhaseA {
-            serde_json::from_value(json!({
-                "outcome": "valid",
-                "affected_repository": affected,
-            }))
-            .unwrap()
-        };
-        assert_eq!(redirected_repository(&phase(""), &checkout), None);
-        assert_eq!(redirected_repository(&phase("appwrite"), &checkout), None);
+        }
+    }
+
+    fn phase(affected: &str) -> PhaseA {
+        serde_json::from_value(json!({
+            "outcome": "valid",
+            "affected_repository": affected,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_an_empty_or_matching_name_keeps_the_checked_repository() {
+        let checkout = checkout("appwrite/appwrite");
+        for affected in [
+            "",
+            "  ",
+            "Appwrite/Appwrite",
+            "https://github.com/appwrite/appwrite.git",
+            "git@github.com:appwrite/appwrite.git",
+            "www.github.com/appwrite/appwrite",
+            "https://github.com/appwrite/appwrite/tree/main/src",
+        ] {
+            assert_eq!(
+                NamedRepository::of(&phase(affected), &checkout),
+                NamedRepository::Checked,
+                "{affected:?}"
+            );
+        }
+        for affected in [
+            "appwrite/console",
+            "git@github.com:appwrite/console.git",
+            "https://github.com/appwrite/console/tree/main/src",
+            "appwrite/appwrite/src",
+        ] {
+            let named = phase(affected);
+            let other = NamedRepository::of(&named, &checkout);
+            assert!(matches!(other, NamedRepository::Other(_)), "{affected:?}");
+            assert!(other.elsewhere().is_some());
+        }
+        for affected in [
+            "appwrite",
+            "console",
+            "not a repository",
+            "https://gitlab.com/appwrite/appwrite",
+        ] {
+            let named = phase(affected);
+            assert_eq!(
+                NamedRepository::of(&named, &checkout),
+                NamedRepository::Unrecognised(affected),
+                "{affected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_multi_segment_checked_repository_is_compared_in_full() {
+        let checkout = checkout("Group/Subgroup/Project");
         assert_eq!(
-            redirected_repository(&phase("Appwrite/Appwrite"), &checkout),
-            None
+            NamedRepository::of(&phase("group/subgroup/project"), &checkout),
+            NamedRepository::Checked
         );
         assert_eq!(
-            redirected_repository(
-                &phase("https://github.com/appwrite/appwrite.git"),
-                &checkout
-            ),
-            None
+            NamedRepository::of(&phase("group/subgroup/other"), &checkout),
+            NamedRepository::Other("group/subgroup/other")
         );
         assert_eq!(
-            redirected_repository(&phase("appwrite/console"), &checkout),
-            Some("appwrite/console")
+            NamedRepository::of(&phase("subgroup/project"), &checkout),
+            NamedRepository::Other("subgroup/project")
+        );
+    }
+
+    #[test]
+    fn a_checked_repository_that_does_not_normalise_is_compared_verbatim() {
+        let checkout = checkout("legacy");
+        assert_eq!(
+            NamedRepository::of(&phase(" Legacy "), &checkout),
+            NamedRepository::Checked
+        );
+        assert_eq!(
+            NamedRepository::of(&phase("legacy-other"), &checkout),
+            NamedRepository::Unrecognised("legacy-other")
+        );
+        assert_eq!(
+            NamedRepository::of(&phase("appwrite/console"), &checkout),
+            NamedRepository::Other("appwrite/console")
+        );
+        assert_eq!(
+            NamedRepository::of(&phase(""), &checkout),
+            NamedRepository::Checked
         );
     }
 
@@ -583,6 +776,25 @@ mod tests {
         assert_eq!(
             Verdict::UnindexedRepository(String::new()).review_reason(),
             Some(ReviewReason::UnindexedRepository)
+        );
+    }
+
+    #[test]
+    fn a_conflicting_repository_is_inconclusive_and_records_its_scrubbed_name() {
+        let mut detail = json!({});
+        Verdict::ConflictingRepository("appwrite/appwrite".to_string()).record(&mut detail);
+        assert_eq!(
+            detail[NAMED_REPOSITORY_DETAIL_KEY],
+            json!("appwrite/appwrite")
+        );
+        Verdict::ConflictingRepository("appwrite-labs/cloud".to_string()).record(&mut detail);
+        assert_eq!(
+            detail[NAMED_REPOSITORY_DETAIL_KEY],
+            json!(super::super::scrub::REDACTED)
+        );
+        assert_eq!(
+            Verdict::ConflictingRepository(String::new()).review_reason(),
+            Some(ReviewReason::AssessmentInconclusive)
         );
     }
 }
