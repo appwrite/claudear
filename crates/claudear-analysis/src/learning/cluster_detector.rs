@@ -122,7 +122,7 @@ mod tests {
     use claudear_storage::{
         ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
         EvaluationStore, ExperimentStore, KnowledgeStore, PrAssignmentStore, RegressionStore,
-        RepoStore, SimilarityStore, UserStore, WebhookStore,
+        RepoStore, SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
     };
     use std::collections::HashMap;
 
@@ -238,6 +238,7 @@ mod tests {
     impl DiscordStore for MockTracker {}
     impl DeployQaStore for MockTracker {}
     impl PrAssignmentStore for MockTracker {}
+    impl SecurityReportStore for MockTracker {}
 
     #[test]
     fn test_detect_clusters_too_few() {

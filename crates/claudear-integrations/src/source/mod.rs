@@ -19,6 +19,7 @@ pub use github::GitHubSource;
 pub use github_code_scanning::GitHubCodeScanningSource;
 pub use gitlab::GitLabSource;
 pub(crate) use gitlab::{format_gitlab_context, gitlab_matches_criteria};
+pub(crate) use helpscout::helpscout_matches_trigger_tags;
 pub use helpscout::HelpScoutSource;
 pub use jira::JiraSource;
 pub use linear::LinearSource;
@@ -32,6 +33,44 @@ use claudear_core::error::Result;
 use claudear_core::types::{Issue, MatchResult};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Conversation status to set together with a reporter reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationStatus {
+    Active,
+    Pending,
+    Closed,
+}
+
+impl ConversationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Pending => "pending",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl std::fmt::Display for ConversationStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Outcome of a customer-facing reply.
+///
+/// `Rejected` means the reply was definitely not sent (it failed before the
+/// request, or the API answered 4xx), so it is safe to retry. `Unconfirmed`
+/// means it may have been sent (the connection failed after the request
+/// started, it timed out, or the API answered 5xx), so it must never be
+/// retried automatically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReporterReply {
+    Sent,
+    Rejected(String),
+    Unconfirmed(String),
+}
 
 /// Trait for issue sources (Linear, Sentry, GitHub, Jira, etc.)
 #[async_trait]
@@ -124,6 +163,24 @@ pub trait IssueSource: Send + Sync {
             "list_open_issues not supported by this source".into(),
         ))
     }
+
+    /// Send a customer-facing reply to the reporter, optionally setting the
+    /// conversation status in the same call.
+    async fn reply_to_reporter(
+        &self,
+        _issue_id: &str,
+        _body: &str,
+        _status: Option<ConversationStatus>,
+    ) -> ReporterReply {
+        ReporterReply::Rejected("reply_to_reporter not supported by this source".into())
+    }
+
+    /// Mark a conversation as spam on the remote source.
+    async fn mark_spam(&self, _issue_id: &str) -> Result<()> {
+        Err(claudear_core::error::Error::Other(
+            "mark_spam not supported by this source".into(),
+        ))
+    }
 }
 
 /// Registry for available sources.
@@ -212,6 +269,110 @@ mod tests {
                 &self.name, "test",
             ))
         }
+    }
+
+    #[tokio::test]
+    async fn test_default_reply_to_reporter_is_rejected() {
+        let source = MockSource::new("test", "Test");
+        let outcome = source
+            .reply_to_reporter("123", "body", Some(ConversationStatus::Closed))
+            .await;
+        assert!(matches!(outcome, ReporterReply::Rejected(_)), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn test_default_mark_spam_is_unsupported() {
+        let source = MockSource::new("test", "Test");
+        assert!(source.mark_spam("123").await.is_err());
+    }
+
+    #[test]
+    fn test_conversation_status_names() {
+        assert_eq!(ConversationStatus::Active.as_str(), "active");
+        assert_eq!(ConversationStatus::Pending.as_str(), "pending");
+        assert_eq!(ConversationStatus::Closed.to_string(), "closed");
+    }
+
+    #[derive(Default)]
+    struct RecordingSource {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingSource {
+        fn record(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    #[async_trait]
+    impl IssueSource for RecordingSource {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn display_name(&self) -> &str {
+            "Recording"
+        }
+        async fn fetch_issues(&self) -> Result<Vec<Issue>> {
+            Ok(vec![])
+        }
+        async fn list_conversations(&self, status: Option<&str>) -> Result<Vec<Issue>> {
+            self.record(format!("list_conversations:{}", status.unwrap_or("-")));
+            Ok(vec![Issue::new("7", "R-7", "Listed", "url", "recording")])
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("test", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, _issue: &Issue) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn get_issue(&self, _id: &str) -> Result<Issue> {
+            Err(claudear_core::error::Error::issue_not_found(
+                "recording",
+                "test",
+            ))
+        }
+        async fn reply_to_reporter(
+            &self,
+            issue_id: &str,
+            body: &str,
+            status: Option<ConversationStatus>,
+        ) -> ReporterReply {
+            self.record(format!(
+                "reply_to_reporter:{issue_id}:{body}:{}",
+                status.map(ConversationStatus::as_str).unwrap_or("-")
+            ));
+            ReporterReply::Unconfirmed("timed out".into())
+        }
+        async fn mark_spam(&self, issue_id: &str) -> Result<()> {
+            self.record(format!("mark_spam:{issue_id}"));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_instrumented_source_forwards_security_methods() {
+        let inner = Arc::new(RecordingSource::default());
+        let wrapped = crate::telemetry::InstrumentedSource::wrap(inner.clone());
+
+        let listed = wrapped.list_conversations(Some("closed")).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "7");
+        assert_eq!(
+            wrapped
+                .reply_to_reporter("42", "hello", Some(ConversationStatus::Closed))
+                .await,
+            ReporterReply::Unconfirmed("timed out".into())
+        );
+        wrapped.mark_spam("42").await.unwrap();
+
+        assert_eq!(
+            *inner.calls.lock().unwrap(),
+            vec![
+                "list_conversations:closed".to_string(),
+                "reply_to_reporter:42:hello:closed".to_string(),
+                "mark_spam:42".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -163,7 +163,7 @@ mod tests {
     use claudear_storage::{
         ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
         EvaluationStore, ExperimentStore, KnowledgeStore, PrAssignmentStore, RegressionStore,
-        RepoStore, SimilarityStore, UserStore, WebhookStore,
+        RepoStore, SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
     };
 
     /// Minimal no-op tracker for tests.
@@ -265,6 +265,7 @@ mod tests {
     impl DiscordStore for NoOpTracker {}
     impl DeployQaStore for NoOpTracker {}
     impl PrAssignmentStore for NoOpTracker {}
+    impl SecurityReportStore for NoOpTracker {}
 
     fn make_candidate(
         id: &str,
@@ -852,6 +853,7 @@ mod tests {
         impl DiscordStore for ClusterTrackingTracker {}
         impl DeployQaStore for ClusterTrackingTracker {}
         impl PrAssignmentStore for ClusterTrackingTracker {}
+        impl SecurityReportStore for ClusterTrackingTracker {}
 
         let config = PrioritisationConfig {
             content_clustering: true,
@@ -899,8 +901,6 @@ mod tests {
         assert!(stored[0].cluster_key.contains("TypeError"));
         assert!(stored[0].cluster_key.contains("payment.handler"));
     }
-
-    // --- Edge cases for the `prioritise` orchestrator ---
 
     #[test]
     fn duplicate_issue_ids_last_match_result_wins() {
@@ -1192,8 +1192,6 @@ mod tests {
         }
     }
 
-    // --- Suppression + clustering interaction ---
-
     #[test]
     fn suppressed_issues_not_clustered() {
         // If issues that would form a cluster are suppressed, no cluster should form.
@@ -1363,8 +1361,6 @@ mod tests {
         );
     }
 
-    // --- Priority ordering edge cases ---
-
     #[test]
     fn identical_priority_stable_relative_order() {
         // Issues with identical scores should not panic or produce unstable results.
@@ -1517,8 +1513,6 @@ mod tests {
         );
     }
 
-    // --- Configuration interaction tests ---
-
     #[test]
     fn high_similarity_threshold_prevents_clustering() {
         let config = PrioritisationConfig {
@@ -1661,8 +1655,6 @@ mod tests {
             result[1].severity_score.score
         );
     }
-
-    // --- Score boundary conditions ---
 
     #[test]
     fn minimum_possible_score() {
@@ -1855,8 +1847,6 @@ mod tests {
         }
     }
 
-    // --- Large batch tests ---
-
     #[test]
     fn large_batch_ordering_preserved() {
         let config = PrioritisationConfig::default();
@@ -1962,8 +1952,6 @@ mod tests {
         }
     }
 
-    // --- Blast radius in prioritise pipeline ---
-
     #[test]
     fn blast_radius_classification_propagated_to_output() {
         let config = PrioritisationConfig::default();
@@ -2053,8 +2041,6 @@ mod tests {
         );
     }
 
-    // --- Multiple suppression rules ---
-
     #[test]
     fn multiple_suppression_rules_first_match_wins() {
         let config = PrioritisationConfig {
@@ -2141,8 +2127,6 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].issue.source, "linear");
     }
-
-    // --- Clustering edge cases ---
 
     #[test]
     fn issues_without_clustering_signals_not_clustered() {
@@ -2339,8 +2323,6 @@ mod tests {
         );
     }
 
-    // --- Regression component edge cases tested through prioritise ---
-
     #[test]
     fn unhandled_fatal_gets_highest_regression_score() {
         let config = PrioritisationConfig {
@@ -2395,8 +2377,6 @@ mod tests {
         assert_eq!(result[2].issue.id, "warn", "warning should rank last");
     }
 
-    // --- MatchResult variations ---
-
     #[test]
     fn match_priority_affects_severity_component() {
         let config = PrioritisationConfig {
@@ -2435,8 +2415,6 @@ mod tests {
         );
     }
 
-    // --- Empty suppression rules ---
-
     #[test]
     fn no_suppression_rules_keeps_all() {
         let config = PrioritisationConfig {
@@ -2458,8 +2436,6 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(suppressed.is_empty());
     }
-
-    // --- Verify score is deterministic ---
 
     #[test]
     fn scoring_is_deterministic() {
@@ -2501,8 +2477,6 @@ mod tests {
         }
     }
 
-    // --- Frequency weight only ---
-
     #[test]
     fn frequency_weight_only_orders_by_event_frequency() {
         let config = PrioritisationConfig {
@@ -2543,8 +2517,6 @@ mod tests {
         assert_eq!(result[0].issue.id, "high-freq");
         assert_eq!(result[1].issue.id, "low-freq");
     }
-
-    // --- Regex suppression through the full pipeline ---
 
     #[test]
     fn regex_suppression_in_full_pipeline() {
@@ -2592,8 +2564,6 @@ mod tests {
         );
     }
 
-    // --- Verify match_result is preserved in output ---
-
     #[test]
     fn match_result_preserved_in_prioritised_output() {
         let config = PrioritisationConfig::default();
@@ -2617,8 +2587,6 @@ mod tests {
         assert_eq!(result[0].match_result.priority, MatchPriority::Urgent);
         assert!(result[0].match_result.matches);
     }
-
-    // --- store_clusters helper function tests ---
 
     #[test]
     fn store_clusters_with_empty_list() {
@@ -2754,6 +2722,7 @@ mod tests {
         impl DiscordStore for CountingTracker {}
         impl DeployQaStore for CountingTracker {}
         impl PrAssignmentStore for CountingTracker {}
+        impl SecurityReportStore for CountingTracker {}
 
         let count = Arc::new(AtomicU32::new(0));
         let tracker = CountingTracker {
@@ -2916,6 +2885,7 @@ mod tests {
         impl DiscordStore for FailingTracker {}
         impl DeployQaStore for FailingTracker {}
         impl PrAssignmentStore for FailingTracker {}
+        impl SecurityReportStore for FailingTracker {}
 
         let tracker = FailingTracker;
         let clusters = vec![ContentCluster {
@@ -2933,8 +2903,6 @@ mod tests {
         // Should not panic even when tracker returns an error
         store_clusters(&tracker, &clusters);
     }
-
-    // --- Suppression field variant tests ---
 
     #[test]
     fn suppression_on_description_field() {
@@ -3179,8 +3147,6 @@ mod tests {
         assert_eq!(result[0].issue.id, "m2");
     }
 
-    // --- Suppression match mode tests ---
-
     #[test]
     fn exact_match_does_not_partial_match() {
         let config = PrioritisationConfig {
@@ -3249,8 +3215,6 @@ mod tests {
         assert!(suppressed.is_empty(), "invalid regex should not suppress");
         assert_eq!(result.len(), 1);
     }
-
-    // --- Blast radius edge cases ---
 
     #[test]
     fn blast_radius_function_metadata_used() {
@@ -3455,8 +3419,6 @@ mod tests {
         );
     }
 
-    // --- Custom config path patterns ---
-
     #[test]
     fn custom_critical_paths() {
         // Segment matching splits on /, \, ., _, - so patterns must be
@@ -3517,8 +3479,6 @@ mod tests {
             claudear_core::types::BlastRadius::Peripheral
         );
     }
-
-    // --- Weight boundary and interaction tests ---
 
     #[test]
     fn negative_weights_produce_negative_scores() {
@@ -3737,8 +3697,6 @@ mod tests {
         );
     }
 
-    // --- Issue metadata edge cases ---
-
     #[test]
     fn escalation_rate_above_one_clamped() {
         let config = PrioritisationConfig::default();
@@ -3868,8 +3826,6 @@ mod tests {
         assert_eq!(result[1].issue.id, "warn");
         assert_eq!(result[2].issue.id, "plain");
     }
-
-    // --- Clustering edge cases ---
 
     #[test]
     fn cluster_with_only_error_type_no_culprit() {
@@ -4073,8 +4029,6 @@ mod tests {
         );
     }
 
-    // --- Score formula verification tests ---
-
     #[test]
     fn score_formula_default_weights_verified() {
         let config = PrioritisationConfig::default();
@@ -4146,8 +4100,6 @@ mod tests {
             result[0].severity_score.severity_component
         );
     }
-
-    // --- Output structure tests ---
 
     #[test]
     fn prioritised_issue_fields_populated() {
@@ -4222,8 +4174,6 @@ mod tests {
         assert_eq!(sr.matched_rule.as_deref(), Some("test-rule"));
         assert_eq!(sr.reason.as_deref(), Some("test reason"));
     }
-
-    // --- Large batch stress tests ---
 
     #[test]
     fn five_hundred_candidates_sorted_correctly() {
@@ -4314,8 +4264,6 @@ mod tests {
             .collect();
         assert_eq!(keys.len(), 3, "should have 3 distinct clusters");
     }
-
-    // --- Multiple suppression rules interaction ---
 
     #[test]
     fn multiple_rules_different_fields() {
@@ -4412,8 +4360,6 @@ mod tests {
         );
     }
 
-    // --- Interaction between all pipeline steps ---
-
     #[test]
     fn full_pipeline_suppression_then_clustering_then_scoring() {
         let config = PrioritisationConfig {
@@ -4491,8 +4437,6 @@ mod tests {
         }
     }
 
-    // --- MatchResult variants ---
-
     #[test]
     fn not_matched_result_still_works_in_pipeline() {
         // A non-matching MatchResult shouldn't break the pipeline
@@ -4516,8 +4460,6 @@ mod tests {
         // Score should still be computed
         assert!(result[0].severity_score.score.is_finite());
     }
-
-    // --- Issue source variations ---
 
     #[test]
     fn different_sources_in_same_batch() {
@@ -4559,8 +4501,6 @@ mod tests {
             );
         }
     }
-
-    // --- Source-scoped suppression edge cases ---
 
     #[test]
     fn source_scoped_suppression_case_insensitive() {
@@ -4638,8 +4578,6 @@ mod tests {
         assert_eq!(result[0].issue.source, "github");
     }
 
-    // --- Edge case: issue with no title ---
-
     #[test]
     fn issue_with_empty_title() {
         let config = PrioritisationConfig::default();
@@ -4662,8 +4600,6 @@ mod tests {
         assert_eq!(result[0].issue.title, "");
         assert!(result[0].severity_score.score.is_finite());
     }
-
-    // --- Edge case: unicode titles and metadata ---
 
     #[test]
     fn unicode_titles_handled_correctly() {
@@ -4744,8 +4680,6 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 
-    // --- Content cluster context formatting ---
-
     #[test]
     fn format_cluster_context_all_fields() {
         let cluster = ContentCluster {
@@ -4812,8 +4746,6 @@ mod tests {
         );
     }
 
-    // --- Title similarity edge cases ---
-
     #[test]
     fn title_similarity_empty_strings() {
         assert_eq!(content_cluster::title_similarity("", ""), 0.0);
@@ -4849,8 +4781,6 @@ mod tests {
         );
     }
 
-    // --- Blast radius score function ---
-
     #[test]
     fn blast_radius_scores_are_ordered() {
         let scores = [
@@ -4869,8 +4799,6 @@ mod tests {
             );
         }
     }
-
-    // --- Clustered issue IDs helper ---
 
     #[test]
     fn clustered_issue_ids_empty_input() {
@@ -4914,8 +4842,6 @@ mod tests {
         assert!(ids.contains("3"));
     }
 
-    // --- Mixed metadata types ---
-
     #[test]
     fn event_count_as_float_metadata() {
         let config = PrioritisationConfig::default();
@@ -4935,8 +4861,6 @@ mod tests {
         );
         assert!(result[0].severity_score.frequency_component > 0.0);
     }
-
-    // --- Default IssuePriority ---
 
     #[test]
     fn default_issue_priority_is_none() {
@@ -4962,8 +4886,6 @@ mod tests {
             result[0].severity_score.severity_component
         );
     }
-
-    // --- Mock LLM tests ---
 
     struct MockLlmAnalyzer {
         assessments: Option<Vec<crate::llm::LlmIssueAssessment>>,

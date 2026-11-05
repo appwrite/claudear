@@ -3,8 +3,13 @@
 use crate::heartbeat::{Heartbeat, Liveness};
 use crate::intent::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
+use crate::processing::{refuse_security_issue, SECURITY_REFUSAL};
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
+use crate::security::{
+    belongs_to_security_inbox, is_security_issue, SecurityFixContext, SecurityFixRequest,
+    SecurityInbox, SecurityPollDecision, SecurityRoute,
+};
 use crate::shutdown::DRAIN_TIMEOUT;
 use chrono::{DateTime, Utc};
 use claudear_analysis::deploy_qa::DEPLOY_QA_SOURCE;
@@ -16,8 +21,11 @@ use claudear_analysis::qa::build_correlation_id;
 use claudear_analysis::repo::{worktree_path, GitOps, RepoRelationships};
 use claudear_config::config::Config;
 use claudear_config::config::DigestFrequency;
+use claudear_config::config::HELPSCOUT_SOURCE;
+use claudear_config::config::MAILBOX_ID_METADATA_KEY;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
+use claudear_core::security::{parse_security_fix_short_id, SECURITY_FIX_SOURCE};
 use claudear_core::types::{
     ActionKind, ActivityLogEntry, AskRequest, BlockingQuestion, DeployQaTip, DeployQaTipStatus,
     FixAttempt, FixAttemptStats, FixAttemptStatus, Issue, IssueEmbedding, IssueType, MatchPriority,
@@ -39,7 +47,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{interval_at, Duration};
@@ -80,6 +88,9 @@ const DRAIN_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// shorter intervals cannot make it busy-loop.
 const MIN_SOURCE_POLL_PERIOD: Duration = Duration::from_secs(1);
 
+/// The source of the watcher's own activity, about work on no issue.
+const COMPONENT: &str = "watcher";
+
 /// Why a trigger is refused once [`Watcher::stop`] has been called.
 const STOPPING_REFUSAL: &str = "Watcher is stopping; not starting new runs";
 
@@ -88,6 +99,32 @@ pub const MANUAL_TRIGGER: &str = "Manual trigger";
 
 /// Prefix of the error recorded on an attempt whose retry could not run.
 pub(crate) const RETRY_TRIGGER_FAILED: &str = "Retry trigger failed";
+
+/// Why a security fix is processed.
+const SECURITY_FIX_REASON: &str = "Security fix";
+
+/// Why [`Watcher::run_security_fix_request`] runs a security fix.
+enum SecurityFixRun<'a> {
+    /// The first run of a vulnerability's fix. It does not start once the
+    /// fix has an attempt, so racing starts run the fix once.
+    Start,
+    /// A retry, review rerun or manual trigger of a fix that already ran.
+    Rerun {
+        admission: Option<Admission<'a>>,
+        review_feedback: Option<String>,
+        existing_pr_branch: Option<String>,
+    },
+}
+
+impl SecurityFixRun<'_> {
+    fn manual() -> Self {
+        Self::Rerun {
+            admission: None,
+            review_feedback: None,
+            existing_pr_branch: None,
+        }
+    }
+}
 
 /// How [`Watcher::process_issue`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +471,15 @@ pub struct Watcher {
     /// URLs of the PRs whose review reruns wait for their repository to be
     /// indexed, so each wait is recorded once rather than every cycle.
     deferred_review_reruns: Mutex<HashSet<String>>,
+    /// The only handler of security conversations and security fixes, set
+    /// once by [`Self::set_security_inbox`].
+    security_inbox: OnceLock<Arc<SecurityInbox>>,
+    /// Whether dropping security conversations for want of an inbox has been
+    /// logged, so it is logged once.
+    security_inbox_missing_logged: AtomicBool,
+    /// The repository inferrer without any classifier, so untrusted report
+    /// text never reaches an agent while its repository is resolved.
+    security_inferrer: Option<RepoInferrer>,
 }
 
 /// A ledger comment carried by a review batch: `(scm_comment_id, comment_kind)`.
@@ -472,6 +518,7 @@ impl Watcher {
     /// Create a new watcher.
     pub fn new(options: WatcherOptions) -> Self {
         let feedback_analyzer = FeedbackAnalyzer::new().with_tracker(options.tracker.clone());
+        let security_inferrer = options.inferrer.clone();
 
         // Wire classifier into inferrer: prefer agent-based when use_agent is set
         let mut inferrer = options.inferrer;
@@ -555,6 +602,48 @@ impl Watcher {
             dispatched_deploy_qa_tips: Mutex::new(HashSet::new()),
             liveness: Liveness::default(),
             deferred_review_reruns: Mutex::new(HashSet::new()),
+            security_inbox: OnceLock::new(),
+            security_inbox_missing_logged: AtomicBool::new(false),
+            security_inferrer,
+        }
+    }
+
+    /// Hand security conversations and security fixes to `inbox`. Without
+    /// one they are dropped. Only the first call takes effect.
+    pub fn set_security_inbox(&self, inbox: Arc<SecurityInbox>) {
+        if self.security_inbox.set(inbox).is_err() {
+            tracing::warn!(
+                component = "security",
+                "The security inbox was already set; keeping the first"
+            );
+        }
+    }
+
+    fn security_inbox(&self) -> Option<Arc<SecurityInbox>> {
+        self.security_inbox.get().cloned()
+    }
+
+    /// The shared processing pipeline, built from this watcher's services.
+    fn processor(&self) -> crate::processing::IssueProcessor {
+        crate::processing::IssueProcessor {
+            config: self.config.clone(),
+            tracker: Arc::clone(&self.tracker),
+            notifier: Arc::clone(&self.notifier),
+            agent: Arc::clone(&self.agent),
+            qa_agent: self.qa_agent.clone(),
+            inferrer: self.inferrer.clone(),
+            embedding_client: self.embedding_client.clone(),
+            issue_embedding_service: self.issue_embedding_service.clone(),
+            code_search_service: self.code_search_service.clone(),
+            discord_search_service: self.discord_search_service.clone(),
+            feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
+                FeedbackAnalyzer::new().with_tracker(self.tracker.clone()),
+            )),
+            review_watcher: self.review_watcher.clone(),
+            user_registry: self.user_registry.clone(),
+            github_client: self.github_client.clone(),
+            llm_analyzer: self.llm_analyzer.clone(),
+            intent_classifier: self.intent_classifier.clone(),
         }
     }
 
@@ -1660,7 +1749,7 @@ impl Watcher {
             self.lock_deferred_review_reruns().remove(pr_url);
         }
 
-        if self.config.learning.review_classification {
+        if self.config.learning.review_classification && attempt.source != SECURITY_FIX_SOURCE {
             if let Some(repo) = &attempt.scm_repo {
                 // Parse feedback as review comments for classification
                 let mock_comment = claudear_integrations::scm::ReviewComment {
@@ -1718,30 +1807,33 @@ impl Watcher {
             }
         }
 
-        // Find the source for this issue
-        let source = match self.sources.iter().find(|s| s.name() == attempt.source) {
-            Some(s) => s,
-            None => {
+        // A security fix has no source issue: the security inbox rebuilds it.
+        if attempt.source != SECURITY_FIX_SOURCE {
+            // Find the source for this issue
+            let source = match self.sources.iter().find(|s| s.name() == attempt.source) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(
+                        source = %attempt.source,
+                        "Source not found for review action"
+                    );
+                    return Ok(ReviewOutcome::Handled);
+                }
+            };
+
+            // Verify the issue exists before processing
+            let issue_exists = source.get_issue(&attempt.issue_id).await.is_ok();
+
+            if !issue_exists {
                 tracing::warn!(
-                    source = %attempt.source,
-                    "Source not found for review action"
+                    issue_id = %attempt.issue_id,
+                    "Could not find original issue for review action"
                 );
-                return Ok(ReviewOutcome::Handled);
+                return Err(claudear_core::error::Error::source(
+                    source.name(),
+                    format!("Issue {} not found for review action", attempt.issue_id),
+                ));
             }
-        };
-
-        // Verify the issue exists before processing
-        let issue_exists = source.get_issue(&attempt.issue_id).await.is_ok();
-
-        if !issue_exists {
-            tracing::warn!(
-                issue_id = %attempt.issue_id,
-                "Could not find original issue for review action"
-            );
-            return Err(claudear_core::error::Error::source(
-                source.name(),
-                format!("Issue {} not found for review action", attempt.issue_id),
-            ));
         }
 
         // Process the issue with the review feedback appended to context.
@@ -1996,6 +2088,29 @@ impl Watcher {
         }
     }
 
+    /// The most recent merged attempt in `repository` a release cascade is
+    /// started from. Security fixes start no cascade, so a release whose
+    /// latest merge is a security fix cascades from the merge before it.
+    fn release_cascade_attempt(&self, repository: &str) -> Option<FixAttempt> {
+        let latest = self
+            .tracker
+            .get_most_recent_merged_attempt_for_repo(repository)
+            .ok()
+            .flatten()?;
+        if latest.source != SECURITY_FIX_SOURCE {
+            return Some(latest);
+        }
+        self.tracker
+            .get_attempts_by_status(FixAttemptStatus::Merged)
+            .ok()?
+            .into_iter()
+            .filter(|attempt| {
+                attempt.source != SECURITY_FIX_SOURCE
+                    && attempt.scm_repo.as_deref() == Some(repository)
+            })
+            .max_by_key(|attempt| attempt.merged_at)
+    }
+
     /// Trigger cascade processing for downstream repos after a PR is merged
     /// or a release is published.
     ///
@@ -2008,6 +2123,9 @@ impl Watcher {
         pr_url: &str,
         trigger_type: claudear_config::config::CascadeTrigger,
     ) -> Result<()> {
+        if attempt.source == SECURITY_FIX_SOURCE {
+            return Ok(());
+        }
         let relationships = match &self.relationships {
             Some(r) => r,
             None => return Ok(()),
@@ -2254,13 +2372,7 @@ impl Watcher {
                 seen.insert(upstream.to_string(), release.tag.clone());
             }
 
-            let merged_attempt = self
-                .tracker
-                .get_most_recent_merged_attempt_for_repo(upstream)
-                .ok()
-                .flatten();
-
-            let attempt = match merged_attempt {
+            let attempt = match self.release_cascade_attempt(upstream) {
                 Some(a) => a,
                 None => {
                     tracing::info!(
@@ -2647,6 +2759,9 @@ Create a PR with your changes.{custom_instructions}"#,
                 Ok(issues) => {
                     let mut seeded = 0;
                     for issue in issues {
+                        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &issue) {
+                            continue;
+                        }
                         if !self.tracker.has_attempted(source.name(), &issue.id)? {
                             let labels: Vec<String> =
                                 issue.get_metadata("labels").unwrap_or_default();
@@ -2966,7 +3081,7 @@ Create a PR with your changes.{custom_instructions}"#,
         let ready = retry_manager.get_ready_retries()?;
         let ready_count = ready.len();
         self.record_source_decision(
-            "watcher",
+            COMPONENT,
             "ready_retry_scan",
             "Scanned for ready retries",
             json!({
@@ -3169,6 +3284,9 @@ Create a PR with your changes.{custom_instructions}"#,
         );
 
         let retry_manager = RetryManager::new(self.config.retry.clone(), Arc::clone(&self.tracker));
+        if attempt.source == SECURITY_FIX_SOURCE {
+            return self.retry_security_fix(&retry_manager, attempt).await;
+        }
         let Some(source) = self
             .sources
             .iter()
@@ -3203,6 +3321,54 @@ Create a PR with your changes.{custom_instructions}"#,
                 })),
             )
             .await;
+        self.retry_outcome(&retry_manager, attempt, run, spend)
+    }
+
+    /// Retry the security fix `attempt` from the fix request the security
+    /// inbox rebuilds for it, never from a source issue.
+    async fn retry_security_fix(
+        &self,
+        retry_manager: &RetryManager,
+        attempt: &FixAttempt,
+    ) -> RetryOutcome {
+        let Some(inbox) = self.security_inbox() else {
+            return RetryOutcome::Failed(claudear_core::error::Error::source(
+                SECURITY_FIX_SOURCE,
+                "the security inbox is not enabled",
+            ));
+        };
+        let request = match Self::security_fix_request(&inbox, &attempt.issue_id) {
+            Ok(request) => request,
+            Err(error) => return self.fail_retry(retry_manager, attempt, error),
+        };
+        let mut spend = None;
+        let run = self
+            .run_security_fix_request(
+                &inbox,
+                request,
+                SecurityFixRun::Rerun {
+                    admission: Some(Box::new(|| {
+                        spend
+                            .insert(retry_manager.prepare_retry(&attempt.source, &attempt.issue_id))
+                            .is_ok()
+                    })),
+                    review_feedback: None,
+                    existing_pr_branch: None,
+                },
+            )
+            .await;
+        self.retry_outcome(retry_manager, attempt, run, spend)
+    }
+
+    /// What a retry of `attempt` that ended in `run` came to, with `spend`
+    /// the result of spending its retry once the run was admitted.
+    fn retry_outcome(
+        &self,
+        retry_manager: &RetryManager,
+        attempt: &FixAttempt,
+        run: IssueRun,
+        spend: Option<Result<()>>,
+    ) -> RetryOutcome {
         let skipped =
             || claudear_core::error::Error::Other(format!("{} was skipped", attempt.short_id));
         let unanswered = || {
@@ -3229,7 +3395,7 @@ Create a PR with your changes.{custom_instructions}"#,
             }
             (IssueRun::Skipped, Some(Err(error))) => RetryOutcome::Failed(error),
             (IssueRun::Skipped, Some(Ok(()))) => self.mark_retry_failed(attempt, skipped()),
-            (IssueRun::Skipped, None) => self.fail_retry(&retry_manager, attempt, skipped()),
+            (IssueRun::Skipped, None) => self.fail_retry(retry_manager, attempt, skipped()),
         }
     }
 
@@ -3358,7 +3524,7 @@ Create a PR with your changes.{custom_instructions}"#,
         };
 
         let inbox_key = issue
-            .get_metadata::<String>("mailbox_id")
+            .get_metadata::<String>(MAILBOX_ID_METADATA_KEY)
             .unwrap_or_else(|| attempt.source.clone());
         let guideline = self.config.reply().template_for(Some(&inbox_key));
         let context = match attempt.pr_url.as_deref() {
@@ -3456,6 +3622,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     // updated the parent and left this row pending, so every poll saw
                     // the merge again and re-fired the cascade
                     let is_cascade = attempt.cascade_repo.is_some();
+                    let is_security_fix = attempt.source == SECURITY_FIX_SOURCE;
                     if is_cascade {
                         self.tracker.mark_cascade_pr_outcome(attempt.id, true)?;
                     } else {
@@ -3490,7 +3657,8 @@ Create a PR with your changes.{custom_instructions}"#,
                     // For bug-type issues, create a regression watch instead of immediate auto-resolve.
                     // A downstream cascade merge does not fix the parent issue, so it
                     // neither watches for regressions nor resolves it.
-                    let regression_watch_id = if !is_cascade && attempt.is_bug() {
+                    let regression_watch_id = if !is_cascade && !is_security_fix && attempt.is_bug()
+                    {
                         let issue_type = match attempt.source.as_str() {
                             "sentry" => IssueType::SentryIssue,
                             "linear" => IssueType::LinearBug,
@@ -3530,6 +3698,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     };
 
                     let should_resolve = !is_cascade
+                        && !is_security_fix
                         && regression_watch_id.is_none()
                         && self.config.github().auto_resolve_on_merge;
                     if should_resolve {
@@ -3565,14 +3734,16 @@ Create a PR with your changes.{custom_instructions}"#,
                         }
                     }
 
-                    if !is_cascade {
+                    if !is_cascade && !is_security_fix {
                         self.maybe_send_fix_shipped_reply(attempt).await;
                     }
 
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
                         .await;
 
-                    self.run_post_merge_learning(attempt).await;
+                    if !is_security_fix {
+                        self.run_post_merge_learning(attempt).await;
+                    }
 
                     if let (Some(review_watcher), Some(pr_url)) =
                         (self.review_watcher.as_ref(), attempt.pr_url.as_ref())
@@ -3581,7 +3752,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     }
 
                     let pr_url = attempt.pr_url.as_deref().unwrap_or("");
-                    if self.config.cascade.enabled {
+                    if self.config.cascade.enabled && !is_security_fix {
                         match self
                             .trigger_cascade(
                                 attempt,
@@ -3695,6 +3866,10 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         let issues = source.fetch_issues().await?;
+        let issues = self.intake_security_issues(source, issues).await;
+        if source.name() == HELPSCOUT_SOURCE {
+            self.advance_security_inbox().await;
+        }
         tracing::info!(source = source.name(), count = issues.len(), "Found issues");
         let fetched_metric = ProcessingMetric::new("issues_fetched", issues.len() as f64)
             .with_source(source.name().to_string());
@@ -4688,7 +4863,16 @@ Create a PR with your changes.{custom_instructions}"#,
         intent: Option<Intent>,
         admission: Option<Admission<'_>>,
     ) -> IssueRun {
-        use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
+        use crate::processing::{ProcessingInput, ProcessingOutcome};
+
+        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &issue) {
+            tracing::warn!(
+                component = "security",
+                short_id = %issue.short_id,
+                "Not processing a security issue outside the security inbox"
+            );
+            return IssueRun::Skipped;
+        }
 
         // Retries, IPC and review-feedback triggers pass no intent, and a
         // deploy_qa attempt must never reach the fix pipeline.
@@ -4948,26 +5132,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
         let issue_short_id = issue.short_id.clone();
 
-        let processor = IssueProcessor {
-            config: self.config.clone(),
-            tracker: Arc::clone(&self.tracker),
-            notifier: Arc::clone(&self.notifier),
-            agent: Arc::clone(&self.agent),
-            qa_agent: self.qa_agent.clone(),
-            inferrer: self.inferrer.clone(),
-            embedding_client: self.embedding_client.clone(),
-            issue_embedding_service: self.issue_embedding_service.clone(),
-            code_search_service: self.code_search_service.clone(),
-            discord_search_service: self.discord_search_service.clone(),
-            feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
-                FeedbackAnalyzer::new().with_tracker(self.tracker.clone()),
-            )),
-            review_watcher: self.review_watcher.clone(),
-            user_registry: self.user_registry.clone(),
-            github_client: self.github_client.clone(),
-            llm_analyzer: self.llm_analyzer.clone(),
-            intent_classifier: self.intent_classifier.clone(),
-        };
+        let processor = self.processor();
 
         let input = ProcessingInput {
             issue,
@@ -5000,6 +5165,396 @@ Create a PR with your changes.{custom_instructions}"#,
                 IssueRun::Skipped
             }
             _ => IssueRun::Processed,
+        }
+    }
+
+    /// Take the security conversations out of `issues` and hand them to the
+    /// security inbox, returning the rest. They skip every generic filter,
+    /// record and pipeline: attempted ids, suppression, semantic dedup, intent
+    /// classification and prioritisation. Without an inbox they are dropped.
+    async fn intake_security_issues(
+        self: &Arc<Self>,
+        source: &Arc<dyn IssueSource>,
+        issues: Vec<Issue>,
+    ) -> Vec<Issue> {
+        let (mut security, rest): (Vec<Issue>, Vec<Issue>) = issues
+            .into_iter()
+            .partition(|issue| is_security_issue(&self.config, issue));
+        let rest = self.without_held_security_conversations(rest);
+        if security.is_empty() {
+            return rest;
+        }
+        let Some(inbox) = self.security_inbox() else {
+            if !self
+                .security_inbox_missing_logged
+                .swap(true, Ordering::SeqCst)
+            {
+                tracing::warn!(
+                    component = "security",
+                    source = source.name(),
+                    count = security.len(),
+                    "Dropping security conversations because the security inbox is not enabled"
+                );
+            }
+            return rest;
+        };
+        if self.dry_run {
+            tracing::info!(
+                component = "security",
+                count = security.len(),
+                "[DRY RUN] Would hand security conversations to the security inbox"
+            );
+            return rest;
+        }
+        security.sort_by_key(|issue| issue.created_at);
+        let mut seen = HashSet::new();
+        for issue in security {
+            if !seen.insert(issue.id.clone()) || !source.matches_criteria(&issue).matches {
+                continue;
+            }
+            match inbox.poll_decision(&issue) {
+                Ok(SecurityPollDecision::Route) => {
+                    self.dispatch_security_issue(source, issue).await
+                }
+                Ok(SecurityPollDecision::FollowUp) => {
+                    if let Err(error) = inbox.observe_follow_up(&issue).await {
+                        tracing::warn!(
+                            component = "security",
+                            short_id = %issue.short_id,
+                            error = %error,
+                            "Failed to record a reporter follow-up"
+                        );
+                    }
+                }
+                Ok(SecurityPollDecision::Skip) => {}
+                Err(error) => tracing::warn!(
+                    component = "security",
+                    short_id = %issue.short_id,
+                    error = %error,
+                    "Failed to decide how to handle a security conversation"
+                ),
+            }
+        }
+        rest
+    }
+
+    /// `issues` without the conversations the security inbox holds a report
+    /// for, which stay out of the generic pipeline after moving to another
+    /// mailbox.
+    fn without_held_security_conversations(&self, issues: Vec<Issue>) -> Vec<Issue> {
+        issues
+            .into_iter()
+            .filter(|issue| {
+                let held = belongs_to_security_inbox(&self.config, self.tracker.as_ref(), issue);
+                if held {
+                    tracing::info!(
+                        component = "security",
+                        short_id = %issue.short_id,
+                        "Leaving a conversation the security inbox holds a report for out of the generic pipeline"
+                    );
+                }
+                !held
+            })
+            .collect()
+    }
+
+    /// Spawn the routing of a security conversation once its source has a
+    /// free processing slot.
+    async fn dispatch_security_issue(
+        self: &Arc<Self>,
+        source: &Arc<dyn IssueSource>,
+        issue: Issue,
+    ) {
+        if self
+            .lock_processing()
+            .contains(&format!("{}:{}", source.name(), issue.id))
+        {
+            return;
+        }
+        let max_concurrent = self.config.max_concurrent_for(source.name()).max(1);
+        loop {
+            let released = self.next_slot_release();
+            if self.active_processing_for_source(source.name()) < max_concurrent {
+                break;
+            }
+            if self.is_stopped() {
+                return;
+            }
+            released.await;
+        }
+        let watcher = Arc::clone(self);
+        let source = Arc::clone(source);
+        let handle = tokio::spawn(async move {
+            watcher.process_security_issue(source, issue).await;
+        });
+        self.spawn_handles.lock().await.push(handle);
+    }
+
+    /// Route a security conversation through the security inbox, then run
+    /// the fix it asks for.
+    ///
+    /// Its repository is resolved without the agent classifier and without
+    /// recording the inference, so the report's text reaches no agent and no
+    /// generic record here.
+    async fn process_security_issue(&self, source: Arc<dyn IssueSource>, issue: Issue) -> IssueRun {
+        let Some(inbox) = self.security_inbox() else {
+            return IssueRun::Skipped;
+        };
+        if self.is_rate_limit_paused().await {
+            return IssueRun::Paused;
+        }
+        let Some(claim) = self.claim_processing(format!("{}:{}", source.name(), issue.id), false)
+        else {
+            return IssueRun::Busy;
+        };
+        if self.is_stopped() {
+            return IssueRun::Stopping;
+        }
+        let resolution = resolve_repo_for_issue(self.security_inferrer.as_ref(), &issue, None);
+        match inbox.route(&issue, &resolution).await {
+            SecurityRoute::Done { reason } => {
+                tracing::info!(
+                    component = "security",
+                    short_id = %issue.short_id,
+                    reason = %reason,
+                    "Security report routed"
+                );
+                IssueRun::Processed
+            }
+            SecurityRoute::RunFix(request) => {
+                drop(claim);
+                self.run_security_fix_request(&inbox, request, SecurityFixRun::Start)
+                    .await
+            }
+        }
+    }
+
+    /// Move every security report and vulnerability along its lifecycle,
+    /// then start the fixes still waiting for a first run that fit in the
+    /// free processing slots. The rest wait for a later poll.
+    async fn advance_security_inbox(self: &Arc<Self>) {
+        if self.dry_run {
+            return;
+        }
+        let Some(inbox) = self.security_inbox() else {
+            return;
+        };
+        let summary = inbox.advance().await;
+        tracing::info!(
+            component = "security",
+            released = summary.released,
+            replies_sent = summary.replies_sent,
+            merged = summary.merged,
+            live = summary.live,
+            awards_prepared = summary.awards_prepared,
+            needs_human = summary.needs_human,
+            errors = summary.errors,
+            "Security inbox advanced"
+        );
+        let requests = match inbox.pending_fix_requests() {
+            Ok(requests) => requests,
+            Err(error) => {
+                tracing::warn!(
+                    component = "security",
+                    error = %error,
+                    "Failed to list security fixes waiting to start"
+                );
+                return;
+            }
+        };
+        let free = self
+            .config
+            .max_concurrent_for(SECURITY_FIX_SOURCE)
+            .max(1)
+            .saturating_sub(self.active_processing_for_source(SECURITY_FIX_SOURCE));
+        let waiting = requests.len();
+        for request in requests.into_iter().take(free) {
+            let watcher = Arc::clone(self);
+            let inbox = Arc::clone(&inbox);
+            let handle = tokio::spawn(async move {
+                watcher
+                    .run_security_fix_request(&inbox, request, SecurityFixRun::Start)
+                    .await;
+            });
+            self.spawn_handles.lock().await.push(handle);
+        }
+        if waiting > free {
+            tracing::info!(
+                component = "security",
+                started = free,
+                waiting = waiting - free,
+                "Security fixes wait for a free processing slot"
+            );
+        }
+    }
+
+    /// Run the fix pipeline for a security fix and report how it ended to
+    /// the security inbox.
+    ///
+    /// The run is claimed as `security:SEC-<id>`, so one fix never runs
+    /// twice at once, and a [`SecurityFixRun::Start`] does not run once the
+    /// fix has an attempt.
+    async fn run_security_fix_request(
+        &self,
+        inbox: &SecurityInbox,
+        request: SecurityFixRequest,
+        run: SecurityFixRun<'_>,
+    ) -> IssueRun {
+        use crate::processing::{ProcessingInput, ProcessingOutcome};
+
+        let short_id = request.issue.short_id.clone();
+        if self.is_rate_limit_paused().await {
+            return IssueRun::Paused;
+        }
+        let Some(_claim) =
+            self.claim_processing(format!("{SECURITY_FIX_SOURCE}:{short_id}"), false)
+        else {
+            return IssueRun::Busy;
+        };
+        if self.is_stopped() {
+            return IssueRun::Stopping;
+        }
+        let (review_feedback, existing_pr_branch) = match run {
+            SecurityFixRun::Start => {
+                match self.tracker.get_attempt(SECURITY_FIX_SOURCE, &short_id) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => return IssueRun::Skipped,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "security",
+                            short_id = %short_id,
+                            error = %error,
+                            "Failed to check whether a security fix already started"
+                        );
+                        return IssueRun::Skipped;
+                    }
+                }
+                (None, None)
+            }
+            SecurityFixRun::Rerun {
+                admission,
+                review_feedback,
+                existing_pr_branch,
+            } => {
+                if admission.is_some_and(|admit| !admit()) {
+                    return IssueRun::Skipped;
+                }
+                (review_feedback, existing_pr_branch)
+            }
+        };
+        let is_review = review_feedback.is_some();
+        tracing::info!(component = "security", short_id = %short_id, "Running security fix");
+        if let Err(error) =
+            self.tracker
+                .record_attempt_with_labels(SECURITY_FIX_SOURCE, &short_id, &short_id, &[])
+        {
+            tracing::error!(short_id = %short_id, error = %error, "Failed to record attempt");
+        }
+        let _heartbeat = Heartbeat::start(
+            Arc::clone(&self.tracker),
+            SECURITY_FIX_SOURCE,
+            &short_id,
+            self.liveness.interval,
+        );
+        let attempt_id = self
+            .tracker
+            .get_attempt(SECURITY_FIX_SOURCE, &short_id)
+            .ok()
+            .flatten()
+            .map(|attempt| attempt.id);
+        let resolution = match request.repository.as_deref() {
+            Some(repository) => resolve_repo_for_cascade(self.inferrer.as_ref(), repository),
+            None => RepoResolution::Skip {
+                reason: "the vulnerability has no repository".to_string(),
+            },
+        };
+        let input = ProcessingInput {
+            issue: request.issue,
+            source_name: SECURITY_FIX_SOURCE.to_string(),
+            match_result: MatchResult::matched(SECURITY_FIX_REASON, MatchPriority::Urgent),
+            resolution,
+            attempt_id,
+            review_feedback,
+            existing_pr_branch,
+            intent: Some(Intent::Security),
+            diagnosis: Some(request.diagnosis),
+        };
+        let context = SecurityFixContext {
+            context: request.context,
+        };
+        let outcome = self.processor().run_security_fix(input, &context).await;
+        let error = match outcome {
+            ProcessingOutcome::Success { pr_url } => {
+                if !is_review {
+                    if let Err(error) =
+                        inbox.link_fix(request.vulnerability_id, attempt_id, &pr_url)
+                    {
+                        tracing::warn!(
+                            component = "security",
+                            short_id = %short_id,
+                            error = %error,
+                            "Failed to link a security fix pull request"
+                        );
+                    }
+                }
+                return IssueRun::Processed;
+            }
+            ProcessingOutcome::Failed { error } => error,
+            ProcessingOutcome::CompletedNoPr { reason } => reason,
+            ProcessingOutcome::WrongRepo { original_repo, .. } => {
+                format!("Wrong repo detected (was: {original_repo})")
+            }
+        };
+        let rate_limited = runner::is_rate_limit_error(&error);
+        if rate_limited {
+            let paused = Issue::new("", &short_id, "", "", SECURITY_FIX_SOURCE);
+            self.pause_until_rate_limit_reset(&paused, &error).await;
+        }
+        let permanent = !rate_limited && self.security_fix_is_permanent(&short_id);
+        if let Err(record_error) = inbox
+            .record_fix_failure(request.vulnerability_id, &error, permanent)
+            .await
+        {
+            tracing::warn!(
+                component = "security",
+                short_id = %short_id,
+                error = %record_error,
+                "Failed to record a security fix failure"
+            );
+        }
+        IssueRun::Processed
+    }
+
+    /// The fix request the security inbox rebuilds for the security fix
+    /// attempt `issue_id`.
+    fn security_fix_request(inbox: &SecurityInbox, issue_id: &str) -> Result<SecurityFixRequest> {
+        let vulnerability_id = parse_security_fix_short_id(issue_id).ok_or_else(|| {
+            claudear_core::error::Error::source(
+                SECURITY_FIX_SOURCE,
+                format!("{issue_id} is not a security fix"),
+            )
+        })?;
+        inbox.fix_request(vulnerability_id)?.ok_or_else(|| {
+            claudear_core::error::Error::source(
+                SECURITY_FIX_SOURCE,
+                format!("vulnerability {vulnerability_id} does not exist"),
+            )
+        })
+    }
+
+    /// Whether the failed security fix `short_id` will not be retried: the
+    /// agent could not fix it, or it has no retries left.
+    fn security_fix_is_permanent(&self, short_id: &str) -> bool {
+        let Ok(Some(attempt)) = self.tracker.get_attempt(SECURITY_FIX_SOURCE, short_id) else {
+            return false;
+        };
+        match attempt.status {
+            FixAttemptStatus::CannotFix => true,
+            FixAttemptStatus::Failed | FixAttemptStatus::Closed => {
+                !RetryManager::new(self.config.retry.clone(), Arc::clone(&self.tracker))
+                    .should_retry(&attempt)
+            }
+            _ => false,
         }
     }
 
@@ -5053,7 +5608,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 "watcher_resumed",
                 format!("Watcher resumed after {} rate-limit pause", provider),
             )
-            .with_source("watcher".to_string())
+            .with_source(COMPONENT)
             .with_metadata(json!({
                 "reason": "provider_rate_limit",
                 "provider": provider,
@@ -5121,9 +5676,9 @@ Create a PR with your changes.{custom_instructions}"#,
                     effective_until.to_rfc3339()
                 ),
             )
-            .with_source("watcher".to_string())
-            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .attributed(COMPONENT, Some(issue))
             .with_metadata(json!({
+                "component": COMPONENT,
                 "reason": "provider_rate_limit",
                 "provider": provider,
                 "pause_until": effective_until.to_rfc3339(),
@@ -5275,6 +5830,9 @@ Create a PR with your changes.{custom_instructions}"#,
         attempt: &claudear_core::types::FixAttempt,
         outcome: Outcome,
     ) {
+        if attempt.source == SECURITY_FIX_SOURCE {
+            return;
+        }
         let issue = Issue::new(
             &attempt.issue_id,
             &attempt.short_id,
@@ -5631,6 +6189,11 @@ Create a PR with your changes.{custom_instructions}"#,
         trigger_reason: Option<String>,
         pr_repo: Option<&str>,
     ) -> Result<()> {
+        if source_name == SECURITY_FIX_SOURCE {
+            return self
+                .trigger_security_fix(issue_id, review_feedback, existing_pr_branch)
+                .await;
+        }
         let source = self
             .sources
             .iter()
@@ -5650,6 +6213,16 @@ Create a PR with your changes.{custom_instructions}"#,
         );
 
         let mut issue = source.get_issue(issue_id).await?;
+        if is_security_issue(&self.config, &issue) {
+            let run = self.process_security_issue(Arc::clone(source), issue).await;
+            return trigger_result(run, source_name, issue_id);
+        }
+        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &issue) {
+            return Err(claudear_core::error::Error::source(
+                source_name,
+                SECURITY_REFUSAL,
+            ));
+        }
         let match_result = MatchResult::matched(MANUAL_TRIGGER, MatchPriority::Urgent);
 
         if let Some(reason) = trigger_reason {
@@ -5670,21 +6243,39 @@ Create a PR with your changes.{custom_instructions}"#,
                 None,
             )
             .await;
-        match run {
-            IssueRun::Processed | IssueRun::Declined => Ok(()),
-            IssueRun::Unanswered | IssueRun::Skipped | IssueRun::Busy | IssueRun::Paused => {
-                Err(claudear_core::error::Error::source(
-                    source_name,
-                    format!(
-                        "Issue {} is already being processed; trigger deferred",
-                        issue_id
-                    ),
-                ))
-            }
-            IssueRun::Stopping => Err(claudear_core::error::Error::Other(
+        trigger_result(run, source_name, issue_id)
+    }
+
+    /// Run the security fix `issue_id` again, with review feedback on its
+    /// pull request when given.
+    async fn trigger_security_fix(
+        &self,
+        issue_id: &str,
+        review_feedback: Option<String>,
+        existing_pr_branch: Option<String>,
+    ) -> Result<()> {
+        if self.is_stopped() {
+            return Err(claudear_core::error::Error::Other(
                 STOPPING_REFUSAL.to_string(),
-            )),
+            ));
         }
+        let inbox = self.security_inbox().ok_or_else(|| {
+            claudear_core::error::Error::source(
+                SECURITY_FIX_SOURCE,
+                "the security inbox is not enabled",
+            )
+        })?;
+        let request = Self::security_fix_request(&inbox, issue_id)?;
+        let run = match review_feedback {
+            Some(feedback) => SecurityFixRun::Rerun {
+                admission: None,
+                review_feedback: Some(feedback),
+                existing_pr_branch,
+            },
+            None => SecurityFixRun::manual(),
+        };
+        let run = self.run_security_fix_request(&inbox, request, run).await;
+        trigger_result(run, SECURITY_FIX_SOURCE, issue_id)
     }
 
     /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
@@ -5699,7 +6290,7 @@ Create a PR with your changes.{custom_instructions}"#,
         source_name: &str,
         issue_id: &str,
     ) -> Result<crate::processing::ProcessingOutcome> {
-        use crate::processing::{refuse_live_qa_action, IssueProcessor, ProcessingInput};
+        use crate::processing::{refuse_live_qa_action, ProcessingInput};
 
         let source = self
             .sources
@@ -5719,6 +6310,16 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         let issue = source.get_issue(issue_id).await?;
+        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &issue) {
+            tracing::warn!(
+                component = "security",
+                source = source_name,
+                issue_id = issue_id,
+                %action,
+                "Refusing a manual action on a security issue"
+            );
+            return Ok(refuse_security_issue());
+        }
         let match_result = MatchResult::matched("Manual action", MatchPriority::Urgent);
         let resolution =
             resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
@@ -5729,26 +6330,7 @@ Create a PR with your changes.{custom_instructions}"#,
             .flatten()
             .map(|a| a.id);
 
-        let processor = IssueProcessor {
-            config: self.config.clone(),
-            tracker: Arc::clone(&self.tracker),
-            notifier: Arc::clone(&self.notifier),
-            agent: Arc::clone(&self.agent),
-            qa_agent: self.qa_agent.clone(),
-            inferrer: self.inferrer.clone(),
-            embedding_client: self.embedding_client.clone(),
-            issue_embedding_service: self.issue_embedding_service.clone(),
-            code_search_service: self.code_search_service.clone(),
-            discord_search_service: self.discord_search_service.clone(),
-            feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
-                FeedbackAnalyzer::new().with_tracker(self.tracker.clone()),
-            )),
-            review_watcher: self.review_watcher.clone(),
-            user_registry: self.user_registry.clone(),
-            github_client: self.github_client.clone(),
-            llm_analyzer: self.llm_analyzer.clone(),
-            intent_classifier: self.intent_classifier.clone(),
-        };
+        let processor = self.processor();
 
         let input = ProcessingInput {
             issue,
@@ -5907,6 +6489,25 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 }
 
+/// What a triggered run of `issue_id` that ended in `run` comes to.
+fn trigger_result(run: IssueRun, source_name: &str, issue_id: &str) -> Result<()> {
+    match run {
+        IssueRun::Processed | IssueRun::Declined => Ok(()),
+        IssueRun::Unanswered | IssueRun::Skipped | IssueRun::Busy | IssueRun::Paused => {
+            Err(claudear_core::error::Error::source(
+                source_name,
+                format!(
+                    "Issue {} is already being processed; trigger deferred",
+                    issue_id
+                ),
+            ))
+        }
+        IssueRun::Stopping => Err(claudear_core::error::Error::Other(
+            STOPPING_REFUSAL.to_string(),
+        )),
+    }
+}
+
 fn priority_order(p: &MatchPriority) -> u8 {
     match p {
         MatchPriority::Urgent => 0,
@@ -5932,6 +6533,9 @@ pub struct SeedResult {
     pub total: usize,
     pub by_source: std::collections::HashMap<String, usize>,
 }
+
+#[cfg(test)]
+mod security_tests;
 
 #[cfg(test)]
 mod tests {
@@ -12859,13 +13463,18 @@ mod tests {
                 .await;
         }
 
-        let pause_until = harness
+        let pause = harness
             .tracker
             .get_recent_activities(50, None)
             .unwrap()
             .into_iter()
             .find(|activity| activity.activity_type == "watcher_paused")
-            .and_then(|activity| activity.metadata)
+            .expect("the rate limit should be logged as a pause");
+        let issue = harness.issue();
+        assert_eq!(pause.source.as_deref(), Some(issue.source.as_str()));
+        assert_eq!(pause.short_id.as_deref(), Some(issue.short_id.as_str()));
+        let pause_until = pause
+            .metadata
             .and_then(|metadata| metadata["pause_until"].as_str().map(str::to_string))
             .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
             .expect("the rate limit should be logged as a pause")

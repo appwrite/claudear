@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { SWRConfig } from "swr";
 import type { ReactNode } from "react";
-import { AuthProvider } from "../src/lib/auth";
+import { AuthProvider, useAuth } from "../src/lib/auth";
 import ChatPage from "../src/pages/chat";
 import ModelsPage from "../src/pages/models";
 import { ModelStatus } from "../src/components/chat/ModelStatus";
@@ -145,21 +145,48 @@ describe("chat disabled state", () => {
     expect(screen.queryByText(CHAT_DISABLED_MESSAGE)).toBeNull();
   });
 
-  for (const status of [401, 500]) {
-    test(`chat page shows an error and never opens a websocket on ${status}`, async () => {
-      mockServer("admin", status);
-      render(<ChatPage />, { wrapper: Wrapper });
+  test("chat page shows an error and never opens a websocket on 500", async () => {
+    mockServer("admin", 500);
+    render(<ChatPage />, { wrapper: Wrapper });
 
-      await waitFor(() => {
-        expect(screen.getByText("Failed to load chat sessions.")).toBeTruthy();
-      });
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(screen.queryByText(CHAT_DISABLED_MESSAGE)).toBeNull();
-      expect(screen.queryByText("Disconnected")).toBeNull();
-      expect(screen.queryByPlaceholderText("Connecting...")).toBeNull();
-      expect(constructedSockets).toBe(0);
+    await waitFor(() => {
+      expect(screen.getByText("Failed to load chat sessions.")).toBeTruthy();
     });
-  }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByText(CHAT_DISABLED_MESSAGE)).toBeNull();
+    expect(screen.queryByText("Disconnected")).toBeNull();
+    expect(screen.queryByPlaceholderText("Connecting...")).toBeNull();
+    expect(constructedSockets).toBe(0);
+  });
+
+  test("a 401 signs the user out, drops the cache and never opens a websocket", async () => {
+    const requested = mockServer("admin", 401);
+    const cache = new Map();
+
+    function SignedInUser() {
+      const { user } = useAuth();
+      return <div data-testid="user">{user?.email ?? "none"}</div>;
+    }
+
+    render(
+      <SWRConfig value={{ provider: () => cache, dedupingInterval: 0 }}>
+        <AuthProvider>
+          <SignedInUser />
+          <ChatPage />
+        </AuthProvider>
+      </SWRConfig>,
+    );
+
+    await waitFor(() => {
+      expect(requested.some((url) => url.endsWith("/api/chat/sessions"))).toBe(true);
+      expect(screen.getByTestId("user").textContent).toBe("none");
+    });
+    await settle();
+    expect([...cache.values()].filter((entry) => entry?.data !== undefined)).toEqual([]);
+    expect(screen.queryByText(CHAT_DISABLED_MESSAGE)).toBeNull();
+    expect(screen.queryByText("Disconnected")).toBeNull();
+    expect(constructedSockets).toBe(0);
+  });
 
   test("models page shows the notice and keeps HuggingFace browsing", async () => {
     mockServer("admin", 404);

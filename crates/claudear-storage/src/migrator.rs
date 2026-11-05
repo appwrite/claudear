@@ -105,6 +105,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "chat_session_owner",
         sql: include_str!("../../../migrations/V17__chat_session_owner.sql"),
     },
+    Migration {
+        version: 18,
+        name: "security_inbox",
+        sql: include_str!("../../../migrations/V18__security_inbox.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -650,6 +655,146 @@ mod tests {
         assert_eq!(applied_version(&connection), 2);
         assert!(table_exists(&connection, "partial_probe"));
         assert!(column_exists(&connection, "applied_probe", "label"));
+    }
+
+    fn unique_constraint_columns(connection: &Connection, table: &str) -> Vec<Vec<String>> {
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM pragma_index_list(?1) WHERE \"unique\" = 1 AND origin = 'u' ORDER BY name",
+            )
+            .unwrap();
+        let indexes: Vec<String> = statement
+            .query_map([table], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        indexes
+            .iter()
+            .map(|index| {
+                let mut statement = connection
+                    .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                    .unwrap();
+                statement
+                    .query_map([index], |row| row.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn foreign_keys(connection: &Connection, table: &str) -> Vec<(String, String)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT \"from\", \"table\" FROM pragma_foreign_key_list(?1) ORDER BY \"from\"",
+            )
+            .unwrap();
+        statement
+            .query_map([table], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_security_inbox_foreign_keys() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+        let pairs = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(column, table)| (column.to_string(), table.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            foreign_keys(&connection, "security_vulnerabilities"),
+            pairs(&[
+                ("first_report_id", "security_reports"),
+                ("fix_attempt_id", "fix_attempts")
+            ])
+        );
+        assert_eq!(
+            foreign_keys(&connection, "security_reports"),
+            pairs(&[("vulnerability_id", "security_vulnerabilities")])
+        );
+        assert_eq!(
+            foreign_keys(&connection, "security_replies"),
+            pairs(&[("report_id", "security_reports")])
+        );
+        assert_eq!(
+            foreign_keys(&connection, "security_awards"),
+            pairs(&[
+                ("report_id", "security_reports"),
+                ("vulnerability_id", "security_vulnerabilities")
+            ])
+        );
+    }
+
+    #[test]
+    fn test_security_replies_allow_one_fix_live_reply_per_report() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO security_reports (source, conversation_id, short_id, mailbox_id, url, subject, reported_at, state, created_at, updated_at)
+                 VALUES ('helpscout', '1', 'HS-1', '249891', '', '', '2026-11-04T00:00:00Z', 'tracking', '2026-11-04T00:00:00Z', '2026-11-04T00:00:00Z');
+                 INSERT INTO security_replies (report_id, kind, status, claimed_at) VALUES (1, 'confirmed', 'sent', '2026-11-04T00:00:00Z');
+                 INSERT INTO security_replies (report_id, kind, status, claimed_at) VALUES (1, 'fix_live', 'sent', '2026-11-04T00:00:00Z');",
+            )
+            .unwrap();
+        assert!(connection
+            .execute(
+                "INSERT INTO security_replies (report_id, kind, status, claimed_at) VALUES (1, 'fix_live_rewarded', 'sending', '2026-11-04T00:00:00Z')",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_security_inbox_schema() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+
+        for table in [
+            "security_vulnerabilities",
+            "security_reports",
+            "security_events",
+            "security_replies",
+            "security_awards",
+        ] {
+            let count: u32 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Table '{table}' should exist");
+        }
+
+        assert_eq!(
+            unique_constraint_columns(&connection, "security_reports"),
+            vec![vec!["source".to_string(), "conversation_id".to_string()]]
+        );
+        assert_eq!(
+            unique_constraint_columns(&connection, "security_replies"),
+            vec![vec!["report_id".to_string(), "kind".to_string()]]
+        );
+        assert_eq!(
+            unique_constraint_columns(&connection, "security_awards"),
+            vec![vec!["vulnerability_id".to_string()]]
+        );
+
+        let defaulted_timestamps: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master AS tables, pragma_table_info(tables.name) AS columns
+                 WHERE tables.type = 'table' AND tables.name LIKE 'security_%'
+                   AND columns.name LIKE '%_at' AND columns.dflt_value IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(defaulted_timestamps, 0);
     }
 
     #[test]

@@ -24,6 +24,8 @@ import {
   fetchRegressions,
   fetchRepos,
   fetchRepoStats,
+  fetchSecurityReports,
+  fetchSecuritySummary,
   fetchTelemetryLatency,
   fetchTelemetryOverview,
   fetchTelemetryPipeline,
@@ -65,6 +67,10 @@ const routePrefetchers: Record<string, () => void> = {
     for (const status of prStatuses) {
       queuePreload(['prs', status], () => fetchPrs({ status: status || undefined }))
     }
+  },
+  '/security': () => {
+    queuePreload('security-summary', fetchSecuritySummary)
+    queuePreload(['security-reports', '', ''], () => fetchSecurityReports())
   },
   '/analytics': () => {
     queuePreload('analytics-summary', fetchAnalyticsSummary)

@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 use claudear::{
     api::{chat_state, ApiServer},
-    config::Config,
+    config::{Config, SecurityDeploymentConfig, HELPSCOUT_SOURCE},
     deploy_qa::{DeployQaPollAction, DeployQaTracker},
     feedback::{EmbeddingClient, EmbeddingConfig, IssueEmbeddingService},
     github::GitHubClient,
@@ -21,7 +21,10 @@ use claudear::{
         RegressionScheduler, RegressionSchedulerConfig, SentryRegressionChecker,
         SentryRegressionConfig,
     },
-    release::{ReleaseTracker, ReleaseTrackerConfig},
+    release::{
+        DeployedApplication, DeployedPackage, DeploymentResolver, DeploymentStatus,
+        DeploymentTopology, ReleaseTracker, ReleaseTrackerConfig,
+    },
     repo::{build_repo_index, DependencyType, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
@@ -46,6 +49,7 @@ use claudear::{
         WebhookServer, WhatsAppWebhookHandler,
     },
 };
+use claudear_engine::security::{SecurityInbox, SecurityInboxDependencies};
 use futures::{Stream, StreamExt};
 use serde_json::json;
 use std::future::{pending, Future};
@@ -1312,7 +1316,7 @@ fn create_sources(
         if helpscout_config.enabled {
             if !helpscout_config.app_id.expose().is_empty()
                 && !helpscout_config.app_secret.expose().is_empty()
-                && !helpscout_config.mailbox_ids.is_empty()
+                && !helpscout_config.all_mailbox_ids().is_empty()
             {
                 sources.push(Arc::new(HelpScoutSource::new(helpscout_config.clone())));
                 tracing::info!("HelpScout source initialized");
@@ -1391,6 +1395,104 @@ fn create_sources(
     sources.into_iter().map(InstrumentedSource::wrap).collect()
 }
 
+/// The security inbox, when `[issues.helpscout.security]` is enabled and
+/// everything it needs runs: the HelpScout source among `sources` (wrapped,
+/// so its calls are instrumented) and an `agent` that can run sandboxed
+/// security queries. Without one, security conversations are dropped.
+async fn build_security_inbox(
+    config: &Config,
+    tracker: &Arc<dyn FixAttemptTracker>,
+    notifier: &Arc<dyn Notifier>,
+    sources: &[Arc<dyn IssueSource>],
+    agent: &Arc<dyn AgentRunner>,
+    embedding_client: Option<Arc<EmbeddingClient>>,
+    inferrer: Option<claudear::inference::RepoInferrer>,
+) -> Option<Arc<SecurityInbox>> {
+    let security = config.security_inbox()?;
+    let Some(source) = sources
+        .iter()
+        .find(|source| source.name() == HELPSCOUT_SOURCE)
+    else {
+        tracing::error!(
+            "The security inbox is enabled but the HelpScout source is not running, so security reports are not processed"
+        );
+        return None;
+    };
+    let probe = Arc::clone(agent);
+    let supported = tokio::task::spawn_blocking(move || probe.supports_security_query())
+        .await
+        .unwrap_or(false);
+    if !supported {
+        tracing::error!(
+            agent = agent.name(),
+            "The security inbox is enabled but the agent cannot run sandboxed security queries, so security reports are not processed"
+        );
+        return None;
+    }
+    let deployment = match config.github().token.as_ref() {
+        Some(token) => Some(Arc::new(DeploymentResolver::new(
+            token.expose(),
+            deployment_topology(&security.deployment),
+        )) as Arc<dyn DeploymentStatus>),
+        None => {
+            tracing::warn!(
+                "No GitHub token is configured, so security fixes are not tracked to production; mark them live from the dashboard"
+            );
+            None
+        }
+    };
+    tracing::info!("Security inbox enabled");
+    Some(Arc::new(SecurityInbox::new(SecurityInboxDependencies {
+        config: security.clone(),
+        tracker: Arc::clone(tracker),
+        agent: Arc::clone(agent),
+        embedding_client,
+        notifier: Arc::clone(notifier),
+        source: Arc::clone(source),
+        deployment,
+        inferrer,
+    })))
+}
+
+/// Why a security inbox that is built without polling processes no report.
+const SECURITY_INBOX_NEEDS_POLLING: &str = "The security inbox only screens, assesses and replies to reports while polling, so reports wait until claudear runs with `start --poll`";
+
+/// Warn when `inbox` is built but never advanced, because only polling
+/// advances it. Returns whether it warned.
+fn warn_unless_security_inbox_advances(inbox: Option<&Arc<SecurityInbox>>, polling: bool) -> bool {
+    let idle = inbox.is_some() && !polling;
+    if idle {
+        tracing::warn!("{SECURITY_INBOX_NEEDS_POLLING}");
+    }
+    idle
+}
+
+/// The production deployment the security inbox tracks fixes into.
+fn deployment_topology(deployment: &SecurityDeploymentConfig) -> DeploymentTopology {
+    DeploymentTopology {
+        configuration_repository: deployment.configuration_repository.clone(),
+        configuration_reference: deployment.configuration_reference.clone(),
+        applications: deployment
+            .applications
+            .iter()
+            .map(|application| DeployedApplication {
+                repository: application.repository.clone(),
+                image: application.image.clone(),
+                directories: application.directories.clone(),
+                packages: application
+                    .packages
+                    .iter()
+                    .map(|package| DeployedPackage {
+                        repository: package.repository.clone(),
+                        package: package.package.clone(),
+                        lock_file: package.lock_file.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 /// Build the live backends for the MCP list tools: a HelpScout source (for
 /// `helpscout_list_conversations`) and a Discord bot client + guild id (for
 /// `discord_list_messages`). Returns `None` for each when not configured.
@@ -1408,7 +1510,7 @@ fn build_mcp_list_backends(
             c.enabled
                 && !c.app_id.expose().is_empty()
                 && !c.app_secret.expose().is_empty()
-                && !c.mailbox_ids.is_empty()
+                && !c.all_mailbox_ids().is_empty()
         })
         .map(|c| Arc::new(HelpScoutSource::new(c.clone())) as Arc<dyn IssueSource>);
 
@@ -3917,6 +4019,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let github_webhook_handler =
             create_github_webhook_handler(&config, deps.review_watcher.clone());
 
+        let security_inbox = build_security_inbox(
+            &config,
+            &tracker,
+            &notifier,
+            &sources,
+            &deps.agent,
+            deps.embedding_client.clone(),
+            deps.inferrer.clone(),
+        )
+        .await;
+        warn_unless_security_inbox_advances(security_inbox.as_ref(), enable_polling);
+
         let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: config.clone(),
             sources: sources.clone(),
@@ -3940,6 +4054,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             dry_run: false,
             llm_engine: deps.llm_engine.clone(),
         }));
+        if let Some(inbox) = security_inbox {
+            watcher.set_security_inbox(inbox);
+        }
 
         let ipc_server = Arc::new(
             IpcServer::builder(tracker.clone(), sources.clone(), notifier.clone())
@@ -4406,6 +4523,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let agent: Arc<dyn AgentRunner> =
             claudear::build_provider_runner(&config, tracker.clone(), None);
 
+        let security_inbox = build_security_inbox(
+            &config,
+            &tracker,
+            &notifier,
+            &sources,
+            &agent,
+            embedding_client.clone(),
+            inferrer.clone(),
+        )
+        .await;
+
         let watcher = Watcher::new(WatcherOptions {
             config: config.clone(),
             sources,
@@ -4429,6 +4557,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             dry_run: false,
             llm_engine: None,
         });
+        if let Some(inbox) = security_inbox {
+            watcher.set_security_inbox(inbox);
+        }
 
         interruptible(async {
             for attempt in ready {
@@ -4621,6 +4752,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 &user_registry,
             );
 
+            let security_inbox = build_security_inbox(
+                &config,
+                &tracker,
+                &notifier,
+                &deps.sources,
+                &deps.agent,
+                deps.embedding_client.clone(),
+                deps.inferrer.clone(),
+            )
+            .await;
+            warn_unless_security_inbox_advances(security_inbox.as_ref(), false);
+
             let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
                 sources: deps.sources,
@@ -4644,6 +4787,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 dry_run: false,
                 llm_engine: deps.llm_engine.clone(),
             }));
+            if let Some(inbox) = security_inbox {
+                watcher.set_security_inbox(inbox);
+            }
 
             let worker = HousekeepingWorker::new(watcher.clone(), config.poll_interval_ms);
             let runs = TaskTracker::new();
@@ -4849,6 +4995,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 provider.and_then(|p| p.qa_model.clone()),
             );
 
+            let security_inbox = build_security_inbox(
+                &config,
+                &tracker,
+                &notifier,
+                &sources,
+                &agent,
+                embedding_client.clone(),
+                inferrer.clone(),
+            )
+            .await;
+
             let tracker_for_api = tracker.clone();
             let vector_store_embeddings = inferrer.as_ref().map(|i| i.embedding_count());
             let watcher = Arc::new(Watcher::new(WatcherOptions {
@@ -4878,6 +5035,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 dry_run,
                 llm_engine,
             }));
+            if let Some(inbox) = security_inbox {
+                watcher.set_security_inbox(inbox);
+            }
 
             match cli.command {
                 Commands::Seed => {
@@ -5082,6 +5242,194 @@ mod tests {
 
     const PARKED_SOURCE: &str = "parked";
     const PARKED_ISSUE: &str = "parked-1";
+
+    /// An agent that can or cannot run sandboxed security queries.
+    struct SecurityProbeAgent {
+        supports_security_query: bool,
+    }
+
+    #[async_trait]
+    impl AgentRunner for SecurityProbeAgent {
+        fn name(&self) -> &str {
+            "security-probe"
+        }
+
+        fn capabilities(&self) -> claudear::runner::ProviderCapabilities {
+            claudear::runner::ProviderCapabilities::default()
+        }
+
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            context: &str,
+            _project_dir: &std::path::Path,
+        ) -> String {
+            context.to_string()
+        }
+
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &std::path::Path,
+        ) -> claudear::Result<claudear::types::AgentResult> {
+            Err(claudear::Error::runner("unused"))
+        }
+
+        fn supports_security_query(&self) -> bool {
+            self.supports_security_query
+        }
+    }
+
+    /// A source with `name` that serves nothing.
+    struct NamedSource(&'static str);
+
+    #[async_trait]
+    impl IssueSource for NamedSource {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn display_name(&self) -> &str {
+            self.0
+        }
+
+        async fn fetch_issues(&self) -> claudear::Result<Vec<Issue>> {
+            Ok(Vec::new())
+        }
+
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::not_matched("serves nothing")
+        }
+
+        async fn build_issue_context(&self, _issue: &Issue) -> claudear::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn get_issue(&self, _issue_id: &str) -> claudear::Result<Issue> {
+            Err(claudear::Error::Other("serves nothing".to_string()))
+        }
+    }
+
+    fn security_inbox_config(enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.issues.helpscout = Some(claudear::config::HelpScoutConfig {
+            enabled: true,
+            mailbox_ids: vec!["249877".to_string()],
+            mailboxes: vec![claudear::config::HelpScoutMailboxConfig {
+                id: "249891".to_string(),
+                profile: claudear::config::MailboxProfile::Security,
+                reply_as: None,
+                trigger_tags: Some(Vec::new()),
+                trigger_status: None,
+            }],
+            security: claudear::config::SecurityInboxConfig {
+                enabled,
+                ..claudear::config::SecurityInboxConfig::default()
+            },
+            ..claudear::config::HelpScoutConfig::default()
+        });
+        config
+    }
+
+    async fn security_inbox_for(
+        config: &Config,
+        sources: &[Arc<dyn IssueSource>],
+        supports_security_query: bool,
+    ) -> Option<Arc<SecurityInbox>> {
+        let agent: Arc<dyn AgentRunner> = Arc::new(SecurityProbeAgent {
+            supports_security_query,
+        });
+        let notifier: Arc<dyn Notifier> = Arc::new(ConsoleNotifier::new());
+        build_security_inbox(
+            config,
+            &in_memory_tracker(),
+            &notifier,
+            sources,
+            &agent,
+            None,
+            None,
+        )
+        .await
+    }
+
+    fn helpscout_sources() -> Vec<Arc<dyn IssueSource>> {
+        vec![Arc::new(NamedSource(HELPSCOUT_SOURCE))]
+    }
+
+    #[tokio::test]
+    async fn the_security_inbox_is_built_when_the_agent_supports_security_queries() {
+        let inbox =
+            security_inbox_for(&security_inbox_config(true), &helpscout_sources(), true).await;
+
+        assert!(inbox.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_security_inbox_is_not_enabled_when_the_agent_cannot_run_security_queries() {
+        let inbox =
+            security_inbox_for(&security_inbox_config(true), &helpscout_sources(), false).await;
+
+        assert!(inbox.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_security_inbox_built_without_polling_warns_that_it_never_advances() {
+        let inbox =
+            security_inbox_for(&security_inbox_config(true), &helpscout_sources(), true).await;
+
+        assert!(warn_unless_security_inbox_advances(inbox.as_ref(), false));
+        assert!(!warn_unless_security_inbox_advances(inbox.as_ref(), true));
+        assert!(!warn_unless_security_inbox_advances(None, false));
+    }
+
+    #[tokio::test]
+    async fn the_security_inbox_is_not_enabled_while_it_is_disabled() {
+        let inbox =
+            security_inbox_for(&security_inbox_config(false), &helpscout_sources(), true).await;
+
+        assert!(inbox.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_security_inbox_is_not_enabled_without_the_helpscout_source() {
+        let sources: Vec<Arc<dyn IssueSource>> = vec![Arc::new(NamedSource("linear"))];
+
+        let inbox = security_inbox_for(&security_inbox_config(true), &sources, true).await;
+
+        assert!(inbox.is_none());
+    }
+
+    #[test]
+    fn the_deployment_topology_mirrors_the_configured_applications() {
+        let config = security_inbox_config(true);
+        let deployment = &config.security_inbox().unwrap().deployment;
+
+        let topology = deployment_topology(deployment);
+
+        assert_eq!(
+            topology.configuration_repository,
+            deployment.configuration_repository
+        );
+        assert_eq!(
+            topology.configuration_reference,
+            deployment.configuration_reference
+        );
+        assert_eq!(topology.applications.len(), deployment.applications.len());
+        for (application, configured) in topology.applications.iter().zip(&deployment.applications)
+        {
+            assert_eq!(application.repository, configured.repository);
+            assert_eq!(application.image, configured.image);
+            assert_eq!(application.directories, configured.directories);
+            assert_eq!(application.packages.len(), configured.packages.len());
+            for (package, configured) in application.packages.iter().zip(&configured.packages) {
+                assert_eq!(package.repository, configured.repository);
+                assert_eq!(package.package, configured.package);
+                assert_eq!(package.lock_file, configured.lock_file);
+            }
+        }
+    }
 
     /// An agent CLI that exits with [`INTERRUPTED_CLI_STATUS`] on SIGINT. Perl, because a shell
     /// cannot trap a signal it inherited as ignored, as a test runner a script backgrounds does.

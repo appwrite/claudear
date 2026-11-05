@@ -1,7 +1,11 @@
 //! GitHub Release API client.
 
+use super::deployment::PullRequestState;
 use abnegate_http::HttpClient;
+use abnegate_http::HttpResponse;
 use abnegate_http::ReqwestHttpClient;
+use chrono::DateTime;
+use chrono::Utc;
 use claudear_core::error::Error;
 use claudear_core::error::Result;
 use serde::Deserialize;
@@ -529,6 +533,109 @@ impl<H: HttpClient> ReleaseClient<H> {
         String::from_utf8(decoded)
             .map(Some)
             .map_err(|e| Error::Other(format!("Invalid UTF-8 in file: {}", e)))
+    }
+
+    /// The paths of the files directly inside `path` at `git_ref`. A missing or
+    /// unreadable directory, or a path that names a file, is an error.
+    pub async fn list_directory(
+        &self,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Vec<String>> {
+        let url = format!(
+            "https://api.github.com/repos/{}/contents/{}?ref={}",
+            repo, path, git_ref
+        );
+        let response = self.http.get(&url, self.build_headers()).await?;
+        Self::require_success(&response, &format!("{repo}/{path}@{git_ref}"))?;
+
+        #[derive(Deserialize)]
+        struct DirectoryEntry {
+            path: String,
+            #[serde(rename = "type")]
+            kind: String,
+        }
+
+        let entries: Vec<DirectoryEntry> = serde_json::from_str(&response.body).map_err(|e| {
+            Error::Other(format!(
+                "{repo}/{path}@{git_ref} is not a directory listing: {e}"
+            ))
+        })?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.kind == "file")
+            .map(|entry| entry.path)
+            .collect())
+    }
+
+    /// Whether `commit` is an ancestor of, or equal to, `git_ref`. Unlike
+    /// [`Self::is_commit_in_release`], a missing commit or ref, an access
+    /// failure or any other non-2xx response is an error, never `false`.
+    pub async fn commit_contained(&self, repo: &str, commit: &str, git_ref: &str) -> Result<bool> {
+        let url = format!(
+            "https://api.github.com/repos/{}/compare/{}...{}?per_page=1",
+            repo, commit, git_ref
+        );
+        let response = self.http.get(&url, self.build_headers()).await?;
+        Self::require_success(&response, &format!("{repo} compare {commit}...{git_ref}"))?;
+
+        #[derive(Deserialize)]
+        struct Comparison {
+            status: String,
+        }
+
+        let comparison: Comparison = response.json()?;
+        match comparison.status.as_str() {
+            "ahead" | "identical" => Ok(true),
+            "behind" | "diverged" => Ok(false),
+            other => Err(Error::Other(format!(
+                "{repo} compare {commit}...{git_ref} returned unknown status {other:?}"
+            ))),
+        }
+    }
+
+    /// The merge state of pull request `number`, or `None` when it does not exist.
+    pub async fn get_pull_request_state(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> Result<Option<PullRequestState>> {
+        let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, number);
+        let response = self.http.get(&url, self.build_headers()).await?;
+        if response.is_not_found() {
+            return Ok(None);
+        }
+        Self::require_success(&response, &format!("{repo}#{number}"))?;
+
+        #[derive(Deserialize)]
+        struct PullRequest {
+            state: String,
+            merged: bool,
+            merge_commit_sha: Option<String>,
+            merged_at: Option<DateTime<Utc>>,
+        }
+
+        let pull_request: PullRequest = response.json()?;
+        Ok(Some(PullRequestState {
+            merged: pull_request.merged,
+            closed: pull_request.state == "closed",
+            merge_commit_sha: pull_request
+                .merge_commit_sha
+                .filter(|_| pull_request.merged),
+            merged_at: pull_request.merged_at.filter(|_| pull_request.merged),
+        }))
+    }
+
+    fn require_success(response: &HttpResponse, subject: &str) -> Result<()> {
+        if response.is_success() {
+            Ok(())
+        } else {
+            Err(Error::Other(format!(
+                "GitHub API error ({}) for {subject}: {}",
+                response.status, response.body
+            )))
+        }
     }
 
     /// Check if a package version in a lock file includes or is after a given version.
@@ -2207,5 +2314,143 @@ version = "1.0.200"
 
         assert_eq!(legacy_false, new_false);
         assert!(!legacy_false);
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_returns_file_paths_only() {
+        let mock = MockHttpClient::new(
+            200,
+            r#"[{"name": "default.yaml", "path": "cloud/default.yaml", "type": "file"},
+                {"name": "charts", "path": "cloud/charts", "type": "dir"}]"#,
+        );
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let files = client
+            .list_directory("org/configuration", "cloud", "main")
+            .await
+            .unwrap();
+
+        assert_eq!(files, vec!["cloud/default.yaml".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_errors_on_missing_forbidden_or_file_paths() {
+        for (status, body) in [
+            (404, r#"{"message": "Not Found"}"#),
+            (403, r#"{"message": "Resource not accessible"}"#),
+            (
+                200,
+                r#"{"name": "default.yaml", "path": "cloud/default.yaml", "type": "file"}"#,
+            ),
+        ] {
+            let client =
+                ReleaseClient::with_http_client("test-token", MockHttpClient::new(status, body));
+            assert!(
+                client
+                    .list_directory("org/configuration", "cloud", "main")
+                    .await
+                    .is_err(),
+                "{status} {body} must be an error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_contained_reads_the_comparison_from_the_commit_to_the_ref() {
+        for (status, contained) in [
+            ("ahead", true),
+            ("identical", true),
+            ("behind", false),
+            ("diverged", false),
+        ] {
+            let mock = MockHttpClient::new(200, &format!(r#"{{"status": "{status}"}}"#));
+            let client = ReleaseClient::with_http_client("test-token", mock);
+            assert_eq!(
+                client
+                    .commit_contained("org/repo", "abc1234", "1.0.0")
+                    .await
+                    .unwrap(),
+                contained,
+                "{status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_contained_errors_instead_of_reporting_false() {
+        for (status, body) in [
+            (404, r#"{"message": "Not Found"}"#),
+            (403, r#"{"message": "Forbidden"}"#),
+            (500, "oops"),
+            (200, r#"{"status": "unknown"}"#),
+        ] {
+            let client =
+                ReleaseClient::with_http_client("test-token", MockHttpClient::new(status, body));
+            assert!(
+                client
+                    .commit_contained("org/repo", "abc1234", "1.0.0")
+                    .await
+                    .is_err(),
+                "{status} {body} must be an error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_pull_request_state_reads_a_merged_pull_request() {
+        let mock = MockHttpClient::new(
+            200,
+            r#"{"state": "closed", "merged": true, "merge_commit_sha": "abc1234", "merged_at": "2026-11-01T10:00:00Z"}"#,
+        );
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let state = client.get_pull_request_state("org/repo", 9).await.unwrap();
+
+        assert_eq!(
+            state,
+            Some(PullRequestState {
+                merged: true,
+                closed: true,
+                merge_commit_sha: Some("abc1234".to_string()),
+                merged_at: Some("2026-11-01T10:00:00Z".parse().unwrap()),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_pull_request_state_reports_an_open_pull_request() {
+        let mock = MockHttpClient::new(
+            200,
+            r#"{"state": "open", "merged": false, "merge_commit_sha": "abc1234", "merged_at": null}"#,
+        );
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let state = client.get_pull_request_state("org/repo", 9).await.unwrap();
+
+        assert_eq!(
+            state,
+            Some(PullRequestState {
+                merged: false,
+                closed: false,
+                merge_commit_sha: None,
+                merged_at: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_pull_request_state_is_none_when_missing_and_errors_when_forbidden() {
+        let missing = ReleaseClient::with_http_client("test-token", MockHttpClient::new(404, "{}"));
+        assert_eq!(
+            missing.get_pull_request_state("org/repo", 9).await.unwrap(),
+            None
+        );
+
+        let forbidden =
+            ReleaseClient::with_http_client("test-token", MockHttpClient::new(403, "{}"));
+        assert!(forbidden
+            .get_pull_request_state("org/repo", 9)
+            .await
+            .is_err());
     }
 }

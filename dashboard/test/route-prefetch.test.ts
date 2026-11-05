@@ -127,6 +127,16 @@ function mockPrefetchPayload(requestUrl: string): unknown {
   if (requestUrl.includes("/api/telemetry/latency")) {
     return { period: "hour", buckets: [], summary: { p50_ms: null, p95_ms: null, p99_ms: null } };
   }
+  if (requestUrl.includes("/api/security/summary")) {
+    return {
+      reports_by_state: {},
+      reports_by_outcome: {},
+      vulnerabilities_by_state: {},
+      pending_awards: 0,
+      unconfirmed_replies: 0,
+    };
+  }
+  if (requestUrl.includes("/api/security/reports?")) return [];
   if (requestUrl.includes("/api/users")) return [];
   if (requestUrl.includes("/api/deploy-qa/tips")) return { tips: [] };
   if (requestUrl.endsWith("/api/deploy-qa")) return { enabled: false, tracks: [] };
@@ -181,6 +191,7 @@ describe("prefetchRouteData", () => {
     prefetchRouteData!("/issues");
     prefetchRouteData!("/attempts");
     prefetchRouteData!("/prs");
+    prefetchRouteData!("/security");
     prefetchRouteData!("/analytics");
     prefetchRouteData!("/errors");
     prefetchRouteData!("/feedback");
@@ -213,6 +224,8 @@ describe("prefetchRouteData", () => {
     expect(calls.some((call) => call.url.includes("/api/issues?"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/attempts?"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/prs/analytics"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/api/security/summary"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/api/security/reports?"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/analytics/summary"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/metrics?"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/errors?limit=50"))).toBe(true);

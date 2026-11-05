@@ -50,7 +50,7 @@ mod console;
 mod delivery;
 mod discord;
 mod email;
-mod html;
+pub(crate) mod html;
 mod push;
 mod slack;
 mod sms;

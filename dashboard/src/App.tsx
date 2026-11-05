@@ -9,6 +9,7 @@ import InvitePage from './pages/invite'
 import OverviewPage from './pages/overview'
 import AttemptsPage from './pages/attempts'
 import PrsPage from './pages/prs'
+import SecurityPage from './pages/security'
 import AnalyticsPage from './pages/analytics'
 import ErrorsPage from './pages/errors'
 import FeedbackPage from './pages/feedback'
@@ -53,6 +54,7 @@ const routes: Record<string, () => JSX.Element | null> = {
   '/issues': IssuesPage,
   '/attempts': AttemptsPage,
   '/prs': PrsPage,
+  '/security': SecurityPage,
   '/analytics': AnalyticsPage,
   '/errors': ErrorsPage,
   '/feedback': FeedbackPage,
