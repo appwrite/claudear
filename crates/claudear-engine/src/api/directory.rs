@@ -766,12 +766,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_handle_storage_refuses_rolls_the_batch_back_with_409() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let app = test_app_on(
-            fixture::tracker_refusing_handle_claims(directory.path()),
-            false,
-        );
+    async fn a_handle_another_process_claimed_rolls_the_batch_back_with_409() {
+        let database = fixture::SharedDatabase::new();
+        let app = test_app_on(database.tracker(), false);
+        database.claim_handle(app.viewer.id, IdentityField::GithubUsernames, "Claimed-GH");
         let before = user_count(&app);
 
         let (status, body) = put(

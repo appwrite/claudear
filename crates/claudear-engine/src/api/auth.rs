@@ -3053,10 +3053,16 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_handle_storage_refuses_creates_no_user_and_is_a_409() {
-            let directory = tempfile::tempdir().expect("temporary directory");
-            let app = test_app_on(fixture::tracker_refusing_handle_claims(directory.path()));
-            let before = app.tracker.list_users().expect("list").len();
+        async fn a_handle_another_process_claimed_creates_no_user_and_is_a_409() {
+            let database = fixture::SharedDatabase::new();
+            let app = test_app_on(database.tracker());
+            let users = app.tracker.list_users().expect("list");
+            database.claim_handle(
+                users[0].id,
+                claudear_core::identity::IdentityField::GithubUsernames,
+                "claimed-gh",
+            );
+            let before = users.len();
 
             let (status, body) = send(
                 &app,

@@ -567,11 +567,13 @@ fn console_entry(state: &ApiState, user_id: i64) -> Result<Option<ConsoleIdentit
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::config_file::ConfigFile;
     use crate::api::create_api_router_with_dashboard;
     use crate::api::fixture;
+    use crate::api::rate_limit::RateLimiters;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use axum::response::Response;
+    use axum::response::{IntoResponse, Response};
     use axum::Router;
     use claudear_config::config::Config;
     use claudear_core::identity::Role;
@@ -580,6 +582,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Instant;
     use tower::ServiceExt;
     use tower_cookies::CookieManagerLayer;
 
@@ -1007,12 +1010,8 @@ mod tests {
     }
 
     fn test_app() -> TestApp {
-        test_app_on(Arc::new(
-            SqliteTracker::in_memory().expect("in-memory tracker"),
-        ))
-    }
-
-    fn test_app_on(tracker: Arc<dyn FixAttemptTracker>) -> TestApp {
+        let tracker: Arc<dyn FixAttemptTracker> =
+            Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
         let admin = session(&tracker, "jake@example.com", Role::Admin);
         let viewer = session(&tracker, "viewer@example.com", Role::Viewer);
         let config = Config {
@@ -1199,29 +1198,116 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_handle_storage_refuses_is_a_conflict_that_names_no_one() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let app = test_app_on(fixture::tracker_refusing_handle_claims(directory.path()));
+    /// What one process serves the identities API from: its own tracker connection,
+    /// registry and identity-write lock.
+    fn process_state(tracker: Arc<dyn FixAttemptTracker>) -> ApiState {
+        let config = Config {
+            users: config_users(),
+            storage_dir: std::env::temp_dir().join("claudear-identities-tests"),
+            ..Config::default()
+        };
+        ApiState {
+            storage_dir: config.storage_dir.clone(),
+            registry: UserRegistry::new(config.users.clone()),
+            config,
+            indexing_rx: tracker.subscribe_indexing_progress(),
+            tracker,
+            start_time: Instant::now(),
+            config_file: ConfigFile::new(std::path::Path::new("claudear.toml")),
+            chat_service: None,
+            identity_writes: Arc::new(tokio::sync::Mutex::new(())),
+            limiters: Arc::new(RateLimiters::default()),
+            startup_config: None,
+        }
+    }
 
-        let (status, body) = send(
-            &app,
-            request(
-                "PUT",
-                &format!("/api/users/{}/identities", app.viewer.id),
-                Some(&app.viewer.token),
-                Some(json!({"github_usernames": ["viewer-gh"]})),
-            ),
-        )
-        .await;
+    // The handler is called without the session extractor, whose session touch is a
+    // write that the held write lock would otherwise serialize ahead of the reload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_processes_claiming_one_handle_let_exactly_one_win() {
+        const UNLOADED: &str = "not-yet-reloaded-gh";
+        let database = fixture::SharedDatabase::new();
+        let daemon = process_state(database.tracker());
+        let dashboard = process_state(database.tracker());
+        let claimants = [
+            "daemon-claimant@example.com",
+            "dashboard-claimant@example.com",
+        ]
+        .map(|email| AuthUser {
+            id: daemon
+                .tracker
+                .create_user(email, "unused-hash", email, Role::Viewer)
+                .expect("create user"),
+            email: email.to_string(),
+            name: email.to_string(),
+            role: Role::Viewer,
+            avatar_url: None,
+        });
+        for state in [&daemon, &dashboard] {
+            state.registry.replace_console(vec![console(
+                0,
+                "unloaded@example.com",
+                None,
+                Identities {
+                    github_usernames: vec![UNLOADED.to_string()],
+                    ..Identities::default()
+                },
+            )]);
+        }
 
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(
-            body,
-            json!({"error": "Identities already belong to another person"})
+        let writes = database.hold_writes();
+        let claims = [daemon.clone(), dashboard.clone()]
+            .into_iter()
+            .zip(claimants)
+            .map(|(state, claimant)| {
+                let update = serde_json::from_value(json!({"github_usernames": ["Shared-GH"]}))
+                    .expect("update");
+                let user_id = claimant.id;
+                tokio::spawn(async move {
+                    update_user_identities_handler(
+                        claimant,
+                        State(state),
+                        Path(user_id),
+                        Ok(Json(update)),
+                    )
+                    .await
+                    .into_response()
+                })
+            })
+            .collect::<Vec<_>>();
+        while [&daemon, &dashboard]
+            .iter()
+            .any(|state| state.registry.resolve("github", UNLOADED).is_some())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        drop(writes);
+        let mut outcomes = Vec::new();
+        for claim in claims {
+            outcomes.push(response_json(claim.await.expect("claim task")).await);
+        }
+
+        let statuses: Vec<StatusCode> = outcomes.iter().map(|(status, _)| *status).collect();
+        assert!(
+            statuses.contains(&StatusCode::OK) && statuses.contains(&StatusCode::CONFLICT),
+            "{outcomes:?}"
         );
-        assert!(app.tracker.list_user_identities().expect("list").is_empty());
-        assert!(app.registry.resolve("github", "viewer-gh").is_none());
+        let (_, refused) = outcomes
+            .iter()
+            .find(|(status, _)| *status == StatusCode::CONFLICT)
+            .expect("one claim refused");
+        assert_eq!(
+            refused,
+            &json!({"error": "Identities already belong to another person"})
+        );
+        let owners = daemon
+            .tracker
+            .list_user_identities()
+            .expect("list")
+            .into_iter()
+            .filter(|entry| entry.identities.github_usernames == ["Shared-GH"])
+            .count();
+        assert_eq!(owners, 1);
     }
 
     #[tokio::test]
