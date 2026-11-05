@@ -1,4 +1,4 @@
-import { preload } from 'swr'
+import { mutate, preload } from 'swr'
 import {
   ADMIN_ROLE,
   fetchActivity,
@@ -46,9 +46,7 @@ const regressionStatuses = ['awaiting_release', 'monitoring', 'resolved', 'regre
 const prStatuses = ['', 'open', 'merged', 'closed'] as const
 
 function queuePreload<T>(key: string | readonly unknown[], fetcher: () => Promise<T>) {
-  void preload(key, fetcher).catch(() => {
-    // Route prefetch is best-effort; normal page loading handles retries/errors.
-  })
+  void preload(key, fetcher).catch(() => mutate(key))
 }
 
 const routePrefetchers: Record<string, () => void> = {

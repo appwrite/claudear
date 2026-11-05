@@ -29,7 +29,7 @@ describe('auth api', () => {
 
   test('login throws on 401', async () => {
     mockFetch(null, 401)
-    expect(login('bad@test.com', 'wrong')).rejects.toThrow()
+    await expect(login('bad@test.com', 'wrong')).rejects.toThrow()
   })
 
   test('logout calls post', async () => {
@@ -46,7 +46,7 @@ describe('auth api', () => {
 
   test('getMe throws on 401', async () => {
     mockFetch(null, 401)
-    expect(getMe()).rejects.toThrow()
+    await expect(getMe()).rejects.toThrow()
   })
 
   test('fetchUsers returns user list', async () => {
