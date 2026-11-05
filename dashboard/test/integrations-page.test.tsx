@@ -233,6 +233,15 @@ describe('IntegrationsPage', () => {
     expect(window.location.pathname).toBe('/models')
   })
 
+  test('links the admin-only security inbox to the security page', async () => {
+    const securityInbox = feature({ key: 'issues.helpscout.security', label: 'Security inbox', category: 'source' })
+    createHarness({ role: 'admin', featuresResponse: () => json(200, { features: [...features, securityInbox] }) })
+    await renderPage()
+
+    fireEvent.click(within(card('Security inbox')).getByRole('button', { name: 'Open Security' }))
+    expect(window.location.pathname).toBe('/security')
+  })
+
   test('shows the server error message when loading fails', async () => {
     createHarness({ role: 'viewer', featuresResponse: () => json(500, { error: 'features unavailable' }) })
     const IntegrationsPage = (await import('../src/pages/integrations')).default

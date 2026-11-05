@@ -10,7 +10,11 @@ pub(crate) mod embedded;
 mod features;
 mod routes;
 mod security;
+mod security_reports;
+#[cfg(test)]
+mod test_support;
 mod tokens;
+mod visibility;
 
 pub use chat::chat_state;
 pub use routes::{create_api_router, create_api_router_full, create_api_router_with_dashboard};

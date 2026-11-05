@@ -1013,15 +1013,11 @@ mod tests {
         assert_eq!(text, "Null error");
     }
 
-    // ===================================================================
-    // Mock tracker and IssueEmbeddingService tests
-    // ===================================================================
-
     use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
     use claudear_storage::{
         ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
         EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
-        SimilarityStore, UserStore, WebhookStore,
+        SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
     };
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -1191,6 +1187,7 @@ mod tests {
     impl SimilarityStore for MockTracker {}
     impl DiscordStore for MockTracker {}
     impl DeployQaStore for MockTracker {}
+    impl SecurityReportStore for MockTracker {}
 
     fn make_service(
         tracker: Arc<dyn claudear_storage::FixAttemptTracker>,

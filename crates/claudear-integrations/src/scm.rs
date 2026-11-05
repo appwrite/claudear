@@ -1069,8 +1069,9 @@ impl ReviewWatcher {
             // Log activity event for the review
             let message = format!("PR review from {}: {}", review.user.login, review.state);
             let activity = ActivityLogEntry::new("pr_review_received", &message)
-                .with_source(self.provider.name().to_string())
+                .with_source(state.source.clone())
                 .with_metadata(serde_json::json!({
+                    "provider": self.provider.name(),
                     "pr_url": state.pr_url,
                     "reviewer": review.user.login,
                     "review_state": review.state,
@@ -2481,7 +2482,7 @@ mod tests {
         use claudear_storage::{
             ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
             EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
-            SimilarityStore, UserStore, WebhookStore,
+            SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
         };
         use std::collections::{HashMap, HashSet};
         use std::sync::{Arc, Mutex};
@@ -2717,6 +2718,7 @@ mod tests {
         impl SimilarityStore for MockFixAttemptTracker {}
         impl DiscordStore for MockFixAttemptTracker {}
         impl DeployQaStore for MockFixAttemptTracker {}
+        impl SecurityReportStore for MockFixAttemptTracker {}
 
         fn make_fix_attempt(
             source: &str,
@@ -4542,7 +4544,7 @@ mod tests {
         use claudear_storage::{
             ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
             EvaluationStore, ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore,
-            RepoStore, SimilarityStore, UserStore, WebhookStore,
+            RepoStore, SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
         };
         use std::collections::HashSet;
         use std::sync::{Arc, Mutex};
@@ -4720,6 +4722,7 @@ mod tests {
         impl SimilarityStore for MockTracker {}
         impl DiscordStore for MockTracker {}
         impl DeployQaStore for MockTracker {}
+        impl SecurityReportStore for MockTracker {}
 
         fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
             CodeReview {
@@ -5233,7 +5236,7 @@ mod tests {
         use claudear_storage::{
             ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
             EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
-            SimilarityStore, UserStore, WebhookStore,
+            SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
         };
         use std::collections::{HashMap, HashSet};
         use std::sync::{Arc, Mutex};
@@ -5436,6 +5439,7 @@ mod tests {
         impl SimilarityStore for MockFixAttemptTracker {}
         impl DiscordStore for MockFixAttemptTracker {}
         impl DeployQaStore for MockFixAttemptTracker {}
+        impl SecurityReportStore for MockFixAttemptTracker {}
 
         fn make_fix_attempt(
             source: &str,
@@ -5855,7 +5859,8 @@ mod tests {
         use claudear_storage::{
             ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
             EvaluationStore, ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore,
-            RepoStore, SimilarityStore, SqliteTracker, UserStore, WebhookStore,
+            RepoStore, SecurityReportStore, SimilarityStore, SqliteTracker, UserStore,
+            WebhookStore,
         };
         use std::collections::HashSet;
         use std::sync::{Arc, Mutex};
@@ -5930,7 +5935,7 @@ mod tests {
 
         struct MockTrackerWithRecording {
             review_calls: Arc<Mutex<Vec<String>>>,
-            activity_calls: Arc<Mutex<Vec<String>>>,
+            activity_calls: Arc<Mutex<Vec<ActivityLogEntry>>>,
             unhandled: Arc<Mutex<Vec<ReviewComment>>>,
             handled_calls: Arc<Mutex<Vec<String>>>,
             fail_record: Arc<Mutex<bool>>,
@@ -6050,10 +6055,7 @@ mod tests {
                 Ok(1)
             }
             fn record_activity(&self, entry: &ActivityLogEntry) -> Result<i64> {
-                self.activity_calls
-                    .lock()
-                    .unwrap()
-                    .push(entry.activity_type.clone());
+                self.activity_calls.lock().unwrap().push(entry.clone());
                 Ok(1)
             }
             fn record_pr_review_comment(
@@ -6096,6 +6098,7 @@ mod tests {
         impl SimilarityStore for MockTrackerWithRecording {}
         impl DiscordStore for MockTrackerWithRecording {}
         impl DeployQaStore for MockTrackerWithRecording {}
+        impl SecurityReportStore for MockTrackerWithRecording {}
 
         fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
             CodeReview {
@@ -6173,7 +6176,12 @@ mod tests {
             // Verify record_activity was called
             let activity_calls = tracker.activity_calls.lock().unwrap();
             assert_eq!(activity_calls.len(), 1);
-            assert_eq!(activity_calls[0], "pr_review_received");
+            assert_eq!(activity_calls[0].activity_type, "pr_review_received");
+            assert_eq!(activity_calls[0].source.as_deref(), Some("linear"));
+            assert_eq!(
+                activity_calls[0].metadata.as_ref().unwrap()["provider"],
+                "github"
+            );
         }
 
         #[tokio::test]

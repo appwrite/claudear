@@ -168,6 +168,28 @@ describe("Sidebar", () => {
     expect(window.location.pathname).toBe("/users");
   });
 
+  test("shows the Security nav item in the Work group for admins", async () => {
+    renderSidebarWithAuth("/");
+    const security = await screen.findByText("Security");
+    const prs = screen.getByText("PRs").closest("button");
+    expect(prs?.parentElement?.contains(security)).toBe(true);
+    fireEvent.click(security.closest("button")!);
+    expect(window.location.pathname).toBe("/security");
+  });
+
+  test("hides the Security nav item for non-admin users", async () => {
+    renderSidebarWithAuth("/", { id: 2, email: "user@test.com", name: "Regular", role: "viewer" });
+    await waitFor(() => {
+      expect(screen.getByText("Regular")).toBeTruthy();
+    });
+    expect(screen.queryByText("Security")).toBeNull();
+  });
+
+  test("hides the Security nav item without a signed-in user", () => {
+    renderSidebar();
+    expect(screen.queryByText("Security")).toBeNull();
+  });
+
   test("does not show admin section for non-admin user", async () => {
     renderSidebarWithAuth("/", { id: 2, email: "user@test.com", name: "Regular", role: "viewer" });
     await waitFor(() => {

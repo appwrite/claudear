@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react'
+import { useSWRConfig } from 'swr'
 import { getMe, login as apiLogin, logout as apiLogout, updateProfile as apiUpdateProfile, setOnUnauthorized, type AuthUser } from './api'
 import { Sentry } from './sentry'
 
@@ -27,13 +28,23 @@ export function useAuth() {
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null)
   const [loading, setLoading] = useState(true)
+  const { mutate } = useSWRConfig()
+
+  const clearCache = useCallback(
+    () => mutate(() => true, undefined, { revalidate: false }),
+    [mutate],
+  )
 
   const handleUnauthorized = useCallback(() => {
     setUser(null)
-  }, [])
+    void clearCache()
+  }, [clearCache])
 
   useEffect(() => {
     setOnUnauthorized(handleUnauthorized)
+  }, [handleUnauthorized])
+
+  useEffect(() => {
     getMe()
       .then((u) => {
         setUser(u)
@@ -44,7 +55,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         Sentry.setUser(null)
       })
       .finally(() => setLoading(false))
-  }, [handleUnauthorized])
+  }, [])
 
   const login = useCallback(async (email: string, password: string) => {
     const res = await apiLogin(email, password)
@@ -56,7 +67,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await apiLogout()
     setUser(null)
     Sentry.setUser(null)
-  }, [])
+    await clearCache()
+  }, [clearCache])
 
   const refreshUser = useCallback(async () => {
     const refreshed = await getMe()

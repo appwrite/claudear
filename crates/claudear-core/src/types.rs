@@ -729,6 +729,17 @@ impl ActivityLogEntry {
         self
     }
 
+    /// Attribute this activity to the issue `component` works on, so it is
+    /// scoped with that issue's source, or to `component` when it works on none.
+    pub fn attributed(self, component: &str, issue: Option<&Issue>) -> Self {
+        match issue {
+            Some(issue) => self
+                .with_source(issue.source.clone())
+                .with_issue(issue.id.clone(), issue.short_id.clone()),
+            None => self.with_source(component),
+        }
+    }
+
     /// Set metadata for this activity.
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
         self.metadata = Some(metadata);
@@ -5234,6 +5245,20 @@ mod tests {
         assert_eq!(entry.source, Some("linear".to_string()));
         assert_eq!(entry.issue_id, Some("issue-1".to_string()));
         assert!(entry.metadata.is_some());
+    }
+
+    #[test]
+    fn activity_is_attributed_to_the_issue_a_component_works_on() {
+        let issue = Issue::new("issue-1", "SEC-1", "Title", "", "security");
+        let entry = ActivityLogEntry::new("claude_started", "m").attributed("claude", Some(&issue));
+        assert_eq!(entry.source.as_deref(), Some("security"));
+        assert_eq!(entry.issue_id.as_deref(), Some("issue-1"));
+        assert_eq!(entry.short_id.as_deref(), Some("SEC-1"));
+
+        let entry = ActivityLogEntry::new("claude_started", "m").attributed("claude", None);
+        assert_eq!(entry.source.as_deref(), Some("claude"));
+        assert!(entry.issue_id.is_none());
+        assert!(entry.short_id.is_none());
     }
 
     #[test]

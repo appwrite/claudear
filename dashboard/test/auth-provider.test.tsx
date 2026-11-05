@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import useSWR, { SWRConfig } from "swr";
 import { AuthProvider, useAuth } from "../src/lib/auth";
 
 function jsonResponse(data: unknown, status = 200) {
@@ -117,6 +118,46 @@ describe("AuthProvider", () => {
     expect(fetchCalls.some((call) => call.url.endsWith("/api/auth/logout") && call.method === "POST")).toBe(true);
     expect(fetchCalls.filter((call) => call.url.endsWith("/api/auth/me")).length).toBe(3);
 
+  });
+
+  test("logging out drops every cached response so the next user never sees them", async () => {
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/api/auth/me")) {
+        return Promise.resolve(
+          jsonResponse({ id: 1, email: "admin@test.com", name: "Admin", role: "admin" })
+        ) as Promise<Response>;
+      }
+      return Promise.resolve(jsonResponse(null, 204)) as Promise<Response>;
+    }) as unknown as typeof fetch;
+    const cache = new Map();
+
+    function CachedSecrets() {
+      const { data } = useSWR("/api/security/summary", () => Promise.resolve("admin-only summary"));
+      return <div data-testid="cached">{data ?? "empty"}</div>;
+    }
+
+    render(
+      <SWRConfig value={{ provider: () => cache, dedupingInterval: 0 }}>
+        <AuthProvider>
+          <TestHarness />
+          <CachedSecrets />
+        </AuthProvider>
+      </SWRConfig>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("user").textContent).toBe("admin@test.com|Admin");
+      expect(screen.getByTestId("cached").textContent).toBe("admin-only summary");
+    });
+
+    fireEvent.click(screen.getByText("logout"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("user").textContent).toBe("none");
+      expect(screen.getByTestId("cached").textContent).toBe("empty");
+    });
+    expect(cache.get("/api/security/summary")?.data).toBeUndefined();
   });
 
   test("clears user when initial auth check fails", async () => {

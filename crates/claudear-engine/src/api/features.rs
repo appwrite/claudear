@@ -6,11 +6,12 @@
 //!
 //! Every signed-in user can read this, so settings exclude filesystem paths,
 //! hosts, URLs and free-form queries; admins see those in the config API.
+//! Features in [`ADMIN_FEATURES`] are reported to admins only.
 
 use super::auth::AuthUser;
 use super::routes::ApiState;
 use axum::{extract::State, Json};
-use claudear_config::config::{Config, ProviderConfig};
+use claudear_config::config::{Config, MailboxProfile, ProviderConfig};
 use claudear_core::secret::SecretValue;
 use serde::Serialize;
 use serde_json::Value;
@@ -22,6 +23,7 @@ const BUILDERS: &[fn(&Config) -> FeatureStatus] = &[
     discord_source,
     slack_source,
     helpscout_source,
+    security_inbox,
     github_code_scanning,
     github,
     gitlab,
@@ -55,6 +57,10 @@ const BUILDERS: &[fn(&Config) -> FeatureStatus] = &[
     tls,
     mcp_server,
 ];
+
+const SECURITY_INBOX: &str = "issues.helpscout.security";
+
+const ADMIN_FEATURES: &[&str] = &[SECURITY_INBOX];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,12 +160,20 @@ impl FeatureStatus {
 
 /// `GET /api/features` — the running configuration's feature status.
 pub async fn features_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Json<FeaturesResponse> {
     Json(FeaturesResponse {
-        features: features(&state.config),
+        features: visible_features(&state.config, &user),
     })
+}
+
+fn visible_features(config: &Config, user: &AuthUser) -> Vec<FeatureStatus> {
+    let mut features = features(config);
+    if !user.is_admin() {
+        features.retain(|feature| !ADMIN_FEATURES.contains(&feature.key));
+    }
+    features
 }
 
 pub fn features(config: &Config) -> Vec<FeatureStatus> {
@@ -340,6 +354,44 @@ fn helpscout_source(config: &Config) -> FeatureStatus {
         .secret("app_id", Some(&helpscout.app_id))
         .secret("app_secret", Some(&helpscout.app_secret))
         .secret("webhook_secret", helpscout.webhook_secret.as_ref())
+}
+
+fn security_inbox(config: &Config) -> FeatureStatus {
+    let feature = FeatureStatus::new(
+        SECURITY_INBOX,
+        "Security inbox",
+        "Assesses vulnerability reports sent to HelpScout security mailboxes and tracks each through its fix and award.",
+        FeatureCategory::Source,
+    );
+    let Some(helpscout) = config.issues.helpscout.as_ref() else {
+        return feature.unconfigured();
+    };
+    let security = &helpscout.security;
+    let mailbox_ids: Vec<String> = helpscout
+        .mailboxes
+        .iter()
+        .filter(|mailbox| mailbox.profile == MailboxProfile::Security)
+        .map(|mailbox| mailbox.id.clone())
+        .collect();
+    feature
+        .state(
+            helpscout.has_security_mailbox(),
+            helpscout.enabled && security.enabled,
+        )
+        .setting("mailbox_ids", mailbox_ids)
+        .setting(
+            "process_after",
+            security.process_after.map(|after| after.to_rfc3339()),
+        )
+        .setting("spam_action", security.spam_action.as_str())
+        .setting("spam_confidence", security.spam_confidence)
+        .setting("acknowledge_valid", security.acknowledge_valid)
+        .setting("close_after_reply", security.close_after_reply)
+        .setting("assessment_timeout_secs", security.assessment_timeout_secs)
+        .setting("max_assessment_attempts", security.max_assessment_attempts)
+        .setting("duplicate_similarity", security.duplicate_similarity)
+        .setting("duplicate_candidates", security.duplicate_candidates)
+        .setting("reward_credits", security.reward.credits)
 }
 
 fn github_code_scanning(config: &Config) -> FeatureStatus {
@@ -961,8 +1013,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use claudear_config::config::{
         DeployQaTrackConfig, DiscordKnowledgebaseConfig, DiscordSourceConfig,
-        GitHubCodeScanningConfig, GitLabConfig, HelpScoutConfig, JiraConfig, LinearConfig,
-        McpServerConfig, SentryConfig, SlackSourceConfig, UserConfig,
+        GitHubCodeScanningConfig, GitLabConfig, HelpScoutConfig, HelpScoutMailboxConfig,
+        JiraConfig, LinearConfig, McpServerConfig, SentryConfig, SlackSourceConfig, UserConfig,
     };
     use claudear_storage::{FixAttemptTracker, SqliteTracker};
     use http_body_util::BodyExt;
@@ -1247,6 +1299,10 @@ mod tests {
         "model_path",
         "domains",
         "allowed_origins",
+        "dashboard_url",
+        "owner_mention",
+        "scope",
+        "default_repository",
     ];
 
     fn internal(field: &str) -> String {
@@ -1274,6 +1330,17 @@ mod tests {
         config.llm.model_path = PathBuf::from(internal("model_path"));
         config.tls.domains = vec![internal("tls.domains")];
         config.mcp_server.allowed_origins = vec![internal("allowed_origins")];
+        if let Some(helpscout) = config.issues.helpscout.as_mut() {
+            let security = &mut helpscout.security;
+            security.dashboard_url = Some(internal("security.dashboard_url"));
+            security.owner_mention = Some(internal("security.owner_mention"));
+            security.scope = internal("security.scope");
+            security.default_repository = Some(internal("security.default_repository"));
+            security.reward.campaign = internal("security.reward.campaign");
+            security.templates.confirmed = internal("security.templates.confirmed");
+            security.deployment.configuration_repository =
+                internal("security.deployment.configuration_repository");
+        }
         config
     }
 
@@ -1295,6 +1362,52 @@ mod tests {
             !body.contains("INTERNAL-"),
             "feature status leaked an internal value: {body}"
         );
+    }
+
+    fn security_mailbox(id: &str) -> HelpScoutMailboxConfig {
+        HelpScoutMailboxConfig {
+            id: id.to_string(),
+            profile: MailboxProfile::Security,
+            reply_as: None,
+            trigger_tags: None,
+            trigger_status: None,
+        }
+    }
+
+    #[test]
+    fn security_inbox_needs_a_security_mailbox_to_be_configured() {
+        let mut config = Config::default();
+        let status = |config: &Config| {
+            let features = features(config);
+            let feature = feature(&features, SECURITY_INBOX);
+            (feature.configured, feature.enabled)
+        };
+        assert_eq!(status(&config), (false, false));
+
+        let mut helpscout = HelpScoutConfig {
+            enabled: true,
+            ..HelpScoutConfig::default()
+        };
+        helpscout.security.enabled = true;
+        config.issues.helpscout = Some(helpscout);
+        assert_eq!(status(&config), (false, false));
+
+        if let Some(helpscout) = config.issues.helpscout.as_mut() {
+            helpscout.mailboxes = vec![security_mailbox("249891")];
+        }
+        assert_eq!(status(&config), (true, true));
+        let features = features(&config);
+        let mailbox_ids = feature(&features, SECURITY_INBOX)
+            .settings
+            .iter()
+            .find(|setting| setting.name == "mailbox_ids")
+            .map(|setting| setting.value.clone());
+        assert_eq!(mailbox_ids, Some(serde_json::json!(["249891"])));
+
+        if let Some(helpscout) = config.issues.helpscout.as_mut() {
+            helpscout.security.enabled = false;
+        }
+        assert_eq!(status(&config), (true, false));
     }
 
     #[test]
@@ -1354,13 +1467,12 @@ mod tests {
         .layer(CookieManagerLayer::new())
     }
 
-    #[tokio::test]
-    async fn viewer_can_read_features() {
+    async fn read_features(role: &str) -> (StatusCode, String) {
         let storage = tempfile::tempdir().unwrap();
         let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         let user_id = tracker
-            .create_user("viewer@example.com", &password_hash, "Viewer", "viewer")
+            .create_user(&format!("{role}@example.com"), &password_hash, role, role)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31 23:59:59")
@@ -1377,13 +1489,56 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let text = String::from_utf8(body.to_vec()).unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    fn reported_keys(text: &str) -> Vec<String> {
+        let json: Value = serde_json::from_str(text).unwrap();
+        json["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|feature| feature["key"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn only_admins_see_admin_features() {
+        let (status, viewer) = read_features("viewer").await;
+        assert_eq!(status, StatusCode::OK);
+        let viewer_keys = reported_keys(&viewer);
+        assert_eq!(viewer_keys.len(), BUILDERS.len() - ADMIN_FEATURES.len());
+        for key in ADMIN_FEATURES {
+            assert!(
+                !viewer_keys.iter().any(|reported| reported == key),
+                "a viewer was shown {key}"
+            );
+        }
+
+        let (status, admin) = read_features("admin").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!admin.contains("LEAKED-"), "response leaked a secret");
+        let admin_keys = reported_keys(&admin);
+        assert_eq!(admin_keys.len(), BUILDERS.len());
+        for key in ADMIN_FEATURES {
+            assert!(
+                admin_keys.iter().any(|reported| reported == key),
+                "an admin was not shown {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn viewer_can_read_features() {
+        let (status, text) = read_features("viewer").await;
+
+        assert_eq!(status, StatusCode::OK);
         assert!(!text.contains("LEAKED-"), "response leaked a secret");
         let json: Value = serde_json::from_str(&text).unwrap();
         let features = json["features"].as_array().unwrap();
-        assert_eq!(features.len(), BUILDERS.len());
+        assert_eq!(features.len(), BUILDERS.len() - ADMIN_FEATURES.len());
         let linear = features
             .iter()
             .find(|feature| feature["key"] == "issues.linear")

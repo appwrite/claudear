@@ -1020,7 +1020,9 @@ impl HeldWriteLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claudear_config::config::{McpServerConfig, UserConfig};
+    use claudear_config::config::{
+        HelpScoutMailboxConfig, MailboxProfile, McpServerConfig, UserConfig,
+    };
     use claudear_core::secret::SecretValue;
     use std::path::PathBuf;
 
@@ -1242,6 +1244,75 @@ mod tests {
                 "{path} must not be redacted"
             );
         }
+    }
+
+    fn config_with_security_inbox() -> Config {
+        let mut config = config_with_fake_secrets();
+        if let Some(helpscout) = config.issues.helpscout.as_mut() {
+            helpscout.mailboxes = vec![HelpScoutMailboxConfig {
+                id: "249891".to_string(),
+                profile: MailboxProfile::Security,
+                reply_as: None,
+                trigger_tags: None,
+                trigger_status: Some("active".to_string()),
+            }];
+            helpscout.security.dashboard_url = Some("https://claudear.example.com".to_string());
+            helpscout.security.owner_mention = Some("<@1234>".to_string());
+            helpscout.security.default_repository = Some("appwrite/appwrite".to_string());
+        }
+        config
+    }
+
+    #[test]
+    fn redact_leaves_the_security_inbox_visible_and_restores_it() {
+        let config = config_with_security_inbox();
+        let document = redact(&config).unwrap();
+        let content: Value = toml::from_str(&document.content).unwrap();
+        let expectations = [
+            (
+                "issues.helpscout.security.dashboard_url",
+                Value::String("https://claudear.example.com".to_string()),
+            ),
+            (
+                "issues.helpscout.security.owner_mention",
+                Value::String("<@1234>".to_string()),
+            ),
+            (
+                "issues.helpscout.security.reward.campaign",
+                Value::String("SecurityResearchers".to_string()),
+            ),
+            (
+                "issues.helpscout.security.deployment.configuration_repository",
+                Value::String("appwrite-labs/application-configuration".to_string()),
+            ),
+        ];
+        for (path, expected) in expectations {
+            assert_eq!(lookup(&content, path), Some(&expected), "{path}");
+        }
+        assert_eq!(
+            content["issues"]["helpscout"]["mailboxes"][0]["profile"],
+            Value::String("security".to_string())
+        );
+        let hidden: Vec<&String> = document
+            .secret_paths
+            .iter()
+            .filter(|path| {
+                path.starts_with("issues.helpscout.security")
+                    || path.starts_with("issues.helpscout.mailboxes")
+            })
+            .collect();
+        assert!(
+            hidden.is_empty(),
+            "security inbox values redacted: {hidden:?}"
+        );
+
+        let on_disk: Value = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        let incoming: Value = toml::from_str(&document.content).unwrap();
+        let restored: Config = restore_all(incoming, &on_disk).unwrap().try_into().unwrap();
+        let helpscout = restored.issues.helpscout.expect("helpscout");
+        let original = config.issues.helpscout.expect("helpscout");
+        assert_eq!(helpscout.mailboxes, original.mailboxes);
+        assert_eq!(helpscout.security, original.security);
     }
 
     #[test]

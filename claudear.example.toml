@@ -631,6 +631,77 @@ webhook_secret = ""
 # Polling interval in milliseconds (overrides global)
 poll_interval_ms = 300000
 
+# Per-mailbox overrides. Each entry is polled in addition to mailbox_ids, and
+# unset fields inherit the values above. trigger_tags = [] matches every
+# conversation in that mailbox.
+#
+# profile = "security" routes the mailbox to the Security inbox: reports are
+# screened for spam, validated read-only against the current code, deduplicated
+# (first reporter wins), fixed through a neutral PR, tracked until the fix is
+# live on Cloud, and answered with the fixed templates below. A security
+# mailbox always sends real customer replies, so reply_as = "note" on it is a
+# config error. Generic paths (webhooks, notes, MCP listing) never handle it.
+# A security mailbox does not inherit the top-level trigger_tags: unset means
+# every conversation. Mailbox ids must not have surrounding whitespace.
+#
+# [[issues.helpscout.mailboxes]]
+# id = "249891"              # Security <security@appwrite.io>
+# profile = "security"
+# trigger_tags = []
+# trigger_status = "active"
+#
+# [[issues.helpscout.mailboxes]]
+# id = "249877"              # Support: optional overrides for an existing mailbox
+# reply_as = "note"
+# trigger_tags = ["auto-implement", "claude"]
+
+# Security inbox. Requires a mailbox with the security profile.
+# [issues.helpscout.security]
+# enabled = true
+# process_after = "2026-11-05T00:00:00Z"   # required: never touch the existing backlog
+# spam_action = "close"                     # "close" or "spam"
+# default_repository = "appwrite-labs/cloud"
+# owner_mention = "<@DISCORD_USER_ID>"      # prefixed to owner pings
+# dashboard_url = "https://<dashboard host>"
+# spam_confidence = 0.9                     # 0..=1, minimum screening confidence for spam
+# acknowledge_valid = true                  # send "confirmed" when a report is valid
+# close_after_reply = true                  # close the conversation with terminal replies
+# assessment_timeout_secs = 1800
+# max_assessment_attempts = 3
+# duplicate_similarity = 0.75               # 0..=1, embedding similarity for duplicate candidates
+# duplicate_candidates = 5
+# scope = "Out of scope: ..."               # defaults to the standard program scope
+#
+# Reward prepared for the first valid reporter, confirmed by an admin.
+# [issues.helpscout.security.reward]
+# campaign = "SecurityResearchers"
+# credits = 100
+#
+# Customer reply templates (plain text, HTML-escaped when sent; line breaks are
+# kept). {reason} and {fixed_on} are filled in and are the only placeholders;
+# not_vulnerability and out_of_scope must contain {reason}, already_fixed must
+# contain {fixed_on}. Defaults are built in; override any of: confirmed,
+# not_reproducible, already_fixed, not_vulnerability, out_of_scope, duplicate,
+# fix_live, fix_live_rewarded.
+# [issues.helpscout.security.templates]
+# not_vulnerability = "Hi,\n\n... {reason}\n\nBest regards,\nAppwrite Security Team"
+#
+# Where production versions are pinned. A fix counts as live only when every
+# pinned production tag contains it.
+# [issues.helpscout.security.deployment]
+# configuration_repository = "appwrite-labs/application-configuration"
+# configuration_reference = "main"
+#
+# [[issues.helpscout.security.deployment.applications]]
+# repository = "appwrite-labs/cloud"
+# image = "appwrite/cloud"
+# directories = ["cloud/production/cloud", "cloud/production/cloud-background"]
+#
+# [[issues.helpscout.security.deployment.applications.packages]]
+# repository = "appwrite/appwrite"
+# package = "appwrite/server-ce"
+# lock_file = "composer.lock"
+
 [issues.github_code_scanning]
 # GitHub code-scanning alerts as an issue source. Each open alert runs through
 # the fix-to-PR pipeline like a GitHub issue. Authenticates with the

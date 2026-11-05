@@ -2,7 +2,7 @@
 
 /// Escape `text` so an HTML renderer shows it verbatim, inside element text or a
 /// double-quoted attribute value.
-pub(super) fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
         match character {

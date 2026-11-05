@@ -68,6 +68,7 @@ const FEATURE_PAGES: ReadonlyMap<string, FeaturePage> = new Map([
   ['llm', { path: '/models', label: 'Models' }],
   ['code_index', { path: '/repos', label: 'Repos' }],
   ['learning', { path: '/learning', label: 'Learning' }],
+  ['issues.helpscout.security', { path: '/security', label: 'Security' }],
 ])
 
 interface FeatureGroup {

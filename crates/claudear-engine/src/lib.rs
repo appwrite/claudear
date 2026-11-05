@@ -17,5 +17,6 @@ pub mod llm_classifier;
 pub mod processing;
 pub mod repo_index;
 pub mod retry;
+pub mod security;
 pub mod shutdown;
 pub mod watcher;
