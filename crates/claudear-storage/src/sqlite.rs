@@ -23611,6 +23611,27 @@ mod tests {
         const MODEL: &str = "test-model";
         const TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+        #[test]
+        fn test_vector_index_sizing_reads_no_embeddings() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let connection = tracker.acquire_lock().unwrap();
+            for index in tracker.vector_indexes.all() {
+                let count = index.statements().count;
+                let plan: Vec<String> = connection
+                    .prepare(&format!("EXPLAIN QUERY PLAN {count}"))
+                    .unwrap()
+                    .query_map([], |row| row.get(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert!(
+                    plan.iter().all(|step| step.contains("COVERING INDEX")),
+                    "{} sizing scans its embedding rows under the connection lock: {plan:?}",
+                    index.table()
+                );
+            }
+        }
+
         fn sample_code_chunk(repository_id: i64, index: usize) -> CodeChunk {
             CodeChunk {
                 id: None,
