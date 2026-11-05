@@ -18,6 +18,7 @@ use claudear_analysis::distribution::Roster;
 use claudear_config::config::Config;
 use claudear_config::config::PrDistributionConfig;
 use claudear_config::users::UserRegistry;
+use claudear_core::error::Error;
 use claudear_core::error::Result;
 use claudear_core::types::AssignmentStatus;
 use claudear_core::types::Issue;
@@ -142,7 +143,9 @@ impl Distributor {
     /// A PR that already has an assignee keeps it, so review reruns that
     /// report the same PR change nothing. Returns `None` when assignment on
     /// open is turned off, the PR is not a GitHub PR, or it does not need
-    /// anyone yet; the scheduled run picks those up later.
+    /// anyone yet; the scheduled run picks those up later. The assignment is
+    /// recorded only once the ping is delivered, so a failed ping leaves the
+    /// PR for the scheduled run to assign and ping again.
     pub async fn assign_opened(&self, pr_url: &str, issue: &Issue) -> Result<Option<PrAssignment>> {
         if !self.notify_on_open {
             return Ok(None);
@@ -192,11 +195,9 @@ impl Distributor {
             decision.reason,
             decision.score,
         );
+        self.notify(&pull_request, &assignment, None).await?;
         match self.store.record_pr_assignment(&assignment)? {
-            Some(stored) => {
-                self.notify(&pull_request, &stored, None).await?;
-                Ok(Some(stored))
-            }
+            Some(stored) => Ok(Some(stored)),
             None => self.store.active_pr_assignment(pr_url),
         }
     }
@@ -207,11 +208,13 @@ impl Distributor {
     /// PR with an active assignment, so an assignment outlives Claudear losing
     /// track of its PR (a failed review rerun, a reset) for as long as the PR
     /// is open on the host. Ends the assignments of merged and closed PRs,
-    /// hands the PRs of
-    /// developers who left the roster to someone else, and assigns every PR
-    /// still needing someone that has no assignee. With the digest on, every
-    /// assignee is then sent the PRs still waiting on them; with it off, each
-    /// new assignee is pinged instead.
+    /// hands the PRs of developers who left the roster to someone else, and
+    /// assigns every PR still needing someone that has no assignee. With the
+    /// digest on, every assignee is then sent the PRs still waiting on them;
+    /// with it off, each new assignee is pinged instead, and an assignment is
+    /// recorded only once its ping is delivered. A digest or ping that no
+    /// channel delivered fails the run, so the scheduler retries it and the
+    /// undelivered message is sent again.
     pub async fn distribute(&self, now: DateTime<Utc>) -> Result<Outcome> {
         let mut outcome = Outcome::default();
 
@@ -305,6 +308,7 @@ impl Distributor {
         }
 
         let mut assigned: Vec<(&Unassigned, PrAssignment)> = Vec::new();
+        let mut undelivered = 0;
         for decision in Balancer::new(&self.roster, self.tolerance).assign(pending, &held) {
             let Some(item) = unassigned.iter().find(|item| item.url == decision.key) else {
                 continue;
@@ -317,6 +321,21 @@ impl Distributor {
                 decision.reason,
                 decision.score,
             );
+            if !self.digest {
+                if let Err(error) = self
+                    .notify(&item.pull_request, &assignment, item.previous.clone())
+                    .await
+                {
+                    tracing::warn!(
+                        component = "pr_distribution",
+                        pr_url = %item.url,
+                        error = %error,
+                        "Failed to ping the new assignee; the PR stays unassigned until the next run"
+                    );
+                    undelivered += 1;
+                    continue;
+                }
+            }
             if let Some(stored) = self.store.record_pr_assignment(&assignment)? {
                 outcome.assigned += 1;
                 assigned.push((item, stored));
@@ -338,13 +357,14 @@ impl Distributor {
             if !digest.is_empty() {
                 self.notifier.notify_pr_digest(&digest).await?;
             }
-        } else {
-            for (item, assignment) in &assigned {
-                self.notify(&item.pull_request, assignment, item.previous.clone())
-                    .await?;
-            }
         }
 
+        if undelivered > 0 {
+            return Err(Error::Notifier {
+                notifier: self.notifier.name().to_string(),
+                message: format!("{undelivered} new assignees were not pinged"),
+            });
+        }
         Ok(outcome)
     }
 
@@ -533,15 +553,18 @@ fn github_pull_request(url: &str) -> Option<(String, i64)> {
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
+    use crate::notifier::CompositeNotifier;
+    use crate::notifier::ConsoleNotifier;
     use async_trait::async_trait;
     use claudear_analysis::distribution::Developer;
     use claudear_analysis::distribution::PullRequestState;
     use claudear_analysis::distribution::Review;
     use claudear_analysis::distribution::Verdict;
-    use claudear_core::error::Error;
     use claudear_core::types::AssignmentReason;
     use claudear_storage::AttemptTracker;
     use claudear_storage::SqliteTracker;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
     const REPO: &str = "org/repo";
@@ -628,6 +651,16 @@ mod tests {
     struct Recorder {
         notices: Mutex<Vec<AssignmentNotice>>,
         digests: Mutex<Vec<Digest>>,
+        unreachable: AtomicBool,
+    }
+
+    impl Recorder {
+        fn refuse(&self) -> Result<()> {
+            if self.unreachable.load(Ordering::SeqCst) {
+                return Err(Error::Other("channel unreachable".to_string()));
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -657,10 +690,12 @@ mod tests {
             Ok(())
         }
         async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
+            self.refuse()?;
             self.notices.lock().unwrap().push(notice.clone());
             Ok(())
         }
         async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
+            self.refuse()?;
             self.digests.lock().unwrap().push(digest.clone());
             Ok(())
         }
@@ -670,15 +705,27 @@ mod tests {
         store: Arc<SqliteTracker>,
         host: Arc<FakeHost>,
         recorder: Arc<Recorder>,
+        notifier: Arc<dyn Notifier>,
     }
 
     impl Harness {
         fn new(host: FakeHost) -> Self {
+            let recorder = Arc::new(Recorder::default());
+            let mut notifier = CompositeNotifier::new();
+            notifier.add(Arc::new(ConsoleNotifier::new()));
+            notifier.add(recorder.clone());
             Self {
                 store: Arc::new(SqliteTracker::in_memory().unwrap()),
                 host: Arc::new(host),
-                recorder: Arc::new(Recorder::default()),
+                recorder,
+                notifier: Arc::new(notifier),
             }
+        }
+
+        fn unreachable(&self, unreachable: bool) {
+            self.recorder
+                .unreachable
+                .store(unreachable, Ordering::SeqCst);
         }
 
         /// Record that Claudear opened PR `number`.
@@ -708,7 +755,7 @@ mod tests {
                 roster,
                 self.store.clone(),
                 self.host.clone(),
-                self.recorder.clone(),
+                self.notifier.clone(),
             )
         }
 
@@ -914,7 +961,7 @@ mod tests {
             Roster::from_developers(vec![Developer::new("amy"), Developer::new("bob")]),
             first.store.clone(),
             Arc::new(changed),
-            first.recorder.clone(),
+            first.notifier.clone(),
         );
         let outcome = sticky.distribute(Utc::now()).await.unwrap();
         assert_eq!(outcome.assigned, 0);
@@ -971,6 +1018,109 @@ mod tests {
         assert_eq!(notices[0].developer.login, "cat");
         assert_eq!(notices[0].previous.as_deref(), Some("amy"));
         assert_eq!(notices[0].reason, AssignmentReason::Load);
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_ping_fails_the_run_and_is_sent_on_the_next() {
+        let harness = Harness::new(FakeHost::with([open(1)]));
+        harness.opened(1);
+        let distributor = harness.distributor(
+            &["amy"],
+            PrDistributionConfig {
+                digest: false,
+                ..config()
+            },
+        );
+
+        harness.unreachable(true);
+        assert!(
+            distributor.distribute(Utc::now()).await.is_err(),
+            "a run whose ping reached nobody must fail so the scheduler retries it"
+        );
+        assert!(harness.assignees().is_empty());
+
+        harness.unreachable(false);
+        let outcome = distributor.distribute(Utc::now()).await.unwrap();
+
+        assert_eq!(outcome.assigned, 1);
+        assert_eq!(harness.assignees(), vec![(1, "amy".to_string())]);
+        let notices = harness.recorder.notices.lock().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].pull_request.url, url(1));
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_ping_on_open_leaves_the_pr_for_the_scheduled_run() {
+        let harness = Harness::new(FakeHost::with([open(1)]));
+        harness.opened(1);
+        let distributor = harness.distributor(
+            &["amy"],
+            PrDistributionConfig {
+                digest: false,
+                ..config()
+            },
+        );
+
+        harness.unreachable(true);
+        assert!(distributor
+            .assign_opened(&url(1), &requested_by("amy"))
+            .await
+            .is_err());
+        assert!(harness.assignees().is_empty());
+
+        harness.unreachable(false);
+        distributor.distribute(Utc::now()).await.unwrap();
+
+        assert_eq!(harness.assignees(), vec![(1, "amy".to_string())]);
+        assert_eq!(harness.recorder.notices.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_undelivered_ping_keeps_the_delivered_ones() {
+        let harness = Harness::new(FakeHost::with([open(1), open(2)]));
+        harness.opened(1);
+        let distributor = harness.distributor(
+            &["amy", "bob"],
+            PrDistributionConfig {
+                digest: false,
+                ..config()
+            },
+        );
+        distributor.distribute(Utc::now()).await.unwrap();
+        harness.opened(2);
+
+        harness.unreachable(true);
+        assert!(distributor.distribute(Utc::now()).await.is_err());
+        assert_eq!(harness.assignees().len(), 1);
+
+        harness.unreachable(false);
+        distributor.distribute(Utc::now()).await.unwrap();
+
+        assert_eq!(harness.assignees().len(), 2);
+        let notices = harness.recorder.notices.lock().unwrap();
+        let pinged: Vec<&str> = notices
+            .iter()
+            .map(|notice| notice.pull_request.url.as_str())
+            .collect();
+        assert_eq!(pinged, vec![url(1).as_str(), url(2).as_str()]);
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_digest_fails_the_run_and_is_sent_on_the_next() {
+        let harness = Harness::new(FakeHost::with([open(1)]));
+        harness.opened(1);
+        let distributor = harness.distributor(&["amy"], config());
+
+        harness.unreachable(true);
+        assert!(distributor.distribute(Utc::now()).await.is_err());
+
+        harness.unreachable(false);
+        let outcome = distributor.distribute(Utc::now()).await.unwrap();
+
+        assert_eq!(outcome.listed, 1);
+        let digests = harness.recorder.digests.lock().unwrap();
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests[0].groups[0].pull_requests[0].url, url(1));
     }
 
     #[tokio::test]
@@ -1155,7 +1305,7 @@ mod tests {
                 registry,
                 harness.store.clone(),
                 Some(harness.host.clone() as Arc<dyn PullRequestHost>),
-                harness.recorder.clone(),
+                harness.notifier.clone(),
             )
             .unwrap()
         };

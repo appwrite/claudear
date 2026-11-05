@@ -141,6 +141,7 @@ impl InstrumentedNotifier {
 impl Notifier for InstrumentedNotifier {
     delegate!(fn name(&self) -> &str);
     delegate!(fn is_enabled(&self) -> bool);
+    delegate!(fn is_local(&self) -> bool);
     delegate!(fn supports_replies(&self) -> bool);
     async fn poll_question_replies(
         &self,
@@ -306,7 +307,6 @@ impl Notifier for InstrumentedNotifier {
                 tracing::info!(
                     component = self.inner.name(),
                     pr_url = %notice.pull_request.url,
-                    assignee = %notice.developer.login,
                     "Notified PR assignment"
                 );
                 Ok(v)

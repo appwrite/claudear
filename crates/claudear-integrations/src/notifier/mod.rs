@@ -73,6 +73,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_analysis::distribution::AssignmentNotice;
 use claudear_analysis::distribution::Digest;
+use claudear_core::error::Error;
 use claudear_core::error::Result;
 use claudear_core::types::{AskDelivery, AskReply, AskRequest, Issue};
 use std::sync::Arc;
@@ -99,6 +100,12 @@ pub trait Notifier: Send + Sync {
 
     /// Whether this notifier is currently enabled/configured.
     fn is_enabled(&self) -> bool;
+
+    /// Whether this channel only writes to the local process output, so a
+    /// message it accepts still reaches nobody.
+    fn is_local(&self) -> bool {
+        false
+    }
 
     /// Notify that processing has started for an issue.
     async fn notify_start(&self, issue: &Issue) -> Result<()>;
@@ -256,6 +263,48 @@ impl CompositeNotifier {
             }
         }
     }
+
+    /// Send to every channel like [`Self::broadcast`], but fail when no
+    /// channel that reaches a person accepted the message, so the caller can
+    /// send it again later. Local channels never count as a delivery.
+    async fn deliver<F, Fut>(&self, f: F) -> Result<()>
+    where
+        F: Fn(Arc<dyn Notifier>) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let futures: Vec<_> = self
+            .notifiers
+            .iter()
+            .map(|notifier| f(Arc::clone(notifier)))
+            .collect();
+
+        let mut attempted = 0;
+        let mut failed: Vec<&str> = Vec::new();
+        for (notifier, result) in self
+            .notifiers
+            .iter()
+            .zip(futures::future::join_all(futures).await)
+        {
+            let remote = !notifier.is_local();
+            if remote {
+                attempted += 1;
+            }
+            if let Err(error) = result {
+                tracing::error!(notifier = notifier.name(), error = %error, "Notification error");
+                if remote {
+                    failed.push(notifier.name());
+                }
+            }
+        }
+
+        if attempted > 0 && failed.len() == attempted {
+            return Err(Error::Notifier {
+                notifier: self.name().to_string(),
+                message: format!("no channel delivered the message: {}", failed.join(", ")),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for CompositeNotifier {
@@ -272,6 +321,10 @@ impl Notifier for CompositeNotifier {
 
     fn is_enabled(&self) -> bool {
         !self.notifiers.is_empty()
+    }
+
+    fn is_local(&self) -> bool {
+        self.notifiers.iter().all(|notifier| notifier.is_local())
     }
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
@@ -406,22 +459,20 @@ impl Notifier for CompositeNotifier {
 
     async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<()> {
         let notice = notice.clone();
-        self.broadcast(|n| {
+        self.deliver(|n| {
             let notice = notice.clone();
             async move { n.notify_pr_assignment(&notice).await }
         })
-        .await;
-        Ok(())
+        .await
     }
 
     async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
         let digest = digest.clone();
-        self.broadcast(|n| {
+        self.deliver(|n| {
             let digest = digest.clone();
             async move { n.notify_pr_digest(&digest).await }
         })
-        .await;
-        Ok(())
+        .await
     }
 
     async fn ask_question(
@@ -1898,5 +1949,73 @@ mod tests {
 
         assert_eq!(first.get_call_count(), 2);
         assert_eq!(second.get_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_composite_pr_notifications_fail_when_every_channel_fails() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(FailingNotifier::new("discord")));
+        composite.add(Arc::new(FailingNotifier::new("slack")));
+
+        let assignment = composite.notify_pr_assignment(&assignment_notice()).await;
+        let digest = composite.notify_pr_digest(&pr_digest()).await;
+
+        assert!(
+            matches!(assignment, Err(Error::Notifier { .. })),
+            "an undelivered ping must fail so it is sent again: {assignment:?}"
+        );
+        assert!(
+            matches!(digest, Err(Error::Notifier { .. })),
+            "an undelivered digest must fail so it is sent again: {digest:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_composite_pr_notifications_succeed_when_one_channel_delivers() {
+        let mut composite = CompositeNotifier::new();
+        let working = Arc::new(MockNotifier::new("slack", true));
+        composite.add(Arc::new(FailingNotifier::new("discord")));
+        composite.add(Arc::clone(&working) as Arc<dyn Notifier>);
+
+        composite
+            .notify_pr_assignment(&assignment_notice())
+            .await
+            .unwrap();
+        composite.notify_pr_digest(&pr_digest()).await.unwrap();
+
+        assert_eq!(working.get_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_composite_pr_notifications_do_not_count_the_console_as_delivered() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(crate::telemetry::InstrumentedNotifier::wrap(Arc::new(
+            ConsoleNotifier::new(),
+        )));
+        composite.add(crate::telemetry::InstrumentedNotifier::wrap(Arc::new(
+            FailingNotifier::new("discord"),
+        )));
+
+        assert!(!composite.is_local());
+        assert!(composite
+            .notify_pr_assignment(&assignment_notice())
+            .await
+            .is_err());
+        assert!(composite.notify_pr_digest(&pr_digest()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_composite_pr_notifications_with_only_local_channels_succeed() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(crate::telemetry::InstrumentedNotifier::wrap(Arc::new(
+            ConsoleNotifier::new(),
+        )));
+
+        assert!(composite.is_local());
+        composite
+            .notify_pr_assignment(&assignment_notice())
+            .await
+            .unwrap();
+        composite.notify_pr_digest(&pr_digest()).await.unwrap();
     }
 }
