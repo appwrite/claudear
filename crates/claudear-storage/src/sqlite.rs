@@ -110,11 +110,7 @@ fn read_status(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<UserSt
 fn read_role(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Role> {
     let value: String = row.get(index)?;
     Ok(value.parse().unwrap_or_else(|_| {
-        let user_id: Option<i64> = row.get(0).ok();
-        tracing::warn!(
-            ?user_id,
-            "Unknown stored role; treating the user as a viewer"
-        );
+        tracing::warn!("Unknown stored role; treating the user as a viewer");
         Role::Viewer
     }))
 }
@@ -24401,16 +24397,24 @@ mod tests {
                     (pending, FUTURE.to_string()),
                 ])
             );
-            for user_id in [reissued, accepted, revoked, pending] {
-                assert_eq!(
-                    expiries.get(&user_id).cloned(),
+            let users = [reissued, accepted, revoked, pending];
+            let listed: Vec<Option<String>> = users
+                .iter()
+                .map(|user_id| expiries.get(user_id).cloned())
+                .collect();
+            let fetched: Vec<Option<String>> = users
+                .iter()
+                .map(|user_id| {
                     tracker
-                        .get_open_invite_for_user(user_id)
+                        .get_open_invite_for_user(*user_id)
                         .unwrap()
-                        .map(|invite| invite.expires_at),
-                    "user {user_id}"
-                );
-            }
+                        .map(|invite| invite.expires_at)
+                })
+                .collect();
+            assert_eq!(
+                listed, fetched,
+                "open_invite_expiries must agree with get_open_invite_for_user"
+            );
         }
 
         #[test]
@@ -24589,8 +24593,12 @@ mod tests {
                 invite: Some(invite("hash_secret_invite", FUTURE, 1)),
             };
             let output = format!("{write:?}");
-            for secret in [UNUSABLE_HASH, "hash_secret_invite", "amy@example.com"] {
-                assert!(!output.contains(secret), "Debug leaked {secret}");
+            for (label, value) in [
+                ("password hash", UNUSABLE_HASH),
+                ("invite token hash", "hash_secret_invite"),
+                ("login email", "amy@example.com"),
+            ] {
+                assert!(!output.contains(value), "Debug output leaked the {label}");
             }
             assert!(output.contains("Invited"));
         }
