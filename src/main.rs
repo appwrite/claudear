@@ -3821,6 +3821,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let tracker = create_tracker(&config);
         let rebuilder = tracker.spawn_vector_index_rebuilder()?;
         let chat = chat_state(&config, tracker.clone(), chat_embedding_client(&config));
+        let registry = UserRegistry::new(config.users.clone());
+        let directory_refresh = tokio::spawn(claudear_engine::registry::refresh_every(
+            registry.clone(),
+            tracker.clone(),
+            Duration::from_millis(config.poll_interval_ms),
+        ));
         let server = if let Some(dir) = dashboard_dir {
             ApiServer::with_dashboard(
                 config,
@@ -3837,6 +3843,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 std::path::PathBuf::from(config_path.clone()),
             )
         }
+        .with_registry(registry)
         .with_chat(chat);
 
         let shutdown = async {
@@ -3846,11 +3853,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("\nReceived shutdown signal...");
         };
 
-        tokio::select! {
-            result = server.start() => result?,
-            _ = shutdown => {}
-        }
+        let served = tokio::select! {
+            result = server.start() => result,
+            _ = shutdown => Ok(()),
+        };
+        directory_refresh.abort();
         rebuilder.stop();
+        served?;
 
         return Ok(());
     }
