@@ -1277,10 +1277,10 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
     }
 
     async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
-        for message in build_pr_digest_messages(digest) {
-            self.send(message).await?;
-        }
-        Ok(())
+        super::send_each(self.name(), build_pr_digest_messages(digest), |message| {
+            self.send(message)
+        })
+        .await
     }
 
     async fn ask_question(
@@ -1463,6 +1463,7 @@ mod tests {
         last_get_calls: Mutex<Vec<(String, Option<String>)>>,
         /// Optional per-URL response overrides (url prefix -> response body).
         get_responses: Mutex<Vec<(String, String)>>,
+        failing_call: Option<usize>,
     }
 
     impl MockSlackHttpClient {
@@ -1474,7 +1475,14 @@ mod tests {
                 last_post_calls: Mutex::new(Vec::new()),
                 last_get_calls: Mutex::new(Vec::new()),
                 get_responses: Mutex::new(Vec::new()),
+                failing_call: None,
             }
+        }
+
+        /// Fail the `call`th request (counting from 1) with a server error.
+        fn failing_on(mut self, call: usize) -> Self {
+            self.failing_call = Some(call);
+            self
         }
 
         fn success() -> Self {
@@ -1519,12 +1527,15 @@ mod tests {
             body: &serde_json::Value,
             auth_token: Option<&str>,
         ) -> Result<HttpResponse> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
             self.last_post_calls.lock().unwrap().push((
                 url.to_string(),
                 body.clone(),
                 auth_token.map(|s| s.to_string()),
             ));
+            if self.failing_call == Some(call) {
+                return Ok(HttpResponse::new(500, "unavailable".to_string()));
+            }
 
             Ok(HttpResponse::new(
                 self.response_status,
@@ -2097,6 +2108,53 @@ mod tests {
         assert_eq!(notifier.http.get_call_count(), 1);
         let (_, body, _) = notifier.http.get_last_post_call().unwrap();
         assert_eq!(body["text"], "<@U1> 1 Claudear PR waiting on you:");
+    }
+
+    fn two_group_digest() -> Digest {
+        Digest {
+            groups: vec![
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("amy", Some("U1")),
+                    pull_requests: vec![pr_summary(1)],
+                },
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("bob", Some("U2")),
+                    pull_requests: vec![pr_summary(2)],
+                },
+            ],
+            generated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notify_pr_digest_delivers_past_a_failed_assignee() {
+        let notifier = SlackNotifier::with_http_client(
+            webhook_config(),
+            MockSlackHttpClient::success().failing_on(1),
+        );
+
+        notifier
+            .notify_pr_digest(&two_group_digest())
+            .await
+            .expect("a digest that reached one assignee must not be resent");
+
+        assert_eq!(notifier.http.get_call_count(), 2);
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        assert_eq!(body["text"], "<@U2> 1 Claudear PR waiting on you:");
+    }
+
+    #[tokio::test]
+    async fn test_notify_pr_digest_fails_when_no_assignee_was_reached() {
+        let notifier = SlackNotifier::with_http_client(
+            webhook_config(),
+            MockSlackHttpClient::error(500, "unavailable"),
+        );
+
+        assert!(notifier
+            .notify_pr_digest(&two_group_digest())
+            .await
+            .is_err());
+        assert_eq!(notifier.http.get_call_count(), 2);
     }
 
     #[tokio::test]

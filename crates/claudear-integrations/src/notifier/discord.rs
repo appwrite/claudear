@@ -1508,10 +1508,21 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     }
 
     async fn notify_pr_digest(&self, digest: &Digest) -> Result<()> {
-        for (message, allowed_mentions) in build_pr_digest_messages(digest) {
-            let _ = self.send_allowing(message, Some(allowed_mentions)).await?;
-        }
-        Ok(())
+        let mut messages = build_pr_digest_messages(digest).into_iter();
+        let Some((title, allowed_mentions)) = messages.next() else {
+            return Ok(());
+        };
+        self.send_allowing(title, Some(allowed_mentions)).await?;
+        super::send_each(
+            self.name(),
+            messages.collect(),
+            |(message, allowed_mentions)| async move {
+                self.send_allowing(message, Some(allowed_mentions))
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
     }
 
     async fn ask_question(
@@ -2093,6 +2104,7 @@ mod tests {
         response_body: String,
         call_count: AtomicUsize,
         last_calls: Mutex<Vec<(String, serde_json::Value)>>,
+        failing_call: Option<usize>,
     }
 
     impl MockDiscordWebhookClient {
@@ -2102,7 +2114,14 @@ mod tests {
                 response_body: body.to_string(),
                 call_count: AtomicUsize::new(0),
                 last_calls: Mutex::new(Vec::new()),
+                failing_call: None,
             }
+        }
+
+        /// Fail the `call`th request (counting from 1) with a server error.
+        fn failing_on(mut self, call: usize) -> Self {
+            self.failing_call = Some(call);
+            self
         }
 
         fn success() -> Self {
@@ -2125,11 +2144,14 @@ mod tests {
     #[async_trait]
     impl DiscordWebhookClient for MockDiscordWebhookClient {
         async fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<HttpResponse> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
             self.last_calls
                 .lock()
                 .unwrap()
                 .push((url.to_string(), body.clone()));
+            if self.failing_call == Some(call) {
+                return Ok(HttpResponse::new(500, "unavailable".to_string()));
+            }
 
             Ok(HttpResponse::new(
                 self.response_status,
@@ -4307,6 +4329,65 @@ mod tests {
             generated_at: Utc::now(),
         };
         assert!(build_pr_digest_messages(&digest).is_empty());
+    }
+
+    fn two_group_digest() -> Digest {
+        Digest {
+            groups: vec![
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("amy", Some("1")),
+                    pull_requests: vec![pr_summary(1)],
+                },
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("bob", Some("2")),
+                    pull_requests: vec![pr_summary(2)],
+                },
+            ],
+            generated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notify_pr_digest_delivers_past_a_failed_assignee() {
+        let notifier = DiscordNotifier::with_http_client(
+            enabled_config(),
+            MockDiscordWebhookClient::success().failing_on(2),
+        );
+
+        notifier
+            .notify_pr_digest(&two_group_digest())
+            .await
+            .expect("a digest that reached one assignee must not be resent");
+
+        assert_eq!(notifier.http.get_call_count(), 3);
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        assert!(body["content"].as_str().unwrap().starts_with("<@2> "));
+    }
+
+    #[tokio::test]
+    async fn test_notify_pr_digest_fails_when_no_assignee_was_reached() {
+        let notifier = DiscordNotifier::with_http_client(
+            enabled_config(),
+            MockDiscordWebhookClient::success().failing_on(1),
+        );
+        assert!(notifier
+            .notify_pr_digest(&two_group_digest())
+            .await
+            .is_err());
+        assert_eq!(
+            notifier.http.get_call_count(),
+            1,
+            "a digest whose title failed sends nothing more"
+        );
+
+        let notifier = DiscordNotifier::with_http_client(
+            enabled_config(),
+            MockDiscordWebhookClient::error(500, "unavailable"),
+        );
+        assert!(notifier
+            .notify_pr_digest(&two_group_digest())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

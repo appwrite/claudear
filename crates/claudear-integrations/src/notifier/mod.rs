@@ -92,6 +92,39 @@ pub(crate) fn get_source_emoji(source: &str) -> &'static str {
     }
 }
 
+/// Send each message of a PR digest in turn, carrying on past one that fails
+/// so the assignees after it still get theirs. Fails only when none was
+/// delivered: failing once some were would have the scheduler resend those.
+pub(crate) async fn send_each<M, F, Fut>(channel: &str, messages: Vec<M>, send: F) -> Result<()>
+where
+    F: Fn(M) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let total = messages.len();
+    let mut failed = 0;
+    let mut last = None;
+    for message in messages {
+        if let Err(error) = send(message).await {
+            failed += 1;
+            last = Some(error);
+        }
+    }
+    let Some(error) = last else {
+        return Ok(());
+    };
+    if failed == total {
+        return Err(error);
+    }
+    tracing::warn!(
+        notifier = channel,
+        failed,
+        total,
+        error = %error,
+        "Some PR digest messages were not delivered"
+    );
+    Ok(())
+}
+
 /// Trait for notification services.
 #[async_trait]
 pub trait Notifier: Send + Sync {
