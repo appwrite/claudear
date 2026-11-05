@@ -1,8 +1,8 @@
 //! Automatic port forwarding for privileged ports (< 1024).
 //!
-//! When running without root privileges, privileged ports cannot be bound
-//! directly. This module detects the OS and delegates to the appropriate
-//! platform backend:
+//! When the process may not bind a privileged port directly (not root, and on
+//! Linux without `CAP_NET_BIND_SERVICE`), this module detects the OS and
+//! delegates to the appropriate platform backend:
 //!
 //! - **macOS**: [`macos`] — `pfctl` rules in a pf anchor.
 //! - **Linux**: [`linux`] — `iptables` NAT REDIRECT rules.
@@ -15,6 +15,8 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, TcpListener};
 use std::process::Command;
 
 /// Offset added to privileged ports to get the actual bind port.
@@ -43,10 +45,17 @@ impl Drop for PortForwardGuard {
     }
 }
 
-/// Returns `true` if the given port is privileged and we are running
-/// on a supported OS as a non-root user (i.e. we cannot bind to it directly).
+/// Returns `true` if the given port is privileged and the OS refuses to let
+/// this process bind it directly.
 pub fn needs_port_forward(port: u16) -> bool {
-    is_supported_platform() && port < 1024 && !is_root()
+    is_supported_platform() && port < 1024 && bind_refused(port)
+}
+
+fn bind_refused(port: u16) -> bool {
+    matches!(
+        TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)),
+        Err(error) if error.kind() == ErrorKind::PermissionDenied
+    )
 }
 
 /// Get the high port to actually bind to when forwarding is needed.
@@ -88,10 +97,6 @@ pub fn setup_port_forward(
         redirects: redirects.to_vec(),
     })
 }
-
-// ---------------------------------------------------------------------------
-// Platform dispatch
-// ---------------------------------------------------------------------------
 
 fn is_supported_platform() -> bool {
     cfg!(target_os = "macos") || cfg!(target_os = "linux")
@@ -142,10 +147,6 @@ fn platform_cleanup_hint(_redirects: &[(u16, u16)]) -> Vec<String> {
     Vec::new()
 }
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
 /// Pre-authenticate sudo so subsequent calls reuse the cached credential.
 fn ensure_sudo() -> Result<(), String> {
     tracing::info!("Port forwarding requires sudo — you may be prompted for your password");
@@ -162,24 +163,9 @@ fn ensure_sudo() -> Result<(), String> {
     Ok(())
 }
 
-/// Check if the current process is running as root.
-fn is_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // forwarded_port
-    // -----------------------------------------------------------------------
 
     #[test]
     fn forwarded_port_standard_https() {
@@ -229,10 +215,6 @@ mod tests {
         assert_eq!(forwarded_port(max_non_saturating), u16::MAX);
     }
 
-    // -----------------------------------------------------------------------
-    // needs_port_forward
-    // -----------------------------------------------------------------------
-
     #[test]
     fn needs_port_forward_high_ports_never_forwarded() {
         assert!(!needs_port_forward(1024));
@@ -243,44 +225,29 @@ mod tests {
     }
 
     #[test]
-    fn needs_port_forward_privileged_ports_on_supported_os() {
-        if is_supported_platform() && !is_root() {
-            assert!(needs_port_forward(80));
-            assert!(needs_port_forward(443));
-            assert!(needs_port_forward(1));
-            assert!(needs_port_forward(1023));
+    fn needs_port_forward_only_when_the_os_refuses_the_bind() {
+        if !is_supported_platform() {
+            return;
+        }
+        for port in [1, 80, 443, 1023] {
+            let refused = matches!(
+                std::net::TcpListener::bind(("0.0.0.0", port)),
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(needs_port_forward(port), refused, "port {port}");
         }
     }
 
     #[test]
-    fn needs_port_forward_port_zero() {
-        if is_supported_platform() && !is_root() {
-            assert!(needs_port_forward(0));
-        }
+    fn needs_port_forward_port_zero_binds_an_ephemeral_port() {
+        assert!(!needs_port_forward(0));
     }
-
-    // -----------------------------------------------------------------------
-    // is_root
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn is_root_consistent() {
-        assert_eq!(is_root(), is_root());
-    }
-
-    // -----------------------------------------------------------------------
-    // is_supported_platform
-    // -----------------------------------------------------------------------
 
     #[test]
     fn is_supported_platform_matches_cfg() {
         let expected = cfg!(target_os = "macos") || cfg!(target_os = "linux");
         assert_eq!(is_supported_platform(), expected);
     }
-
-    // -----------------------------------------------------------------------
-    // Guard
-    // -----------------------------------------------------------------------
 
     #[test]
     fn guard_empty_does_not_panic() {
@@ -314,18 +281,10 @@ mod tests {
         assert!(guard.redirects.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // Constants
-    // -----------------------------------------------------------------------
-
     #[test]
     fn port_offset_is_8000() {
         assert_eq!(PORT_OFFSET, 8000);
     }
-
-    // -----------------------------------------------------------------------
-    // Platform cleanup hint
-    // -----------------------------------------------------------------------
 
     #[test]
     fn cleanup_hint_not_empty_for_nonempty_redirects() {

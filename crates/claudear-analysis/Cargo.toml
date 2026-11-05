@@ -70,6 +70,7 @@ rayon = { workspace = true }
 walkdir = { workspace = true }
 
 # Crypto (for content hashing)
+hex = { workspace = true }
 sha2 = { workspace = true }
 
 # Logging
@@ -97,4 +98,5 @@ dirs = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 tempfile = { workspace = true }

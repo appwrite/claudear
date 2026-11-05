@@ -68,7 +68,7 @@ hex = { workspace = true }
 rand = { workspace = true }
 
 # Configuration
-toml = { workspace = true }
+toml = { workspace = true, features = ["preserve_order"] }
 
 # UUID
 uuid = { workspace = true }
@@ -95,5 +95,8 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 abnegate-http = { workspace = true }
+claudear-analysis = { workspace = true, features = ["test-support"] }
 http-body-util = { workspace = true }
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = { workspace = true }

@@ -223,7 +223,19 @@ weight = 0.2
 # ============================================
 # Map team members to their identifiers across services.
 # When an issue is assigned to a user, notifications are routed to them specifically.
-# Global config fields (e.g. notifiers.discord.user_id) can reference user slugs instead of raw IDs.
+# Global config fields (e.g. notifiers.discord.user_id) can reference user slugs instead of raw IDs;
+# they are resolved each time a notification is sent, so dashboard edits apply without a restart.
+#
+# These entries are the seed and fallback for identities edited in the dashboard
+# (Users page, or Settings > My Identities). A dashboard user's identities replace
+# this whole entry, config-only fields included, when their person key is "jake":
+# an admin set their slug to "jake", or their dashboard LOGIN email is
+# jake@example.com (the email below). The identity email they edit themselves
+# never links. Entries without a dashboard override stay active.
+# Reverting to config in the dashboard brings this entry back.
+#
+# A person with github_usernames (here or in the dashboard) is on the
+# [pr_distribution] roster.
 
 [users.jake]
 # Source identifiers (accepts a single string or a list of strings)
@@ -631,6 +643,102 @@ webhook_secret = ""
 # Polling interval in milliseconds (overrides global)
 poll_interval_ms = 300000
 
+# Per-mailbox overrides. Each entry is polled in addition to mailbox_ids, and
+# unset fields inherit the values above. trigger_tags = [] matches every
+# conversation in that mailbox.
+#
+# profile = "security" routes the mailbox to the Security inbox: reports are
+# screened for spam, validated read-only against the current code, deduplicated
+# (first reporter wins), fixed through a neutral PR, tracked until the fix is
+# live on Cloud, and answered with the fixed templates below. A security
+# mailbox always sends real customer replies, so reply_as = "note" on it is a
+# config error. Generic paths (webhooks, notes, MCP listing) never handle it.
+# A security mailbox does not inherit the top-level trigger_tags: unset means
+# every conversation. Mailbox ids must not have surrounding whitespace.
+#
+# [[issues.helpscout.mailboxes]]
+# id = "249891"              # Security <security@appwrite.io>
+# profile = "security"
+# trigger_tags = []
+# trigger_status = "active"
+#
+# [[issues.helpscout.mailboxes]]
+# id = "249877"              # Support: optional overrides for an existing mailbox
+# reply_as = "note"
+# trigger_tags = ["auto-implement", "claude"]
+
+# Security inbox. Requires a mailbox with the security profile.
+# [issues.helpscout.security]
+# enabled = true
+# process_after = "2026-11-05T00:00:00Z"   # required: never touch the existing backlog
+# spam_action = "close"                     # "close" or "spam"
+# default_repository = "appwrite-labs/cloud"
+# owner_mention = "<@DISCORD_USER_ID>"      # prefixed to owner pings
+# dashboard_url = "https://<dashboard host>"
+# spam_confidence = 0.9                     # 0..=1, minimum screening confidence for spam
+# acknowledge_valid = true                  # send "confirmed" when a report is valid
+# close_after_reply = true                  # close the conversation with terminal replies
+# assessment_timeout_secs = 1800
+# max_assessment_attempts = 3
+# duplicate_similarity = 0.75               # 0..=1, embedding similarity for duplicate candidates
+# duplicate_candidates = 5
+# scope = "Out of scope: ..."               # defaults to the standard program scope
+#
+# Reward prepared for the first valid reporter, confirmed by an admin.
+# [issues.helpscout.security.reward]
+# campaign = "SecurityResearchers"
+# credits = 100
+#
+# Customer reply templates (plain text, HTML-escaped when sent; line breaks are
+# kept). {reason} and {fixed_on} are filled in and are the only placeholders;
+# not_vulnerability and out_of_scope must contain {reason}, already_fixed must
+# contain {fixed_on}. Defaults are built in; override any of: confirmed,
+# not_reproducible, already_fixed, not_vulnerability, out_of_scope, duplicate,
+# fix_live, fix_live_rewarded.
+# [issues.helpscout.security.templates]
+# not_vulnerability = "Hi,\n\n... {reason}\n\nBest regards,\nAppwrite Security Team"
+#
+# Where production versions are pinned. A fix counts as live only when every
+# pinned production tag contains it.
+# [issues.helpscout.security.deployment]
+# configuration_repository = "appwrite-labs/application-configuration"
+# configuration_reference = "main"
+#
+# [[issues.helpscout.security.deployment.applications]]
+# repository = "appwrite-labs/cloud"
+# image = "appwrite/cloud"
+# directories = ["cloud/production/cloud", "cloud/production/cloud-background"]
+#
+# [[issues.helpscout.security.deployment.applications.packages]]
+# repository = "appwrite/appwrite"
+# package = "appwrite/server-ce"
+# lock_file = "composer.lock"
+
+[issues.github_code_scanning]
+# GitHub code-scanning alerts as an issue source. Each open alert runs through
+# the fix-to-PR pipeline like a GitHub issue. Authenticates with the
+# [scm.github] token, which needs the security_events scope (classic PAT) or
+# "Code scanning alerts: read" (fine-grained token).
+# Alerts take no comments and are never dismissed: an alert closes itself when
+# the next scan stops reporting it.
+enabled = false
+
+# Repositories to poll for open alerts (e.g., ["owner/repo"])
+repos = ["my-org/my-repo"]
+
+# Analysis tool names to include (one API request per tool). Empty includes all tools.
+tool_names = ["CodeQL"]
+
+# Severities to include, matched against rule.security_severity_level
+# (critical, high, medium, low), falling back to rule.severity (error, warning, note).
+# Default: ["critical", "high", "medium"]
+severities = ["critical", "high", "medium"]
+
+# Per-source rate limiting (overrides global values if set)
+max_issues_per_cycle = 3
+max_concurrent = 2
+poll_interval_ms = 3600000
+
 # ============================================
 # Notifiers
 # ============================================
@@ -868,7 +976,9 @@ skip_if_previous_running = true
 # up to [retry] max_retries times.
 timeout_secs = 1800
 discord_channel_id = "990878183580651571"
-# GitHub login -> Discord user map for the FAIL @releaser mention. Use an
+# GitHub login -> Discord user map for the FAIL @releaser mention, used only
+# when the person who owns that GitHub login in the user registry ([users] or
+# dashboard identities) has no discord_id, or no person owns the login. Use an
 # absolute path: a relative one breaks under systemd and drops the mention.
 github_discord_map_path = "/etc/claudear/github-discord-map.json"
 # Optional; defaults to the bundled playbooks/deploy_qa.md. When set, use an
@@ -876,25 +986,77 @@ github_discord_map_path = "/etc/claudear/github-discord-map.json"
 # instructions_path = "/etc/claudear/deploy_qa.md"
 
 # Track names must be unique and must not contain ':'; repo is owner/name.
+# tag_filter: "any", "suffix:<text>", "not_suffix:<text>" or "prefix:<text>".
+# Tracks sharing a repo need filters that split its tags between them, or each
+# runs QA on the same tag. A prefix track reads the repo's tags under that
+# prefix (GitHub releases need not exist), takes the highest version after the
+# prefix, and names the change range since the previous tag in the prompt.
 [[deploy_qa.tracks]]
 name = "cloud"
 repo = "appwrite-labs/cloud"
 tag_filter = "any"
 
 [[deploy_qa.tracks]]
-name = "edge-db"
-repo = "appwrite-labs/edge"
-tag_filter = "suffix:-db"
-
-[[deploy_qa.tracks]]
-name = "edge-network"
+name = "edge"
 repo = "appwrite-labs/edge"
 tag_filter = "not_suffix:-db"
 
 [[deploy_qa.tracks]]
-name = "vibes"
-repo = "appwrite/vibes"
-tag_filter = "any"
+name = "edge-db"
+repo = "appwrite-labs/edge"
+tag_filter = "suffix:-db"
+
+# The console deploys from apps/console/<version> tags in the appwrite
+# monorepo. Its production workflow publishes each deploy's GitHub release
+# (never marked latest, since the repo's other releases are the server's),
+# which the poller uses; a tag without one is QA'd as a bare tag.
+[[deploy_qa.tracks]]
+name = "console"
+repo = "appwrite/appwrite"
+tag_filter = "prefix:apps/console/"
+
+# ============================================
+# PR Distribution
+# ============================================
+# Makes one developer responsible for each open Claudear PR and pings them,
+# balanced so no single developer ends up holding every PR. If you're tagged,
+# it's your responsibility to get the PR over the line.
+#
+# The roster is everyone in the user directory (dashboard identities merged with
+# [users]) who owns a GitHub login, plus logins in the [deploy_qa]
+# github_discord_map_path map that nobody owns, minus `excluded`. It is rebuilt
+# for every PR and scheduled run, so dashboard edits apply without a restart.
+# Mentions use each developer's Discord id on Discord (the map fills in a
+# missing one) and Slack id on Slack, and @login elsewhere.
+#
+# Ownership, strongest first: who asked for the work (the issue's resolved
+# [users] assignee, a GitHub issue's assignee or author, or the Discord/Slack
+# user who posted it), CODEOWNERS for the changed files, recent commits to the
+# changed files, then recent commits to the repository. Each PR goes to its
+# strongest owner still under the fair share (open PRs / roster size, rounded
+# up, plus `tolerance`), otherwise to the least-loaded developer. Assignments
+# are sticky until the PR merges or closes or the assignee leaves the roster.
+# Requires scm.github.token.
+
+[pr_distribution]
+# Off by default (default: false)
+enabled = false
+# Assign and ping as soon as Claudear opens a PR (default: true). When false,
+# new PRs are assigned on the next scheduled run.
+notify_on_open = true
+# Send each assignee the PRs still waiting on them on every scheduled run
+# (default: true). When false, the scheduled run pings each new assignee.
+digest = true
+# How often the scheduled run fires: "daily", "weekly-monday" .. "weekly-sunday",
+# or "monthly" (default: "daily"). Any other value fails config loading.
+digest_frequency = "daily"
+# Hour the scheduled run fires, 0-23 UTC (default: 9)
+digest_hour = 9
+# GitHub logins never assigned, e.g. people on leave (default: [])
+excluded = []
+# PRs a developer may hold above the fair share before an owner loses a PR to
+# someone less loaded (default: 0)
+tolerance = 0
 
 # Enables chained follow-up fixes across repositories.
 
@@ -1181,6 +1343,14 @@ max_plan_monthly_cost = 0.0
 # Hourly engineer rate for cost-savings calculation (default: 150.0)
 hourly_engineer_rate = 150.0
 
+# Address people use to reach the dashboard, used to build absolute invite
+# links (invite_url). It must be the dashboard's origin with no sub-path,
+# because the dashboard is served from /. Unset, the API returns only the
+# relative /invite#cldi_... link and invite_url is null. A trailing slash is
+# fine.
+# Env override: CLAUDEAR_DASHBOARD_PUBLIC_URL (empty means unset).
+# public_url = "https://claudear.example.com"
+
 # ============================================
 # Local LLM
 # ============================================
@@ -1316,7 +1486,8 @@ reindex_interval_hours = 6.0
 # frequently and posts them once a week to your notifier(s), mentioning
 # notifiers.discord.user_id on Discord so a human can act. Report-only: it does
 # not change the fix pipeline. Requires a configured Sentry source + Discord
-# webhook.
+# webhook. The on-call mention resolves through the user registry like every
+# other notifier reference.
 
 # Enable the weekly digest (default: false)
 enabled = false

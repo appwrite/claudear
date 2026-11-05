@@ -3,6 +3,7 @@ import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/re
 import { Router, RouterProvider } from "../src/router";
 import { Sidebar } from "../src/components/layout/sidebar";
 import { AuthProvider } from "../src/lib/auth";
+import { resetPrefetchedRoutes } from "../src/lib/route-prefetch";
 
 function jsonResponse(data: unknown, status = 200) {
   return {
@@ -76,8 +77,10 @@ describe("Sidebar", () => {
       "Errors",
       "Feedback",
       "Regressions",
+      "Deploy QA",
       "Experiments",
       "Repos",
+      "Integrations",
       "Inference",
       "Activity",
       "Telemetry",
@@ -166,13 +169,57 @@ describe("Sidebar", () => {
     expect(window.location.pathname).toBe("/users");
   });
 
-  test("does not show admin section for non-admin user", async () => {
+  test("shows the Security nav item in the Work group for admins", async () => {
+    renderSidebarWithAuth("/");
+    const security = await screen.findByText("Security");
+    const prs = screen.getByText("PRs").closest("button");
+    expect(prs?.parentElement?.contains(security)).toBe(true);
+    fireEvent.click(security.closest("button")!);
+    expect(window.location.pathname).toBe("/security");
+  });
+
+  test("hides the Security nav item for non-admin users", async () => {
     renderSidebarWithAuth("/", { id: 2, email: "user@test.com", name: "Regular", role: "viewer" });
     await waitFor(() => {
       expect(screen.getByText("Regular")).toBeTruthy();
     });
+    expect(screen.queryByText("Security")).toBeNull();
+  });
+
+  test("hides the Security nav item without a signed-in user", () => {
+    renderSidebar();
+    expect(screen.queryByText("Security")).toBeNull();
+  });
+
+  test("non-admin user sees Users but not the admin section", async () => {
+    renderSidebarWithAuth("/", { id: 2, email: "user@test.com", name: "Regular", role: "viewer" });
+    await waitFor(() => {
+      expect(screen.getByText("Regular")).toBeTruthy();
+    });
+    expect(screen.getByText("Users")).toBeTruthy();
     expect(screen.queryByText("Config")).toBeNull();
+    expect(screen.queryByText("Admin")).toBeNull();
+  });
+
+  test("non-admin Users button navigates to /users without prefetching the admin user list", async () => {
+    renderSidebarWithAuth("/", { id: 2, email: "user@test.com", name: "Regular", role: "viewer" });
+    await waitFor(() => {
+      expect(screen.getByText("Users")).toBeTruthy();
+    });
+    resetPrefetchedRoutes();
+    const usersBtn = screen.getByText("Users").closest("button");
+    fireEvent.mouseEnter(usersBtn!);
+    fireEvent.focus(usersBtn!);
+    const requested = (globalThis.fetch as unknown as ReturnType<typeof mock>).mock.calls.map(([input]) => String(input));
+    expect(requested.some((url) => url.endsWith("/api/users"))).toBe(false);
+    fireEvent.click(usersBtn!);
+    expect(window.location.pathname).toBe("/users");
+  });
+
+  test("signed-out sidebar shows neither Users nor Config", () => {
+    renderSidebar();
     expect(screen.queryByText("Users")).toBeNull();
+    expect(screen.queryByText("Config")).toBeNull();
   });
 
   test("shows user name and email when loaded", async () => {

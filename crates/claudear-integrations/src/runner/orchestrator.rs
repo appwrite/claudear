@@ -3,13 +3,14 @@
 //! Implements `AgentRunner` itself (composite pattern), so consumers hold
 //! `Arc<dyn AgentRunner>` and are completely unaware of orchestration logic.
 
-use super::{AgentRunner, ProviderCapabilities};
+use super::{AgentRunner, ProviderCapabilities, SecuritySandbox};
 use async_trait::async_trait;
 use claudear_core::error::{Error, Result};
 use claudear_core::types::{AgentResult, Issue, ReplyKind, VerifyResult};
 use rand::RngExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A provider with an associated weight for experiment selection.
 pub struct WeightedProvider {
@@ -253,6 +254,31 @@ impl AgentRunner for AgentOrchestrator {
             .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
         provider
             .structured_query(prompt, json_schema, project_dir)
+            .await
+    }
+
+    fn supports_security_query(&self) -> bool {
+        self.providers
+            .first()
+            .is_some_and(|primary| primary.provider.supports_security_query())
+    }
+
+    async fn security_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+        sandbox: SecuritySandbox,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        // Security queries always use the primary provider.
+        let provider = self
+            .providers
+            .first()
+            .map(|p| &p.provider)
+            .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
+        provider
+            .security_query(prompt, json_schema, project_dir, sandbox, timeout)
             .await
     }
 }
@@ -1075,8 +1101,6 @@ mod tests {
         );
     }
 
-    // --- Additional orchestrator tests ---
-
     #[tokio::test]
     async fn test_orchestrator_passes_prompt_through() {
         use std::sync::Mutex;
@@ -1456,5 +1480,88 @@ mod tests {
         let original = SelectionStrategy::Fallback;
         let cloned = original.clone();
         assert!(matches!(cloned, SelectionStrategy::Fallback));
+    }
+
+    #[tokio::test]
+    async fn test_security_query_uses_the_primary_provider() {
+        let primary = Arc::new(crate::runner::tests::SecurityRecorder::default());
+        let secondary = Arc::new(crate::runner::tests::SecurityRecorder::default());
+        let orchestrator = AgentOrchestrator::new(
+            vec![
+                WeightedProvider {
+                    provider: primary.clone(),
+                    weight: 1.0,
+                },
+                WeightedProvider {
+                    provider: secondary.clone(),
+                    weight: 1.0,
+                },
+            ],
+            SelectionStrategy::WeightedRandom,
+            None,
+        );
+
+        assert!(orchestrator.supports_security_query());
+        let answer = orchestrator
+            .security_query(
+                "prompt",
+                "{}",
+                Path::new("."),
+                SecuritySandbox::NoTools,
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answer, serde_json::json!({"ok": true}));
+        assert_eq!(
+            *primary.queries.lock().unwrap(),
+            vec![(
+                "prompt".to_string(),
+                "{}".to_string(),
+                SecuritySandbox::NoTools,
+                Duration::from_secs(3),
+            )]
+        );
+        assert!(secondary.queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_security_query_follows_the_primary_providers_support() {
+        let orchestrator = AgentOrchestrator::new(
+            vec![WeightedProvider {
+                provider: Arc::new(MockProvider {
+                    name: "alpha".into(),
+                    should_fail: false,
+                }),
+                weight: 1.0,
+            }],
+            SelectionStrategy::Primary,
+            None,
+        );
+        assert!(!orchestrator.supports_security_query());
+        assert!(orchestrator
+            .security_query(
+                "prompt",
+                "{}",
+                Path::new("."),
+                SecuritySandbox::NoTools,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err());
+
+        let empty = AgentOrchestrator::new(vec![], SelectionStrategy::Primary, None);
+        assert!(!empty.supports_security_query());
+        assert!(empty
+            .security_query(
+                "prompt",
+                "{}",
+                Path::new("."),
+                SecuritySandbox::NoTools,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err());
     }
 }

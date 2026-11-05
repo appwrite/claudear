@@ -30,6 +30,10 @@ impl Notifier for ConsoleNotifier {
         true
     }
 
+    fn is_local(&self) -> bool {
+        true
+    }
+
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
         println!(
             "\n[{}] Processing: {} - {}",

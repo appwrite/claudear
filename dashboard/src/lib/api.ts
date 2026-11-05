@@ -116,11 +116,15 @@ export interface SourcesResponse {
 }
 
 
+export type Role = 'admin' | 'viewer'
+
+export const ADMIN_ROLE: Role = 'admin'
+
 export interface AuthUser {
   id: number
   email: string
   name: string
-  role: string
+  role: Role
   avatar_url: string | null
 }
 
@@ -128,15 +132,85 @@ export interface LoginResponse {
   user: AuthUser
 }
 
+export type UserStatus = 'active' | 'invited'
+
 export interface UserRecord {
   id: number
   email: string
   name: string
-  role: string
+  role: Role
   avatar_url: string | null
+  status: UserStatus
+  invite_expires_at: string | null
   created_at: string
   updated_at: string
 }
+
+export interface UserInvite {
+  invite_link: string
+  invite_url: string | null
+  expires_at: string
+}
+
+export interface CreatedUser extends UserRecord {
+  invite: UserInvite | null
+}
+
+export interface InviteDetails {
+  name: string
+  email: string
+  expires_at: string
+}
+
+export type IdentityOrigin = 'console' | 'config' | 'unset'
+
+export interface Identities {
+  linear_names: string[]
+  github_usernames: string[]
+  sentry_usernames: string[]
+  jira_usernames: string[]
+  gitlab_usernames: string[]
+  discord_id: string | null
+  slack_id: string | null
+  email: string | null
+  push_user_key: string | null
+  sms_number: string | null
+  whatsapp_number: string | null
+  telegram_chat_id: string | null
+}
+
+export interface UserIdentities {
+  user_id: number
+  name: string
+  login_email: string | null
+  person_key: string | null
+  slug: string | null
+  origin: IdentityOrigin
+  status: UserStatus
+  redacted: boolean
+  identities: Identities
+  updated_at: string | null
+}
+
+export type IdentityFieldName = 'slug' | keyof Identities
+
+export interface IdentityViolation {
+  field: IdentityFieldName
+  message: string
+  email?: string
+}
+
+export type IdentitiesUpdate = { slug?: string } & {
+  [K in keyof Identities]?: Identities[K] extends string[] ? string[] : string
+}
+
+export const SENSITIVE_IDENTITY_FIELDS: ReadonlyArray<keyof Identities> = [
+  'email',
+  'push_user_key',
+  'sms_number',
+  'whatsapp_number',
+  'telegram_chat_id',
+]
 
 
 export interface ActivityLogEntry {
@@ -709,7 +783,6 @@ export interface TelemetryLatency {
   histogram: TelemetryLatencyHistogramBucket[];
 }
 
-
 let onUnauthorized: (() => void) | null = null
 
 export function setOnUnauthorized(cb: () => void) {
@@ -727,17 +800,62 @@ export function getCsrfToken(): string {
   return match ? decodeURIComponent(match[1]) : ''
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url)
+export class ApiError extends Error {
+  readonly status: number
+  readonly code?: string
+  readonly violations: IdentityViolation[]
+
+  constructor(status: number, message: string, code?: string, violations: IdentityViolation[] = []) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+    this.violations = violations
+  }
+}
+
+type ApiMethod = 'GET' | 'POST' | 'PUT' | 'DELETE'
+
+const failureVerbs: Record<ApiMethod, string> = {
+  GET: 'fetch',
+  POST: 'post',
+  PUT: 'put',
+  DELETE: 'delete',
+}
+
+async function readApiError(res: Response, url: string, method: ApiMethod): Promise<ApiError> {
+  let body: unknown
+  try {
+    body = await res.json()
+  } catch {
+    body = undefined
+  }
+  const payload = typeof body === 'object' && body !== null
+    ? (body as { error?: unknown; code?: unknown; violations?: unknown })
+    : {}
+  const message = typeof payload.error === 'string' && payload.error
+    ? payload.error
+    : `Failed to ${failureVerbs[method]} ${url}: ${res.status}`
+  const code = typeof payload.code === 'string' ? payload.code : undefined
+  const violations = Array.isArray(payload.violations) ? (payload.violations as IdentityViolation[]) : []
+  return new ApiError(res.status, message, code, violations)
+}
+
+async function ensureOk(res: Response, url: string, method: ApiMethod): Promise<void> {
   if (res.status === 401) {
     onUnauthorized?.()
     throw new Error('Unauthorized')
   }
   if (!res.ok) {
-    const err = new Error(`Failed to fetch ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'GET', 'api.status': String(res.status) } })
+    const err = await readApiError(res, url, method)
+    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': method, 'api.status': String(res.status) } })
     throw err
   }
+}
+
+export async function fetchJson<T>(url: string): Promise<T> {
+  const res = await fetch(url)
+  await ensureOk(res, url, 'GET')
   return res.json()
 }
 
@@ -751,15 +869,7 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
     },
     body: body ? JSON.stringify(body) : undefined,
   })
-  if (res.status === 401) {
-    onUnauthorized?.()
-    throw new Error('Unauthorized')
-  }
-  if (!res.ok) {
-    const err = new Error(`Failed to post ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'POST', 'api.status': String(res.status) } })
-    throw err
-  }
+  await ensureOk(res, url, 'POST')
   if (res.status === 204) return undefined as T
   return res.json()
 }
@@ -774,36 +884,36 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
     },
     body: JSON.stringify(body),
   })
-  if (res.status === 401) {
-    onUnauthorized?.()
-    throw new Error('Unauthorized')
-  }
-  if (!res.ok) {
-    const err = new Error(`Failed to put ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'PUT', 'api.status': String(res.status) } })
-    throw err
-  }
+  await ensureOk(res, url, 'PUT')
   return res.json()
 }
 
-async function deleteRequest(url: string): Promise<void> {
+async function sendJson<T>(method: ApiMethod, url: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {}
+  if (method !== 'GET') {
+    Sentry.addBreadcrumb({ category: 'api', message: `${method} ${url}`, level: 'info' })
+    headers['x-csrf-token'] = getCsrfToken()
+  }
+  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  await ensureOk(res, url, method)
+  if (res.status === 204) return undefined as T
+  return res.json()
+}
+
+export async function deleteRequest(url: string): Promise<void> {
   Sentry.addBreadcrumb({ category: 'api', message: `DELETE ${url}`, level: 'info' })
   const res = await fetch(url, {
     method: 'DELETE',
     headers: { 'x-csrf-token': getCsrfToken() },
   })
-  if (res.status === 401) {
-    onUnauthorized?.()
-    throw new Error('Unauthorized')
-  }
-  if (!res.ok) {
-    const err = new Error(`Failed to delete ${url}: ${res.status}`)
-    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'DELETE', 'api.status': String(res.status) } })
-    throw err
-  }
+  await ensureOk(res, url, 'DELETE')
 }
 
-// Existing
 export async function fetchOverview(): Promise<Overview> {
   return fetchJson(`${API_BASE}/stats/overview`);
 }
@@ -849,8 +959,6 @@ export async function getRetries(): Promise<RetriesResponse> {
 export async function getSources(): Promise<SourcesResponse> {
   return fetchJson(`${API_BASE}/sources`);
 }
-
-// New fetchers
 
 export async function fetchActivity(params?: {
   limit?: number;
@@ -1160,17 +1268,36 @@ export async function fetchRepoLearning(repo: string): Promise<RepoLearningRespo
 }
 
 
+export type ConfigErrorCode = 'invalid' | 'read_only' | 'revision_mismatch' | 'unreadable'
+
+export interface OptionalConfigSection {
+  key: string
+  template: string
+}
+
 export interface ConfigResponse {
   content: string
-  path: string
+  secret_paths: string[]
+  runtime_overrides: string[]
+  restart_required: boolean
+  writable: boolean
+  revision: string
+  optional_sections: OptionalConfigSection[]
+}
+
+export interface SaveConfigResponse {
+  ok: true
+  restart_required: boolean
+  revision: string
+  message: string
 }
 
 export async function fetchConfig(): Promise<ConfigResponse> {
   return fetchJson(`${API_BASE}/config`)
 }
 
-export async function saveConfig(content: string): Promise<{ ok: boolean; message: string }> {
-  return putJson(`${API_BASE}/config`, { content })
+export async function saveConfig(content: string, revision?: string): Promise<SaveConfigResponse> {
+  return putJson(`${API_BASE}/config`, revision === undefined ? { content } : { content, revision })
 }
 
 
@@ -1230,30 +1357,64 @@ export async function uploadAvatar(file: File): Promise<{ avatar_url: string }> 
 
 
 export async function fetchUsers(): Promise<UserRecord[]> {
-  return fetchJson(`${API_BASE}/users`)
+  return sendJson('GET', `${API_BASE}/users`)
 }
 
 export async function getUser(id: number): Promise<UserRecord> {
-  return fetchJson(`${API_BASE}/users/${id}`)
+  return sendJson('GET', `${API_BASE}/users/${id}`)
 }
 
 export async function createUser(data: {
-  email: string; password: string; name: string; role: string
-}): Promise<UserRecord> {
-  return postJson(`${API_BASE}/users`, data)
+  email: string; name: string; role: Role; password?: string; identities?: IdentitiesUpdate
+}): Promise<CreatedUser> {
+  return sendJson('POST', `${API_BASE}/users`, data)
 }
 
 export async function updateUser(id: number, data: {
-  email?: string; password?: string; name?: string; role?: string
+  email?: string; password?: string; name?: string; role?: Role
 }): Promise<UserRecord> {
-  return putJson(`${API_BASE}/users/${id}`, data)
+  return sendJson('PUT', `${API_BASE}/users/${id}`, data)
 }
 
 export async function deleteUser(id: number): Promise<void> {
-  return deleteRequest(`${API_BASE}/users/${id}`)
+  await sendJson<unknown>('DELETE', `${API_BASE}/users/${id}`)
 }
 
-// --- Personal access tokens -------------------------------------------------
+export async function issueInvite(userId: number): Promise<UserInvite> {
+  return sendJson('POST', `${API_BASE}/users/${userId}/invite`)
+}
+
+export async function revokeInvite(userId: number): Promise<void> {
+  await sendJson<unknown>('DELETE', `${API_BASE}/users/${userId}/invite`)
+}
+
+export async function inspectInvite(token: string): Promise<InviteDetails> {
+  return sendJson('POST', `${API_BASE}/auth/invite/inspect`, { token })
+}
+
+export async function acceptInvite(token: string, password: string): Promise<void> {
+  await sendJson<unknown>('POST', `${API_BASE}/auth/invite/accept`, { token, password })
+}
+
+export function inviteAbsoluteUrl(invite: UserInvite): string {
+  return invite.invite_url ?? window.location.origin + invite.invite_link
+}
+
+export async function fetchIdentities(): Promise<UserIdentities[]> {
+  return sendJson('GET', `${API_BASE}/identities`)
+}
+
+export async function fetchUserIdentities(userId: number): Promise<UserIdentities> {
+  return sendJson('GET', `${API_BASE}/users/${userId}/identities`)
+}
+
+export async function updateUserIdentities(userId: number, update: IdentitiesUpdate): Promise<UserIdentities> {
+  return sendJson('PUT', `${API_BASE}/users/${userId}/identities`, update)
+}
+
+export async function resetUserIdentities(userId: number): Promise<UserIdentities> {
+  return sendJson('DELETE', `${API_BASE}/users/${userId}/identities`)
+}
 
 /** A personal access token (never includes the secret after creation). */
 export interface ApiToken {
@@ -1300,7 +1461,440 @@ export async function fetchMyTokens(): Promise<ApiToken[]> {
   return fetchJson(`${API_BASE}/tokens`)
 }
 
+/** Mint a token for the current user. `expires_at` is RFC3339; the secret is returned once. */
+export async function createMyToken(data: { name: string; expires_at?: string }): Promise<CreatedToken> {
+  return postJson(`${API_BASE}/tokens`, data)
+}
+
 /** Admin: every token with its owner. */
 export async function fetchAllTokens(): Promise<ApiTokenWithOwner[]> {
   return fetchJson(`${API_BASE}/tokens/all`)
+}
+
+export const SECURITY_REPORT_STATES = [
+  'received',
+  'assessing',
+  'needs_human',
+  'registering',
+  'spam',
+  'replying',
+  'closed',
+  'tracking',
+  'resolved',
+] as const
+export type SecurityReportState = (typeof SECURITY_REPORT_STATES)[number]
+
+export const SECURITY_OUTCOMES = [
+  'spam',
+  'valid',
+  'not_reproducible',
+  'already_fixed',
+  'not_vulnerability',
+  'out_of_scope',
+  'duplicate',
+] as const
+export type SecurityOutcome = (typeof SECURITY_OUTCOMES)[number]
+export type SecurityOverrideOutcome = Exclude<SecurityOutcome, 'valid'>
+
+export const VULNERABILITY_STATES = ['awaiting_fix', 'fixing', 'merged', 'live', 'needs_human'] as const
+export type VulnerabilityState = (typeof VULNERABILITY_STATES)[number]
+
+export const SECURITY_SEVERITIES = ['critical', 'high', 'medium', 'low', 'informational'] as const
+export type SecuritySeverity = (typeof SECURITY_SEVERITIES)[number]
+
+export const SECURITY_REPLY_KINDS = [
+  'confirmed',
+  'not_reproducible',
+  'already_fixed',
+  'not_vulnerability',
+  'out_of_scope',
+  'duplicate',
+  'fix_live',
+  'fix_live_rewarded',
+] as const
+export type SecurityReplyKind = (typeof SECURITY_REPLY_KINDS)[number]
+
+export const DELIVERY_STATUSES = ['sending', 'sent', 'failed', 'unconfirmed'] as const
+export type DeliveryStatus = (typeof DELIVERY_STATUSES)[number]
+
+export const AWARD_STATUSES = ['prepared', 'owner_notified', 'awarded', 'cancelled'] as const
+export type AwardStatus = (typeof AWARD_STATUSES)[number]
+
+export const SECURITY_EVENT_KINDS = [
+  'received',
+  'assessment_started',
+  'assessment_released',
+  'assessment_failed',
+  'needs_human',
+  'overridden',
+  'admin_confirmed',
+  'screened_spam',
+  'assessed',
+  'vulnerability_created',
+  'duplicate_linked',
+  'first_reporter_replaced',
+  'reply_claimed',
+  'reply_sent',
+  'reply_failed',
+  'reply_unconfirmed',
+  'delivery_confirmed',
+  'conversation_closed',
+  'reporter_follow_up',
+  'fix_started',
+  'pull_request_opened',
+  'pull_request_linked',
+  'fix_failed',
+  'merged',
+  'cloud_bump_required',
+  'live',
+  'deployment_check_failed',
+  'award_prepared',
+  'owner_notified',
+  'awarded',
+  'award_cancelled',
+] as const
+export type SecurityEventKind = (typeof SECURITY_EVENT_KINDS)[number]
+
+export const SECURITY_REVIEW_REASONS = [
+  'assessment_failed',
+  'assessment_inconclusive',
+  'unverifiable_fix',
+  'attachment_evidence',
+  'untracked_repository',
+  'unindexed_repository',
+  'pull_request_closed',
+  'fix_failed',
+  'reply_unconfirmed',
+  'deployment_check_failed',
+  'fix_found_in_history',
+  'reply_failed',
+  'missing_merge_commit',
+  'registration_failed',
+  'invalid_pull_request',
+] as const
+export type SecurityReviewReason = (typeof SECURITY_REVIEW_REASONS)[number]
+
+export interface SecuritySummary {
+  reports_by_state: Partial<Record<SecurityReportState, number>>
+  reports_by_outcome: Partial<Record<SecurityOutcome, number>>
+  vulnerabilities_by_state: Partial<Record<VulnerabilityState, number>>
+  pending_awards: number
+  unconfirmed_replies: number
+}
+
+export interface SecurityReportRow {
+  id: number
+  short_id: string
+  url: string
+  subject: string
+  reporter_email: string | null
+  reported_at: string
+  state: SecurityReportState
+  outcome: SecurityOutcome | null
+  vulnerability_id: number | null
+  is_first_reporter: boolean
+  vulnerability_state: VulnerabilityState | null
+  severity: SecuritySeverity | null
+  pull_request_url: string | null
+  deployed_version: string | null
+  live_at: string | null
+  award_status: AwardStatus | null
+  unconfirmed_reply: boolean
+  updated_at: string
+}
+
+export interface SecurityReport {
+  id: number
+  source: string
+  conversation_id: string
+  short_id: string
+  mailbox_id: string
+  url: string
+  subject: string
+  reporter_email: string | null
+  reporter_customer_id: string | null
+  reported_at: string
+  state: SecurityReportState
+  outcome: SecurityOutcome | null
+  public_reason: string | null
+  assessment_summary: string | null
+  affected_repository: string | null
+  fixed_by_commit: string | null
+  fixed_on: string | null
+  spam_confidence: number | null
+  assessment_attempts: number
+  customer_thread_count: number
+  vulnerability_id: number | null
+  created_at: string
+  updated_at: string
+}
+
+export interface SecurityVulnerability {
+  id: number
+  title: string
+  summary: string
+  repository: string | null
+  severity: SecuritySeverity | null
+  state: VulnerabilityState
+  first_report_id: number
+  first_reported_at: string
+  fix_attempt_id: number | null
+  pull_request_url: string | null
+  merge_commit: string | null
+  merged_at: string | null
+  deployed_version: string | null
+  live_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface SecurityEvent {
+  id: number
+  report_id: number | null
+  vulnerability_id: number | null
+  kind: SecurityEventKind
+  from_state: string | null
+  to_state: string | null
+  actor: string | null
+  detail: unknown
+  created_at: string
+}
+
+export interface SecurityReply {
+  id: number
+  report_id: number
+  kind: SecurityReplyKind
+  status: DeliveryStatus
+  error: string | null
+  claimed_at: string
+  completed_at: string | null
+}
+
+export interface SecurityAward {
+  id: number
+  vulnerability_id: number
+  report_id: number
+  recipient_email: string | null
+  campaign: string
+  credits: number
+  status: AwardStatus
+  actor: string | null
+  note: string | null
+  prepared_at: string
+  updated_at: string
+}
+
+export interface SecurityReportDetail {
+  report: SecurityReport
+  vulnerability: SecurityVulnerability | null
+  events: SecurityEvent[]
+  replies: SecurityReply[]
+  award: SecurityAward | null
+  related_reports: SecurityReportRow[]
+}
+
+export type SecurityOverride =
+  | { action: 'reassess' }
+  | {
+      action: 'outcome'
+      outcome: SecurityOverrideOutcome
+      public_reason?: string
+      fixed_on?: string
+    }
+  | { action: 'confirm_delivery'; kind: SecurityReplyKind; delivered: boolean }
+  | {
+      action: 'confirm_valid'
+      title: string
+      summary: string
+      repository?: string
+      severity?: SecuritySeverity
+    }
+
+export interface SecurityReportFilter {
+  state?: SecurityReportState
+  outcome?: SecurityOutcome
+  limit?: number
+}
+
+export async function fetchSecuritySummary(): Promise<SecuritySummary> {
+  return fetchJson(`${API_BASE}/security/summary`)
+}
+
+export async function fetchSecurityReports(filter?: SecurityReportFilter): Promise<SecurityReportRow[]> {
+  const searchParams = new URLSearchParams()
+  if (filter?.state) searchParams.set('state', filter.state)
+  if (filter?.outcome) searchParams.set('outcome', filter.outcome)
+  if (filter?.limit) searchParams.set('limit', filter.limit.toString())
+  return fetchJson(`${API_BASE}/security/reports?${searchParams}`)
+}
+
+export async function fetchSecurityReport(id: number): Promise<SecurityReportDetail> {
+  return fetchJson(`${API_BASE}/security/reports/${id}`)
+}
+
+export async function overrideSecurityReport(
+  id: number,
+  override: SecurityOverride,
+): Promise<SecurityReport> {
+  return postJson(`${API_BASE}/security/reports/${id}/override`, override)
+}
+
+export async function markSecurityAwardGranted(
+  vulnerabilityId: number,
+  note?: string,
+): Promise<SecurityAward> {
+  return postJson(`${API_BASE}/security/vulnerabilities/${vulnerabilityId}/award`, note ? { note } : {})
+}
+
+export async function linkSecurityPullRequest(
+  vulnerabilityId: number,
+  pullRequestUrl: string,
+): Promise<SecurityVulnerability> {
+  return postJson(`${API_BASE}/security/vulnerabilities/${vulnerabilityId}/pull-request`, {
+    pull_request_url: pullRequestUrl,
+  })
+}
+
+export async function markSecurityLive(
+  vulnerabilityId: number,
+  deployedVersion: string,
+): Promise<SecurityVulnerability> {
+  return postJson(`${API_BASE}/security/vulnerabilities/${vulnerabilityId}/live`, {
+    deployed_version: deployedVersion,
+  })
+}
+
+export type DeployQaTipStatus = 'pending' | 'running' | 'verified' | 'unverified' | 'failed' | 'errored'
+
+export interface DeployQaTipView {
+  id: number
+  track: string
+  repo: string
+  tag: string
+  status: DeployQaTipStatus
+  published_at: string | null
+  release_url: string | null
+  author_login: string | null
+  attempt_id: number | null
+  discord_message_url: string | null
+  discord_thread_url: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface DeployQaTrackStatus {
+  name: string
+  repo: string
+  tag_filter: string
+  last_seen: DeployQaTipView | null
+  in_flight: boolean
+}
+
+export interface DeployQaStatus {
+  enabled: boolean
+  restart_required: boolean
+  poll_interval_ms: number
+  timeout_secs: number
+  skip_if_previous_running: boolean
+  discord_channel_id: string | null
+  tracks: DeployQaTrackStatus[]
+}
+
+export interface DeployQaTrackSettings {
+  name: string
+  repo: string
+  tag_filter: string
+}
+
+export interface DeployQaSettings {
+  enabled: boolean
+  poll_interval_ms: number
+  skip_if_previous_running: boolean
+  timeout_secs: number
+  discord_channel_id: string | null
+  github_discord_map_path: string | null
+  instructions_path: string | null
+  tracks: DeployQaTrackSettings[]
+}
+
+export interface DeployQaTagFilterKind {
+  kind: string
+  requires_value: boolean
+}
+
+export interface DeployQaConfigResponse {
+  settings: DeployQaSettings
+  tag_filter_kinds: DeployQaTagFilterKind[]
+  track_name_separator: string
+  restart_required: boolean
+  writable: boolean
+  revision: string
+}
+
+export interface DeployQaSaveResponse {
+  ok: true
+  restart_required: boolean
+  revision: string
+  message: string
+}
+
+export async function fetchDeployQaStatus(): Promise<DeployQaStatus> {
+  return fetchJson(`${API_BASE}/deploy-qa`)
+}
+
+export async function fetchDeployQaTips(track?: string): Promise<DeployQaTipView[]> {
+  const query = track ? `?${new URLSearchParams({ track })}` : ''
+  const response = await fetchJson<{ tips: DeployQaTipView[] }>(`${API_BASE}/deploy-qa/tips${query}`)
+  return response.tips
+}
+
+export async function fetchDeployQaConfig(): Promise<DeployQaConfigResponse> {
+  return fetchJson(`${API_BASE}/deploy-qa/config`)
+}
+
+export async function saveDeployQaConfig(
+  settings: DeployQaSettings,
+  revision: string,
+): Promise<DeployQaSaveResponse> {
+  return putJson(`${API_BASE}/deploy-qa/config`, { settings, revision })
+}
+
+export type FeatureCategory = 'source' | 'scm' | 'notifier' | 'automation' | 'intelligence' | 'platform'
+
+export type FeatureSettingValue =
+  | string
+  | number
+  | boolean
+  | null
+  | FeatureSettingValue[]
+  | { [name: string]: FeatureSettingValue }
+
+export interface FeatureSetting {
+  name: string
+  value: FeatureSettingValue
+}
+
+export interface FeatureSecret {
+  name: string
+  set: boolean
+}
+
+export interface FeatureStatus {
+  key: string
+  label: string
+  description: string
+  category: FeatureCategory
+  configured: boolean
+  enabled: boolean
+  settings: FeatureSetting[]
+  secrets: FeatureSecret[]
+}
+
+export interface FeaturesResponse {
+  features: FeatureStatus[]
+}
+
+export async function fetchFeatures(): Promise<FeatureStatus[]> {
+  const response = await fetchJson<FeaturesResponse>(`${API_BASE}/features`)
+  return response.features
 }

@@ -1,21 +1,26 @@
 //! API route handlers for the dashboard.
 
 use super::auth::*;
+use super::config_file::{self, ConfigFile, ConfigFileError, OptionalSection};
+use super::rate_limit::RateLimiters;
+use super::visibility::Visibility;
 use crate::retry::RetryManager;
 use axum::{
     extract::{
+        rejection::JsonRejection,
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use claudear_config::config::Config;
+use claudear_config::users::UserRegistry;
 use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, RegressionWatchStatus};
-use claudear_storage::FixAttemptTracker;
+use claudear_storage::{AttemptScope, FixAttemptTracker};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -31,14 +36,23 @@ pub struct ApiState {
     pub tracker: Arc<dyn FixAttemptTracker>,
     /// Instant when the server started, for uptime calculation.
     pub start_time: Instant,
-    /// Path to the config file on disk (for read/write from dashboard).
-    pub config_path: PathBuf,
+    /// The config file on disk, for read/write from the dashboard.
+    pub config_file: ConfigFile,
     /// Watch channel for real-time indexing progress pushed from SQLite hooks.
     pub indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
     /// General-purpose storage directory for user uploads (avatars, etc.).
     pub storage_dir: PathBuf,
     /// Chat service for model browsing/downloading (None if chat is disabled).
     pub chat_service: Option<Arc<claudear_integrations::chat::ChatService>>,
+    /// The shared person directory; identity writes reload it so edits apply at once.
+    pub registry: UserRegistry,
+    /// Held across reload, plan, conflict check, save and reload by every user,
+    /// identity and directory write, so two writes never both pass the same check.
+    pub identity_writes: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) limiters: Arc<RateLimiters>,
+    /// The config file as it was when the server started, normalized without
+    /// env overrides; `None` when it could not be read or parsed.
+    pub startup_config: Option<Arc<toml::Value>>,
 }
 
 /// Create the API router.
@@ -48,7 +62,8 @@ pub fn create_api_router(
     config_path: PathBuf,
     indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
 ) -> Router {
-    create_api_router_with_dashboard(config, tracker, config_path, indexing_rx, None)
+    let registry = UserRegistry::new(config.users.clone());
+    create_api_router_with_dashboard(config, tracker, config_path, indexing_rx, None, registry)
 }
 
 /// Create the API router with optional dashboard static file serving.
@@ -58,6 +73,7 @@ pub fn create_api_router_with_dashboard(
     config_path: PathBuf,
     indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
     dashboard_dir: Option<PathBuf>,
+    registry: UserRegistry,
 ) -> Router {
     create_api_router_full(
         config,
@@ -66,6 +82,7 @@ pub fn create_api_router_with_dashboard(
         indexing_rx,
         dashboard_dir,
         None,
+        registry,
     )
 }
 
@@ -77,8 +94,10 @@ pub fn create_api_router_full(
     indexing_rx: tokio::sync::watch::Receiver<claudear_storage::IndexingProgress>,
     dashboard_dir: Option<PathBuf>,
     chat_state: Option<claudear_integrations::chat::ChatState>,
+    registry: UserRegistry,
 ) -> Router {
     let storage_dir = config.storage_dir.clone();
+    crate::registry::reload(&registry, tracker.as_ref());
 
     // Ensure avatar upload directory exists
     let avatars_dir = storage_dir.join("avatars");
@@ -87,15 +106,26 @@ pub fn create_api_router_full(
     }
 
     let chat_service = chat_state.as_ref().map(|cs| cs.chat_service.clone());
+    let file = ConfigFile::new(&config_path);
+    let startup_config = file
+        .read()
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|content| config_file::normalize(&content).ok())
+        .map(Arc::new);
 
     let state = ApiState {
         config,
         tracker,
         start_time: Instant::now(),
-        config_path,
+        config_file: file,
         indexing_rx,
         storage_dir: storage_dir.clone(),
         chat_service,
+        registry,
+        identity_writes: Arc::new(tokio::sync::Mutex::new(())),
+        limiters: Arc::new(RateLimiters::default()),
+        startup_config,
     };
 
     let api_routes = Router::new()
@@ -117,6 +147,7 @@ pub fn create_api_router_full(
             get(attempt_retrieval_handler),
         )
         .route("/api/sources", get(sources_handler))
+        .route("/api/features", get(super::features::features_handler))
         .route("/api/retries", get(retries_handler))
         .route("/api/activity", get(activity_handler))
         .route("/api/analytics/summary", get(analytics_summary_handler))
@@ -141,6 +172,12 @@ pub fn create_api_router_full(
         )
         .route("/api/feedback", get(feedback_handler))
         .route("/api/regressions", get(regressions_handler))
+        .route("/api/deploy-qa", get(super::deploy_qa::status_handler))
+        .route("/api/deploy-qa/tips", get(super::deploy_qa::tips_handler))
+        .route(
+            "/api/deploy-qa/config",
+            get(super::deploy_qa::get_config_handler).put(super::deploy_qa::put_config_handler),
+        )
         .route(
             "/api/regressions/{id}/checks",
             get(regression_checks_handler),
@@ -176,6 +213,34 @@ pub fn create_api_router_full(
         )
         .route("/api/telemetry/pipeline", get(telemetry_pipeline_handler))
         .route("/api/telemetry/latency", get(telemetry_latency_handler))
+        .route(
+            "/api/security/summary",
+            get(super::security_reports::summary_handler),
+        )
+        .route(
+            "/api/security/reports",
+            get(super::security_reports::reports_handler),
+        )
+        .route(
+            "/api/security/reports/{id}",
+            get(super::security_reports::report_handler),
+        )
+        .route(
+            "/api/security/reports/{id}/override",
+            axum::routing::post(super::security_reports::override_handler),
+        )
+        .route(
+            "/api/security/vulnerabilities/{id}/award",
+            axum::routing::post(super::security_reports::award_handler),
+        )
+        .route(
+            "/api/security/vulnerabilities/{id}/pull-request",
+            axum::routing::post(super::security_reports::pull_request_handler),
+        )
+        .route(
+            "/api/security/vulnerabilities/{id}/live",
+            axum::routing::post(super::security_reports::live_handler),
+        )
         // Auth routes
         .route("/api/auth/login", axum::routing::post(login_handler))
         .route("/api/auth/logout", axum::routing::post(logout_handler))
@@ -183,6 +248,14 @@ pub fn create_api_router_full(
         .route(
             "/api/auth/profile",
             axum::routing::put(update_profile_handler),
+        )
+        .route(
+            "/api/auth/invite/inspect",
+            axum::routing::post(super::invites::inspect_invite_handler),
+        )
+        .route(
+            "/api/auth/invite/accept",
+            axum::routing::post(super::invites::accept_invite_handler),
         )
         .route(
             "/api/auth/avatar",
@@ -208,6 +281,25 @@ pub fn create_api_router_full(
             axum::routing::get(get_user_handler)
                 .put(update_user_handler)
                 .delete(delete_user_handler),
+        )
+        .route(
+            "/api/users/{id}/invite",
+            axum::routing::post(super::invites::issue_invite_handler)
+                .delete(super::invites::revoke_invite_handler),
+        )
+        .route(
+            "/api/directory",
+            axum::routing::put(super::directory::put_directory_handler),
+        )
+        .route(
+            "/api/identities",
+            axum::routing::get(super::identities::list_identities_handler),
+        )
+        .route(
+            "/api/users/{id}/identities",
+            axum::routing::get(super::identities::get_user_identities_handler)
+                .put(super::identities::update_user_identities_handler)
+                .delete(super::identities::reset_user_identities_handler),
         )
         // Personal access token routes (for the MCP server and other clients)
         .route(
@@ -242,29 +334,34 @@ pub fn create_api_router_full(
             "/api/chat/models/download",
             axum::routing::post(download_model_handler),
         )
-        .with_state(state)
+        .with_state(state.clone())
         .nest_service("/avatars", ServeDir::new(avatars_dir));
 
-    // Merge chat routes if enabled
-    let api_routes = if let Some(chat_state) = chat_state {
-        api_routes.merge(claudear_integrations::chat::create_chat_router(chat_state))
-    } else {
-        api_routes
-    };
+    let api_routes = super::chat::mount(
+        api_routes,
+        chat_state.map(claudear_integrations::chat::create_chat_router),
+        state,
+    );
 
     // If dashboard directory is provided, serve from filesystem (development override)
     if let Some(dashboard_path) = dashboard_dir {
         let index_file = dashboard_path.join("index.html");
-        let serve_dir =
-            ServeDir::new(&dashboard_path).not_found_service(ServeFile::new(&index_file));
+        let serve_dir = ServeDir::new(&dashboard_path).fallback(ServeFile::new(&index_file));
 
-        api_routes.fallback_service(serve_dir)
+        api_routes
+            .route("/api", axum::routing::any(api_not_found_handler))
+            .route("/api/{*path}", axum::routing::any(api_not_found_handler))
+            .fallback_service(serve_dir)
     } else if super::embedded::has_dashboard() {
         // Serve the embedded dashboard compiled into the binary
         api_routes.fallback_service(tower::service_fn(super::embedded::embedded_fallback))
     } else {
         api_routes
     }
+}
+
+async fn api_not_found_handler() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 #[derive(Serialize)]
@@ -383,21 +480,26 @@ async fn health_handler(_user: AuthUser, State(state): State<ApiState>) -> Json<
 }
 
 async fn stats_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<FixAttemptStats>, StatusCode> {
-    state.tracker.get_stats().map(Json).map_err(|e| {
-        tracing::error!(error = %e, "Internal server error");
-        sentry::capture_error(&e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
+    let stats = state
+        .tracker
+        .get_scoped_stats(Visibility::for_user(&user).scope())
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(stats))
 }
 
 async fn overview_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<OverviewResponse>, StatusCode> {
-    let stats = state.tracker.get_stats().map_err(|e| {
+    let scope = Visibility::for_user(&user).scope();
+    let stats = state.tracker.get_scoped_stats(scope).map_err(|e| {
         tracing::error!(error = %e, "Internal server error");
         sentry::capture_error(&e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -419,7 +521,7 @@ async fn overview_handler(
     // Get recent attempts (last 10).
     let recent = state
         .tracker
-        .list_recent_attempts(10)
+        .list_scoped_attempts(None, scope, 10, 0)
         .map(|records| {
             records
                 .into_iter()
@@ -467,12 +569,13 @@ async fn overview_handler(
             &seven_days_ago,
             state.config.dashboard.hourly_engineer_rate,
             "7d",
+            scope,
         )
         .ok();
 
     let agent_spawns_today = state
         .tracker
-        .get_agent_spawn_count(&twenty_four_h_ago)
+        .get_agent_spawn_count(&twenty_four_h_ago, scope)
         .unwrap_or(0);
 
     Ok(Json(OverviewResponse {
@@ -487,10 +590,11 @@ async fn overview_handler(
 }
 
 async fn attempts_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<AttemptsQuery>,
 ) -> Result<Json<AttemptsResponse>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let status_filter = query.status.as_ref().map(|s| s.to_lowercase());
@@ -498,23 +602,36 @@ async fn attempts_handler(
     let status_filter = status_filter.as_deref();
     let source_filter = source_filter.as_deref();
 
+    if visibility.hides_filter(source_filter) {
+        return Ok(Json(AttemptsResponse {
+            attempts: Vec::new(),
+            total: 0,
+            page,
+            per_page,
+        }));
+    }
+
+    let internal_error = |e: claudear_core::error::Error| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
     let offset = (page - 1) * per_page;
-    let rows = state
-        .tracker
-        .list_attempts(status_filter, source_filter, per_page, offset)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let rows = match source_filter {
+        Some(source) => state
+            .tracker
+            .list_attempts(status_filter, Some(source), per_page, offset),
+        None => {
+            state
+                .tracker
+                .list_scoped_attempts(status_filter, visibility.scope(), per_page, offset)
+        }
+    }
+    .map_err(internal_error)?;
     let total = state
         .tracker
-        .count_attempts(status_filter, source_filter)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .count_attempts(status_filter, source_filter, visibility.scope())
+        .map_err(internal_error)?;
     let attempts: Vec<AttemptSummary> = rows
         .into_iter()
         .map(|attempt| attempt_to_summary(&attempt))
@@ -529,10 +646,15 @@ async fn attempts_handler(
 }
 
 async fn attempt_detail_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<FixAttempt>, StatusCode> {
+    visible_attempt(&state, &user, id).map(Json)
+}
+
+/// The attempt with `id`, or 404 when it is missing or hidden from `user`.
+fn visible_attempt(state: &ApiState, user: &AuthUser, id: i64) -> Result<FixAttempt, StatusCode> {
     state
         .tracker
         .get_attempt_by_id(id)
@@ -541,7 +663,7 @@ async fn attempt_detail_handler(
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
-        .map(Json)
+        .filter(|attempt| Visibility::for_user(user).shows(&attempt.source))
         .ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -599,14 +721,15 @@ async fn sources_handler(_user: AuthUser, State(state): State<ApiState>) -> Json
 }
 
 async fn retries_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<RetriesResponse>, StatusCode> {
     use crate::retry::RetryManager;
 
+    let visibility = Visibility::for_user(&user);
     let max_retries = state.config.retry.max_retries;
 
-    let retryable = state
+    let mut retryable = state
         .tracker
         .get_retryable_issues(max_retries)
         .map_err(|e| {
@@ -614,6 +737,7 @@ async fn retries_handler(
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    retryable.retain(|attempt| visibility.shows(&attempt.source));
 
     // Create RetryManager to compute which attempts are ready for retry
     let retry_manager = RetryManager::new(state.config.retry.clone(), state.tracker.clone());
@@ -708,18 +832,20 @@ fn get_attempt_records(tracker: &Arc<dyn FixAttemptTracker>) -> Vec<FixAttempt> 
     all
 }
 
-/// Get raw attempt records since a timestamp for telemetry aggregation.
+/// Get the raw attempt records within `scope` since a timestamp for telemetry
+/// aggregation.
 fn get_attempt_records_since(
     tracker: &Arc<dyn FixAttemptTracker>,
     since: DateTime<Utc>,
+    scope: AttemptScope,
 ) -> Vec<FixAttempt> {
-    if let Ok(attempts) = tracker.list_attempts_since(since) {
+    if let Ok(attempts) = tracker.list_attempts_since(since, scope) {
         return attempts;
     }
 
     get_attempt_records(tracker)
         .into_iter()
-        .filter(|a| a.attempted_at >= since)
+        .filter(|a| a.attempted_at >= since && scope.includes(&a.source))
         .collect()
 }
 
@@ -1171,19 +1297,11 @@ struct TelemetryLatencyResponse {
 }
 
 async fn attempt_full_detail_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<AttemptDetailResponse>, StatusCode> {
-    let attempt = state
-        .tracker
-        .get_attempt_by_id(id)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let attempt = visible_attempt(&state, &user, id)?;
 
     let executions = state
         .tracker
@@ -1211,10 +1329,13 @@ async fn attempt_full_detail_handler(
 /// Retrieval-quality assessment for an attempt: every chunk pulled from each RAG
 /// source, with score/rank/injected/used/quality_score.
 async fn attempt_retrieval_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<AttemptRetrievalResponse>, StatusCode> {
+    if Visibility::for_user(&user).scope() != AttemptScope::All {
+        visible_attempt(&state, &user, id)?;
+    }
     let rows = state.tracker.get_retrieval_usage(id).map_err(|e| {
         tracing::error!(error = %e, "Internal server error");
         sentry::capture_error(&e);
@@ -1227,7 +1348,7 @@ async fn attempt_retrieval_handler(
 }
 
 async fn attempt_execution_log_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Path((attempt_id, execution_id, stream)): Path<(i64, i64, String)>,
 ) -> Result<Json<AttemptExecutionLogResponse>, StatusCode> {
@@ -1235,18 +1356,7 @@ async fn attempt_execution_log_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let attempt_exists = state
-        .tracker
-        .get_attempt_by_id(attempt_id)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .is_some();
-    if !attempt_exists {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    visible_attempt(&state, &user, attempt_id)?;
 
     let execution = state
         .tracker
@@ -1346,16 +1456,27 @@ fn tail_utf8(value: &str, max_bytes: usize) -> (String, bool) {
 }
 
 async fn activity_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<ActivityQuery>,
 ) -> Result<Json<Vec<claudear_core::types::ActivityLogEntry>>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let limit = query.limit.unwrap_or(50).min(500);
     let source_filter = query.source.as_deref();
+    if visibility.hides_filter(source_filter) {
+        return Ok(Json(Vec::new()));
+    }
 
-    state
-        .tracker
-        .get_recent_activities_filtered(limit, source_filter)
+    visibility
+        .prefix(
+            |limit| {
+                state
+                    .tracker
+                    .get_recent_activities_filtered(limit, source_filter)
+            },
+            |entry| visibility.shows_optional(entry.source.as_deref()),
+            limit,
+        )
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -1366,10 +1487,13 @@ async fn activity_handler(
 
 /// Return the timeline for a single issue.
 async fn issue_timeline_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Path((source, issue_id)): Path<(String, String)>,
 ) -> Result<Json<claudear_core::types::IssueTimeline>, StatusCode> {
+    if !Visibility::for_user(&user).shows(&source) {
+        return Err(StatusCode::NOT_FOUND);
+    }
     state
         .tracker
         .get_issue_timeline(&source, &issue_id)
@@ -1382,16 +1506,17 @@ async fn issue_timeline_handler(
 }
 
 async fn analytics_summary_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<claudear_core::types::AnalyticsSummary>, StatusCode> {
-    let mut summary = state.tracker.get_analytics_summary().map_err(|e| {
+    let scope = Visibility::for_user(&user).scope();
+    let mut summary = state.tracker.get_analytics_summary(scope).map_err(|e| {
         tracing::error!(error = %e, "Internal server error");
         sentry::capture_error(&e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    summary.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr().unwrap_or(None);
+    summary.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr(scope).unwrap_or(None);
 
     let thirty_days_ago = (chrono::Utc::now() - chrono::Duration::days(30))
         .format("%Y-%m-%d %H:%M:%S")
@@ -1402,11 +1527,18 @@ async fn analytics_summary_handler(
             &thirty_days_ago,
             state.config.dashboard.max_plan_monthly_cost,
             "30d",
+            scope,
         )
         .ok();
-    summary.mttr_trend = state.tracker.get_mttr_trend(8).unwrap_or_default();
-    summary.repo_leaderboard = state.tracker.get_repo_leaderboard().unwrap_or_default();
-    summary.commit_trend = state.tracker.get_commit_trend(30).unwrap_or_default();
+    summary.mttr_trend = state.tracker.get_mttr_trend(8, scope).unwrap_or_default();
+    summary.repo_leaderboard = state
+        .tracker
+        .get_repo_leaderboard(scope)
+        .unwrap_or_default();
+    summary.commit_trend = state
+        .tracker
+        .get_commit_trend(30, scope)
+        .unwrap_or_default();
     summary.support_rating = state.tracker.get_support_rating_summary().ok();
 
     Ok(Json(summary))
@@ -1540,7 +1672,7 @@ async fn review_draft_handler(
 }
 
 async fn metrics_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<MetricsQuery>,
 ) -> Result<Json<Vec<claudear_core::types::ProcessingMetric>>, StatusCode> {
@@ -1558,9 +1690,13 @@ async fn metrics_handler(
         Some(chrono::Utc::now() - duration)
     });
 
-    state
-        .tracker
-        .get_metrics(metric_name, since, limit)
+    let visibility = Visibility::for_user(&user);
+    visibility
+        .prefix(
+            |limit| state.tracker.get_metrics(metric_name, since, limit),
+            |metric| visibility.shows_metric(metric),
+            limit,
+        )
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -1570,15 +1706,19 @@ async fn metrics_handler(
 }
 
 async fn errors_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<ErrorsQuery>,
 ) -> Result<Json<Vec<claudear_core::types::ErrorPattern>>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let limit = query.limit.unwrap_or(50).min(200);
 
-    state
-        .tracker
-        .get_error_patterns(limit)
+    visibility
+        .prefix(
+            |limit| state.tracker.get_error_patterns(limit),
+            |pattern| visibility.shows_all(pattern.sources.iter().flatten().map(String::as_str)),
+            limit,
+        )
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -1588,31 +1728,42 @@ async fn errors_handler(
 }
 
 async fn issues_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<IssuesQuery>,
 ) -> Result<Json<IssuesResponse>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(100).min(500);
     let offset = (page - 1) * per_page;
+    let source_filter = query.source.as_deref();
 
+    if visibility.hides_filter(source_filter) {
+        return Ok(Json(IssuesResponse {
+            issues: Vec::new(),
+            total: 0,
+            page,
+            per_page,
+        }));
+    }
+
+    let internal_error = |e: claudear_core::error::Error| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
     let total = state
         .tracker
-        .count_issues(query.source.as_deref())
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .count_issues(source_filter, visibility.scope())
+        .map_err(internal_error)?;
 
-    let rows = state
-        .tracker
-        .list_issues(query.source.as_deref(), per_page, offset)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let rows = match source_filter {
+        Some(source) => state.tracker.list_issues(Some(source), per_page, offset),
+        None => state
+            .tracker
+            .list_scoped_issues(visibility.scope(), per_page, offset),
+    }
+    .map_err(internal_error)?;
 
     let issues: Vec<IssueSummary> = rows
         .into_iter()
@@ -1650,15 +1801,16 @@ async fn issues_handler(
 }
 
 async fn prs_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<PrsQuery>,
 ) -> Result<Json<Vec<claudear_core::types::PrRecord>>, StatusCode> {
+    let scope = Visibility::for_user(&user).scope();
     let limit = query.limit.unwrap_or(100).min(500);
 
     state
         .tracker
-        .list_prs(query.status.as_deref(), limit)
+        .list_prs(query.status.as_deref(), limit, scope)
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -1668,31 +1820,40 @@ async fn prs_handler(
 }
 
 async fn pr_analytics_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<claudear_core::types::PrAnalytics>, StatusCode> {
-    let mut analytics = state.tracker.get_pr_analytics().map_err(|e| {
+    let scope = Visibility::for_user(&user).scope();
+    let mut analytics = state.tracker.get_pr_analytics(scope).map_err(|e| {
         tracing::error!(error = %e, "Internal server error");
         sentry::capture_error(&e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    analytics.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr().unwrap_or(None);
+    analytics.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr(scope).unwrap_or(None);
     analytics.rejection_reasons = state.tracker.get_rejection_reasons(10).unwrap_or_default();
 
     Ok(Json(analytics))
 }
 
 async fn feedback_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<FeedbackQuery>,
 ) -> Result<Json<Vec<claudear_analysis::feedback::FixOutcome>>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
     let limit = query.limit.unwrap_or(50).min(200);
+    let source_filter = query.source.as_deref();
+    if visibility.hides_filter(source_filter) {
+        return Ok(Json(Vec::new()));
+    }
 
-    state
-        .tracker
-        .get_feedback_outcomes(query.source.as_deref(), limit)
+    visibility
+        .prefix(
+            |limit| state.tracker.get_feedback_outcomes(source_filter, limit),
+            |outcome| visibility.shows(&outcome.source),
+            limit,
+        )
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -2165,16 +2326,18 @@ async fn inference_history_handler(
 }
 
 async fn telemetry_overview_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<TelemetryOverviewResponse>, StatusCode> {
+    let visibility = Visibility::for_user(&user);
+    let scope = visibility.scope();
     let now = Utc::now();
-    let stats = state.tracker.get_stats().map_err(|e| {
+    let stats = state.tracker.get_scoped_stats(scope).map_err(|e| {
         tracing::error!(error = %e, "Internal server error");
         sentry::capture_error(&e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let recent_attempts = get_attempt_records_since(&state.tracker, now - Duration::days(7));
+    let recent_attempts = get_attempt_records_since(&state.tracker, now - Duration::days(7), scope);
 
     let windows = vec![
         summarize_window(&recent_attempts, "1h", now - Duration::hours(1)),
@@ -2182,7 +2345,7 @@ async fn telemetry_overview_handler(
         summarize_window(&recent_attempts, "7d", now - Duration::days(7)),
     ];
 
-    let retryable = state
+    let mut retryable = state
         .tracker
         .get_retryable_issues(state.config.retry.max_retries)
         .map_err(|e| {
@@ -2190,13 +2353,14 @@ async fn telemetry_overview_handler(
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    retryable.retain(|attempt| visibility.shows(&attempt.source));
     let retry_manager = RetryManager::new(state.config.retry.clone(), state.tracker.clone());
     let ready_retries = retryable
         .iter()
         .filter(|a| retry_manager.is_ready_for_retry(a))
         .count() as i64;
 
-    let pr_analytics = state.tracker.get_pr_analytics().map_err(|e| {
+    let pr_analytics = state.tracker.get_pr_analytics(scope).map_err(|e| {
         tracing::error!(error = %e, "Internal server error");
         sentry::capture_error(&e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -2223,24 +2387,34 @@ async fn telemetry_overview_handler(
         }
     }
 
-    let processing_time_all = state
-        .tracker
-        .get_metrics("processing_time", None, 20_000)
-        .unwrap_or_default();
-    let processing_time_last_24h = state
-        .tracker
-        .get_metrics("processing_time", Some(now - Duration::hours(24)), 20_000)
-        .unwrap_or_default();
+    let processing_time_all = visibility.visible_metrics(
+        state
+            .tracker
+            .get_metrics("processing_time", None, 20_000)
+            .unwrap_or_default(),
+    );
+    let processing_time_last_24h = visibility.visible_metrics(
+        state
+            .tracker
+            .get_metrics("processing_time", Some(now - Duration::hours(24)), 20_000)
+            .unwrap_or_default(),
+    );
     let processing_time = TelemetryProcessingTime {
         all_time: compute_processing_time_summary(processing_time_all),
         last_24h: compute_processing_time_summary(processing_time_last_24h),
     };
 
-    let top_errors = state.tracker.get_error_patterns(10).unwrap_or_default();
+    let top_errors = visibility
+        .prefix(
+            |limit| state.tracker.get_error_patterns(limit),
+            |pattern| visibility.shows_all(pattern.sources.iter().flatten().map(String::as_str)),
+            10,
+        )
+        .unwrap_or_default();
 
     let activity_last_hour = state
         .tracker
-        .get_activity_type_counts_since(now - Duration::hours(1))
+        .get_activity_type_counts_since(now - Duration::hours(1), scope)
         .unwrap_or_default();
 
     let metric_names = [
@@ -2271,7 +2445,7 @@ async fn telemetry_overview_handler(
     ];
     let counts = state
         .tracker
-        .get_metric_counts_since(&metric_names, now - Duration::hours(24))
+        .get_metric_counts_since(&metric_names, now - Duration::hours(24), scope)
         .unwrap_or_default();
     let mut metric_counts_last_24h: HashMap<String, i64> = HashMap::new();
     for metric_name in metric_names {
@@ -2328,7 +2502,10 @@ async fn telemetry_overview_handler(
         .collect();
     source_breakdown.sort_by(|a, b| a.source.cmp(&b.source));
 
-    let diagnostics = state.tracker.get_diagnostic_counts().ok();
+    let diagnostics = visibility
+        .shows_diagnostics()
+        .then(|| state.tracker.get_diagnostic_counts().ok())
+        .flatten();
 
     let twenty_four_h_ago_iso = (now - Duration::hours(24))
         .format("%Y-%m-%d %H:%M:%S")
@@ -2338,11 +2515,11 @@ async fn telemetry_overview_handler(
         .to_string();
     let agent_spawns_today = state
         .tracker
-        .get_agent_spawn_count(&twenty_four_h_ago_iso)
+        .get_agent_spawn_count(&twenty_four_h_ago_iso, scope)
         .unwrap_or(0);
     let agent_spawns_this_week = state
         .tracker
-        .get_agent_spawn_count(&seven_days_ago_iso)
+        .get_agent_spawn_count(&seven_days_ago_iso, scope)
         .unwrap_or(0);
 
     let response = TelemetryOverviewResponse {
@@ -2365,7 +2542,7 @@ async fn telemetry_overview_handler(
 }
 
 async fn telemetry_timeseries_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<TelemetryTimeseriesQuery>,
 ) -> Result<Json<TelemetryTimeseriesResponse>, StatusCode> {
@@ -2400,7 +2577,8 @@ async fn telemetry_timeseries_handler(
         cursor += Duration::seconds(bucket_seconds);
     }
 
-    for attempt in get_attempt_records_since(&state.tracker, start) {
+    let scope = Visibility::for_user(&user).scope();
+    for attempt in get_attempt_records_since(&state.tracker, start, scope) {
         let bucket = floor_to_bucket(attempt.attempted_at, bucket_minutes).timestamp();
         if let Some(point) = buckets.get_mut(&bucket) {
             point.total += 1;
@@ -2425,7 +2603,7 @@ async fn telemetry_timeseries_handler(
 }
 
 async fn telemetry_pipeline_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<TelemetryPeriodQuery>,
 ) -> Result<Json<TelemetryPipelineResponse>, StatusCode> {
@@ -2463,9 +2641,10 @@ async fn telemetry_pipeline_handler(
     let mut totals = TelemetryPipelineTotals::default();
     let mut per_source: HashMap<String, TelemetryPipelineSource> = HashMap::new();
 
+    let visibility = Visibility::for_user(&user);
     let sums = state
         .tracker
-        .get_metric_sums_since(&total_metric_names, since)
+        .get_metric_sums_since(&total_metric_names, since, visibility.scope())
         .unwrap_or_default();
 
     totals.fetched = sums.get("issues_fetched").copied().unwrap_or(0.0);
@@ -2496,7 +2675,7 @@ async fn telemetry_pipeline_handler(
 
     let per_source_sums = state
         .tracker
-        .get_metric_sums_by_source_since(&per_source_metric_names, since)
+        .get_metric_sums_by_source_since(&per_source_metric_names, since, visibility.scope())
         .unwrap_or_default();
     for ((metric_name, source), value) in per_source_sums {
         let entry = per_source
@@ -2517,22 +2696,18 @@ async fn telemetry_pipeline_handler(
         }
     }
 
-    let poll_cycle_duration = state
-        .tracker
-        .get_metrics("poll_cycle_duration_secs", Some(since), 50_000)
-        .unwrap_or_default();
-    let active_processing = state
-        .tracker
-        .get_metrics("active_processing", Some(since), 50_000)
-        .unwrap_or_default();
-    let pending_attempts = state
-        .tracker
-        .get_metrics("pending_attempts", Some(since), 50_000)
-        .unwrap_or_default();
-    let total_attempts = state
-        .tracker
-        .get_metrics("total_attempts", Some(since), 50_000)
-        .unwrap_or_default();
+    let gauge = |name: &str| {
+        visibility.visible_metrics(
+            state
+                .tracker
+                .get_metrics(name, Some(since), 50_000)
+                .unwrap_or_default(),
+        )
+    };
+    let poll_cycle_duration = gauge("poll_cycle_duration_secs");
+    let active_processing = gauge("active_processing");
+    let pending_attempts = gauge("pending_attempts");
+    let total_attempts = gauge("total_attempts");
 
     let conversion = TelemetryPipelineConversion {
         match_rate: ratio(totals.matched, totals.fetched),
@@ -2576,7 +2751,7 @@ async fn telemetry_pipeline_handler(
 }
 
 async fn telemetry_latency_handler(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<TelemetryPeriodQuery>,
 ) -> Result<Json<TelemetryLatencyResponse>, StatusCode> {
@@ -2584,10 +2759,12 @@ async fn telemetry_latency_handler(
     let (period_label, period_duration) = parse_telemetry_period(query.period.as_deref(), "week");
     let since = now - period_duration;
 
-    let processing_metrics = state
-        .tracker
-        .get_metrics("processing_time", Some(since), 50_000)
-        .unwrap_or_default();
+    let processing_metrics = Visibility::for_user(&user).visible_metrics(
+        state
+            .tracker
+            .get_metrics("processing_time", Some(since), 50_000)
+            .unwrap_or_default(),
+    );
     let overall = compute_processing_time_summary(processing_metrics.clone());
 
     let all_values: Vec<f64> = processing_metrics.iter().map(|m| m.metric_value).collect();
@@ -2666,187 +2843,119 @@ async fn telemetry_latency_handler(
     }))
 }
 
+const CONFIG_SAVED_MESSAGE: &str = "Config saved. Restart claudear to apply changes.";
+
 #[derive(Serialize)]
 struct ConfigResponse {
     content: String,
+    secret_paths: Vec<String>,
+    runtime_overrides: Vec<String>,
+    restart_required: bool,
+    writable: bool,
+    revision: String,
+    optional_sections: Vec<OptionalSection>,
 }
 
 #[derive(Deserialize)]
 struct ConfigUpdateRequest {
     content: String,
+    #[serde(default)]
+    revision: Option<String>,
 }
 
-/// Redact values of keys that look like secrets in raw TOML content.
-fn redact_secrets(content: &str) -> String {
-    let re = regex_lite::Regex::new(
-        r#"(?im)^(\s*(?:[a-z_]*(?:token|secret|password|api_key|auth)[a-z_]*)\s*=\s*)("[^"]*"|'[^']*'|[^\n]*)"#,
-    )
-    .expect("valid regex");
-    re.replace_all(content, r#"${1}"[REDACTED]""#).into_owned()
+#[derive(Serialize)]
+struct ConfigSaveResponse {
+    ok: bool,
+    restart_required: bool,
+    revision: String,
+    message: &'static str,
 }
 
-/// Restore [REDACTED] to actual values before saving to disk
-const REDACTED: &str = "[REDACTED]";
-fn restore_redacted(incoming: &mut toml::Value, current: &toml::Value) {
-    match (incoming, current) {
-        (toml::Value::Table(inc), toml::Value::Table(cur)) => {
-            for (k, v) in inc.iter_mut() {
-                if let Some(cur_val) = cur.get(k) {
-                    restore_redacted(v, cur_val);
-                }
-            }
-        }
-        // Skipping arrays intentionally as secrets will not be stored in the arrays due to ordering issue
-        // (toml::Value::Array(inc), toml::Value::Array(cur)) => {
-        //     for (inc_val, cur_val) in inc.iter_mut().zip(cur.iter()) {
-        //         restore_redacted(inc_val, cur_val);
-        //     }
-        // }
-        (inc @ toml::Value::String(_), cur) if inc.as_str() == Some(REDACTED) => {
-            *inc = cur.clone();
-        }
-
-        _ => {}
-    }
+fn restart_required(state: &ApiState, current: &toml::Value) -> bool {
+    state.startup_config.as_deref() != Some(current)
 }
 
-fn find_redacted(value: &toml::Value, path: &str, out: &mut Vec<String>) {
-    match value {
-        toml::Value::Table(table) => {
-            for (k, v) in table {
-                let child = if path.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{path}.{k}")
-                };
-                find_redacted(v, &child, out);
-            }
-        }
-        toml::Value::Array(items) => {
-            for (i, v) in items.iter().enumerate() {
-                find_redacted(v, &format!("{path}[{i}]"), out);
-            }
-        }
-        toml::Value::String(s) if s == REDACTED => out.push(path.to_string()),
-        _ => {}
-    }
-}
-
-/// GET /api/config — return the raw TOML config file content with secrets redacted.
+/// GET /api/config — the config file rendered from its parsed form with every
+/// secret redacted, plus the file's revision and restart state.
 async fn get_config_handler(
     _user: AdminUser,
     State(state): State<ApiState>,
-) -> Result<Json<ConfigResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let content = tokio::fs::read_to_string(&state.config_path)
+) -> Result<Json<ConfigResponse>, ConfigFileError> {
+    let bytes = config_file::read_locked(&state.config_file)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Failed to read config: {}", e) })),
-            )
-        })?;
+        .map_err(|error| ConfigFileError::unreadable(format!("Failed to read config: {error}")))?;
+    let content = String::from_utf8(bytes)
+        .map_err(|error| ConfigFileError::unreadable(format!("Failed to read config: {error}")))?;
+    let disk = config_file::parse(&content)?;
+    let current = config_file::normalize(&content)?;
+    let document = config_file::redact(&disk)?;
+    let optional_sections = config_file::optional_sections(&current);
+    let revision = config_file::revision(content.as_bytes());
+    let restart_required = restart_required(&state, &current);
+
+    let file = state.config_file.clone();
+    let (writable, runtime_overrides) = tokio::task::spawn_blocking(move || {
+        (
+            config_file::writable(&file),
+            config_file::runtime_overrides(&file, &disk),
+        )
+    })
+    .await
+    .map_err(|error| ConfigFileError::unreadable(format!("Failed to inspect config: {error}")))?;
 
     Ok(Json(ConfigResponse {
-        content: redact_secrets(&content),
+        content: document.content,
+        secret_paths: document.secret_paths,
+        runtime_overrides,
+        restart_required,
+        writable,
+        revision,
+        optional_sections,
     }))
 }
 
-/// PUT /api/config — validate and write the TOML config file.
+/// PUT /api/config — restore redacted secrets, validate as daemon startup
+/// would, and write the file.
 async fn put_config_handler(
-    _user: AdminUser,
+    user: AdminUser,
     State(state): State<ApiState>,
-    Json(body): Json<ConfigUpdateRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !check_api_rate_limit(_user.0.id) {
-        return Err((
+    body: Result<Json<ConfigUpdateRequest>, JsonRejection>,
+) -> Response {
+    if !state.limiters.api.allow(&user.0.id) {
+        return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({ "error": "Rate limit exceeded" })),
-        ));
-    }
-
-    let mut incoming: toml::Value = toml::from_str(&body.content).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("Invalid TOML config: {}", e) })),
         )
-    })?;
-
-    let current: toml::Value = match tokio::fs::read_to_string(&state.config_path).await {
-        Ok(s) => toml::from_str(&s).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Invalid on-disk config: {}", e) })),
-            )
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            toml::Value::Table(toml::Table::new())
-        }
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({ "error": format!("Failed to read on-disk config: {}", e) }),
-                ),
-            ));
-        }
+            .into_response();
+    }
+    let result = match body {
+        Ok(Json(update)) => save_config(&state, update).await,
+        Err(rejection) => Err(ConfigFileError::rejected(&rejection)),
     };
-
-    // Replace any [REDACTED] sentinels in the submitted config with the real
-    // values from the on-disk config before validating and saving.
-    restore_redacted(&mut incoming, &current);
-
-    // Reject any sentinel that could not be restored — writing the literal
-    // "[REDACTED]" would silently corrupt the secret on the next restart.
-    let mut unrestored = Vec::new();
-    find_redacted(&incoming, "", &mut unrestored);
-    if !unrestored.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!(
-                    "Config still contains redacted placeholders for: {}. \
-                     Provide the actual value(s) for these fields.",
-                    unrestored.join(", ")
-                )
-            })),
-        ));
+    match result {
+        Ok(saved) => Json(saved).into_response(),
+        Err(error) => error.into_response(),
     }
+}
 
-    let parsed: Config = incoming.try_into().map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("Invalid TOML config: {}", e) })),
-        )
-    })?;
+async fn save_config(
+    state: &ApiState,
+    body: ConfigUpdateRequest,
+) -> Result<ConfigSaveResponse, ConfigFileError> {
+    let incoming = config_file::parse_document(&body.content)?;
+    let outcome = config_file::write_validated(
+        &state.config_file,
+        body.revision.as_deref(),
+        move |current| config_file::restore_all(incoming, &current),
+    )
+    .await?;
 
-    parsed.validate().map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("Config validation failed: {}", e) })),
-        )
-    })?;
-
-    // Re-serialize the validated config to ensure only parsed fields are written to disk.
-    // This prevents injection of arbitrary content via raw user input.
-    let re_serialized = toml::to_string_pretty(&parsed).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Failed to serialize config: {}", e) })),
-        )
-    })?;
-
-    tokio::fs::write(&state.config_path, &re_serialized)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Failed to write config: {}", e) })),
-            )
-        })?;
-
-    Ok(Json(
-        serde_json::json!({ "ok": true, "message": "Config saved. Restart to apply changes." }),
-    ))
+    Ok(ConfigSaveResponse {
+        ok: true,
+        restart_required: restart_required(state, &outcome.normalized),
+        revision: outcome.revision,
+        message: CONFIG_SAVED_MESSAGE,
+    })
 }
 
 #[derive(Serialize)]
@@ -2909,7 +3018,7 @@ async fn put_global_instruction_handler(
     State(state): State<ApiState>,
     Json(body): Json<InstructionUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !check_api_rate_limit(_user.0.id) {
+    if !state.limiters.api.allow(&_user.0.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     state
@@ -2956,7 +3065,7 @@ async fn put_repo_instruction_handler(
     Path(repo): Path<String>,
     Json(body): Json<InstructionUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !check_api_rate_limit(_user.0.id) {
+    if !state.limiters.api.allow(&_user.0.id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     state
@@ -3122,9 +3231,10 @@ mod tests {
     use axum::http::Request;
     use claudear_config::config::{
         AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, DeployQaConfig, IssuesConfig,
-        LearningConfig, NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig,
-        ScmConfig,
+        LearningConfig, NotifiersConfig, PrDistributionConfig, PrioritisationConfig,
+        RegressionConfig, RetryConfig, ScmConfig,
     };
+    use claudear_core::identity::Role;
     use claudear_core::secret::SecretValue;
     use claudear_storage::{IndexingProgress, SqliteTracker};
     use http_body_util::BodyExt;
@@ -3154,6 +3264,7 @@ mod tests {
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
             deploy_qa: DeployQaConfig::default(),
+            pr_distribution: PrDistributionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
@@ -3190,9 +3301,9 @@ mod tests {
         let config = test_config();
 
         // Create a test user and session
-        let password_hash = bcrypt::hash("testpass", 4).unwrap(); // cost=4 for speed
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap(); // cost=4 for speed
         tracker
-            .create_user("test@example.com", &password_hash, "Test User", "admin")
+            .create_user("test@example.com", &password_hash, "Test User", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4262,9 +4373,9 @@ mod tests {
         let config = test_config();
 
         // Use a nonexistent config path to test the error case
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4291,9 +4402,9 @@ mod tests {
         let tracker = create_test_tracker();
         let config = test_config();
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4324,9 +4435,9 @@ mod tests {
     async fn test_get_config_endpoint_viewer_forbidden() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -4374,9 +4485,9 @@ mod tests {
     async fn test_put_config_endpoint_viewer_forbidden() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -5432,153 +5543,6 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_secrets_basic() {
-        let content = "api_token = \"sk-12345\"\nwebhook_secret = \"whsec_abc\"\nnormal_key = \"not_a_secret\"\n";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(redacted.contains("normal_key"));
-        assert!(!redacted.contains("sk-12345"));
-        assert!(!redacted.contains("whsec_abc"));
-    }
-
-    #[test]
-    fn test_redact_secrets_no_secrets() {
-        let content = "workspace = \"/tmp/repos\"\npoll_interval_ms = 300000\n";
-        let redacted = redact_secrets(content);
-        assert!(!redacted.contains("[REDACTED]"));
-        assert!(redacted.contains("/tmp/repos"));
-        assert!(redacted.contains("300000"));
-    }
-
-    #[test]
-    fn test_redact_secrets_password_key() {
-        let content = "password = \"my_secret_pass\"";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("my_secret_pass"));
-    }
-
-    #[test]
-    fn test_redact_secrets_api_key() {
-        let content = "api_key = \"key-abc123\"";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("key-abc123"));
-    }
-
-    /// Parse TOML, run restore_redacted against the on-disk version, return merged value.
-    fn merge_redacted(incoming: &str, current: &str) -> toml::Value {
-        let mut incoming: toml::Value = toml::from_str(incoming).expect("valid incoming toml");
-        let current: toml::Value = toml::from_str(current).expect("valid current toml");
-        restore_redacted(&mut incoming, &current);
-        incoming
-    }
-
-    #[test]
-    fn test_restore_redacted_replaces_sentinel() {
-        let merged = merge_redacted("api_token = \"[REDACTED]\"", "api_token = \"sk-real\"");
-        assert_eq!(merged["api_token"].as_str(), Some("sk-real"));
-    }
-
-    #[test]
-    fn test_restore_redacted_keeps_edited_value() {
-        // User typed a new secret — it must not be overwritten by the on-disk value.
-        let merged = merge_redacted("api_token = \"sk-new\"", "api_token = \"sk-old\"");
-        assert_eq!(merged["api_token"].as_str(), Some("sk-new"));
-    }
-
-    #[test]
-    fn test_restore_redacted_leaves_non_secret_values_untouched() {
-        let merged = merge_redacted(
-            "workspace = \"/tmp/repos\"\npoll_interval_ms = 300000",
-            "workspace = \"/other\"\npoll_interval_ms = 1",
-        );
-        assert_eq!(merged["workspace"].as_str(), Some("/tmp/repos"));
-        assert_eq!(merged["poll_interval_ms"].as_integer(), Some(300000));
-    }
-
-    #[test]
-    fn test_restore_redacted_nested_table() {
-        let merged = merge_redacted(
-            "[notifiers.helpscout]\napi_key = \"[REDACTED]\"\nmailbox = \"support\"",
-            "[notifiers.helpscout]\napi_key = \"hs-real\"\nmailbox = \"old\"",
-        );
-        assert_eq!(
-            merged["notifiers"]["helpscout"]["api_key"].as_str(),
-            Some("hs-real")
-        );
-        // Non-secret edit in the same table is preserved.
-        assert_eq!(
-            merged["notifiers"]["helpscout"]["mailbox"].as_str(),
-            Some("support")
-        );
-    }
-
-    #[test]
-    fn test_restore_redacted_leaves_arrays_untouched() {
-        // Arrays are intentionally not traversed during restore (the system never
-        // stores secrets in arrays). A sentinel inside an array is therefore left
-        // as-is by restore_redacted; find_redacted catches it and the handler
-        // rejects the save with a 400.
-        let merged = merge_redacted(
-            "tokens = [\"[REDACTED]\", \"keep\"]",
-            "tokens = [\"real-0\", \"stale-1\"]",
-        );
-        let arr = merged["tokens"].as_array().expect("array");
-        assert_eq!(arr[0].as_str(), Some("[REDACTED]"));
-        assert_eq!(arr[1].as_str(), Some("keep"));
-
-        // The unrestored sentinel is surfaced for rejection.
-        let mut out = Vec::new();
-        find_redacted(&merged, "", &mut out);
-        assert_eq!(out, vec!["tokens[0]"]);
-    }
-
-    #[test]
-    fn test_restore_redacted_missing_on_disk_key_keeps_sentinel() {
-        // A secret that was never set on disk cannot be restored, so the literal
-        // sentinel survives the merge. find_redacted is what catches this and the
-        // handler rejects it before writing (see tests below).
-        let merged = merge_redacted("api_token = \"[REDACTED]\"", "other = \"x\"");
-        assert_eq!(merged["api_token"].as_str(), Some("[REDACTED]"));
-    }
-
-    fn redacted_paths(content: &str) -> Vec<String> {
-        let value: toml::Value = toml::from_str(content).expect("valid toml");
-        let mut out = Vec::new();
-        find_redacted(&value, "", &mut out);
-        out
-    }
-
-    #[test]
-    fn test_find_redacted_none_when_fully_restored() {
-        let merged = merge_redacted("api_token = \"[REDACTED]\"", "api_token = \"sk-real\"");
-        let mut out = Vec::new();
-        find_redacted(&merged, "", &mut out);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn test_find_redacted_reports_top_level_key() {
-        assert_eq!(
-            redacted_paths("api_token = \"[REDACTED]\""),
-            vec!["api_token"]
-        );
-    }
-
-    #[test]
-    fn test_find_redacted_reports_nested_path() {
-        let paths = redacted_paths("[notifiers.helpscout]\napi_key = \"[REDACTED]\"");
-        assert_eq!(paths, vec!["notifiers.helpscout.api_key"]);
-    }
-
-    #[test]
-    fn test_find_redacted_reports_array_index() {
-        let paths = redacted_paths("tokens = [\"ok\", \"[REDACTED]\"]");
-        assert_eq!(paths, vec!["tokens[1]"]);
-    }
-
-    #[test]
     fn test_summarize_window_with_merged_and_cannotfix() {
         let now = chrono::Utc::now();
         let attempts = vec![
@@ -5870,6 +5834,11 @@ mod tests {
         let req: ConfigUpdateRequest =
             serde_json::from_str(r#"{"content": "key = \"value\""}"#).unwrap();
         assert_eq!(req.content, r#"key = "value""#);
+        assert!(req.revision.is_none());
+
+        let req: ConfigUpdateRequest =
+            serde_json::from_str(r#"{"content": "", "revision": "abc"}"#).unwrap();
+        assert_eq!(req.revision.as_deref(), Some("abc"));
     }
 
     #[test]
@@ -5967,10 +5936,22 @@ mod tests {
     fn test_config_response_serialization() {
         let resp = ConfigResponse {
             content: "workspace = \"/tmp\"".to_string(),
+            secret_paths: vec!["scm.github.token".to_string()],
+            runtime_overrides: Vec::new(),
+            restart_required: false,
+            writable: true,
+            revision: "abc".to_string(),
+            optional_sections: Vec::new(),
         };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("workspace"));
-        assert!(json.contains("content"));
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["content"], "workspace = \"/tmp\"");
+        assert_eq!(json["secret_paths"][0], "scm.github.token");
+        assert_eq!(json["restart_required"], false);
+        assert_eq!(json["writable"], true);
+        assert_eq!(json["revision"], "abc");
+        assert!(json["optional_sections"].is_array());
+        assert!(json["runtime_overrides"].is_array());
+        assert!(json.get("path").is_none());
     }
 
     #[test]
@@ -6186,9 +6167,9 @@ mod tests {
             ..claudear_config::config::LinearConfig::default()
         });
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6229,9 +6210,9 @@ mod tests {
             ..claudear_config::config::SentryConfig::default()
         });
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6266,9 +6247,9 @@ mod tests {
         config.issues.linear = Some(claudear_config::config::LinearConfig::default());
         config.issues.sentry = Some(claudear_config::config::SentryConfig::default());
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -6351,12 +6332,12 @@ mod tests {
         seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
 
         let since = chrono::Utc::now() - Duration::seconds(1);
-        let records = get_attempt_records_since(&tracker, since);
+        let records = get_attempt_records_since(&tracker, since, AttemptScope::All);
         assert_eq!(records.len(), 1);
 
         // Future timestamp should yield no records
         let future = chrono::Utc::now() + Duration::hours(1);
-        let records = get_attempt_records_since(&tracker, future);
+        let records = get_attempt_records_since(&tracker, future, AttemptScope::All);
         assert!(records.is_empty());
     }
 
@@ -6404,45 +6385,6 @@ mod tests {
         assert!((summary.p50_secs.unwrap() - 50.5).abs() < 2.0);
         assert!(summary.p95_secs.unwrap() >= 94.0);
         assert!(summary.p99_secs.unwrap() >= 98.0);
-    }
-
-    #[test]
-    fn test_redact_secrets_single_quoted_values() {
-        let content = "api_token = 'sk-12345'\n";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("sk-12345"));
-    }
-
-    #[test]
-    fn test_redact_secrets_unquoted_values() {
-        let content = "auth_token = mytoken123\n";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("mytoken123"));
-    }
-
-    #[test]
-    fn test_redact_secrets_with_leading_whitespace() {
-        let content = "  client_secret = \"supersecret\"\n";
-        let redacted = redact_secrets(content);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("supersecret"));
-    }
-
-    #[test]
-    fn test_redact_secrets_preserves_structure() {
-        let content = "[linear]\napi_key = \"lin_key\"\ntrigger_labels = [\"autofix\"]\n";
-        let redacted = redact_secrets(content);
-        assert!(!redacted.contains("lin_key"));
-        assert!(redacted.contains("trigger_labels"));
-        assert!(redacted.contains("[\"autofix\"]"));
-    }
-
-    #[test]
-    fn test_redact_secrets_empty_string() {
-        let redacted = redact_secrets("");
-        assert_eq!(redacted, "");
     }
 
     #[test]
@@ -6974,9 +6916,9 @@ mod tests {
         let tracker = create_test_tracker();
 
         // Test that "events" is also a valid stream
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -7106,9 +7048,9 @@ mod tests {
         });
         let valid_toml = toml::to_string_pretty(&valid_config).unwrap();
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -7570,9 +7512,9 @@ mod tests {
     async fn test_expired_session_returns_401() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("test@test.com", &password_hash, "Test", "admin")
+            .create_user("test@test.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         // Create a session that already expired
         let token = tracker.create_session(1, "2020-01-01 00:00:00").unwrap();
@@ -7957,7 +7899,7 @@ mod tests {
 
         // Query since 1 hour ago -- should include the just-created attempt
         let since = chrono::Utc::now() - chrono::Duration::hours(1);
-        let records = get_attempt_records_since(&tracker, since);
+        let records = get_attempt_records_since(&tracker, since, AttemptScope::All);
         assert_eq!(records.len(), 1);
     }
 
@@ -7971,7 +7913,7 @@ mod tests {
 
         // Query since far in the future -- should exclude everything
         let since = chrono::Utc::now() + chrono::Duration::hours(24);
-        let records = get_attempt_records_since(&tracker, since);
+        let records = get_attempt_records_since(&tracker, since, AttemptScope::All);
         assert!(records.is_empty());
     }
 
@@ -7980,9 +7922,9 @@ mod tests {
         let tracker = create_test_tracker();
         let config = test_config();
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .create_user("admin@test.com", &password_hash, "Admin", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8083,9 +8025,9 @@ mod tests {
             Some(claudear_core::secret::SecretValue::new("wa_token"));
         config.notifiers.whatsapp.phone_number_id = Some("12345".to_string());
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8122,9 +8064,9 @@ mod tests {
             Some(claudear_core::secret::SecretValue::new("tg_bot_token"));
         config.notifiers.telegram.chat_id = Some("123456789".to_string());
 
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .create_user("test@example.com", &password_hash, "Test", Role::Admin)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8206,7 +8148,7 @@ mod tests {
                 &token,
                 serde_json::json!({
                     "email": "newuser@example.com",
-                    "password": "securepass123",
+                    "password": crate::api::fixture::password(),
                     "name": "New User",
                     "role": "viewer"
                 }),
@@ -8234,7 +8176,7 @@ mod tests {
                 &token,
                 serde_json::json!({
                     "email": "test@example.com",
-                    "password": "password123",
+                    "password": crate::api::fixture::password(),
                     "name": "Duplicate",
                     "role": "viewer"
                 }),
@@ -8304,9 +8246,9 @@ mod tests {
         tracker
             .create_user(
                 "todelete@example.com",
-                &bcrypt::hash("pass", 4).unwrap(),
+                &bcrypt::hash(crate::api::fixture::password(), 4).unwrap(),
                 "Delete Me",
-                "viewer",
+                Role::Viewer,
             )
             .unwrap();
 
@@ -8325,9 +8267,9 @@ mod tests {
     async fn test_users_endpoint_viewer_forbidden() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
         tracker
-            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .create_user("viewer@test.com", &password_hash, "Viewer", Role::Viewer)
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -8347,7 +8289,7 @@ mod tests {
                 &token,
                 serde_json::json!({
                     "email": "new@example.com",
-                    "password": "password123",
+                    "password": crate::api::fixture::password(),
                     "name": "New User",
                     "role": "viewer"
                 }),
@@ -8356,6 +8298,479 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    const FAKE_CONFIG_FILE: &str = "workspace = \"/tmp/repos\"\n\n\
+        [scm.github]\ntoken = \"fake-route-github-token\"\n\n\
+        [issues.linear]\napi_key = \"fake-route-linear-key\"\n\n\
+        [notifiers.discord]\nwebhook_url = \"https://discord.invalid/fake-route-webhook\"\n";
+
+    const FAKE_ROUTE_SECRETS: &[&str] = &[
+        "fake-route-github-token",
+        "fake-route-linear-key",
+        "fake-route-webhook",
+    ];
+
+    fn config_file_router(path: PathBuf, role: Role) -> (Router, String) {
+        let tracker = create_test_tracker();
+        let password_hash = bcrypt::hash(crate::api::fixture::password(), 4).unwrap();
+        tracker
+            .create_user("config@test.com", &password_hash, "Config", role)
+            .unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(Config::default(), tracker, path, indexing_rx)
+            .layer(CookieManagerLayer::new());
+        (router, token)
+    }
+
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_get_config_redacts_secrets_by_type() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, FAKE_CONFIG_FILE).unwrap();
+        let (router, token) = config_file_router(path.clone(), Role::Admin);
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let content = body["content"].as_str().unwrap();
+        for fake in FAKE_ROUTE_SECRETS {
+            assert!(!content.contains(fake), "{fake} leaked:\n{content}");
+            assert!(!body.to_string().contains(fake), "{fake} leaked: {body}");
+        }
+        let secret_paths: Vec<&str> = body["secret_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.as_str())
+            .collect();
+        for expected in [
+            "scm.github.token",
+            "issues.linear.api_key",
+            "notifiers.discord.webhook_url",
+        ] {
+            assert!(
+                secret_paths.contains(&expected),
+                "{expected}: {secret_paths:?}"
+            );
+        }
+        assert!(body["path"].is_null(), "path field should not be exposed");
+        assert_eq!(body["restart_required"], false);
+        assert_eq!(body["writable"], true);
+        assert_eq!(
+            body["revision"],
+            config_file::revision(FAKE_CONFIG_FILE.as_bytes())
+        );
+        assert!(body["runtime_overrides"].is_array());
+        let optional: Vec<&str> = body["optional_sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|section| section["key"].as_str())
+            .collect();
+        assert!(optional.contains(&"issues.sentry"));
+        assert!(!optional.contains(&"issues.linear"));
+    }
+
+    #[tokio::test]
+    async fn test_put_config_keeps_redacted_secrets_and_tracks_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, FAKE_CONFIG_FILE).unwrap();
+        let (router, token) = config_file_router(path.clone(), Role::Admin);
+
+        let loaded = json_body(
+            router
+                .clone()
+                .oneshot(auth_get("/api/config", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let content = loaded["content"].as_str().unwrap().to_string();
+        assert!(content.contains("token = \"[REDACTED]\""), "{content}");
+
+        let response = router
+            .clone()
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": content, "revision": loaded["revision"] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = json_body(response).await;
+        assert_eq!(saved["ok"], true);
+        assert_eq!(saved["restart_required"], false);
+        assert_eq!(
+            saved["message"],
+            "Config saved. Restart claudear to apply changes."
+        );
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        for fake in FAKE_ROUTE_SECRETS {
+            assert!(on_disk.contains(fake), "{fake} lost from disk:\n{on_disk}");
+        }
+        assert!(!on_disk.contains("[REDACTED]"));
+        assert_eq!(saved["revision"], config_file::revision(on_disk.as_bytes()));
+
+        let changed = content.replace("poll_interval_ms = 300000", "poll_interval_ms = 300001");
+        assert_ne!(changed, content);
+        let response = router
+            .clone()
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": changed, "revision": saved["revision"] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["restart_required"], true);
+
+        let reloaded = json_body(
+            router
+                .oneshot(auth_get("/api/config", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(reloaded["restart_required"], true);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_rejects_a_stale_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, FAKE_CONFIG_FILE).unwrap();
+        let (router, token) = config_file_router(path.clone(), Role::Admin);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": FAKE_CONFIG_FILE, "revision": "stale" }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(response).await["code"], "revision_mismatch");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_validation_failure_returns_invalid_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, FAKE_CONFIG_FILE).unwrap();
+        let (router, token) = config_file_router(path.clone(), Role::Admin);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": "workspace = \"/tmp/repos\"\n" }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("No sources configured"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    fn config_router_with(content: &str) -> (Router, String, tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, content).unwrap();
+        let (router, token) = config_file_router(path.clone(), Role::Admin);
+        (router, token, directory, path)
+    }
+
+    #[tokio::test]
+    async fn test_get_config_omits_lines_of_an_unparseable_file() {
+        let content = "workspace = \"/tmp/repos\"\n\n[scm.github]\ntoken = fake-secret-unquoted\n";
+        let (router, token, _directory, _path) = config_router_with(content);
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(
+            !body.to_string().contains("fake-secret-unquoted"),
+            "secret leaked: {body}"
+        );
+        assert!(
+            body["error"].as_str().unwrap().contains("(line 4)"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_config_omits_lines_of_unparseable_content() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({
+                    "content": "workspace = \"/tmp/repos\"\n[scm.github]\ntoken = fake-typed-secret\n"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(
+            !body.to_string().contains("fake-typed-secret"),
+            "secret leaked: {body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_omits_values_from_type_errors() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({
+                    "content": "workspace = \"/tmp/repos\"\npoll_interval_ms = \"fake-misplaced-secret\"\n"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert!(
+            !body.to_string().contains("fake-misplaced-secret"),
+            "secret leaked: {body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_rejects_a_malformed_body_as_invalid() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": 5 }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert!(body["error"].is_string(), "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_refuses_a_kept_secret_for_a_changed_host() {
+        let content = format!(
+            "{FAKE_CONFIG_FILE}\n[notifiers.email]\nsmtp_host = \"smtp.invalid\"\n\
+             smtp_password = \"fake-route-smtp-password\"\n"
+        );
+        let (router, token, _directory, path) = config_router_with(&content);
+        let loaded = json_body(
+            router
+                .clone()
+                .oneshot(auth_get("/api/config", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let redacted = loaded["content"].as_str().unwrap();
+        let redirected = redacted.replace(
+            "smtp_host = \"smtp.invalid\"",
+            "smtp_host = \"evil.invalid\"",
+        );
+        assert_ne!(redirected, redacted);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": redirected, "revision": loaded["revision"] }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid");
+        assert_eq!(
+            body["error"],
+            "Re-enter notifiers.email.smtp_password when changing notifiers.email.smtp_host"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn test_get_config_redacts_pushover_and_twilio_identifiers() {
+        let content = format!(
+            "{FAKE_CONFIG_FILE}\n[notifiers.sms]\naccount_sid = \"fake-route-twilio-sid\"\n\n\
+             [notifiers.push]\nuser_key = \"fake-route-pushover-user\"\n\n\
+             [users.jake]\npush_user_key = \"fake-route-pushover-registry\"\n"
+        );
+        let (router, token, _directory, _path) = config_router_with(&content);
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        for fake in [
+            "fake-route-twilio-sid",
+            "fake-route-pushover-user",
+            "fake-route-pushover-registry",
+        ] {
+            assert!(!body.to_string().contains(fake), "{fake} leaked: {body}");
+        }
+        let secret_paths = body["secret_paths"].to_string();
+        for path in [
+            "notifiers.sms.account_sid",
+            "notifiers.push.user_key",
+            "users.jake.push_user_key",
+        ] {
+            assert!(secret_paths.contains(path), "{path}: {secret_paths}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_config_waits_for_an_in_progress_write() {
+        let (router, token, _directory, _path) = config_router_with(FAKE_CONFIG_FILE);
+        let held = config_file::HeldWriteLock::acquire();
+
+        let request = tokio::spawn(router.oneshot(auth_get("/api/config", &token)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !request.is_finished(),
+            "GET /api/config read the file during a write"
+        );
+
+        held.release();
+        assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_restores_secrets_from_the_file_it_writes_over() {
+        let (router, token, _directory, path) = config_router_with(FAKE_CONFIG_FILE);
+        let loaded = json_body(
+            router
+                .clone()
+                .oneshot(auth_get("/api/config", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let held = config_file::HeldWriteLock::acquire();
+
+        let request = tokio::spawn(router.oneshot(auth_put_json(
+            "/api/config",
+            &token,
+            serde_json::json!({ "content": loaded["content"] }),
+        )));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::fs::write(
+            &path,
+            FAKE_CONFIG_FILE.replace("fake-route-github-token", "fake-rotated-github-token"),
+        )
+        .unwrap();
+        held.release();
+
+        assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("fake-rotated-github-token"), "{on_disk}");
+        assert!(!on_disk.contains("fake-route-github-token"), "{on_disk}");
+    }
+
+    #[tokio::test]
+    async fn test_config_endpoints_forbid_viewers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.toml");
+        std::fs::write(&path, FAKE_CONFIG_FILE).unwrap();
+        let (router, token) = config_file_router(path.clone(), Role::Viewer);
+
+        let response = router
+            .clone()
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/config",
+                &token,
+                serde_json::json!({ "content": "workspace = \"/tmp/other\"\n" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_CONFIG_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_put_config_returns_401() {
+        let tracker = create_test_tracker();
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            Config::default(),
+            tracker,
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"content":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -8379,6 +8794,9 @@ mod tests {
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "invalid");
     }
 
     #[test]
@@ -8425,5 +8843,2010 @@ mod tests {
         assert_eq!(summary.samples, 0);
         assert!(summary.avg_secs.is_none());
         assert!(summary.max_secs.is_none());
+    }
+
+    mod identity_authorization {
+        use super::{auth_get, auth_put_json, create_test_tracker, test_config, Role};
+        use crate::api::create_api_router_with_dashboard;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::Router;
+        use claudear_config::config::{Config, UserConfig};
+        use claudear_config::users::UserRegistry;
+        use claudear_core::identity::{Identities, IdentityField, IdentityOrigin};
+        use claudear_storage::{DirectoryUser, DirectoryWrite, FixAttemptTracker, IdentityWrite};
+        use http_body_util::BodyExt;
+        use serde_json::{json, Value};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+        use tower_cookies::CookieManagerLayer;
+
+        const ADMIN_EMAIL: &str = "identity-admin@example.com";
+        const VIEWER_EMAIL: &str = "identity-viewer@example.com";
+        const OTHER_EMAIL: &str = "identity-other@example.com";
+        const VIEWER_DISCORD_ID: &str = "452316113016193041";
+        const OTHER_DISCORD_ID: &str = "452316113016193042";
+        const CONFIG_DISCORD_ID: &str = "452316113016193043";
+        const SLACK_ID: &str = "U0123456789";
+        const SMS_NUMBER: &str = "+14155550123";
+        const PUSH_USER_KEY: &str = "abcdefghij0123456789ABCDEFGHIJ";
+        const TELEGRAM_CHAT_ID: &str = "-1001234567";
+        const CONFLICT_MESSAGE: &str = "already belongs to another person";
+
+        struct Account {
+            id: i64,
+            token: String,
+        }
+
+        struct Harness {
+            router: Router,
+            tracker: Arc<dyn FixAttemptTracker>,
+            registry: UserRegistry,
+            admin: Account,
+            viewer: Account,
+            other: Account,
+        }
+
+        impl Harness {
+            fn new(users: HashMap<String, UserConfig>) -> Self {
+                let tracker = create_test_tracker();
+                let admin = account(&tracker, ADMIN_EMAIL, "Admin", Role::Admin);
+                let viewer = account(&tracker, VIEWER_EMAIL, "Viewer", Role::Viewer);
+                let other = account(&tracker, OTHER_EMAIL, "Other", Role::Viewer);
+                let config = Config {
+                    users,
+                    ..test_config()
+                };
+                let registry = UserRegistry::new(config.users.clone());
+                let router = create_api_router_with_dashboard(
+                    config,
+                    tracker.clone(),
+                    PathBuf::from("claudear.toml"),
+                    tracker.subscribe_indexing_progress(),
+                    None,
+                    registry.clone(),
+                )
+                .layer(CookieManagerLayer::new());
+                Self {
+                    router,
+                    tracker,
+                    registry,
+                    admin,
+                    viewer,
+                    other,
+                }
+            }
+
+            async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
+                let response = self
+                    .router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("response");
+                let status = response.status();
+                let bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                let body = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).expect("json body")
+                };
+                (status, body)
+            }
+
+            /// Store a console row directly, bypassing the API and its write limiter.
+            fn seed(&self, user_id: i64, slug: Option<&str>, identities: Identities) {
+                self.tracker
+                    .save_directory(&[DirectoryWrite {
+                        user: DirectoryUser::Existing {
+                            user_id,
+                            name: None,
+                            role: None,
+                        },
+                        identities: Some(IdentityWrite {
+                            slug: slug.map(str::to_string),
+                            identities,
+                        }),
+                        invite: None,
+                    }])
+                    .expect("seed identities");
+                crate::registry::reload(&self.registry, self.tracker.as_ref());
+            }
+
+            fn person(&self, source: &str, handle: &str) -> Option<String> {
+                self.registry
+                    .resolve(source, handle)
+                    .map(|person| person.slug)
+            }
+
+            fn stored_user_ids(&self) -> Vec<i64> {
+                self.tracker
+                    .list_user_identities()
+                    .expect("list identities")
+                    .into_iter()
+                    .map(|entry| entry.user_id)
+                    .collect()
+            }
+        }
+
+        fn account(
+            tracker: &Arc<dyn FixAttemptTracker>,
+            email: &str,
+            name: &str,
+            role: Role,
+        ) -> Account {
+            let id = tracker
+                .create_user(email, "unused-hash", name, role)
+                .expect("create user");
+            let token = tracker
+                .create_session(id, "2099-12-31 23:59:59")
+                .expect("create session");
+            Account { id, token }
+        }
+
+        fn identities_uri(user_id: i64) -> String {
+            format!("/api/users/{user_id}/identities")
+        }
+
+        fn console_key(user_id: i64) -> String {
+            format!("console-{user_id}")
+        }
+
+        fn auth_delete(uri: &str, token: &str) -> Request<Body> {
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("cookie", format!("claudear_session={token}"))
+                .body(Body::empty())
+                .expect("request")
+        }
+
+        fn anonymous(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
+            let builder = Request::builder().method(method).uri(uri);
+            match body {
+                Some(body) => builder
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string())),
+                None => builder.body(Body::empty()),
+            }
+            .expect("request")
+        }
+
+        fn sensitive_identities(github: &str, discord_id: &str) -> Identities {
+            Identities {
+                github_usernames: vec![github.to_string()],
+                discord_id: Some(discord_id.to_string()),
+                email: Some(format!("notify-{github}@example.com")),
+                push_user_key: Some(PUSH_USER_KEY.to_string()),
+                sms_number: Some(SMS_NUMBER.to_string()),
+                whatsapp_number: Some(SMS_NUMBER.to_string()),
+                telegram_chat_id: Some(TELEGRAM_CHAT_ID.to_string()),
+                ..Identities::default()
+            }
+        }
+
+        fn chief_config() -> HashMap<String, UserConfig> {
+            HashMap::from([(
+                "ceo".to_string(),
+                UserConfig {
+                    github_usernames: vec!["chief-gh".to_string()],
+                    discord_id: Some(CONFIG_DISCORD_ID.to_string()),
+                    email: Some("chief@example.com".to_string()),
+                    ..UserConfig::default()
+                },
+            )])
+        }
+
+        fn violation_fields(body: &Value) -> Vec<String> {
+            let mut fields: Vec<String> = body["violations"]
+                .as_array()
+                .expect("violations")
+                .iter()
+                .map(|violation| violation["field"].as_str().expect("field").to_string())
+                .collect();
+            fields.sort();
+            fields
+        }
+
+        fn assert_redacted(person: &Value) {
+            assert_eq!(person["redacted"], true);
+            assert_eq!(person["login_email"], Value::Null);
+            for field in IdentityField::ALL
+                .into_iter()
+                .filter(|field| field.is_sensitive())
+            {
+                assert_eq!(
+                    person["identities"][field.as_str()],
+                    Value::Null,
+                    "{} must be redacted",
+                    field.as_str()
+                );
+            }
+        }
+
+        fn find_person(people: &Value, user_id: i64) -> &Value {
+            people
+                .as_array()
+                .expect("array")
+                .iter()
+                .find(|person| person["user_id"] == user_id)
+                .expect("person listed")
+        }
+
+        #[tokio::test]
+        async fn admin_writes_another_users_identities_and_reads_them_back() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({
+                        "github_usernames": ["viewer-gh"],
+                        "discord_id": VIEWER_DISCORD_ID,
+                        "sms_number": SMS_NUMBER,
+                    }),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["user_id"], harness.viewer.id);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["redacted"], false);
+
+            for token in [&harness.admin.token, &harness.viewer.token] {
+                let (status, read) = harness.send(auth_get(&uri, token)).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(read["redacted"], false);
+                assert_eq!(read["login_email"], VIEWER_EMAIL);
+                assert_eq!(read["identities"], body["identities"]);
+                assert_eq!(read["identities"]["github_usernames"], json!(["viewer-gh"]));
+                assert_eq!(read["identities"]["discord_id"], VIEWER_DISCORD_ID);
+                assert_eq!(read["identities"]["sms_number"], SMS_NUMBER);
+            }
+            assert_eq!(
+                harness.person("github", "viewer-gh"),
+                Some(console_key(harness.viewer.id))
+            );
+        }
+
+        #[tokio::test]
+        async fn viewer_writes_and_resets_their_own_identities() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({
+                        "github_usernames": ["@Viewer-GH"],
+                        "telegram_chat_id": TELEGRAM_CHAT_ID,
+                    }),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "active");
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["redacted"], false);
+            assert_eq!(body["login_email"], VIEWER_EMAIL);
+            assert_eq!(body["name"], "Viewer");
+            assert_eq!(body["identities"]["github_usernames"], json!(["Viewer-GH"]));
+            assert_eq!(body["identities"]["telegram_chat_id"], TELEGRAM_CHAT_ID);
+            assert!(body["updated_at"].is_string());
+            assert_eq!(
+                harness.person("github", "viewer-gh"),
+                Some(console_key(harness.viewer.id))
+            );
+
+            let (status, body) = harness.send(auth_delete(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "unset");
+            assert_eq!(body["person_key"], Value::Null);
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!([]));
+            assert!(harness.stored_user_ids().is_empty());
+            assert_eq!(harness.person("github", "viewer-gh"), None);
+        }
+
+        #[tokio::test]
+        async fn viewer_cannot_write_or_reset_another_users_identities() {
+            let harness = Harness::new(HashMap::new());
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("other-gh", OTHER_DISCORD_ID),
+            );
+
+            for target in [harness.other.id, harness.admin.id] {
+                let (status, body) = harness
+                    .send(auth_put_json(
+                        &identities_uri(target),
+                        &harness.viewer.token,
+                        json!({"github_usernames": ["sneaky-gh"]}),
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(
+                    body,
+                    json!({"error": "You can only change your own identities"})
+                );
+            }
+
+            let (status, _) = harness
+                .send(auth_delete(
+                    &identities_uri(harness.other.id),
+                    &harness.viewer.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+
+            let (status, _) = harness
+                .send(auth_put_json(
+                    &identities_uri(999_999_999),
+                    &harness.viewer.token,
+                    json!({"github_usernames": ["sneaky-gh"]}),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a viewer must not learn whether another user id exists"
+            );
+
+            let (status, _) = harness
+                .send(auth_put_json(
+                    &identities_uri(999_999_999),
+                    &harness.admin.token,
+                    json!({"github_usernames": ["sneaky-gh"]}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            assert_eq!(harness.stored_user_ids(), vec![harness.other.id]);
+            assert_eq!(harness.person("github", "sneaky-gh"), None);
+            assert_eq!(
+                harness.person("github", "other-gh"),
+                Some(console_key(harness.other.id))
+            );
+        }
+
+        #[tokio::test]
+        async fn only_an_admin_sets_the_person_key() {
+            let harness = Harness::new(chief_config());
+            harness.seed(harness.other.id, Some("other-key"), Identities::default());
+            let uri = identities_uri(harness.viewer.id);
+
+            for body in [
+                json!({"slug": "viewer-key"}),
+                json!({"slug": ""}),
+                json!({"slug": "viewer-key", "github_usernames": ["viewer-gh"]}),
+            ] {
+                let (status, _) = harness
+                    .send(auth_put_json(&uri, &harness.viewer.token, body))
+                    .await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+            }
+            assert_eq!(harness.stored_user_ids(), vec![harness.other.id]);
+            assert_eq!(harness.person("github", "viewer-gh"), None);
+
+            for slug in ["Bad Slug", "console-7"] {
+                let (status, body) = harness
+                    .send(auth_put_json(
+                        &uri,
+                        &harness.admin.token,
+                        json!({"slug": slug}),
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "slug {slug:?}");
+                assert_eq!(violation_fields(&body), vec!["slug"]);
+            }
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({"slug": "other-key"}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(violation_fields(&body), vec!["slug"]);
+            assert_eq!(
+                harness.registry.origin("other-key"),
+                Some(IdentityOrigin::Console)
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({"slug": "ceo"}),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "an admin links a console user to a config-only person by key"
+            );
+            assert_eq!(body["slug"], "ceo");
+            assert_eq!(body["person_key"], "ceo");
+            assert_eq!(
+                harness.registry.origin("ceo"),
+                Some(IdentityOrigin::Console)
+            );
+            assert_eq!(harness.person("github", "chief-gh"), None);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.admin.token,
+                    json!({"slug": "viewer-key"}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["slug"], "viewer-key");
+            assert_eq!(body["person_key"], "viewer-key");
+            assert_eq!(harness.registry.origin("ceo"), Some(IdentityOrigin::Config));
+            assert_eq!(
+                harness.person("github", "chief-gh"),
+                Some("ceo".to_string())
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"discord_id": VIEWER_DISCORD_ID}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["slug"], "viewer-key");
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("viewer-key")
+                    .and_then(|person| person.discord_id),
+                Some(VIEWER_DISCORD_ID.to_string())
+            );
+            assert!(harness
+                .registry
+                .get_by_slug(&console_key(harness.viewer.id))
+                .is_some());
+        }
+
+        #[tokio::test]
+        async fn viewer_reads_other_people_redacted_and_themselves_in_full() {
+            let harness = Harness::new(HashMap::new());
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("other-gh", OTHER_DISCORD_ID),
+            );
+            harness.seed(
+                harness.viewer.id,
+                None,
+                sensitive_identities("viewer-gh", VIEWER_DISCORD_ID),
+            );
+
+            let (status, other) = harness
+                .send(auth_get(
+                    &identities_uri(harness.other.id),
+                    &harness.viewer.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_redacted(&other);
+            assert_eq!(other["name"], "Other");
+            assert_eq!(other["origin"], "console");
+            assert_eq!(other["identities"]["github_usernames"], json!(["other-gh"]));
+            assert_eq!(other["identities"]["discord_id"], OTHER_DISCORD_ID);
+
+            let (status, own) = harness
+                .send(auth_get(
+                    &identities_uri(harness.viewer.id),
+                    &harness.viewer.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(own["redacted"], false);
+            assert_eq!(own["login_email"], VIEWER_EMAIL);
+            assert_eq!(own["identities"]["sms_number"], SMS_NUMBER);
+            assert_eq!(own["identities"]["push_user_key"], PUSH_USER_KEY);
+            assert_eq!(own["identities"]["email"], "notify-viewer-gh@example.com");
+
+            let (status, other) = harness
+                .send(auth_get(
+                    &identities_uri(harness.other.id),
+                    &harness.admin.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(other["redacted"], false);
+            assert_eq!(other["login_email"], OTHER_EMAIL);
+            assert_eq!(other["identities"]["telegram_chat_id"], TELEGRAM_CHAT_ID);
+        }
+
+        #[tokio::test]
+        async fn identity_list_redacts_only_other_people_for_a_viewer() {
+            let harness = Harness::new(HashMap::from([(
+                "chief".to_string(),
+                UserConfig {
+                    github_usernames: vec!["chief-gh".to_string()],
+                    email: Some(ADMIN_EMAIL.to_string()),
+                    ..UserConfig::default()
+                },
+            )]));
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("other-gh", OTHER_DISCORD_ID),
+            );
+            harness.seed(
+                harness.viewer.id,
+                None,
+                sensitive_identities("viewer-gh", VIEWER_DISCORD_ID),
+            );
+            let newcomer = account(
+                &harness.tracker,
+                "identity-newcomer@example.com",
+                "Newcomer",
+                Role::Viewer,
+            );
+
+            let (status, people) = harness
+                .send(auth_get("/api/identities", &harness.viewer.token))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(people.as_array().expect("array").len(), 4);
+            let other = find_person(&people, harness.other.id);
+            assert_redacted(other);
+            assert_eq!(other["identities"]["github_usernames"], json!(["other-gh"]));
+            let admin = find_person(&people, harness.admin.id);
+            assert_redacted(admin);
+            assert_eq!(admin["origin"], "config");
+            assert_eq!(admin["person_key"], "chief");
+            assert_eq!(admin["slug"], Value::Null);
+            assert!(admin.get("email").is_none(), "no login email field leaks");
+            assert_eq!(admin["identities"]["github_usernames"], json!(["chief-gh"]));
+            let newcomer = find_person(&people, newcomer.id);
+            assert_eq!(newcomer["origin"], "unset");
+            assert_eq!(newcomer["person_key"], Value::Null);
+            assert_eq!(newcomer["status"], "active");
+            let own = find_person(&people, harness.viewer.id);
+            assert_eq!(own["redacted"], false);
+            assert_eq!(own["login_email"], VIEWER_EMAIL);
+            assert_eq!(own["identities"]["sms_number"], SMS_NUMBER);
+
+            let (status, people) = harness
+                .send(auth_get("/api/identities", &harness.admin.token))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(people
+                .as_array()
+                .expect("array")
+                .iter()
+                .all(|person| person["redacted"] == false));
+            let other = find_person(&people, harness.other.id);
+            assert_eq!(other["login_email"], OTHER_EMAIL);
+            assert_eq!(other["identities"]["sms_number"], SMS_NUMBER);
+        }
+
+        #[tokio::test]
+        async fn invalid_values_are_rejected_per_field_without_echoing_them() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            for (field, value, body) in [
+                ("discord_id", "123", json!({"discord_id": "123"})),
+                ("sms_number", "12345678", json!({"sms_number": "12345678"})),
+                (
+                    "github_usernames",
+                    "-bad-",
+                    json!({"github_usernames": ["-bad-"]}),
+                ),
+                ("email", "not-an-email", json!({"email": "not-an-email"})),
+            ] {
+                let (status, response) = harness
+                    .send(auth_put_json(&uri, &harness.viewer.token, body))
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+                assert_eq!(response["error"], "Invalid identities");
+                assert_eq!(violation_fields(&response), vec![field]);
+                let message = response["violations"][0]["message"]
+                    .as_str()
+                    .expect("message");
+                if field != "github_usernames" {
+                    assert!(
+                        !message.contains(value),
+                        "{field} violation must not echo the value"
+                    );
+                }
+            }
+
+            let (status, response) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({
+                        "discord_id": "123",
+                        "sms_number": "12345678",
+                        "github_usernames": ["-bad-"],
+                        "email": "not-an-email",
+                    }),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                violation_fields(&response),
+                vec!["discord_id", "email", "github_usernames", "sms_number"]
+            );
+
+            assert!(harness.stored_user_ids().is_empty());
+            assert_eq!(harness.person("github", "-bad-"), None);
+        }
+
+        #[tokio::test]
+        async fn handles_owned_by_another_person_conflict_for_every_role() {
+            let harness = Harness::new(chief_config());
+            harness.seed(
+                harness.other.id,
+                None,
+                sensitive_identities("taken-gh", OTHER_DISCORD_ID),
+            );
+            let uri = identities_uri(harness.viewer.id);
+
+            for (token, body, field) in [
+                (
+                    &harness.viewer.token,
+                    json!({"github_usernames": ["Taken-GH"]}),
+                    "github_usernames",
+                ),
+                (
+                    &harness.viewer.token,
+                    json!({"github_usernames": ["chief-gh"]}),
+                    "github_usernames",
+                ),
+                (
+                    &harness.viewer.token,
+                    json!({"discord_id": OTHER_DISCORD_ID}),
+                    "discord_id",
+                ),
+                (
+                    &harness.admin.token,
+                    json!({"github_usernames": ["chief-gh"]}),
+                    "github_usernames",
+                ),
+            ] {
+                let (status, response) = harness.send(auth_put_json(&uri, token, body)).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{field}");
+                assert_eq!(violation_fields(&response), vec![field]);
+                let message = response["violations"][0]["message"]
+                    .as_str()
+                    .expect("message");
+                assert!(message.contains(CONFLICT_MESSAGE), "{message}");
+                assert!(!message.contains("ceo"), "{message}");
+                assert!(
+                    !message.contains(&console_key(harness.other.id)),
+                    "{message}"
+                );
+                assert!(!message.contains("Other"), "{message}");
+            }
+            assert_eq!(harness.stored_user_ids(), vec![harness.other.id]);
+            assert_eq!(
+                harness.person("github", "chief-gh"),
+                Some("ceo".to_string())
+            );
+            assert_eq!(
+                harness.person("github", "taken-gh"),
+                Some(console_key(harness.other.id))
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"sms_number": SMS_NUMBER, "email": "notify-taken-gh@example.com"}),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "notification targets may be shared between people"
+            );
+            assert_eq!(body["identities"]["sms_number"], SMS_NUMBER);
+        }
+
+        #[tokio::test]
+        async fn config_person_becomes_console_on_save_and_reverts_on_reset() {
+            let harness = Harness::new(HashMap::from([(
+                "jake".to_string(),
+                UserConfig {
+                    github_usernames: vec!["jake-gh".to_string()],
+                    discord_id: Some(CONFIG_DISCORD_ID.to_string()),
+                    email: Some("Identity-Viewer@Example.com".to_string()),
+                    ..UserConfig::default()
+                },
+            )]));
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "config");
+            assert_eq!(body["person_key"], "jake");
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["updated_at"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
+            assert_eq!(body["identities"]["discord_id"], CONFIG_DISCORD_ID);
+            assert_eq!(
+                harness.registry.origin("jake"),
+                Some(IdentityOrigin::Config)
+            );
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"slack_id": SLACK_ID}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], "jake");
+            assert_eq!(body["slug"], "jake");
+            assert!(body["updated_at"].is_string());
+            assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
+            assert_eq!(body["identities"]["discord_id"], CONFIG_DISCORD_ID);
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+            assert_eq!(
+                harness.registry.origin("jake"),
+                Some(IdentityOrigin::Console)
+            );
+            assert_eq!(
+                harness.person("github", "jake-gh"),
+                Some("jake".to_string())
+            );
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("jake")
+                    .and_then(|person| person.slack_id),
+                Some(SLACK_ID.to_string())
+            );
+
+            let (status, body) = harness.send(auth_delete(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body["origin"], "config",
+                "the config link of the viewer's own login email is not a key to keep"
+            );
+            assert_eq!(body["person_key"], "jake");
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["updated_at"], Value::Null);
+            assert_eq!(body["identities"]["slack_id"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!(["jake-gh"]));
+            assert_eq!(
+                harness.registry.origin("jake"),
+                Some(IdentityOrigin::Config)
+            );
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("jake")
+                    .and_then(|person| person.slack_id),
+                None
+            );
+            assert!(harness.stored_user_ids().is_empty());
+
+            let (status, body) = harness
+                .send(auth_get(
+                    &identities_uri(harness.other.id),
+                    &harness.admin.token,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "unset");
+            assert_eq!(body["person_key"], Value::Null);
+            assert_eq!(body["slug"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn sparse_updates_keep_earlier_fields() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+
+            for body in [
+                json!({"github_usernames": ["viewer-gh"], "slack_id": SLACK_ID}),
+                json!({"discord_id": VIEWER_DISCORD_ID}),
+            ] {
+                let (status, _) = harness
+                    .send(auth_put_json(&uri, &harness.viewer.token, body))
+                    .await;
+                assert_eq!(status, StatusCode::OK);
+            }
+            let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["identities"]["github_usernames"], json!(["viewer-gh"]));
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+            assert_eq!(body["identities"]["discord_id"], VIEWER_DISCORD_ID);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"discord_id": ""}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["identities"]["discord_id"], Value::Null);
+            assert_eq!(body["identities"]["github_usernames"], json!(["viewer-gh"]));
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"github_usernames": []}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["identities"]["github_usernames"], json!([]));
+            assert_eq!(body["identities"]["slack_id"], SLACK_ID);
+            assert_eq!(harness.person("github", "viewer-gh"), None);
+        }
+
+        #[tokio::test]
+        async fn identity_email_never_links_a_viewer_to_a_config_person() {
+            let harness = Harness::new(chief_config());
+            let uri = identities_uri(harness.viewer.id);
+
+            let (status, body) = harness
+                .send(auth_put_json(
+                    &uri,
+                    &harness.viewer.token,
+                    json!({"email": "chief@example.com", "github_usernames": ["viewer-gh"]}),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "active");
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
+            assert_eq!(body["identities"]["email"], "chief@example.com");
+
+            let (status, body) = harness.send(auth_get(&uri, &harness.viewer.token)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["origin"], "console");
+            assert_eq!(body["person_key"], console_key(harness.viewer.id));
+
+            assert_eq!(
+                harness.person("github", "chief-gh"),
+                Some("ceo".to_string())
+            );
+            assert_eq!(harness.registry.origin("ceo"), Some(IdentityOrigin::Config));
+            assert_eq!(
+                harness
+                    .registry
+                    .get_by_slug("ceo")
+                    .and_then(|person| person.discord_id),
+                Some(CONFIG_DISCORD_ID.to_string())
+            );
+            assert_eq!(
+                harness.person("github", "viewer-gh"),
+                Some(console_key(harness.viewer.id))
+            );
+        }
+
+        #[tokio::test]
+        async fn identity_endpoints_require_a_session() {
+            let harness = Harness::new(HashMap::new());
+            let uri = identities_uri(harness.viewer.id);
+            let update = json!({"github_usernames": ["anonymous-gh"]});
+
+            for request in [
+                anonymous("GET", "/api/identities", None),
+                anonymous("GET", &uri, None),
+                anonymous("PUT", &uri, Some(update.clone())),
+                anonymous("DELETE", &uri, None),
+                auth_get(&uri, "not-a-session"),
+                auth_put_json(&uri, "not-a-session", update.clone()),
+                auth_delete(&uri, "not-a-session"),
+            ] {
+                let (status, _) = harness.send(request).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+            }
+            assert!(harness.stored_user_ids().is_empty());
+            assert_eq!(harness.person("github", "anonymous-gh"), None);
+        }
+    }
+
+    mod invite_directory {
+        use super::*;
+        use crate::api::apply_dashboard_middleware;
+        use crate::api::fixture;
+        use axum::body::Bytes;
+        use axum::http::Method;
+        use claudear_core::identity::{Identities, UserStatus};
+        use claudear_storage::{DirectoryUser, DirectoryWrite, IdentityWrite, InviteWrite};
+        use serde_json::{json, Value};
+
+        const INVALID_INVITE: &str = "This invite link is invalid or has expired";
+        const PUBLIC_URL: &str = "https://claudear.example.com/";
+        const DISCORD_ID: &str = "452316113016193024";
+        const SLACK_ID: &str = "U0123456789";
+        const LINK_PREFIX: &str = "/invite#cldi_";
+        const SECRET_HEX_LENGTH: usize = 64;
+
+        struct Account {
+            id: i64,
+            session: String,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Caller<'a> {
+            Anonymous,
+            Session(&'a str),
+            Bearer(&'a str),
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Csrf {
+            Sent,
+            Omitted,
+        }
+
+        struct TestApp {
+            router: Router,
+            tracker: Arc<dyn FixAttemptTracker>,
+            registry: UserRegistry,
+            admin: Account,
+            viewer: Account,
+            csrf: String,
+        }
+
+        impl TestApp {
+            async fn new() -> Self {
+                Self::build(None).await
+            }
+
+            async fn with_public_url(public_url: &str) -> Self {
+                Self::build(Some(public_url.to_string())).await
+            }
+
+            async fn build(public_url: Option<String>) -> Self {
+                let tracker = create_test_tracker();
+                let admin = account(&tracker, "admin@invite.test", Role::Admin);
+                let viewer = account(&tracker, "viewer@invite.test", Role::Viewer);
+
+                let mut config = test_config();
+                config.storage_dir = std::env::temp_dir().join("claudear-invite-directory-tests");
+                config.dashboard.public_url = public_url;
+                let registry = UserRegistry::new(config.users.clone());
+                let router = apply_dashboard_middleware(
+                    create_api_router_with_dashboard(
+                        config,
+                        tracker.clone(),
+                        PathBuf::from("claudear.toml"),
+                        test_indexing_rx(&tracker),
+                        None,
+                        registry.clone(),
+                    ),
+                    false,
+                );
+                let csrf = fetch_csrf(&router).await;
+
+                Self {
+                    router,
+                    tracker,
+                    registry,
+                    admin,
+                    viewer,
+                    csrf,
+                }
+            }
+
+            fn email(&self, name: &str) -> String {
+                format!("{name}@invite.test")
+            }
+
+            fn request(
+                &self,
+                method: Method,
+                uri: &str,
+                caller: Caller<'_>,
+                csrf: Csrf,
+                body: Option<Value>,
+            ) -> Request<Body> {
+                let mut cookies = Vec::new();
+                let mut builder = Request::builder().method(method).uri(uri);
+                match caller {
+                    Caller::Anonymous => {}
+                    Caller::Session(session) => cookies.push(format!("claudear_session={session}")),
+                    Caller::Bearer(token) => {
+                        builder = builder.header("authorization", format!("Bearer {token}"));
+                    }
+                }
+                if csrf == Csrf::Sent {
+                    cookies.push(format!("claudear_csrf={}", self.csrf));
+                    builder = builder.header("x-csrf-token", &self.csrf);
+                }
+                if !cookies.is_empty() {
+                    builder = builder.header("cookie", cookies.join("; "));
+                }
+                match body {
+                    Some(body) => builder
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string())),
+                    None => builder.body(Body::empty()),
+                }
+                .expect("request")
+            }
+
+            async fn send_bytes(&self, request: Request<Body>) -> (StatusCode, Bytes) {
+                let response = self
+                    .router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("response");
+                let status = response.status();
+                let bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                (status, bytes)
+            }
+
+            async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
+                let (status, bytes) = self.send_bytes(request).await;
+                let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                (status, body)
+            }
+
+            async fn call(
+                &self,
+                method: Method,
+                uri: &str,
+                caller: Caller<'_>,
+                body: Option<Value>,
+            ) -> (StatusCode, Value) {
+                self.send(self.request(method, uri, caller, Csrf::Sent, body))
+                    .await
+            }
+
+            async fn as_admin(
+                &self,
+                method: Method,
+                uri: &str,
+                body: Option<Value>,
+            ) -> (StatusCode, Value) {
+                self.call(method, uri, Caller::Session(&self.admin.session), body)
+                    .await
+            }
+
+            async fn put_directory(&self, caller: Caller<'_>, body: Value) -> (StatusCode, Value) {
+                self.send(self.request(
+                    Method::PUT,
+                    "/api/directory",
+                    caller,
+                    Csrf::Omitted,
+                    Some(body),
+                ))
+                .await
+            }
+
+            /// Admin `POST /api/users` without a password; returns the new user's id, the
+            /// invite secret and the response body.
+            async fn create_invited_user(
+                &self,
+                name: &str,
+                identities: Option<Value>,
+            ) -> (i64, String, Value) {
+                let mut request =
+                    json!({"email": self.email(name), "name": name, "role": "viewer"});
+                if let Some(identities) = identities {
+                    request["identities"] = identities;
+                }
+                let (status, body) = self
+                    .as_admin(Method::POST, "/api/users", Some(request))
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "create invited user: {body}");
+                let id = body["id"].as_i64().expect("user id");
+                (id, secret_of(&body["invite"]), body)
+            }
+
+            async fn inspect(&self, token: &str) -> (StatusCode, Value) {
+                self.call(
+                    Method::POST,
+                    "/api/auth/invite/inspect",
+                    Caller::Anonymous,
+                    Some(json!({"token": token})),
+                )
+                .await
+            }
+
+            async fn accept(&self, token: &str, password: &str) -> (StatusCode, Value) {
+                self.call(
+                    Method::POST,
+                    "/api/auth/invite/accept",
+                    Caller::Anonymous,
+                    Some(json!({"token": token, "password": password})),
+                )
+                .await
+            }
+
+            async fn login(&self, email: &str, password: &str) -> (StatusCode, Bytes) {
+                self.send_bytes(self.request(
+                    Method::POST,
+                    "/api/auth/login",
+                    Caller::Anonymous,
+                    Csrf::Omitted,
+                    Some(json!({"email": email, "password": password})),
+                ))
+                .await
+            }
+
+            /// Store an invited user directly, bypassing the HTTP API, with an invite for
+            /// `secret` that expires at `expires_at`.
+            fn seed_invited(
+                &self,
+                email: &str,
+                role: Role,
+                password_hash: &str,
+                secret: &str,
+                expires_at: &str,
+            ) -> i64 {
+                let ids = self
+                    .tracker
+                    .save_directory(&[DirectoryWrite {
+                        user: DirectoryUser::New {
+                            email: email.to_string(),
+                            name: "Seeded".to_string(),
+                            role,
+                            password_hash: password_hash.to_string(),
+                            status: UserStatus::Invited,
+                        },
+                        identities: None,
+                        invite: Some(InviteWrite {
+                            token_hash: sha256_hex(secret),
+                            expires_at: expires_at.to_string(),
+                            created_by: self.admin.id,
+                        }),
+                    }])
+                    .expect("seed invited user");
+                ids[0]
+            }
+
+            /// Store console identities for an existing user and reload the registry.
+            fn seed_identities(&self, user_id: i64, identities: Identities) {
+                self.tracker
+                    .save_directory(&[DirectoryWrite {
+                        user: DirectoryUser::Existing {
+                            user_id,
+                            name: None,
+                            role: None,
+                        },
+                        identities: Some(IdentityWrite {
+                            slug: None,
+                            identities,
+                        }),
+                        invite: None,
+                    }])
+                    .expect("seed identities");
+                assert!(crate::registry::reload(
+                    &self.registry,
+                    self.tracker.as_ref()
+                ));
+            }
+
+            /// Mint an API token for `user_id` the way `POST /api/tokens` does.
+            fn mint_bearer(&self, user_id: i64) -> String {
+                let secret = format!("cldr_{}", hex::encode(rand::random::<[u8; 24]>()));
+                self.tracker
+                    .create_api_token(
+                        user_id,
+                        "directory load",
+                        &sha256_hex(&secret),
+                        &secret[.."cldr_".len() + 8],
+                        None,
+                    )
+                    .expect("create api token");
+                secret
+            }
+
+            fn user_count(&self) -> i64 {
+                self.tracker.count_users().expect("count users")
+            }
+
+            fn status_of(&self, user_id: i64) -> UserStatus {
+                self.tracker
+                    .get_user_by_id(user_id)
+                    .expect("get user")
+                    .expect("user exists")
+                    .status
+            }
+        }
+
+        fn account(tracker: &Arc<dyn FixAttemptTracker>, email: &str, role: Role) -> Account {
+            let id = tracker
+                .create_user(email, "unused-hash", email, role)
+                .expect("create user");
+            let session = tracker
+                .create_session(id, "2099-12-31 23:59:59")
+                .expect("create session");
+            Account { id, session }
+        }
+
+        /// Read the CSRF cookie the middleware issues on a plain `GET`, as the SPA does.
+        async fn fetch_csrf(router: &Router) -> String {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/health")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .find_map(|cookie| cookie.strip_prefix("claudear_csrf="))
+                .and_then(|cookie| cookie.split(';').next())
+                .map(str::to_string)
+                .expect("claudear_csrf cookie")
+        }
+
+        fn sha256_hex(secret: &str) -> String {
+            hex::encode(Sha256::digest(secret.as_bytes()))
+        }
+
+        fn invite_secret() -> String {
+            format!("cldi_{}", hex::encode(rand::random::<[u8; 32]>()))
+        }
+
+        fn timestamp(offset: Duration) -> String {
+            (Utc::now() + offset)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        }
+
+        fn password_hash(password: &str) -> String {
+            bcrypt::hash(password, 4).expect("bcrypt hash")
+        }
+
+        /// The secret from a `UserInvite`, asserting the link shape on the way.
+        fn secret_of(invite: &Value) -> String {
+            let link = invite["invite_link"].as_str().expect("invite_link");
+            assert!(link.starts_with(LINK_PREFIX), "invite link shape: {link}");
+            let secret = link.trim_start_matches("/invite#").to_string();
+            assert_eq!(secret.len(), "cldi_".len() + SECRET_HEX_LENGTH);
+            secret
+        }
+
+        fn invalid_invite() -> Value {
+            json!({"error": INVALID_INVITE})
+        }
+
+        #[tokio::test]
+        async fn post_users_without_a_password_creates_an_invited_user() {
+            let password = fixture::password();
+            let app = TestApp::new().await;
+
+            let (id, _, body) = app.create_invited_user("amy", None).await;
+            assert_eq!(body["status"], "invited");
+            assert_eq!(body["email"], app.email("amy"));
+            assert!(body["invite"]["invite_url"].is_null());
+            assert_eq!(body["invite_expires_at"], body["invite"]["expires_at"]);
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+
+            let (status, user) = app
+                .as_admin(Method::GET, &format!("/api/users/{id}"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(user["status"], "invited");
+            assert_eq!(user["invite_expires_at"], body["invite"]["expires_at"]);
+
+            let (status, active) = app
+                .as_admin(
+                    Method::POST,
+                    "/api/users",
+                    Some(json!({
+                        "email": app.email("bob"),
+                        "name": "Bob",
+                        "role": "viewer",
+                        "password": &password,
+                    })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{active}");
+            assert_eq!(active["status"], "active");
+            assert!(active["invite"].is_null());
+            assert!(active["invite_expires_at"].is_null());
+
+            let (status, users) = app.as_admin(Method::GET, "/api/users", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let expiry_of = |user_id: &Value| {
+                users
+                    .as_array()
+                    .expect("users")
+                    .iter()
+                    .find(|user| &user["id"] == user_id)
+                    .map(|user| user["invite_expires_at"].clone())
+                    .expect("user listed")
+            };
+            assert_eq!(expiry_of(&json!(id)), body["invite"]["expires_at"]);
+            assert!(expiry_of(&active["id"]).is_null());
+            assert!(expiry_of(&json!(app.admin.id)).is_null());
+        }
+
+        #[tokio::test]
+        async fn public_url_makes_the_invite_link_absolute() {
+            let app = TestApp::with_public_url(PUBLIC_URL).await;
+
+            let (_, _, body) = app.create_invited_user("amy", None).await;
+            let link = body["invite"]["invite_link"].as_str().expect("invite_link");
+            assert_eq!(
+                body["invite"]["invite_url"],
+                format!("{}{link}", PUBLIC_URL.trim_end_matches('/'))
+            );
+        }
+
+        #[tokio::test]
+        async fn post_users_identities_for_an_invited_user_are_live_in_the_registry() {
+            let app = TestApp::new().await;
+
+            let (id, _, _) = app
+                .create_invited_user("amy", Some(json!({"github_usernames": ["amy"]})))
+                .await;
+
+            let person = app.registry.resolve("github", "amy").expect("amy resolves");
+            let people = app.registry.users();
+            assert!(people.contains_key(&person.slug));
+            assert_eq!(
+                people[&person.slug].github_usernames,
+                vec!["amy".to_string()]
+            );
+
+            let (status, identities) = app
+                .as_admin(Method::GET, &format!("/api/users/{id}/identities"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(identities["status"], "invited");
+            assert_eq!(identities["identities"]["github_usernames"], json!(["amy"]));
+        }
+
+        #[tokio::test]
+        async fn an_invite_is_inspected_then_accepted_then_the_user_logs_in() {
+            let password = fixture::password();
+            let app = TestApp::new().await;
+            let (id, secret, _) = app.create_invited_user("amy", None).await;
+
+            let (status, details) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::OK, "{details}");
+            assert_eq!(details["name"], "amy");
+            assert_eq!(details["email"], app.email("amy"));
+            assert!(details["expires_at"].is_string());
+
+            let (status, _) = app
+                .send(app.request(
+                    Method::POST,
+                    "/api/auth/invite/inspect",
+                    Caller::Anonymous,
+                    Csrf::Omitted,
+                    Some(json!({"token": secret})),
+                ))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "inspect needs the CSRF header"
+            );
+
+            let (status, rejected) = app.accept(&secret, &fixture::password_with_length(5)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(rejected, json!({"error": "Password must be 8-72 bytes"}));
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+
+            let (status, accepted) = app.accept(&secret, &password).await;
+            assert_eq!(status, StatusCode::OK, "{accepted}");
+            assert_eq!(accepted, json!({"message": "Invite accepted"}));
+            assert_eq!(app.status_of(id), UserStatus::Active);
+
+            let (status, body) = app.login(&app.email("amy"), &password).await;
+            assert_eq!(status, StatusCode::OK);
+            let session: Value = serde_json::from_slice(&body).expect("login body");
+            assert_eq!(session["user"]["email"], app.email("amy"));
+
+            let (_, user) = app
+                .as_admin(Method::GET, &format!("/api/users/{id}"), None)
+                .await;
+            assert_eq!(user["status"], "active");
+            assert!(user["invite_expires_at"].is_null());
+        }
+
+        #[tokio::test]
+        async fn an_admin_password_activates_an_invited_user_and_closes_the_invite() {
+            let password = fixture::password();
+            let app = TestApp::new().await;
+            let (id, secret, _) = app.create_invited_user("amy", None).await;
+
+            let (status, updated) = app
+                .as_admin(
+                    Method::PUT,
+                    &format!("/api/users/{id}"),
+                    Some(json!({"password": &password})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{updated}");
+            assert_eq!(updated["status"], "active");
+            assert!(updated["invite_expires_at"].is_null());
+            assert_eq!(app.status_of(id), UserStatus::Active);
+
+            let (status, body) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, _) = app.login(&app.email("amy"), &password).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn login_for_an_invited_user_matches_a_wrong_password() {
+            let password = fixture::password();
+            let app = TestApp::new().await;
+            let active = app.email("active");
+            app.tracker
+                .create_user(&active, &password_hash(&password), "Active", Role::Viewer)
+                .expect("create active user");
+            let invited = app.email("invited");
+            // A real hash for the right password, so only the status gate can refuse it.
+            app.seed_invited(
+                &invited,
+                Role::Admin,
+                &password_hash(&password),
+                &invite_secret(),
+                &timestamp(Duration::days(7)),
+            );
+
+            let (wrong_status, wrong_body) = app.login(&active, &fixture::password()).await;
+            let (invited_status, invited_body) = app.login(&invited, &password).await;
+            let (unknown_status, unknown_body) = app.login(&app.email("unknown"), &password).await;
+
+            assert_eq!(wrong_status, StatusCode::UNAUTHORIZED);
+            assert_eq!(invited_status, StatusCode::UNAUTHORIZED);
+            assert_eq!(unknown_status, StatusCode::UNAUTHORIZED);
+            assert_eq!(invited_body, wrong_body);
+            assert_eq!(unknown_body, wrong_body);
+        }
+
+        #[tokio::test]
+        async fn an_accepted_invite_cannot_be_reused() {
+            let password = fixture::password();
+            let app = TestApp::new().await;
+            let (_, secret, _) = app.create_invited_user("amy", None).await;
+
+            let (status, _) = app.accept(&secret, &password).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let (status, body) = app.accept(&secret, &fixture::password()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, body) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+
+            let (status, _) = app.login(&app.email("amy"), &password).await;
+            assert_eq!(status, StatusCode::OK, "the first password still stands");
+        }
+
+        #[tokio::test]
+        async fn an_expired_invite_is_rejected() {
+            let password = fixture::password();
+            let app = TestApp::new().await;
+            let original = invite_secret();
+            let id = app.seed_invited(
+                &app.email("late"),
+                Role::Viewer,
+                &password_hash(&fixture::password()),
+                &original,
+                &timestamp(Duration::days(7)),
+            );
+            let expired = invite_secret();
+            app.tracker
+                .issue_invite(
+                    id,
+                    &sha256_hex(&expired),
+                    &timestamp(-Duration::days(1)),
+                    app.admin.id,
+                )
+                .expect("issue expired invite");
+
+            for secret in [&expired, &original] {
+                let (status, body) = app.inspect(secret).await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(body, invalid_invite());
+                let (status, body) = app.accept(secret, &password).await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(body, invalid_invite());
+            }
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+        }
+
+        #[tokio::test]
+        async fn a_revoked_invite_is_rejected() {
+            let password = fixture::password();
+            let app = TestApp::new().await;
+            let (id, secret, _) = app.create_invited_user("amy", None).await;
+            let uri = format!("/api/users/{id}/invite");
+
+            let (status, body) = app.as_admin(Method::DELETE, &uri, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body, json!({"message": "Invite revoked"}));
+
+            let (status, body) = app.inspect(&secret).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, _) = app.accept(&secret, &password).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            let (status, _) = app.as_admin(Method::DELETE, &uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "no open invite is left");
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+        }
+
+        #[tokio::test]
+        async fn reissuing_an_invite_invalidates_the_previous_link() {
+            let password = fixture::password();
+            let app = TestApp::new().await;
+            let (id, previous, _) = app.create_invited_user("amy", None).await;
+
+            let (status, invite) = app
+                .as_admin(Method::POST, &format!("/api/users/{id}/invite"), None)
+                .await;
+            assert!(status.is_success(), "re-issue: {status} {invite}");
+            let current = secret_of(&invite);
+            assert_ne!(current, previous);
+            assert!(invite["invite_url"].is_null());
+            assert!(invite["expires_at"].is_string());
+
+            let (status, body) = app.inspect(&previous).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body, invalid_invite());
+            let (status, _) = app.accept(&previous, &password).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            let (status, _) = app.inspect(&current).await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _) = app.accept(&current, &password).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn issuing_an_invite_for_an_active_user_conflicts() {
+            let app = TestApp::new().await;
+
+            let (status, body) = app
+                .as_admin(
+                    Method::POST,
+                    &format!("/api/users/{}/invite", app.viewer.id),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, json!({"error": "User is already active"}));
+
+            let (status, _) = app
+                .as_admin(Method::POST, "/api/users/999999/invite", None)
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn viewers_cannot_manage_users_invites_or_the_directory() {
+            let app = TestApp::new().await;
+            let (id, _, _) = app.create_invited_user("amy", None).await;
+            let viewer = Caller::Session(&app.viewer.session);
+            let invite_uri = format!("/api/users/{id}/invite");
+            let directory = json!({"users": [{
+                "email": app.email("eve"), "name": "Eve", "role": "admin",
+            }]});
+            let count = app.user_count();
+
+            let (status, _) = app
+                .call(
+                    Method::POST,
+                    "/api/users",
+                    viewer,
+                    Some(json!({"email": app.email("eve"), "name": "Eve", "role": "admin"})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "POST /api/users");
+            let (status, _) = app.call(Method::POST, &invite_uri, viewer, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "POST invite");
+            let (status, _) = app.call(Method::DELETE, &invite_uri, viewer, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "DELETE invite");
+            let (status, _) = app
+                .call(
+                    Method::PUT,
+                    "/api/directory",
+                    viewer,
+                    Some(directory.clone()),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "PUT /api/directory by session"
+            );
+
+            let token = app.mint_bearer(app.viewer.id);
+            let (status, _) = app.put_directory(Caller::Bearer(&token), directory).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "PUT /api/directory by Bearer"
+            );
+
+            assert_eq!(app.user_count(), count);
+            assert!(app
+                .tracker
+                .get_open_invite_for_user(id)
+                .expect("open invite")
+                .is_some());
+        }
+
+        #[tokio::test]
+        async fn directory_takes_an_admin_bearer_without_csrf_but_not_a_bare_session() {
+            let app = TestApp::new().await;
+            let token = app.mint_bearer(app.admin.id);
+            let entry = |name: &str| json!({"users": [{"email": app.email(name), "name": name, "role": "viewer"}]});
+
+            let (status, body) = app
+                .put_directory(Caller::Bearer(&token), entry("amy"))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["users"][0]["created"], true);
+
+            let (status, _) = app
+                .put_directory(Caller::Session(&app.admin.session), entry("bob"))
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "a session still needs CSRF");
+
+            let mut request = app.request(
+                Method::PUT,
+                "/api/directory",
+                Caller::Session(&app.admin.session),
+                Csrf::Sent,
+                Some(entry("carl")),
+            );
+            request.headers_mut().insert(
+                "authorization",
+                "Bearer cldr_not-a-real-token".parse().expect("header"),
+            );
+            let (status, _) = app.send(request).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a bad Bearer never falls back to the cookie"
+            );
+
+            let (status, _) = app
+                .call(
+                    Method::POST,
+                    "/api/users",
+                    Caller::Bearer(&token),
+                    Some(json!({"email": app.email("dan"), "name": "Dan", "role": "viewer"})),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "Bearer is accepted only on PUT /api/directory"
+            );
+
+            for name in ["bob", "carl", "dan"] {
+                assert!(app
+                    .tracker
+                    .get_user_by_email(&app.email(name))
+                    .expect("lookup")
+                    .is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn bearer_token_of_an_invited_user_is_rejected() {
+            let app = TestApp::new().await;
+            let id = app.seed_invited(
+                &app.email("pending-admin"),
+                Role::Admin,
+                &password_hash(&fixture::password()),
+                &invite_secret(),
+                &timestamp(Duration::days(7)),
+            );
+            let token = app.mint_bearer(id);
+            let count = app.user_count();
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [{"email": app.email("amy"), "name": "Amy", "role": "viewer"}]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body, json!({"error": "Invalid or expired token"}));
+            assert_eq!(app.user_count(), count);
+        }
+
+        #[tokio::test]
+        async fn directory_invited_users_are_live_in_the_registry() {
+            let app = TestApp::new().await;
+            let token = app.mint_bearer(app.admin.id);
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [{
+                        "email": app.email("amy"), "name": "Amy", "role": "viewer",
+                        "identities": {
+                            "github_usernames": ["amy"],
+                            "discord_id": DISCORD_ID,
+                            "slack_id": SLACK_ID,
+                        },
+                    }]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let entry = &body["users"][0];
+            assert_eq!(entry["email"], app.email("amy"));
+            assert_eq!(entry["created"], true);
+            assert_eq!(entry["status"], "invited");
+            assert_eq!(entry["identities"]["status"], "invited");
+            assert_eq!(
+                entry["identities"]["identities"]["github_usernames"],
+                json!(["amy"])
+            );
+            secret_of(&entry["invite"]);
+            let id = entry["user_id"].as_i64().expect("user id");
+            assert_eq!(app.status_of(id), UserStatus::Invited);
+
+            let person = app.registry.resolve("github", "amy").expect("amy resolves");
+            assert_eq!(person.discord_id.as_deref(), Some(DISCORD_ID));
+            assert_eq!(
+                app.registry.discord_id_for_github("amy").as_deref(),
+                Some(DISCORD_ID)
+            );
+            let people = app.registry.users();
+            assert_eq!(
+                people[&person.slug].slack_id.as_deref(),
+                Some(SLACK_ID),
+                "registry.users() lists the invited person"
+            );
+        }
+
+        #[tokio::test]
+        async fn directory_rejects_the_whole_batch_when_one_entry_is_invalid() {
+            let app = TestApp::new().await;
+            let token = app.mint_bearer(app.admin.id);
+            let count = app.user_count();
+            let twin = app.email("amy").to_uppercase();
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [
+                        {"email": app.email("amy"), "name": "Amy", "role": "viewer",
+                         "identities": {"github_usernames": ["amy"]}},
+                        {"email": app.email("bob"), "name": "Bob", "role": "owner",
+                         "identities": {"discord_id": "not-a-snowflake"}},
+                        {"email": app.email("dan")},
+                        {"email": "not-an-email", "name": "X", "role": "viewer"},
+                        {"email": twin, "name": "Twice", "role": "viewer"},
+                    ]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], "Invalid directory entries");
+            let violations: Vec<(String, String)> = body["violations"]
+                .as_array()
+                .expect("violations")
+                .iter()
+                .map(|violation| {
+                    (
+                        violation["email"].as_str().unwrap_or_default().to_string(),
+                        violation["field"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            let expected = [
+                (app.email("bob"), "role"),
+                (app.email("bob"), "discord_id"),
+                (app.email("dan"), "name"),
+                (app.email("dan"), "role"),
+                ("not-an-email".to_string(), "email"),
+                (twin.clone(), "email"),
+            ];
+            assert_eq!(
+                violations,
+                expected
+                    .into_iter()
+                    .map(|(email, field)| (email, field.to_string()))
+                    .collect::<Vec<_>>(),
+                "every problem is reported and a case-insensitive repeat is a duplicate"
+            );
+            assert!(
+                !body.to_string().contains("not-a-snowflake"),
+                "rejected values are never echoed"
+            );
+
+            let duplicate = json!({"email": app.email("carl"), "name": "Carl", "role": "viewer"});
+            let (status, _) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [duplicate.clone(), duplicate]}),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "duplicate email in one batch"
+            );
+
+            assert_eq!(app.user_count(), count);
+            assert!(app
+                .tracker
+                .get_user_by_email(&app.email("amy"))
+                .expect("lookup")
+                .is_none());
+            assert!(app.registry.resolve("github", "amy").is_none());
+        }
+
+        #[tokio::test]
+        async fn directory_updates_an_existing_user_sparsely_without_an_invite() {
+            let app = TestApp::new().await;
+            app.seed_identities(
+                app.viewer.id,
+                Identities {
+                    github_usernames: vec!["jake-old".to_string()],
+                    discord_id: Some(DISCORD_ID.to_string()),
+                    ..Identities::default()
+                },
+            );
+            let token = app.mint_bearer(app.admin.id);
+            let count = app.user_count();
+
+            let (status, body) = app
+                .put_directory(
+                    Caller::Bearer(&token),
+                    json!({"users": [{
+                        "email": app.email("viewer"),
+                        "name": "Jake",
+                        "identities": {"linear_names": ["Jake Barnby"]},
+                    }]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let entry = &body["users"][0];
+            assert_eq!(entry["user_id"], app.viewer.id);
+            assert_eq!(entry["created"], false);
+            assert_eq!(entry["status"], "active");
+            assert!(entry["invite"].is_null());
+            let identities = &entry["identities"]["identities"];
+            assert_eq!(identities["github_usernames"], json!(["jake-old"]));
+            assert_eq!(identities["discord_id"], DISCORD_ID);
+            assert_eq!(identities["linear_names"], json!(["Jake Barnby"]));
+
+            assert_eq!(app.user_count(), count);
+            let user = app
+                .tracker
+                .get_user_by_id(app.viewer.id)
+                .expect("get user")
+                .expect("user exists");
+            assert_eq!(user.name, "Jake");
+            assert_eq!(user.role, Role::Viewer);
+            assert!(app
+                .tracker
+                .get_open_invite_for_user(app.viewer.id)
+                .expect("open invite")
+                .is_none());
+            assert!(app.registry.resolve("linear", "Jake Barnby").is_some());
+        }
+
+        #[tokio::test]
+        async fn deleting_a_user_removes_them_from_the_registry() {
+            let app = TestApp::new().await;
+            let id = app
+                .tracker
+                .create_user(&app.email("leaver"), "unused-hash", "Leaver", Role::Viewer)
+                .expect("create user");
+            app.seed_identities(
+                id,
+                Identities {
+                    github_usernames: vec!["leaver".to_string()],
+                    ..Identities::default()
+                },
+            );
+            let person = app
+                .registry
+                .resolve("github", "leaver")
+                .expect("leaver resolves before the delete");
+
+            let (status, body) = app
+                .as_admin(Method::DELETE, &format!("/api/users/{id}"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            assert!(app.registry.resolve("github", "leaver").is_none());
+            assert!(!app.registry.users().contains_key(&person.slug));
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_dir_serves_spa_routes_and_rejects_unknown_api_paths() {
+        let dashboard = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(dashboard.path().join("index.html"), "<html>console</html>").unwrap();
+        std::fs::write(dashboard.path().join("app.js"), "console.log(1)").unwrap();
+        let tracker = create_test_tracker();
+        let config = Config {
+            storage_dir: storage.path().to_path_buf(),
+            ..Config::default()
+        };
+        let router = create_api_router_with_dashboard(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            test_indexing_rx(&tracker),
+            Some(dashboard.path().to_path_buf()),
+            UserRegistry::new(HashMap::new()),
+        )
+        .layer(CookieManagerLayer::new());
+
+        let request = |uri: &str| Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let body = |response: axum::response::Response| async {
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+
+        for uri in ["/api/nope", "/api", "/api/attempts/1/unknown"] {
+            let response = router.clone().oneshot(request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(
+                !body(response).await.contains("console"),
+                "{uri} served index.html"
+            );
+        }
+
+        for uri in ["/deploy-qa", "/", "/attempts/abc"] {
+            let response = router.clone().oneshot(request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(body(response).await, "<html>console</html>", "{uri}");
+        }
+
+        let response = router.clone().oneshot(request("/app.js")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body(response).await, "console.log(1)");
+
+        let response = router.oneshot(request("/api/health")).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a registered API route must still reach its handler"
+        );
     }
 }

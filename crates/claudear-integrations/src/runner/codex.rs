@@ -4,6 +4,7 @@ use super::{process_group, AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
 use claudear_config::AgentConfig;
 use claudear_core::error::{Error, Result};
+use claudear_core::security::SECURITY_FIX_SOURCE;
 use claudear_core::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
 use claudear_core::types::{ActivityLogEntry, AgentExecution, AgentResult, Issue};
 use claudear_storage::FixAttemptTracker;
@@ -15,8 +16,26 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
+/// The runner's name, and the source of activity from runs that work on no issue.
+const COMPONENT: &str = "codex";
+
 const OUTPUT_HELD_OPEN_MESSAGE: &str =
     "Stopped reading Codex output held open by a process outside its process group";
+
+/// The fix prompt of a security fix. It names neither the issue's source nor
+/// its id, so neither reaches the pull request.
+const SECURITY_FIX_PROMPT: &str = r#"Here is the context for this fix:
+
+{context}
+
+Your task:
+1. Analyze the problem described in the context
+2. Find the relevant code in this codebase
+3. Implement a fix for the problem
+4. Write or update tests if applicable
+5. Create a PR with your changes
+6. Ensure all checks pass on the PR
+"#;
 
 /// Configuration for the Codex agent runner.
 #[derive(Debug, Clone)]
@@ -64,6 +83,9 @@ impl CodexAgentRunner {
 
     fn build_prompt(&self, issue: &Issue, context: &str, project_dir: &Path) -> String {
         let template_loader = TemplateLoader::new(project_dir);
+        if issue.source == SECURITY_FIX_SOURCE {
+            return Self::security_fix_prompt(context, template_loader.load_agent_md());
+        }
         if let Ok(template) = template_loader.get_template(issue) {
             let agent_md = template_loader.load_agent_md();
             let template_context =
@@ -88,6 +110,14 @@ The PR title should include the issue ID: {}
 "#,
             issue.source, context, issue.short_id
         )
+    }
+
+    fn security_fix_prompt(context: &str, agent_md: Option<String>) -> String {
+        let prompt = SECURITY_FIX_PROMPT.replace("{context}", context);
+        match agent_md {
+            Some(agent_md) => format!("{}\n\n---\n\n{prompt}", agent_md.trim()),
+            None => prompt,
+        }
     }
 
     /// Extract a PR URL from Codex text output.
@@ -145,7 +175,7 @@ The PR title should include the issue ID: {}
 #[async_trait]
 impl AgentRunner for CodexAgentRunner {
     fn name(&self) -> &str {
-        "codex"
+        COMPONENT
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -191,8 +221,9 @@ impl AgentRunner for CodexAgentRunner {
             "agent_started",
             format!("Codex execution started for {}", label),
         )
-        .with_source("codex".to_string())
+        .attributed(COMPONENT, issue)
         .with_metadata(json!({
+            "component": COMPONENT,
             "timeout_secs": self.config.timeout_secs,
             "working_dir": project_dir.display().to_string(),
             "label": label
@@ -317,8 +348,9 @@ impl AgentRunner for CodexAgentRunner {
 
         let activity = if success {
             ActivityLogEntry::new("agent_completed", format!("Codex completed for {}", label))
-                .with_source("codex".to_string())
+                .attributed(COMPONENT, issue)
                 .with_metadata(json!({
+                    "component": COMPONENT,
                     "duration_secs": execution.duration_secs,
                     "exit_code": exit_code,
                     "has_pr": pr_url.is_some(),
@@ -329,8 +361,9 @@ impl AgentRunner for CodexAgentRunner {
                 "agent_failed",
                 format!("Codex failed for {} (exit {})", label, exit_code),
             )
-            .with_source("codex".to_string())
+            .attributed(COMPONENT, issue)
             .with_metadata(json!({
+                "component": COMPONENT,
                 "duration_secs": execution.duration_secs,
                 "exit_code": exit_code,
                 "label": label
@@ -422,6 +455,31 @@ mod tests {
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "context", Path::new("/tmp"));
         assert!(prompt.contains("TEST-1"));
+    }
+
+    #[test]
+    fn a_security_fix_prompt_names_neither_its_source_nor_its_id() {
+        let tracker = Arc::new(claudear_storage::NoopTracker);
+        let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
+        let issue = Issue::new("SEC-7", "SEC-7", "Hardening", "", SECURITY_FIX_SOURCE);
+        let bare = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENT.md"), "Run the unit tests first.").unwrap();
+
+        for prompt in [
+            runner.build_prompt(&issue, "Harden the session revocation", bare.path()),
+            runner.build_prompt(&issue, "Harden the session revocation", project.path()),
+        ] {
+            assert!(prompt.contains("Harden the session revocation"), "{prompt}");
+            assert!(!prompt.contains("SEC-"), "{prompt}");
+            assert!(!prompt.contains("Hardening"), "{prompt}");
+            assert!(!prompt.contains(SECURITY_FIX_SOURCE), "{prompt}");
+            assert!(!prompt.contains("PR title should include"), "{prompt}");
+            assert!(!prompt.contains("issue ID"), "{prompt}");
+        }
+        assert!(runner
+            .build_prompt(&issue, "Harden the session revocation", project.path())
+            .starts_with("Run the unit tests first."));
     }
 
     #[test]
@@ -584,6 +642,81 @@ mod tests {
             ..CodexRunnerConfig::default()
         };
         CodexAgentRunner::new(config, Arc::new(claudear_storage::NoopTracker))
+    }
+
+    /// The type, source and short id of every activity a run of a stub CLI
+    /// exiting with `exit_code` records for `issue`.
+    #[cfg(all(unix, feature = "sqlite"))]
+    async fn run_activities(
+        issue: Option<&Issue>,
+        exit_code: i32,
+    ) -> Vec<(String, Option<String>, Option<String>)> {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("codex");
+        install_stub(&binary, &format!("exit {exit_code}\n"));
+        let tracker = Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
+        let config = CodexRunnerConfig {
+            binary: binary.display().to_string(),
+            ..CodexRunnerConfig::default()
+        };
+        CodexAgentRunner::new(config, tracker.clone())
+            .execute_with_attempt("fix", issue, None, directory.path())
+            .await
+            .unwrap();
+        tracker
+            .get_recent_activities(50, None)
+            .unwrap()
+            .into_iter()
+            .map(|activity| {
+                assert_eq!(activity.metadata.as_ref().unwrap()["component"], COMPONENT);
+                (activity.activity_type, activity.source, activity.short_id)
+            })
+            .collect()
+    }
+
+    #[cfg(all(unix, feature = "sqlite"))]
+    #[tokio::test]
+    async fn a_security_fix_run_records_its_activity_under_the_security_source() {
+        let issue = Issue::new(
+            "vulnerability-7",
+            "SEC-7",
+            "Hardening",
+            "",
+            SECURITY_FIX_SOURCE,
+        );
+        let mut types = Vec::new();
+        for exit_code in [0, 1] {
+            for (activity_type, source, short_id) in run_activities(Some(&issue), exit_code).await {
+                assert_eq!(
+                    source.as_deref(),
+                    Some(SECURITY_FIX_SOURCE),
+                    "{activity_type}"
+                );
+                assert_eq!(short_id.as_deref(), Some("SEC-7"), "{activity_type}");
+                types.push(activity_type);
+            }
+        }
+        types.sort();
+        assert_eq!(
+            types,
+            [
+                "agent_completed",
+                "agent_failed",
+                "agent_started",
+                "agent_started"
+            ]
+        );
+    }
+
+    #[cfg(all(unix, feature = "sqlite"))]
+    #[tokio::test]
+    async fn a_run_on_no_issue_records_its_activity_under_the_runner() {
+        let activities = run_activities(None, 0).await;
+        assert_eq!(activities.len(), 2);
+        for (activity_type, source, short_id) in activities {
+            assert_eq!(source.as_deref(), Some(COMPONENT), "{activity_type}");
+            assert_eq!(short_id, None, "{activity_type}");
+        }
     }
 
     /// A stub `codex` binary that runs `setup`, then prints [`PR_URL`] and exits.

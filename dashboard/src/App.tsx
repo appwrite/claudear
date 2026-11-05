@@ -2,19 +2,24 @@ import { useEffect, type JSX } from 'react'
 import { Router, RouterProvider } from './router'
 import { AppShell } from './components/layout/app-shell'
 import { AuthProvider, useAuth } from './lib/auth'
+import { isInvitePath } from './lib/invite-token'
 import { Sentry } from './lib/sentry'
 import LoginPage from './pages/login'
+import InvitePage from './pages/invite'
 import OverviewPage from './pages/overview'
 import AttemptsPage from './pages/attempts'
 import PrsPage from './pages/prs'
+import SecurityPage from './pages/security'
 import AnalyticsPage from './pages/analytics'
 import ErrorsPage from './pages/errors'
 import FeedbackPage from './pages/feedback'
 import SupportPage from './pages/support'
 import RegressionsPage from './pages/regressions'
+import DeployQaPage from './pages/deploy-qa'
 import ExperimentsPage from './pages/experiments'
 import ReposPage from './pages/repos'
 import ChannelsPage from './pages/channels'
+import IntegrationsPage from './pages/integrations'
 import InferencePage from './pages/inference'
 import ActivityPage from './pages/activity'
 import UsersPage from './pages/users'
@@ -51,13 +56,16 @@ const routes: Record<string, () => JSX.Element | null> = {
   '/attempts': AttemptsPage,
   '/prs': PrsPage,
   '/support': SupportPage,
+  '/security': SecurityPage,
   '/analytics': AnalyticsPage,
   '/errors': ErrorsPage,
   '/feedback': FeedbackPage,
   '/regressions': RegressionsPage,
+  '/deploy-qa': DeployQaPage,
   '/experiments': ExperimentsPage,
   '/repos': ReposPage,
   '/channels': ChannelsPage,
+  '/integrations': IntegrationsPage,
   '/learning': LearningPage,
   '/chat': ChatPage,
   '/models': ModelsPage,
@@ -96,6 +104,14 @@ function AuthenticatedApp() {
 }
 
 function App() {
+  if (isInvitePath()) {
+    return (
+      <Sentry.ErrorBoundary fallback={<SentryFallback />}>
+        <InvitePage />
+      </Sentry.ErrorBoundary>
+    )
+  }
+
   return (
     <AuthProvider>
       <AuthenticatedApp />

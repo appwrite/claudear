@@ -5,6 +5,7 @@
 //! and release tracking.
 
 pub mod deploy_qa;
+pub mod distribution;
 pub mod evaluation;
 pub mod feedback;
 pub mod inference;

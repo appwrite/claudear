@@ -3,7 +3,15 @@
 //! Configuration is loaded from a TOML file (`claudear.toml` by default).
 //! Environment variables can override any TOML values.
 
+pub use crate::security_inbox::{
+    render_security_template, DeploymentApplicationConfig, DeploymentPackageConfig,
+    HelpScoutMailboxConfig, MailboxProfile, SecurityDeploymentConfig, SecurityInboxConfig,
+    SecurityReplyVariables, SecurityRewardConfig, SecurityTemplates, SpamAction,
+    ATTACHMENTS_METADATA_KEY, CUSTOMER_THREAD_COUNT_METADATA_KEY, DEFAULT_SECURITY_SCOPE,
+    HELPSCOUT_SOURCE, MAILBOX_ID_METADATA_KEY, MAILBOX_PROFILE_METADATA_KEY,
+};
 use claudear_core::error::{Error, Result};
+use claudear_core::identity::CONSOLE_KEY_PREFIX;
 use claudear_core::secret::SecretValue;
 use claudear_core::types::DeployQaTip;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -305,6 +313,8 @@ pub struct IssuesConfig {
     pub slack: Option<SlackSourceConfig>,
     /// HelpScout as an issue source (support conversations from one or more mailboxes).
     pub helpscout: Option<HelpScoutConfig>,
+    /// GitHub code-scanning alerts as an issue source (uses the `[scm.github]` token).
+    pub github_code_scanning: Option<GitHubCodeScanningConfig>,
 }
 
 /// Notifier configuration group.
@@ -484,6 +494,9 @@ pub struct Config {
     /// Live deploy QA for GitHub release tips (separate from `[regression]`).
     #[serde(default)]
     pub deploy_qa: DeployQaConfig,
+    /// Distribution of Claudear's open PRs across developers.
+    #[serde(default)]
+    pub pr_distribution: PrDistributionConfig,
     /// Cascade configuration for multi-repo chaining.
     #[serde(default)]
     pub cascade: CascadeConfig,
@@ -641,6 +654,10 @@ pub struct DashboardConfig {
     pub max_plan_monthly_cost: f64,
     /// Hourly engineer rate for cost-savings calculation.
     pub hourly_engineer_rate: f64,
+    /// Externally reachable base URL of the dashboard (for example
+    /// `https://claudear.example.com`). When set, invite links are returned as absolute
+    /// URLs; otherwise only the relative link is available.
+    pub public_url: Option<String>,
 }
 
 impl Default for DashboardConfig {
@@ -648,6 +665,7 @@ impl Default for DashboardConfig {
         Self {
             max_plan_monthly_cost: 0.0,
             hourly_engineer_rate: 75.0,
+            public_url: None,
         }
     }
 }
@@ -663,8 +681,8 @@ pub struct EmbeddingModelConfig {
     pub gpu: bool,
     /// CUDA device index (default: 0).
     pub device_id: i32,
-    /// Override model instance pool size (0 = auto-detect from available CPUs/RAM).
-    /// GPU should typically use 1 to avoid wasting VRAM.
+    /// Override model instance pool size (0 = one instance, capped by available RAM).
+    /// Each instance already uses every core, so larger CPU pools only add memory.
     pub pool_size: u32,
     /// Override sub-batch size (0 = auto-detect from available memory).
     /// GPU can handle larger batches (64-256) than CPU (4-16).
@@ -805,6 +823,7 @@ impl Default for Config {
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
             deploy_qa: DeployQaConfig::default(),
+            pr_distribution: PrDistributionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
@@ -975,6 +994,150 @@ impl Default for RepetitiveDigestConfig {
             day: "monday".to_string(),
             hour: 9,
             min_event_count: 50,
+        }
+    }
+}
+
+/// Distribution of Claudear's open PRs across developers.
+///
+/// Makes one developer from the roster responsible for each open Claudear PR,
+/// pings them when the PR opens, and sends each assignee a digest of the PRs
+/// still waiting on them. The roster is every person in the shared user
+/// registry (console identities merged with `[users]`) who owns a GitHub
+/// login, plus `[deploy_qa] github_discord_map_path` logins nobody owns, minus
+/// `excluded`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrDistributionConfig {
+    /// Whether PR distribution is enabled (default: false).
+    pub enabled: bool,
+    /// Assign and ping a developer as soon as Claudear opens a PR
+    /// (default: true).
+    pub notify_on_open: bool,
+    /// Send the scheduled per-assignee digest (default: true). When false the
+    /// scheduled run still assigns unowned PRs, pinging each new assignee.
+    pub digest: bool,
+    /// How often the scheduled run fires: "daily", "weekly-monday" …
+    /// "weekly-sunday", or "monthly" (default: "daily").
+    pub digest_frequency: DigestFrequency,
+    /// Hour the scheduled run fires, 0-23 UTC (default: 9).
+    pub digest_hour: u32,
+    /// GitHub logins never assigned, e.g. people on leave (default: empty).
+    pub excluded: Vec<String>,
+    /// How many PRs a developer may hold above the fair share before an owner
+    /// loses a PR to someone less loaded (default: 0).
+    pub tolerance: usize,
+}
+
+/// How often the `[pr_distribution]` scheduled run fires.
+///
+/// Written as "daily", "monthly", or "weekly-<day>" with the day in full or
+/// abbreviated ("weekly-friday", "weekly-fri"); anything else fails to load,
+/// so a typo can never silently switch the scheduled run off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum DigestFrequency {
+    /// Every day.
+    #[default]
+    Daily,
+    /// Once a week, on the given day.
+    Weekly(chrono::Weekday),
+    /// On the first of every month.
+    Monthly,
+}
+
+impl DigestFrequency {
+    const DAILY: &str = "daily";
+    const MONTHLY: &str = "monthly";
+    const WEEKLY_PREFIX: &str = "weekly-";
+}
+
+impl std::str::FromStr for DigestFrequency {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let normalized = value.trim().to_lowercase();
+        match normalized.as_str() {
+            Self::DAILY => return Ok(Self::Daily),
+            Self::MONTHLY => return Ok(Self::Monthly),
+            _ => {}
+        }
+        normalized
+            .strip_prefix(Self::WEEKLY_PREFIX)
+            .and_then(|day| day.parse::<chrono::Weekday>().ok())
+            .map(Self::Weekly)
+            .ok_or_else(|| {
+                format!(
+                    "unsupported digest_frequency '{value}': expected \
+                     \"{}\", \"{}\" or \"{}<day>\" (e.g. \"weekly-monday\")",
+                    Self::DAILY,
+                    Self::MONTHLY,
+                    Self::WEEKLY_PREFIX
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for DigestFrequency {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl std::fmt::Display for DigestFrequency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let day = |day: &chrono::Weekday| match day {
+            chrono::Weekday::Mon => "monday",
+            chrono::Weekday::Tue => "tuesday",
+            chrono::Weekday::Wed => "wednesday",
+            chrono::Weekday::Thu => "thursday",
+            chrono::Weekday::Fri => "friday",
+            chrono::Weekday::Sat => "saturday",
+            chrono::Weekday::Sun => "sunday",
+        };
+        match self {
+            Self::Daily => write!(f, "{}", Self::DAILY),
+            Self::Weekly(weekday) => write!(f, "{}{}", Self::WEEKLY_PREFIX, day(weekday)),
+            Self::Monthly => write!(f, "{}", Self::MONTHLY),
+        }
+    }
+}
+
+impl From<DigestFrequency> for String {
+    fn from(frequency: DigestFrequency) -> Self {
+        frequency.to_string()
+    }
+}
+
+impl PrDistributionConfig {
+    /// Latest hour of the day [`Self::digest_hour`] accepts.
+    pub const LATEST_HOUR: u32 = 23;
+
+    /// Validate `[pr_distribution]`.
+    pub fn validate(&self) -> Result<()> {
+        if self.digest_hour > Self::LATEST_HOUR {
+            return Err(Error::config(format!(
+                "pr_distribution.digest_hour must be 0-{}, got {}",
+                Self::LATEST_HOUR,
+                self.digest_hour
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for PrDistributionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            notify_on_open: true,
+            digest: true,
+            digest_frequency: DigestFrequency::Daily,
+            digest_hour: 9,
+            excluded: Vec::new(),
+            tolerance: 0,
         }
     }
 }
@@ -1703,7 +1866,7 @@ pub struct TelegramConfig {
 }
 
 /// Per-user configuration mapping source identifiers to notification channel IDs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserConfig {
     /// User's display names in Linear (matched against issue assignee).
@@ -2042,6 +2205,10 @@ pub struct HelpScoutConfig {
     pub max_concurrent: Option<usize>,
     /// Polling interval in milliseconds for this source (overrides global).
     pub poll_interval_ms: Option<u64>,
+    /// Per-mailbox profile and overrides (`[[issues.helpscout.mailboxes]]`).
+    pub mailboxes: Vec<HelpScoutMailboxConfig>,
+    /// Security inbox handling for mailboxes with `profile = "security"`.
+    pub security: SecurityInboxConfig,
 }
 
 impl Default for HelpScoutConfig {
@@ -2055,6 +2222,251 @@ impl Default for HelpScoutConfig {
             trigger_status: "active".to_string(),
             reply_as: ReplyAs::Note,
             webhook_secret: None,
+            max_issues_per_cycle: None,
+            max_concurrent: None,
+            poll_interval_ms: None,
+            mailboxes: Vec::new(),
+            security: SecurityInboxConfig::default(),
+        }
+    }
+}
+
+impl HelpScoutConfig {
+    pub fn all_mailbox_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for id in self
+            .mailbox_ids
+            .iter()
+            .chain(self.mailboxes.iter().map(|mailbox| &mailbox.id))
+        {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    fn mailbox(&self, mailbox_id: &str) -> Option<&HelpScoutMailboxConfig> {
+        self.mailboxes
+            .iter()
+            .find(|mailbox| mailbox.id == mailbox_id)
+    }
+
+    pub fn profile_for(&self, mailbox_id: &str) -> MailboxProfile {
+        if self.is_security_mailbox(mailbox_id) {
+            MailboxProfile::Security
+        } else {
+            MailboxProfile::Support
+        }
+    }
+
+    pub fn is_security_mailbox(&self, mailbox_id: &str) -> bool {
+        self.mailboxes
+            .iter()
+            .any(|mailbox| mailbox.id == mailbox_id && mailbox.profile == MailboxProfile::Security)
+    }
+
+    pub fn has_security_mailbox(&self) -> bool {
+        self.mailboxes
+            .iter()
+            .any(|mailbox| mailbox.profile == MailboxProfile::Security)
+    }
+
+    pub fn has_mailbox_overrides(&self) -> bool {
+        !self.mailboxes.is_empty()
+    }
+
+    /// Whether a conversation must be handled as a security report. An unknown
+    /// mailbox fails closed while any security mailbox is configured.
+    pub fn treats_as_security(&self, mailbox_id: Option<&str>) -> bool {
+        match mailbox_id {
+            Some(id) => self.is_security_mailbox(id),
+            None => self.has_security_mailbox(),
+        }
+    }
+
+    pub fn reply_as_for(&self, mailbox_id: &str) -> ReplyAs {
+        if self.is_security_mailbox(mailbox_id) {
+            return ReplyAs::Reply;
+        }
+        self.mailbox(mailbox_id)
+            .and_then(|mailbox| mailbox.reply_as)
+            .unwrap_or(self.reply_as)
+    }
+
+    /// The mailbox's own `trigger_tags`, else the top-level ones. A security
+    /// mailbox never inherits the support tags: unset means every
+    /// conversation.
+    pub fn trigger_tags_for(&self, mailbox_id: &str) -> &[String] {
+        match self.mailbox(mailbox_id) {
+            Some(mailbox) => match mailbox.trigger_tags.as_deref() {
+                Some(tags) => tags,
+                None if mailbox.profile == MailboxProfile::Security => &[],
+                None => &self.trigger_tags,
+            },
+            None => &self.trigger_tags,
+        }
+    }
+
+    pub fn trigger_status_for(&self, mailbox_id: &str) -> &str {
+        let status = self
+            .mailbox(mailbox_id)
+            .and_then(|mailbox| mailbox.trigger_status.as_deref())
+            .unwrap_or(&self.trigger_status)
+            .trim();
+        if status.is_empty() {
+            "active"
+        } else {
+            status
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for id in &self.mailbox_ids {
+            validate_mailbox_id("issues.helpscout.mailbox_ids[]", id)?;
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for mailbox in &self.mailboxes {
+            let id = mailbox.id.as_str();
+            validate_mailbox_id("issues.helpscout.mailboxes[].id", id)?;
+            if seen.contains(&id) {
+                return Err(Error::config(format!(
+                    "issues.helpscout.mailboxes lists mailbox '{id}' more than once"
+                )));
+            }
+            seen.push(id);
+            if mailbox.profile == MailboxProfile::Security
+                && mailbox.reply_as == Some(ReplyAs::Note)
+            {
+                return Err(Error::config(format!(
+                    "issues.helpscout.mailboxes '{id}' has profile = \"security\", which always sends customer replies; remove reply_as = \"note\""
+                )));
+            }
+        }
+        if self.security.enabled && !self.has_security_mailbox() {
+            return Err(Error::config(
+                "issues.helpscout.security.enabled requires a [[issues.helpscout.mailboxes]] entry with profile = \"security\"",
+            ));
+        }
+        self.security.validate().map_err(Error::config)
+    }
+}
+
+/// Mailbox ids are compared exactly against the ids HelpScout returns, so a
+/// padded id would silently never match.
+fn validate_mailbox_id(field: &str, id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(Error::config(format!("{field} must not be empty")));
+    }
+    if id != id.trim() {
+        return Err(Error::config(format!(
+            "{field} '{id}' must not have surrounding whitespace"
+        )));
+    }
+    Ok(())
+}
+
+/// Severity of a GitHub code-scanning alert.
+///
+/// Covers both `rule.security_severity_level` (`critical`, `high`, `medium`, `low`)
+/// and the fallback `rule.severity` (`error`, `warning`, `note`, `none`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodeScanningSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Error,
+    Warning,
+    Note,
+    None,
+}
+
+impl CodeScanningSeverity {
+    /// Every severity, in descending order of urgency.
+    pub const ALL: [Self; 8] = [
+        Self::Critical,
+        Self::High,
+        Self::Medium,
+        Self::Low,
+        Self::Error,
+        Self::Warning,
+        Self::Note,
+        Self::None,
+    ];
+
+    /// The name GitHub uses for this severity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Note => "note",
+            Self::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for CodeScanningSeverity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for CodeScanningSeverity {
+    type Err = String;
+
+    fn from_str(name: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|severity| severity.as_str().eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("Unknown code-scanning severity '{}'", name))
+    }
+}
+
+/// GitHub code-scanning alerts source configuration.
+///
+/// Authenticates with the `[scm.github]` token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitHubCodeScanningConfig {
+    /// Whether this source is enabled.
+    pub enabled: bool,
+    /// Repositories to poll for open alerts (e.g., ["owner/repo"]).
+    pub repos: Vec<String>,
+    /// Analysis tool names to include (e.g., ["CodeQL"]). Empty includes every tool.
+    pub tool_names: Vec<String>,
+    /// Severities to include, matched against `rule.security_severity_level`,
+    /// falling back to `rule.severity`.
+    pub severities: Vec<CodeScanningSeverity>,
+    /// Maximum issues to process per poll cycle for this source (overrides global).
+    pub max_issues_per_cycle: Option<usize>,
+    /// Maximum concurrent issue processing for this source (overrides global).
+    pub max_concurrent: Option<usize>,
+    /// Polling interval in milliseconds for this source (overrides global).
+    pub poll_interval_ms: Option<u64>,
+}
+
+impl GitHubCodeScanningConfig {
+    /// Name of the issue source this section configures.
+    pub const SOURCE_NAME: &'static str = "github_code_scanning";
+}
+
+impl Default for GitHubCodeScanningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repos: Vec::new(),
+            tool_names: Vec::new(),
+            severities: vec![
+                CodeScanningSeverity::Critical,
+                CodeScanningSeverity::High,
+                CodeScanningSeverity::Medium,
+            ],
             max_issues_per_cycle: None,
             max_concurrent: None,
             poll_interval_ms: None,
@@ -2301,7 +2713,8 @@ impl Default for RegressionConfig {
 
 /// Tag filter for a `[deploy_qa]` track.
 ///
-/// TOML values: `"any"`, `"suffix:-db"`, `"not_suffix:-db"`.
+/// TOML values: `"any"`, `"suffix:-db"`, `"not_suffix:-db"`,
+/// `"prefix:apps/console/"`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DeployQaTagFilter {
     /// Match every release tag.
@@ -2311,32 +2724,56 @@ pub enum DeployQaTagFilter {
     Suffix(String),
     /// Match tags that do **not** end with the given suffix.
     NotSuffix(String),
+    /// Match tags that start with the given prefix (e.g. `apps/console/`), as
+    /// a monorepo namespaces one app's tags. The version is what follows it.
+    Prefix(String),
 }
 
 impl DeployQaTagFilter {
+    const ANY: &str = "any";
+    const SUFFIX: &str = "suffix:";
+    const NOT_SUFFIX: &str = "not_suffix:";
+    const PREFIX: &str = "prefix:";
+
     /// Parse a tag filter from its TOML string form.
     pub fn parse(raw: &str) -> std::result::Result<Self, String> {
         let raw = raw.trim();
-        if raw.is_empty() || raw.eq_ignore_ascii_case("any") {
+        if raw.is_empty() || raw.eq_ignore_ascii_case(Self::ANY) {
             return Ok(Self::Any);
         }
-        if let Some(suffix) = raw.strip_prefix("suffix:") {
-            let suffix = suffix.trim();
-            if suffix.is_empty() {
-                return Err("tag_filter 'suffix:' requires a non-empty suffix".to_string());
-            }
-            return Ok(Self::Suffix(suffix.to_string()));
+        if let Some(suffix) = raw.strip_prefix(Self::SUFFIX) {
+            return Self::operand(Self::SUFFIX, suffix).map(Self::Suffix);
         }
-        if let Some(suffix) = raw.strip_prefix("not_suffix:") {
-            let suffix = suffix.trim();
-            if suffix.is_empty() {
-                return Err("tag_filter 'not_suffix:' requires a non-empty suffix".to_string());
+        if let Some(suffix) = raw.strip_prefix(Self::NOT_SUFFIX) {
+            return Self::operand(Self::NOT_SUFFIX, suffix).map(Self::NotSuffix);
+        }
+        if let Some(prefix) = raw.strip_prefix(Self::PREFIX) {
+            let prefix = Self::operand(Self::PREFIX, prefix)?;
+            if let Some(invalid) = prefix.chars().find(|character| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/'))
+            }) {
+                return Err(format!(
+                    "tag_filter '{raw}' has '{invalid}' in its prefix (allowed: ASCII letters, digits, '-', '_', '.', '/')"
+                ));
             }
-            return Ok(Self::NotSuffix(suffix.to_string()));
+            if prefix.starts_with('/') || prefix.contains("..") || prefix.contains("//") {
+                return Err(format!(
+                    "tag_filter '{raw}' prefix must not start with '/' or contain '..' or '//', which no git tag can"
+                ));
+            }
+            return Ok(Self::Prefix(prefix));
         }
         Err(format!(
-            "unknown tag_filter '{raw}' (expected any | suffix:<text> | not_suffix:<text>)"
+            "unknown tag_filter '{raw}' (expected any | suffix:<text> | not_suffix:<text> | prefix:<text>)"
         ))
+    }
+
+    fn operand(kind: &str, operand: &str) -> std::result::Result<String, String> {
+        let operand = operand.trim();
+        if operand.is_empty() {
+            return Err(format!("tag_filter '{kind}' requires a non-empty value"));
+        }
+        Ok(operand.to_string())
     }
 
     /// Whether `tag` matches this filter.
@@ -2345,15 +2782,26 @@ impl DeployQaTagFilter {
             Self::Any => true,
             Self::Suffix(suffix) => tag.ends_with(suffix),
             Self::NotSuffix(suffix) => !tag.ends_with(suffix),
+            Self::Prefix(prefix) => tag.len() > prefix.len() && tag.starts_with(prefix),
+        }
+    }
+
+    /// The version a matching `tag` names: the tag without a
+    /// [`Self::Prefix`] prefix, otherwise the whole tag.
+    pub fn version<'a>(&self, tag: &'a str) -> &'a str {
+        match self {
+            Self::Prefix(prefix) => tag.strip_prefix(prefix.as_str()).unwrap_or(tag),
+            Self::Any | Self::Suffix(_) | Self::NotSuffix(_) => tag,
         }
     }
 
     /// Canonical TOML string for this filter.
     pub fn as_str(&self) -> String {
         match self {
-            Self::Any => "any".to_string(),
-            Self::Suffix(suffix) => format!("suffix:{suffix}"),
-            Self::NotSuffix(suffix) => format!("not_suffix:{suffix}"),
+            Self::Any => Self::ANY.to_string(),
+            Self::Suffix(suffix) => format!("{}{suffix}", Self::SUFFIX),
+            Self::NotSuffix(suffix) => format!("{}{suffix}", Self::NOT_SUFFIX),
+            Self::Prefix(prefix) => format!("{}{prefix}", Self::PREFIX),
         }
     }
 }
@@ -2598,9 +3046,6 @@ impl Config {
         let resolved_instructions = config.resolve_instructions_file(config_dir)?;
         config.agent.default_provider_config_mut().instructions = resolved_instructions;
 
-        // Resolve user slug references in global notification configs
-        config.resolve_user_slugs();
-
         // Validate project directory configuration
         config.validate_project_config()?;
 
@@ -2609,8 +3054,8 @@ impl Config {
 
     /// Validate minimal configuration needed for loading.
     ///
-    /// Only validates `workspace` is set. Repository validation is done
-    /// in `validate()` for commands that actually need repositories.
+    /// Only validates `workspace` is set and the `[users]` keys. Repository
+    /// validation is done in `validate()` for commands that actually need repositories.
     fn validate_project_config(&self) -> Result<()> {
         if self.workspace.as_os_str().is_empty() {
             return Err(Error::config(
@@ -2618,7 +3063,26 @@ impl Config {
             ));
         }
 
-        Ok(())
+        self.validate_user_keys()
+    }
+
+    /// Reject `[users.<key>]` entries whose key starts with the prefix reserved for the
+    /// `console-<user_id>` alias of every console user.
+    fn validate_user_keys(&self) -> Result<()> {
+        let mut reserved: Vec<&str> = self
+            .users
+            .keys()
+            .map(String::as_str)
+            .filter(|key| key.starts_with(CONSOLE_KEY_PREFIX))
+            .collect();
+        reserved.sort_unstable();
+        match reserved.first() {
+            Some(key) => Err(Error::config(format!(
+                "[users.{key}]: user keys must not start with '{CONSOLE_KEY_PREFIX}', which is \
+                 reserved for console users; rename the entry"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Load configuration from the default config file path.
@@ -2677,62 +3141,6 @@ impl Config {
             (None, Some(inline)) => Ok(Some(inline.clone())),
             (None, None) => Ok(None),
         }
-    }
-
-    /// Resolve user slug references in global notification configs.
-    ///
-    /// If a field like `discord.user_id` matches a key in `users`,
-    /// replace it with the user's actual channel-specific ID.
-    pub fn resolve_user_slugs(&mut self) {
-        // Resolve discord notifier user_id
-        if let Some(ref user_id) = self.notifiers.discord.user_id {
-            if let Some(user) = self.users.get(user_id) {
-                if let Some(ref discord_id) = user.discord_id {
-                    self.notifiers.discord.user_id = Some(discord_id.clone());
-                }
-            }
-        }
-
-        // Resolve email.to_addresses
-        let resolved_emails: Vec<String> = self
-            .notifiers
-            .email
-            .to_addresses
-            .iter()
-            .map(|addr| {
-                if let Some(user) = self.users.get(addr) {
-                    user.email.clone().unwrap_or_else(|| addr.clone())
-                } else {
-                    addr.clone()
-                }
-            })
-            .collect();
-        self.notifiers.email.to_addresses = resolved_emails;
-
-        // Resolve push.user_key
-        if let Some(ref user_key) = self.notifiers.push.user_key {
-            if let Some(user) = self.users.get(user_key) {
-                if let Some(ref push_key) = user.push_user_key {
-                    self.notifiers.push.user_key = Some(push_key.clone());
-                }
-            }
-        }
-
-        // Resolve sms.to_numbers
-        let resolved_numbers: Vec<String> = self
-            .notifiers
-            .sms
-            .to_numbers
-            .iter()
-            .map(|num| {
-                if let Some(user) = self.users.get(num) {
-                    user.sms_number.clone().unwrap_or_else(|| num.clone())
-                } else {
-                    num.clone()
-                }
-            })
-            .collect();
-        self.notifiers.sms.to_numbers = resolved_numbers;
     }
 
     /// Apply environment variable overrides to the config.
@@ -3252,6 +3660,11 @@ impl Config {
             self.retry.max_delay_ms = v;
         }
 
+        if let Ok(v) = env::var("CLAUDEAR_DASHBOARD_PUBLIC_URL") {
+            let url = v.trim();
+            self.dashboard.public_url = (!url.is_empty()).then(|| url.to_string());
+        }
+
         // Linear - apply overrides to existing config or create new one
         self.apply_linear_env_overrides();
 
@@ -3614,6 +4027,11 @@ impl Config {
             .as_ref()
             .is_some_and(|s| s.bot_token.is_some());
         let has_deploy_qa = self.deploy_qa.enabled && !self.deploy_qa.tracks.is_empty();
+        let has_github_code_scanning = self
+            .issues
+            .github_code_scanning
+            .as_ref()
+            .is_some_and(|c| c.enabled && !c.repos.is_empty());
 
         if !has_linear
             && !has_sentry
@@ -3622,9 +4040,10 @@ impl Config {
             && !has_slack
             && !has_discord
             && !has_deploy_qa
+            && !has_github_code_scanning
         {
             return Err(Error::config(
-                "No sources configured. Configure linear, sentry, jira, gitlab, slack, discord, or deploy_qa tracks in config file with valid API credentials.",
+                "No sources configured. Configure linear, sentry, jira, gitlab, slack, discord, github_code_scanning, or deploy_qa tracks in config file with valid API credentials.",
             ));
         }
 
@@ -3661,6 +4080,10 @@ impl Config {
             }
         }
 
+        if let Some(helpscout) = self.helpscout() {
+            helpscout.validate()?;
+        }
+
         // Validate prioritisation config only when engine is enabled
         if self.prioritisation.enabled {
             self.prioritisation.validate()?;
@@ -3674,6 +4097,10 @@ impl Config {
             self.reports.support_digest.validate()?;
         }
 
+        if self.pr_distribution.enabled {
+            self.pr_distribution.validate()?;
+        }
+
         let has_github_token = self
             .github()
             .token
@@ -3683,6 +4110,18 @@ impl Config {
             return Err(Error::config(
                 "deploy_qa requires a GitHub token to poll release tips. \
                  Set scm.github.token or CLAUDEAR_GITHUB_TOKEN, or disable deploy_qa.",
+            ));
+        }
+        if self.pr_distribution.enabled && !has_github_token {
+            return Err(Error::config(
+                "pr_distribution reads PRs, reviews and CODEOWNERS from GitHub. \
+                 Set scm.github.token or CLAUDEAR_GITHUB_TOKEN, or disable pr_distribution.",
+            ));
+        }
+        if has_github_code_scanning && !has_github_token {
+            return Err(Error::config(
+                "issues.github_code_scanning requires a GitHub token to poll alerts. \
+                 Set scm.github.token or CLAUDEAR_GITHUB_TOKEN, or disable github_code_scanning.",
             ));
         }
 
@@ -3784,6 +4223,21 @@ impl Config {
     /// Accessor: get reference to HelpScoutConfig.
     pub fn helpscout(&self) -> Option<&HelpScoutConfig> {
         self.issues.helpscout.as_ref()
+    }
+
+    /// The Security inbox configuration, only when HelpScout and the inbox are
+    /// both enabled and a security mailbox exists.
+    pub fn security_inbox(&self) -> Option<&SecurityInboxConfig> {
+        self.helpscout()
+            .filter(|helpscout| {
+                helpscout.enabled && helpscout.security.enabled && helpscout.has_security_mailbox()
+            })
+            .map(|helpscout| &helpscout.security)
+    }
+
+    /// Accessor: get reference to GitHubCodeScanningConfig.
+    pub fn github_code_scanning(&self) -> Option<&GitHubCodeScanningConfig> {
+        self.issues.github_code_scanning.as_ref()
     }
 
     /// Accessor: reply-action configuration, sourced from `[notifiers.helpscout]`.
@@ -3894,6 +4348,12 @@ impl Config {
                 .as_ref()
                 .and_then(|c| c.max_issues_per_cycle)
                 .unwrap_or(self.max_issues_per_cycle),
+            GitHubCodeScanningConfig::SOURCE_NAME => self
+                .issues
+                .github_code_scanning
+                .as_ref()
+                .and_then(|c| c.max_issues_per_cycle)
+                .unwrap_or(self.max_issues_per_cycle),
             _ => self.max_issues_per_cycle,
         }
     }
@@ -3923,6 +4383,12 @@ impl Config {
             "gitlab" => self
                 .scm
                 .gitlab
+                .as_ref()
+                .and_then(|c| c.max_concurrent)
+                .unwrap_or(self.max_concurrent),
+            GitHubCodeScanningConfig::SOURCE_NAME => self
+                .issues
+                .github_code_scanning
                 .as_ref()
                 .and_then(|c| c.max_concurrent)
                 .unwrap_or(self.max_concurrent),
@@ -3967,6 +4433,12 @@ impl Config {
             "gitlab" => self
                 .scm
                 .gitlab
+                .as_ref()
+                .and_then(|c| c.poll_interval_ms)
+                .unwrap_or(self.poll_interval_ms),
+            GitHubCodeScanningConfig::SOURCE_NAME => self
+                .issues
+                .github_code_scanning
                 .as_ref()
                 .and_then(|c| c.poll_interval_ms)
                 .unwrap_or(self.poll_interval_ms),
@@ -4183,6 +4655,445 @@ mod tests {
         assert_eq!(hs.reply_as, ReplyAs::Reply);
     }
 
+    const SUPPORT_HELPSCOUT_TOML: &str = r#"
+        [issues.linear]
+        enabled = true
+        api_key = "key"
+
+        [issues.helpscout]
+        enabled = true
+        mailbox_ids = ["249877"]
+        trigger_tags = ["auto-implement", "claude"]
+        trigger_status = "active"
+        reply_as = "note"
+    "#;
+
+    const SECURITY_MAILBOX_TOML: &str = r#"
+        [[issues.helpscout.mailboxes]]
+        id = "249891"
+        profile = "security"
+        trigger_tags = []
+        trigger_status = "active"
+
+        [issues.helpscout.security]
+        enabled = true
+        process_after = "2026-11-05T00:00:00Z"
+        spam_action = "close"
+        default_repository = "appwrite-labs/cloud"
+
+        [issues.helpscout.security.reward]
+        campaign = "SecurityResearchers"
+        credits = 100
+
+        [issues.helpscout.security.deployment]
+        configuration_repository = "appwrite-labs/application-configuration"
+        configuration_reference = "main"
+
+        [[issues.helpscout.security.deployment.applications]]
+        repository = "appwrite-labs/cloud"
+        image = "appwrite/cloud"
+        directories = ["cloud/production/cloud", "cloud/production/cloud-background"]
+
+        [[issues.helpscout.security.deployment.applications.packages]]
+        repository = "appwrite/appwrite"
+        package = "appwrite/server-ce"
+        lock_file = "composer.lock"
+    "#;
+
+    fn parse_helpscout(toml: &str) -> Config {
+        toml::from_str(toml).expect("parse")
+    }
+
+    #[test]
+    fn test_helpscout_support_only_toml_is_unchanged() {
+        let config = parse_helpscout(SUPPORT_HELPSCOUT_TOML);
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert!(helpscout.mailboxes.is_empty());
+        assert!(!helpscout.has_mailbox_overrides());
+        assert!(!helpscout.has_security_mailbox());
+        assert_eq!(helpscout.all_mailbox_ids(), vec!["249877".to_string()]);
+        assert_eq!(helpscout.profile_for("249877"), MailboxProfile::Support);
+        assert_eq!(helpscout.reply_as_for("249877"), ReplyAs::Note);
+        assert_eq!(
+            helpscout.trigger_tags_for("249877"),
+            ["auto-implement".to_string(), "claude".to_string()]
+        );
+        assert_eq!(helpscout.trigger_status_for("249877"), "active");
+        assert!(!helpscout.treats_as_security(Some("249877")));
+        assert!(!helpscout.treats_as_security(None));
+        assert_eq!(helpscout.security, SecurityInboxConfig::default());
+        assert!(config.security_inbox().is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_helpscout_security_mailbox_toml_parses() {
+        let config = parse_helpscout(&format!("{SUPPORT_HELPSCOUT_TOML}{SECURITY_MAILBOX_TOML}"));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert_eq!(
+            helpscout.all_mailbox_ids(),
+            vec!["249877".to_string(), "249891".to_string()]
+        );
+        assert_eq!(helpscout.profile_for("249891"), MailboxProfile::Security);
+        assert_eq!(helpscout.profile_for("249877"), MailboxProfile::Support);
+        assert!(helpscout.is_security_mailbox("249891"));
+        assert!(!helpscout.is_security_mailbox("249877"));
+        assert_eq!(helpscout.reply_as_for("249891"), ReplyAs::Reply);
+        assert_eq!(helpscout.reply_as_for("249877"), ReplyAs::Note);
+        assert!(helpscout.trigger_tags_for("249891").is_empty());
+        assert_eq!(
+            helpscout.trigger_tags_for("249877"),
+            ["auto-implement".to_string(), "claude".to_string()]
+        );
+        let security = config.security_inbox().expect("security inbox enabled");
+        assert_eq!(
+            security.process_after,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-11-05T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
+        );
+        assert_eq!(security.spam_action, SpamAction::Close);
+        assert_eq!(
+            security.default_repository.as_deref(),
+            Some("appwrite-labs/cloud")
+        );
+        assert_eq!(security.deployment.applications.len(), 1);
+        assert_eq!(
+            security.deployment.applications[0].packages[0].package,
+            "appwrite/server-ce"
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_helpscout_mailbox_overrides_inherit_and_override() {
+        let config = parse_helpscout(
+            r#"
+            [issues.helpscout]
+            enabled = true
+            mailbox_ids = ["1", "2"]
+            trigger_tags = ["bug"]
+            trigger_status = ""
+            reply_as = "note"
+
+            [[issues.helpscout.mailboxes]]
+            id = "2"
+            reply_as = "reply"
+            trigger_tags = []
+            trigger_status = "pending"
+
+            [[issues.helpscout.mailboxes]]
+            id = "3"
+            trigger_tags = ["vip"]
+            "#,
+        );
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert_eq!(
+            helpscout.all_mailbox_ids(),
+            vec!["1".to_string(), "2".to_string(), "3".to_string()]
+        );
+        assert!(helpscout.has_mailbox_overrides());
+        assert!(!helpscout.has_security_mailbox());
+        assert_eq!(helpscout.reply_as_for("1"), ReplyAs::Note);
+        assert_eq!(helpscout.reply_as_for("2"), ReplyAs::Reply);
+        assert_eq!(helpscout.reply_as_for("3"), ReplyAs::Note);
+        assert_eq!(helpscout.trigger_tags_for("1"), ["bug".to_string()]);
+        assert!(helpscout.trigger_tags_for("2").is_empty());
+        assert_eq!(helpscout.trigger_tags_for("3"), ["vip".to_string()]);
+        assert_eq!(helpscout.trigger_status_for("1"), "active");
+        assert_eq!(helpscout.trigger_status_for("2"), "pending");
+        assert_eq!(helpscout.profile_for("3"), MailboxProfile::Support);
+    }
+
+    #[test]
+    fn test_helpscout_treats_missing_mailbox_as_security_when_one_exists() {
+        let config = parse_helpscout(&format!("{SUPPORT_HELPSCOUT_TOML}{SECURITY_MAILBOX_TOML}"));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert!(helpscout.treats_as_security(None));
+        assert!(helpscout.treats_as_security(Some("249891")));
+        assert!(!helpscout.treats_as_security(Some("249877")));
+    }
+
+    #[test]
+    fn test_helpscout_security_mailbox_rejects_note_replies() {
+        let config = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}{}",
+            SECURITY_MAILBOX_TOML.replace(
+                "profile = \"security\"",
+                "profile = \"security\"\nreply_as = \"note\""
+            )
+        ));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert_eq!(helpscout.mailboxes[0].reply_as, Some(ReplyAs::Note));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("249891"), "{error}");
+        assert!(error.contains("reply_as"), "{error}");
+    }
+
+    #[test]
+    fn test_helpscout_security_mailbox_ignores_top_level_note() {
+        let config = parse_helpscout(&format!("{SUPPORT_HELPSCOUT_TOML}{SECURITY_MAILBOX_TOML}"));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert_eq!(helpscout.reply_as, ReplyAs::Note);
+        assert_eq!(helpscout.reply_as_for("249891"), ReplyAs::Reply);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_helpscout_security_enabled_requires_security_mailbox() {
+        let config = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}\n[issues.helpscout.security]\nenabled = true\n"
+        ));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("profile = \"security\""), "{error}");
+        assert!(config.security_inbox().is_none());
+    }
+
+    #[test]
+    fn test_helpscout_security_thresholds_are_validated() {
+        let mut config =
+            parse_helpscout(&format!("{SUPPORT_HELPSCOUT_TOML}{SECURITY_MAILBOX_TOML}"));
+        let helpscout = config.issues.helpscout.as_mut().unwrap();
+        helpscout.security.spam_confidence = 1.01;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("spam_confidence"));
+        let helpscout = config.issues.helpscout.as_mut().unwrap();
+        helpscout.security.spam_confidence = 0.9;
+        helpscout.security.duplicate_similarity = 2.0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate_similarity"));
+    }
+
+    #[test]
+    fn test_helpscout_duplicate_mailbox_entries_are_rejected() {
+        let config = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}{SECURITY_MAILBOX_TOML}\n[[issues.helpscout.mailboxes]]\nid = \"249891\"\nprofile = \"support\"\n"
+        ));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert!(helpscout.is_security_mailbox("249891"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("more than once"));
+    }
+
+    #[test]
+    fn test_helpscout_mailbox_ids_with_surrounding_whitespace_are_rejected() {
+        for (toml, field) in [
+            (
+                format!(
+                    "{SUPPORT_HELPSCOUT_TOML}{}",
+                    SECURITY_MAILBOX_TOML.replace("id = \"249891\"", "id = \" 249891\"")
+                ),
+                "issues.helpscout.mailboxes[].id ' 249891'",
+            ),
+            (
+                format!(
+                    "{SUPPORT_HELPSCOUT_TOML}{}",
+                    SECURITY_MAILBOX_TOML.replace("id = \"249891\"", "id = \"249891\\n\"")
+                ),
+                "issues.helpscout.mailboxes[].id",
+            ),
+            (
+                format!(
+                    "{}{SECURITY_MAILBOX_TOML}",
+                    SUPPORT_HELPSCOUT_TOML.replace("[\"249877\"]", "[\"249877 \"]")
+                ),
+                "issues.helpscout.mailbox_ids[] '249877 '",
+            ),
+        ] {
+            let config = parse_helpscout(&toml);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains("surrounding whitespace"), "{error}");
+        }
+        for toml in [
+            format!(
+                "{SUPPORT_HELPSCOUT_TOML}{}",
+                SECURITY_MAILBOX_TOML.replace("id = \"249891\"", "id = \"\"")
+            ),
+            format!(
+                "{}{SECURITY_MAILBOX_TOML}",
+                SUPPORT_HELPSCOUT_TOML.replace("[\"249877\"]", "[\"\"]")
+            ),
+        ] {
+            let error = parse_helpscout(&toml).validate().unwrap_err().to_string();
+            assert!(error.contains("must not be empty"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_helpscout_security_mailbox_does_not_inherit_support_trigger_tags() {
+        let config = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}{}\n[[issues.helpscout.mailboxes]]\nid = \"249877\"\nreply_as = \"note\"\n",
+            SECURITY_MAILBOX_TOML.replace("trigger_tags = []\n", "")
+        ));
+        let helpscout = config.helpscout().expect("helpscout config");
+        assert_eq!(helpscout.mailboxes[0].trigger_tags, None);
+        assert!(helpscout.trigger_tags_for("249891").is_empty());
+        assert_eq!(
+            helpscout.trigger_tags_for("249877"),
+            ["auto-implement".to_string(), "claude".to_string()]
+        );
+
+        let explicit = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}{}",
+            SECURITY_MAILBOX_TOML.replace("trigger_tags = []", "trigger_tags = [\"report\"]")
+        ));
+        assert_eq!(
+            explicit.helpscout().unwrap().trigger_tags_for("249891"),
+            ["report".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_helpscout_security_enabled_requires_process_after() {
+        let config = parse_helpscout(&format!(
+            "{SUPPORT_HELPSCOUT_TOML}{}",
+            SECURITY_MAILBOX_TOML.replace("process_after = \"2026-11-05T00:00:00Z\"\n", "")
+        ));
+        assert_eq!(config.helpscout().unwrap().security.process_after, None);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("process_after"), "{error}");
+    }
+
+    #[test]
+    fn test_example_toml_security_block_parses() {
+        let example = include_str!("../../../claudear.example.toml");
+        let start = example
+            .find("# [[issues.helpscout.mailboxes]]")
+            .expect("documented mailboxes block");
+        let end = example[start..]
+            .find("# lock_file = \"composer.lock\"")
+            .map(|offset| start + offset + "# lock_file = \"composer.lock\"".len())
+            .expect("documented deployment block");
+        let snippet: String = example[start..end]
+            .lines()
+            .filter_map(|line| line.strip_prefix('#'))
+            .map(str::trim)
+            .filter(|line| line.starts_with('[') || line.contains(" = "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let config: Config = toml::from_str(&format!(
+            "[issues.helpscout]\nenabled = true\nmailbox_ids = [\"249877\"]\n{snippet}"
+        ))
+        .expect("example parses");
+        let helpscout = config.helpscout().expect("helpscout config");
+        helpscout.validate().expect("example validates");
+        assert!(helpscout.is_security_mailbox("249891"));
+        assert_eq!(helpscout.reply_as_for("249877"), ReplyAs::Note);
+        let security = config.security_inbox().expect("security inbox");
+        assert!(security.templates.not_vulnerability.contains("{reason}"));
+        assert_eq!(security.deployment, SecurityDeploymentConfig::default());
+    }
+
+    #[test]
+    fn test_security_inbox_requires_helpscout_enabled() {
+        let config = parse_helpscout(&format!(
+            "{}{SECURITY_MAILBOX_TOML}",
+            SUPPORT_HELPSCOUT_TOML.replace(
+                "[issues.helpscout]\n        enabled = true",
+                "[issues.helpscout]\n        enabled = false"
+            )
+        ));
+        assert!(!config.helpscout().unwrap().enabled);
+        assert!(config.security_inbox().is_none());
+    }
+
+    #[test]
+    fn test_github_code_scanning_config_parses_from_toml() {
+        let toml = r#"
+            [issues.github_code_scanning]
+            enabled = true
+            repos = ["appwrite/appwrite"]
+            tool_names = ["ureview security review"]
+            severities = ["critical", "error"]
+            max_issues_per_cycle = 2
+            max_concurrent = 1
+        "#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        let code_scanning = config
+            .github_code_scanning()
+            .expect("github_code_scanning config");
+        assert!(code_scanning.enabled);
+        assert_eq!(code_scanning.repos, vec!["appwrite/appwrite".to_string()]);
+        assert_eq!(
+            code_scanning.tool_names,
+            vec!["ureview security review".to_string()]
+        );
+        assert_eq!(
+            code_scanning.severities,
+            vec![CodeScanningSeverity::Critical, CodeScanningSeverity::Error]
+        );
+        assert_eq!(
+            config.max_issues_per_cycle_for(GitHubCodeScanningConfig::SOURCE_NAME),
+            2
+        );
+        assert_eq!(
+            config.max_concurrent_for(GitHubCodeScanningConfig::SOURCE_NAME),
+            1
+        );
+    }
+
+    #[test]
+    fn test_github_code_scanning_config_defaults() {
+        let toml = r#"
+            [issues.github_code_scanning]
+            enabled = true
+        "#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        let code_scanning = config
+            .github_code_scanning()
+            .expect("github_code_scanning config");
+        assert!(code_scanning.repos.is_empty());
+        assert!(code_scanning.tool_names.is_empty());
+        assert_eq!(
+            code_scanning.severities,
+            vec![
+                CodeScanningSeverity::Critical,
+                CodeScanningSeverity::High,
+                CodeScanningSeverity::Medium,
+            ]
+        );
+        assert_eq!(
+            config.max_issues_per_cycle_for(GitHubCodeScanningConfig::SOURCE_NAME),
+            config.max_issues_per_cycle
+        );
+        assert_eq!(
+            config.poll_interval_ms_for(GitHubCodeScanningConfig::SOURCE_NAME),
+            config.poll_interval_ms
+        );
+    }
+
+    #[test]
+    fn test_code_scanning_severity_names_match_serde() {
+        for severity in CodeScanningSeverity::ALL {
+            let serialized = serde_json::to_value(severity).expect("serialize");
+            assert_eq!(serialized, serde_json::json!(severity.as_str()));
+            assert_eq!(
+                severity.as_str().parse::<CodeScanningSeverity>(),
+                Ok(severity)
+            );
+            assert_eq!(
+                severity
+                    .as_str()
+                    .to_uppercase()
+                    .parse::<CodeScanningSeverity>(),
+                Ok(severity)
+            );
+        }
+        assert!("severe".parse::<CodeScanningSeverity>().is_err());
+    }
+
     // All environment variables that Config reads
     const CONFIG_ENV_VARS: &[&str] = &[
         "CLAUDEAR_WORKSPACE",
@@ -4290,6 +5201,7 @@ mod tests {
         "CLAUDEAR_CLAUDE_INSTRUCTIONS_FILE",
         "CLAUDEAR_CLAUDE_PERMISSIONS",
         "CLAUDEAR_CLAUDE_SKIP_PERMISSIONS",
+        "CLAUDEAR_DASHBOARD_PUBLIC_URL",
     ];
 
     fn with_env<F, R>(vars: &[(&str, &str)], f: F) -> R
@@ -4554,6 +5466,45 @@ known_orgs = ["appwrite"]
             let result = Config::load(file.path());
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains("workspace"));
+        });
+    }
+
+    #[test]
+    fn test_load_rejects_a_user_key_with_the_reserved_console_prefix() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[users.jake]
+github_usernames = ["jakebarnby"]
+
+[users.console-7]
+github_usernames = ["impostor"]
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[], || {
+            let message = Config::load(file.path()).unwrap_err().to_string();
+            assert!(message.contains("[users.console-7]"), "{message}");
+            assert!(message.contains("reserved"), "{message}");
+        });
+    }
+
+    #[test]
+    fn test_load_accepts_user_keys_that_only_resemble_the_console_prefix() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[users.console]
+github_usernames = ["console-bot"]
+
+[users.consoles-team]
+github_usernames = ["consoles"]
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[], || {
+            let config = Config::load(file.path()).unwrap();
+            assert_eq!(config.users.len(), 2);
         });
     }
 
@@ -5575,6 +6526,109 @@ monitoring_duration_hours = 12
     }
 
     #[test]
+    fn test_pr_distribution_is_off_by_default() {
+        let config = Config::default();
+        assert!(!config.pr_distribution.enabled);
+        assert!(config.pr_distribution.notify_on_open);
+        assert!(config.pr_distribution.digest);
+        assert_eq!(
+            config.pr_distribution.digest_frequency,
+            DigestFrequency::Daily
+        );
+        assert_eq!(config.pr_distribution.digest_hour, 9);
+        assert!(config.pr_distribution.excluded.is_empty());
+        assert_eq!(config.pr_distribution.tolerance, 0);
+    }
+
+    #[test]
+    fn test_pr_distribution_from_toml() {
+        let config: Config = toml::from_str(
+            "[pr_distribution]\n\
+             enabled = true\n\
+             notify_on_open = false\n\
+             digest_frequency = \"weekly-monday\"\n\
+             digest_hour = 14\n\
+             excluded = [\"alice\"]\n\
+             tolerance = 2\n",
+        )
+        .expect("parse");
+        let distribution = config.pr_distribution;
+        assert!(distribution.enabled);
+        assert!(!distribution.notify_on_open);
+        assert!(distribution.digest);
+        assert_eq!(
+            distribution.digest_frequency,
+            DigestFrequency::Weekly(chrono::Weekday::Mon)
+        );
+        assert_eq!(distribution.digest_hour, 14);
+        assert_eq!(distribution.excluded, vec!["alice".to_string()]);
+        assert_eq!(distribution.tolerance, 2);
+    }
+
+    #[test]
+    fn test_digest_frequency_parses_every_supported_spelling() {
+        for (text, frequency) in [
+            ("daily", DigestFrequency::Daily),
+            ("Monthly", DigestFrequency::Monthly),
+            (
+                "weekly-friday",
+                DigestFrequency::Weekly(chrono::Weekday::Fri),
+            ),
+            (
+                " WEEKLY-tue ",
+                DigestFrequency::Weekly(chrono::Weekday::Tue),
+            ),
+        ] {
+            assert_eq!(text.parse::<DigestFrequency>(), Ok(frequency), "{text}");
+        }
+        for frequency in [
+            DigestFrequency::Daily,
+            DigestFrequency::Monthly,
+            DigestFrequency::Weekly(chrono::Weekday::Sun),
+        ] {
+            assert_eq!(frequency.to_string().parse(), Ok(frequency));
+        }
+    }
+
+    #[test]
+    fn test_pr_distribution_rejects_an_unsupported_digest_frequency() {
+        for text in ["fortnightly", "weekly", "weekly-someday", ""] {
+            assert!(text.parse::<DigestFrequency>().is_err(), "{text}");
+        }
+        let error = toml::from_str::<Config>(
+            "[pr_distribution]\nenabled = true\ndigest_frequency = \"fortnightly\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsupported digest_frequency 'fortnightly'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_pr_distribution_round_trips_through_toml() {
+        let config: Config =
+            toml::from_str("[pr_distribution]\ndigest_frequency = \"weekly-wed\"\n").unwrap();
+        let written = toml::to_string(&config.pr_distribution).unwrap();
+        assert!(
+            written.contains("digest_frequency = \"weekly-wednesday\""),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn test_pr_distribution_rejects_an_hour_past_the_day() {
+        let mut distribution = PrDistributionConfig {
+            digest_hour: PrDistributionConfig::LATEST_HOUR,
+            ..PrDistributionConfig::default()
+        };
+        assert!(distribution.validate().is_ok());
+        distribution.digest_hour = PrDistributionConfig::LATEST_HOUR + 1;
+        assert!(distribution.validate().is_err());
+    }
+
+    #[test]
     fn test_deploy_qa_timeout_from_toml() {
         let config: Config = toml::from_str("[deploy_qa]\ntimeout_secs = 42\n").expect("parse");
         assert_eq!(config.deploy_qa.timeout_secs, 42);
@@ -5603,6 +6657,107 @@ monitoring_duration_hours = 12
         assert!(!DeployQaTagFilter::Suffix("-db".into()).matches("1.2.3"));
         assert!(DeployQaTagFilter::NotSuffix("-db".into()).matches("1.2.3"));
         assert!(!DeployQaTagFilter::NotSuffix("-db".into()).matches("1.2.3-db"));
+    }
+
+    #[test]
+    fn test_deploy_qa_tag_filter_parses_prefixes() {
+        assert_eq!(
+            DeployQaTagFilter::parse("prefix:apps/console/").unwrap(),
+            DeployQaTagFilter::Prefix("apps/console/".into())
+        );
+        assert_eq!(
+            DeployQaTagFilter::parse("  prefix: apps/console/ ").unwrap(),
+            DeployQaTagFilter::Prefix("apps/console/".into())
+        );
+        for invalid in [
+            "prefix:",
+            "prefix:   ",
+            "prefix:apps console/",
+            "prefix:apps/console?",
+            "prefix:apps/console#",
+            "prefix:apps/%2e%2e/",
+            "prefix:../",
+            "prefix:apps/../",
+            "prefix:/apps/console/",
+            "prefix:apps//console/",
+        ] {
+            assert!(
+                DeployQaTagFilter::parse(invalid).is_err(),
+                "'{invalid}' must be rejected: it is empty or unsafe in a GitHub API path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_tag_filter_round_trips_through_toml() {
+        #[derive(Serialize, Deserialize)]
+        struct Holder {
+            tag_filter: DeployQaTagFilter,
+        }
+
+        for filter in [
+            DeployQaTagFilter::Any,
+            DeployQaTagFilter::Suffix("-db".into()),
+            DeployQaTagFilter::NotSuffix("-db".into()),
+            DeployQaTagFilter::Prefix("apps/console/".into()),
+        ] {
+            let serialized = toml::to_string(&Holder {
+                tag_filter: filter.clone(),
+            })
+            .unwrap();
+            let parsed: Holder = toml::from_str(&serialized).unwrap();
+            assert_eq!(parsed.tag_filter, filter, "{serialized}");
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_console_prefix_skips_the_monorepos_other_tags() {
+        let console = DeployQaTagFilter::parse("prefix:apps/console/").unwrap();
+        for other in [
+            "2.7.0",
+            "1.9.10",
+            "2.0.0-rc.3",
+            "cl-1.9.0-5",
+            "console/0.3.0",
+            "cl-1.6.0-console-roles.3",
+            "storage/4.5.0",
+            "apps/console",
+            "apps/console/",
+            "apps/consoles/1.0.0",
+            "packages/apps/console/1.0.0",
+        ] {
+            assert!(
+                !console.matches(other),
+                "console must not consume '{other}'"
+            );
+        }
+        assert!(console.matches("apps/console/1.2.141"));
+        assert_eq!(console.version("apps/console/1.2.141"), "1.2.141");
+        assert_eq!(DeployQaTagFilter::Any.version("1.53.30"), "1.53.30");
+        assert_eq!(
+            DeployQaTagFilter::Suffix("-db".into()).version("0.16.10-db"),
+            "0.16.10-db"
+        );
+    }
+
+    #[test]
+    fn test_deploy_qa_edge_tracks_split_every_tag_between_them() {
+        let network = DeployQaTagFilter::parse("not_suffix:-db").unwrap();
+        let database = DeployQaTagFilter::parse("suffix:-db").unwrap();
+        for tag in [
+            "0.10.61",
+            "0.16.10-db",
+            "1.0.0-rc.3-db",
+            "0.10.0-rc.1",
+            "0.9.0-dbx",
+        ] {
+            assert!(
+                network.matches(tag) ^ database.matches(tag),
+                "exactly one edge track must consume '{tag}'"
+            );
+        }
+        assert!(network.matches("0.10.61"));
+        assert!(database.matches("0.16.10-db"));
     }
 
     #[test]
@@ -5635,9 +6790,14 @@ repo = "appwrite-labs/edge"
 tag_filter = "not_suffix:-db"
 
 [[deploy_qa.tracks]]
-name = "vibes"
-repo = "appwrite/vibes"
+name = "website"
+repo = "appwrite/website"
 tag_filter = "any"
+
+[[deploy_qa.tracks]]
+name = "console"
+repo = "appwrite/appwrite"
+tag_filter = "prefix:apps/console/"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
             assert!(config.deploy_qa.enabled);
@@ -5647,7 +6807,7 @@ tag_filter = "any"
                 config.deploy_qa.discord_channel_id.as_deref(),
                 Some("990878183580651571")
             );
-            assert_eq!(config.deploy_qa.tracks.len(), 4);
+            assert_eq!(config.deploy_qa.tracks.len(), 5);
             assert_eq!(config.deploy_qa.tracks[0].name, "cloud");
             assert_eq!(
                 config.deploy_qa.tracks[0].tag_filter,
@@ -5661,7 +6821,12 @@ tag_filter = "any"
                 config.deploy_qa.tracks[2].tag_filter,
                 DeployQaTagFilter::NotSuffix("-db".into())
             );
-            assert_eq!(config.deploy_qa.tracks[3].repo, "appwrite/vibes");
+            assert_eq!(config.deploy_qa.tracks[3].repo, "appwrite/website");
+            assert_eq!(
+                config.deploy_qa.tracks[4].tag_filter,
+                DeployQaTagFilter::Prefix("apps/console/".into())
+            );
+            config.deploy_qa.validate().unwrap();
             assert_eq!(
                 config.regression.enabled,
                 RegressionConfig::default().enabled
@@ -6237,97 +7402,6 @@ email = "alice@example.com"
     fn test_users_config_default_empty() {
         let config = Config::default();
         assert!(config.users.is_empty());
-    }
-
-    #[test]
-    fn test_resolve_user_slug_in_discord_config() {
-        let toml_str = r#"
-[users.jake]
-discord_id = "123456789"
-email = "jake@example.com"
-
-[notifiers.discord]
-webhook_url = "https://discord.com/api/webhooks/123/abc"
-user_id = "jake"
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        assert_eq!(
-            config.notifiers.discord.user_id.as_deref(),
-            Some("123456789")
-        );
-    }
-
-    #[test]
-    fn test_resolve_user_slug_not_found_keeps_raw_value() {
-        let toml_str = r#"
-[users.jake]
-discord_id = "123456789"
-
-[notifiers.discord]
-webhook_url = "https://discord.com/api/webhooks/123/abc"
-user_id = "999888777"
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        assert_eq!(
-            config.notifiers.discord.user_id.as_deref(),
-            Some("999888777")
-        );
-    }
-
-    #[test]
-    fn test_resolve_user_slug_in_email_config() {
-        let toml_str = r#"
-[users.jake]
-email = "jake@resolved.com"
-
-[notifiers.email]
-smtp_host = "smtp.example.com"
-to_addresses = ["jake", "other@example.com"]
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        assert_eq!(
-            config.notifiers.email.to_addresses,
-            vec!["jake@resolved.com", "other@example.com"]
-        );
-    }
-
-    #[test]
-    fn test_resolve_user_slug_in_push_config() {
-        let toml_str = r#"
-[users.jake]
-push_user_key = "resolved_push_key"
-
-[notifiers.push]
-api_token = "token"
-user_key = "jake"
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        assert_eq!(
-            config.notifiers.push.user_key.as_deref(),
-            Some("resolved_push_key")
-        );
-    }
-
-    #[test]
-    fn test_resolve_user_slug_in_sms_config() {
-        let toml_str = r#"
-[users.jake]
-sms_number = "+1234567890"
-
-[notifiers.sms]
-account_sid = "sid"
-to_numbers = ["jake", "+9876543210"]
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        assert_eq!(
-            config.notifiers.sms.to_numbers,
-            vec!["+1234567890", "+9876543210"]
-        );
     }
 
     #[test]
@@ -7083,56 +8157,6 @@ workspace = "/tmp/repos"
     }
 
     #[test]
-    fn test_resolve_user_slug_user_has_no_channel_id() {
-        let toml_str = r#"
-[users.jake]
-linear_names = ["Jake B"]
-
-[notifiers.discord]
-user_id = "jake"
-
-[notifiers.push]
-user_key = "jake"
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        // User exists but has no discord_id, should keep slug
-        assert_eq!(config.notifiers.discord.user_id.as_deref(), Some("jake"));
-        // User exists but has no push_user_key, should keep slug
-        assert_eq!(config.notifiers.push.user_key.as_deref(), Some("jake"));
-    }
-
-    #[test]
-    fn test_resolve_user_slug_email_user_has_no_email() {
-        let toml_str = r#"
-[users.jake]
-linear_names = ["Jake B"]
-
-[notifiers.email]
-to_addresses = ["jake"]
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        // User exists but has no email field, should keep the slug as-is
-        assert_eq!(config.notifiers.email.to_addresses, vec!["jake"]);
-    }
-
-    #[test]
-    fn test_resolve_user_slug_sms_user_has_no_number() {
-        let toml_str = r#"
-[users.jake]
-linear_names = ["Jake B"]
-
-[notifiers.sms]
-to_numbers = ["jake"]
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.resolve_user_slugs();
-        // User exists but has no sms_number, should keep the slug as-is
-        assert_eq!(config.notifiers.sms.to_numbers, vec!["jake"]);
-    }
-
-    #[test]
     fn test_is_github_app_configured() {
         let mut config = Config::default();
         assert!(!config.is_github_app_configured());
@@ -7525,6 +8549,69 @@ hourly_engineer_rate = 200.0
             let config = Config::from_toml(toml_str).unwrap();
             assert!((config.dashboard.max_plan_monthly_cost - 100.0).abs() < f64::EPSILON);
             assert!((config.dashboard.hourly_engineer_rate - 200.0).abs() < f64::EPSILON);
+        });
+    }
+
+    #[test]
+    fn test_dashboard_public_url_defaults_to_none() {
+        assert!(DashboardConfig::default().public_url.is_none());
+        with_env(&[], || {
+            let config = Config::from_toml("workspace = \"/tmp/repos\"\n").unwrap();
+            assert!(config.dashboard.public_url.is_none());
+        });
+    }
+
+    #[test]
+    fn test_dashboard_public_url_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+workspace = "/tmp/repos"
+
+[dashboard]
+public_url = "https://claudear.example.com"
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert_eq!(
+                config.dashboard.public_url.as_deref(),
+                Some("https://claudear.example.com")
+            );
+        });
+    }
+
+    #[test]
+    fn test_dashboard_public_url_env_override() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[dashboard]
+public_url = "https://from-toml.example.com"
+"#;
+        with_env(
+            &[(
+                "CLAUDEAR_DASHBOARD_PUBLIC_URL",
+                "https://from-env.example.com",
+            )],
+            || {
+                let config = Config::from_toml(toml_str).unwrap();
+                assert_eq!(
+                    config.dashboard.public_url.as_deref(),
+                    Some("https://from-env.example.com")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_dashboard_public_url_empty_env_clears_value() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[dashboard]
+public_url = "https://from-toml.example.com"
+"#;
+        with_env(&[("CLAUDEAR_DASHBOARD_PUBLIC_URL", "")], || {
+            let config = Config::from_toml(toml_str).unwrap();
+            assert!(config.dashboard.public_url.is_none());
         });
     }
 
@@ -8491,7 +9578,7 @@ sms_number = "+1111111111"
             &[
                 ("edge-db", "appwrite-labs/edge"),
                 ("edge-network", "appwrite-labs/edge"),
-                ("vibes", "appwrite/vibes"),
+                ("website", "appwrite/website"),
             ],
         );
         assert!(config.validate().is_ok());
@@ -8503,7 +9590,7 @@ sms_number = "+1111111111"
             true,
             &[
                 ("cloud", "appwrite-labs/cloud"),
-                ("cloud", "appwrite/vibes"),
+                ("cloud", "appwrite/website"),
             ],
         );
         let error = config.validate().unwrap_err().to_string();
@@ -8544,6 +9631,82 @@ sms_number = "+1111111111"
             },
             ..ScmConfig::default()
         }
+    }
+
+    fn issues_with_github_code_scanning() -> IssuesConfig {
+        IssuesConfig {
+            github_code_scanning: Some(GitHubCodeScanningConfig {
+                enabled: true,
+                repos: vec!["appwrite/appwrite".to_string()],
+                ..GitHubCodeScanningConfig::default()
+            }),
+            ..IssuesConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_validation_github_code_scanning_counts_as_source() {
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            issues: issues_with_github_code_scanning(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_github_code_scanning_requires_github_token() {
+        let config = Config {
+            scm: scm_with_github_token(None),
+            issues: issues_with_github_code_scanning(),
+            ..Config::default()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("github_code_scanning"), "{error}");
+        assert!(error.contains("GitHub token"), "{error}");
+    }
+
+    fn pr_distribution_enabled() -> PrDistributionConfig {
+        PrDistributionConfig {
+            enabled: true,
+            ..PrDistributionConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_validation_pr_distribution_requires_github_token() {
+        let config = Config {
+            scm: scm_with_github_token(None),
+            pr_distribution: pr_distribution_enabled(),
+            ..config_with_linear()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("pr_distribution"), "{error}");
+        assert!(error.contains("scm.github.token"), "{error}");
+
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            pr_distribution: pr_distribution_enabled(),
+            ..config_with_linear()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_pr_distribution_checks_the_hour_only_when_enabled() {
+        let mut config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            pr_distribution: PrDistributionConfig {
+                digest_hour: 24,
+                ..PrDistributionConfig::default()
+            },
+            ..config_with_linear()
+        };
+        assert!(config.validate().is_ok());
+
+        config.pr_distribution.enabled = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("digest_hour"), "{error}");
     }
 
     #[test]

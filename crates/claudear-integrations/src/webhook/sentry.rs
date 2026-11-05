@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use claudear_config::config::SentryConfig;
 use claudear_core::error::Result;
 use claudear_core::types::{Issue, IssuePriority, IssueStatus, MatchPriority, MatchResult};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;

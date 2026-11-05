@@ -123,13 +123,19 @@ pub struct WebhookServer {
     port: u16,
     /// When set, the dashboard API routes are merged into the webhook server.
     dashboard_config_path: Option<std::path::PathBuf>,
+    user_registry: UserRegistry,
     runs: TaskTracker,
 }
 
 impl WebhookServer {
     /// Create a new webhook server.
+    ///
+    /// `user_registry` is the daemon's shared person directory, so webhook processing
+    /// and the merged dashboard see the same identities as the notifiers and the watcher.
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
+        user_registry: UserRegistry,
         handlers: WebhookHandlerRegistry,
         notifier: Arc<dyn Notifier>,
         tracker: Arc<dyn FixAttemptTracker>,
@@ -139,6 +145,7 @@ impl WebhookServer {
     ) -> Self {
         Self::new_with_github(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker,
@@ -153,6 +160,7 @@ impl WebhookServer {
     #[expect(clippy::too_many_arguments)]
     pub fn new_with_github(
         config: Config,
+        user_registry: UserRegistry,
         handlers: WebhookHandlerRegistry,
         notifier: Arc<dyn Notifier>,
         tracker: Arc<dyn FixAttemptTracker>,
@@ -182,6 +190,7 @@ impl WebhookServer {
             qa_agent: None,
             port,
             dashboard_config_path: None,
+            user_registry,
             runs: TaskTracker::new(),
         }
     }
@@ -262,8 +271,8 @@ impl WebhookServer {
     /// Start the server.
     pub async fn start(self) -> Result<()> {
         let bind_address = self.config.bind_address.clone();
+        let user_registry = self.user_registry;
         let embedding_client = self.embedding_client;
-        let user_registry = UserRegistry::new(self.config.users.clone());
 
         // Initialize FeedbackAnalyzer and warm-start with DB outcomes
         let mut feedback_analyzer = FeedbackAnalyzer::new();
@@ -400,12 +409,19 @@ impl WebhookServer {
         let dashboard_enabled = self.dashboard_config_path.is_some();
         let app = if let Some(config_path) = self.dashboard_config_path {
             let indexing_rx = state.tracker.subscribe_indexing_progress();
-            let dashboard_routes = claudear_engine::api::create_api_router_with_dashboard(
+            let chat = claudear_engine::api::chat_state(
+                &state.config,
+                state.tracker.clone(),
+                state.embedding_client.clone(),
+            );
+            let dashboard_routes = claudear_engine::api::create_api_router_full(
                 state.config.clone(),
                 state.tracker.clone(),
                 config_path,
                 indexing_rx,
                 None,
+                chat,
+                state.user_registry.clone(),
             );
             // Apply the dashboard middleware (cookies, CSRF, CORS, security
             // headers) to the dashboard routes only — not the webhook routes,
@@ -1251,8 +1267,8 @@ mod tests {
     use super::*;
     use crate::config::{
         AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, DeployQaConfig, IssuesConfig,
-        LearningConfig, NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig,
-        ScmConfig,
+        LearningConfig, NotifiersConfig, PrDistributionConfig, PrioritisationConfig,
+        RegressionConfig, RetryConfig, ScmConfig,
     };
     use crate::notifier::Notifier;
     use crate::processing::{
@@ -1264,6 +1280,7 @@ mod tests {
     use crate::types::Outcome;
     use crate::types::{Issue, MatchPriority, MatchResult};
     use async_trait::async_trait;
+    use claudear_core::identity::Role;
     use futures::FutureExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1386,6 +1403,7 @@ mod tests {
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
             deploy_qa: DeployQaConfig::default(),
+            pr_distribution: PrDistributionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
@@ -1420,8 +1438,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -1441,8 +1461,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -1452,6 +1474,68 @@ mod tests {
         );
 
         assert_eq!(server.port, 3000);
+    }
+
+    fn registry_test_server(config: Config, user_registry: UserRegistry) -> WebhookServer {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        WebhookServer::new(
+            config,
+            user_registry,
+            WebhookHandlerRegistry::new(),
+            Arc::new(MockNotifier::new()),
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        )
+    }
+
+    #[test]
+    fn webhook_server_serves_the_given_registry_instance() {
+        use claudear_core::identity::{ConsoleIdentity, Identities};
+
+        let registry = UserRegistry::new(HashMap::new());
+        let server = registry_test_server(test_config(), registry.clone());
+
+        server.user_registry.replace_console(vec![ConsoleIdentity {
+            user_id: 7,
+            login_email: "amy@example.com".to_string(),
+            name: "Amy".to_string(),
+            slug: Some("amy".to_string()),
+            identities: Identities {
+                github_usernames: vec!["amy-gh".to_string()],
+                ..Identities::default()
+            },
+            updated_at: "2026-11-04 10:00:00".to_string(),
+        }]);
+
+        assert_eq!(
+            registry
+                .resolve("github", "amy-gh")
+                .map(|resolved| resolved.slug),
+            Some("amy".to_string())
+        );
+    }
+
+    #[test]
+    fn webhook_server_never_rebuilds_a_registry_from_config() {
+        let mut config = test_config();
+        config.users = HashMap::from([(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                github_usernames: vec!["jakebarnby".to_string()],
+                ..Default::default()
+            },
+        )]);
+        let server = registry_test_server(config, UserRegistry::new(HashMap::new()));
+
+        assert_eq!(
+            server
+                .user_registry
+                .resolve("github", "jakebarnby")
+                .map(|resolved| resolved.slug),
+            None
+        );
     }
 
     #[test]
@@ -2420,8 +2504,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config.clone(),
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -3435,7 +3521,7 @@ mod tests {
     async fn test_router_mcp_requires_valid_token() {
         let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
         let uid = tracker
-            .create_user("mcp@test.com", "h", "Mcp", "viewer")
+            .create_user("mcp@test.com", "h", "Mcp", Role::Viewer)
             .unwrap();
         let secret = "cldr_router_secret";
         tracker
@@ -3867,8 +3953,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let mut server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -3889,8 +3977,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let mut server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -3913,8 +4003,10 @@ mod tests {
         let github_handler =
             GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new_with_github(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -3935,8 +4027,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new_with_github(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -4509,8 +4603,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let agent = test_agent(tracker.clone());
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -4530,8 +4626,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -4559,8 +4657,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -4585,8 +4685,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let mut server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -4610,8 +4712,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let mut server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -4640,8 +4744,10 @@ mod tests {
             GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
 
         let agent = test_agent(tracker.clone());
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new_with_github(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -5239,8 +5345,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -6609,8 +6717,10 @@ mod tests {
             GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
 
         let agent = test_agent(tracker.clone());
+        let user_registry = UserRegistry::new(config.users.clone());
         let mut server = WebhookServer::new_with_github(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -6830,8 +6940,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -6850,8 +6962,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -7205,8 +7319,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -7225,8 +7341,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -7245,8 +7363,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -7458,8 +7578,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let mut server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -7480,8 +7602,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let mut server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -7505,8 +7629,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let user_registry = UserRegistry::new(config.users.clone());
         let server = WebhookServer::new_with_github(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -7856,8 +7982,10 @@ mod tests {
         let handlers = WebhookHandlerRegistry::new();
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let user_registry = UserRegistry::new(config.users.clone());
         let mut server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),
@@ -7876,8 +8004,10 @@ mod tests {
         let handlers = WebhookHandlerRegistry::new();
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let user_registry = UserRegistry::new(config.users.clone());
         let mut server = WebhookServer::new(
             config,
+            user_registry,
             handlers,
             notifier,
             tracker.clone(),

@@ -7,9 +7,9 @@ Authoritative live-QA procedure for Appwrite Labs release tips. Encode this into
 | Track | Repo | Tag filter |
 |-------|------|------------|
 | cloud | `appwrite-labs/cloud` | any release tag |
+| edge | `appwrite-labs/edge` | tags **without** `-db` |
 | edge-db | `appwrite-labs/edge` | tags with `-db` suffix |
-| edge-network | `appwrite-labs/edge` | tags **without** `-db` |
-| vibes (Console IV / frontend) | `appwrite/vibes` | any release tag |
+| console | `appwrite/appwrite` (monorepo) | `apps/console/<version>` tags (see **Console** below) |
 
 Persist last-seen tip per track. Skip if unchanged. Skip-if-previous-still-running.
 
@@ -24,13 +24,27 @@ Persist last-seen tip per track. Skip if unchanged. Skip-if-previous-still-runni
 7. Dedicated-DB / DAT: throwaway project `qa-1044` / project id `6a8415b8002ea65eec9c` only. **Never** touch M01 or Production PostgreSQL.
 8. Finish every LIVE-TESTABLE PR with pass / fail / blocked before reporting.
 
+## Console (`apps/console/<version>` tags)
+
+The console is `apps/console` in the `appwrite/appwrite` monorepo: image `appwrite/new:<version>`, serving `https://appwrite.io` (marketing, docs and the signed-in console). Pushing an `apps/console/<version>` tag runs the `Console / Production` workflow, which builds the image, publishes assets to `https://cdn.appwrite.io`, and pins the version in GitOps. Once the deploy succeeds, the workflow publishes a GitHub release for the tag (`Console <version>`, never marked latest), which carries the release notes and is announced in `#releases` like any other release. An older tag without a release is bare: read the compare range instead. The repo's other GitHub releases (`2.7.0`, `1.9.10`, ...) are the **server**, and `console/<version>` is the console SDK package; neither is a console deploy.
+
+1. Changes: the release notes list the console PRs; for a bare tag, the release body gives the compare range since the previous console tag. List the commits in it that touch `apps/console/**` and their merged PRs (`gh api repos/appwrite/appwrite/compare/<previous>...<tag>`, then `gh api repos/appwrite/appwrite/commits/<sha>/pulls`). Commits outside `apps/console` ship in other deploys: list them as INFRA for this track.
+2. Deployed version: the `Console / Production` run for the tag concluded `success` (`gh run list -R appwrite/appwrite --workflow console-production.yml --branch apps/console/<version>`; a run waiting for `console-production` approval or still running is BLOCKED), and `assets/production/console/default.yaml` in `appwrite-labs/application-configuration` pins `global.image.repository: appwrite/new` and `global.image.tag: <version>` (the version without `apps/console/`). The console does not render its own version, so this pin plus the successful run is the version check. A different pinned tag is FAIL; never infer it from `main`.
+3. Reachability: `curl -fsS https://appwrite.io/health` returns `OK`; `https://appwrite.io/`, `/docs`, `/pricing` and `/sign-in` return 200; legacy `https://cloud.appwrite.io/console` redirects to `https://appwrite.io`.
+4. Assets: every `https://cdn.appwrite.io/assets/...` script and stylesheet the `/` and `/sign-in` HTML references returns 200. A missing asset is FAIL: the page ships HTML for assets that never published.
+5. Key pages (browser, signed in as the QA account): `/sign-in` renders; the organization view loads after sign-in; the QA project's `/projects/6a8415b8002ea65eec9c/overview`, `/databases`, `/auth` and `/settings` render without an error screen. Look, don't change anything, outside what a PR's own test plan needs in the QA project.
+6. Console errors: on those pages, no uncaught exception and no failed (4xx/5xx) request to `cloud.appwrite.io/v1` or `cdn.appwrite.io` in the browser console or network log. Ignore third-party analytics the headless browser blocks. Quote the first error, trimmed, in the PR's result line.
+7. Then test each LIVE-TESTABLE console PR as above. Staging (`https://new.staging.appwrite.io`) follows `main`, not the tag: use it only to reproduce, never as the result.
+
+List steps 2 to 6 in the report as `- console deploy LIVE PASS|FAIL|BLOCKED` with the failing step named, before the PR lines.
+
 ## Discord `#releases` (posted by Claudear)
 
-Claudear posts the outcome under the automated release announcement in `#releases` from your report's verdict footer. **Do not post to Discord yourself** — no messages, replies, threads, or reactions.
+Claudear posts the outcome under the automated release announcement in `#releases` from your report's verdict footer. A tip nothing announced (a bare tag, such as every console release) gets a post of its own naming the repo and tag instead. **Do not post to Discord yourself** — no messages, replies, threads, or reactions.
 
 - **All verified** (`ALL_VERIFIED`, nothing blocked): a reply on the release announcement, **no @**.
 - **Unverified** (`UNVERIFIED`: nothing failed, but a LIVE-TESTABLE check was blocked or incomplete): a reply on the release announcement, **no @**.
-- **FAIL** (`FAIL`: a LIVE-TESTABLE PR failed): a thread under the release announcement that **@s the releaser**, mapped from their GitHub login via `github-discord-map.json`.
+- **FAIL** (`FAIL`: a LIVE-TESTABLE PR failed): a thread under the release announcement that **@s the releaser**, mapped from their GitHub login through the user registry, with `github-discord-map.json` as the fallback.
 
 Your report becomes the post, so keep it short: one bullet per PR, no curl dumps or URL walls. Detail stays in the attempt log.
 

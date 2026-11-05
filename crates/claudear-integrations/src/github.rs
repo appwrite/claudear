@@ -50,6 +50,67 @@ struct PullRequestRef {
     ref_name: String,
 }
 
+/// Most items GitHub returns in one page of a list endpoint.
+const PAGE_SIZE: usize = 100;
+
+/// Commits per changed file read as that file's recent authorship.
+const RECENT_FILE_COMMITS: usize = 30;
+
+/// Commits read as a repository's recent activity.
+const RECENT_REPOSITORY_COMMITS: usize = 100;
+
+/// Where GitHub looks for CODEOWNERS, in the order it looks.
+const CODEOWNERS_PATHS: [&str; 3] = [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"];
+
+/// Media type that makes the contents API return a file's raw bytes.
+const RAW_MEDIA_TYPE: &str = "application/vnd.github.raw+json";
+
+/// A PR with the fields PR distribution reads.
+#[derive(Debug, Deserialize)]
+struct PullRequestDetail {
+    html_url: String,
+    title: String,
+    state: String,
+    #[serde(default)]
+    merged: bool,
+    #[serde(default)]
+    draft: bool,
+    auto_merge: Option<serde_json::Value>,
+    head: Option<PullRequestHead>,
+    #[serde(default)]
+    requested_reviewers: Vec<Account>,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A GitHub account, read only for its login.
+#[derive(Debug, Deserialize)]
+struct Account {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestHead {
+    sha: Option<String>,
+}
+
+/// A review with the commit it was submitted against.
+#[derive(Debug, Deserialize)]
+struct SubmittedReview {
+    user: Option<Account>,
+    state: String,
+    commit_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangedFile {
+    filename: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitSummary {
+    author: Option<Account>,
+}
+
 /// Minimal shape of the response from creating a PR / reading repo metadata.
 #[derive(Debug, Deserialize)]
 struct CreatedPr {
@@ -81,6 +142,65 @@ pub struct GitHubIssue {
 #[derive(Debug, Deserialize)]
 pub struct GitHubLabel {
     pub name: String,
+}
+
+/// A code-scanning alert from the Code Scanning API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningAlert {
+    pub number: i64,
+    pub state: String,
+    pub html_url: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub rule: CodeScanningRule,
+    pub tool: CodeScanningTool,
+    pub most_recent_instance: Option<CodeScanningInstance>,
+}
+
+/// The rule that raised a code-scanning alert.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningRule {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub full_description: Option<String>,
+    pub severity: Option<String>,
+    pub security_severity_level: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub help: Option<String>,
+    pub help_uri: Option<String>,
+}
+
+/// The analysis tool that raised a code-scanning alert.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningTool {
+    pub name: String,
+    pub version: Option<String>,
+}
+
+/// The most recent occurrence of a code-scanning alert.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningInstance {
+    #[serde(rename = "ref")]
+    pub reference: Option<String>,
+    pub commit_sha: Option<String>,
+    pub message: Option<CodeScanningMessage>,
+    pub location: Option<CodeScanningLocation>,
+}
+
+/// The message attached to a code-scanning alert instance.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningMessage {
+    pub text: Option<String>,
+}
+
+/// The source location of a code-scanning alert instance.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeScanningLocation {
+    pub path: Option<String>,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
 }
 
 impl GitHubClient<ReqwestHttpClient> {
@@ -985,6 +1105,95 @@ impl<H: HttpClient> GitHubClient<H> {
         Ok(())
     }
 
+    /// List open code-scanning alerts for a repository, optionally for one tool.
+    pub async fn list_code_scanning_alerts(
+        &self,
+        repo: &str,
+        tool_name: Option<&str>,
+    ) -> Result<Vec<CodeScanningAlert>> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let mut alerts = Vec::new();
+        let mut page = 1usize;
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 10;
+
+        loop {
+            let mut url = format!(
+                "https://api.github.com/repos/{}/code-scanning/alerts?state=open&per_page={}&page={}",
+                repo, PER_PAGE, page
+            );
+            if let Some(tool_name) = tool_name {
+                url.push_str(&format!("&tool_name={}", urlencoding::encode(tool_name)));
+            }
+
+            let headers = self.build_headers(token);
+            let response = self.http.get(&url, headers).await?;
+
+            if !response.is_success() {
+                return Err(Error::Other(format!(
+                    "GitHub API error listing code-scanning alerts for {}: {}",
+                    repo, response.body
+                )));
+            }
+
+            let page_alerts: Vec<CodeScanningAlert> = response.json()?;
+            let count = page_alerts.len();
+            alerts.extend(page_alerts);
+
+            if count < PER_PAGE {
+                break;
+            }
+
+            page += 1;
+            if page > MAX_PAGES {
+                tracing::warn!(repo = %repo, "Hit pagination limit for code-scanning alerts");
+                break;
+            }
+        }
+
+        Ok(alerts)
+    }
+
+    /// Fetch a single code-scanning alert by number.
+    pub async fn get_code_scanning_alert(
+        &self,
+        repo: &str,
+        alert_number: i64,
+    ) -> Result<CodeScanningAlert> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let url = format!(
+            "https://api.github.com/repos/{}/code-scanning/alerts/{}",
+            repo, alert_number
+        );
+        let headers = self.build_headers(token);
+        let response = self.http.get(&url, headers).await?;
+
+        if response.is_not_found() {
+            return Err(Error::Other(format!(
+                "Code-scanning alert not found: {}/code-scanning/alerts/{}",
+                repo, alert_number
+            )));
+        }
+
+        if !response.is_success() {
+            return Err(Error::Other(format!("GitHub API error: {}", response.body)));
+        }
+
+        Ok(response.json()?)
+    }
+
     pub async fn get_default_branch(&self, repo: &str) -> Result<String> {
         let token = self
             .config
@@ -1043,6 +1252,185 @@ impl<H: HttpClient> GitHubClient<H> {
         }
         let created: CreatedPr = response.json()?;
         Ok(created.html_url)
+    }
+}
+
+impl<H: HttpClient> GitHubClient<H> {
+    fn require_token(&self) -> Result<&str> {
+        self.token()
+            .ok_or_else(|| Error::config("GitHub token not configured"))
+    }
+
+    /// Every item of a paginated list endpoint, `PAGE_SIZE` per request.
+    async fn get_pages<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<Vec<T>> {
+        let headers = self.build_headers(self.require_token()?);
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let mut items = Vec::new();
+        let mut page = 1usize;
+        loop {
+            let response = self
+                .http
+                .get(
+                    &format!("{url}{separator}per_page={PAGE_SIZE}&page={page}"),
+                    headers.clone(),
+                )
+                .await?;
+            if !response.is_success() {
+                return Err(Error::Other(format!(
+                    "GitHub API error ({}) for {url}: {}",
+                    response.status, response.body
+                )));
+            }
+            let batch: Vec<T> = response.json()?;
+            let count = batch.len();
+            items.extend(batch);
+            if count < PAGE_SIZE {
+                return Ok(items);
+            }
+            page += 1;
+        }
+    }
+
+    /// A PR's state, outstanding review requests and submitted reviews.
+    pub async fn get_pull_request(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> Result<claudear_analysis::distribution::PullRequest> {
+        use claudear_analysis::distribution::PullRequestState;
+        use claudear_analysis::distribution::Review;
+        use claudear_analysis::distribution::Verdict;
+
+        let headers = self.build_headers(self.require_token()?);
+        let url = format!("https://api.github.com/repos/{repo}/pulls/{number}");
+        let response = self.http.get(&url, headers).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to fetch PR {repo}#{number} ({}): {}",
+                response.status, response.body
+            )));
+        }
+        let detail: PullRequestDetail = response.json()?;
+        let reviews: Vec<SubmittedReview> = self.get_pages(&format!("{url}/reviews")).await?;
+
+        Ok(claudear_analysis::distribution::PullRequest {
+            url: detail.html_url,
+            repo: repo.to_string(),
+            number,
+            title: detail.title,
+            state: if detail.merged {
+                PullRequestState::Merged
+            } else if detail.state == "closed" {
+                PullRequestState::Closed
+            } else {
+                PullRequestState::Open
+            },
+            draft: detail.draft,
+            auto_merge: detail.auto_merge.is_some_and(|value| !value.is_null()),
+            head: detail.head.and_then(|head| head.sha),
+            requested_reviewers: detail
+                .requested_reviewers
+                .into_iter()
+                .map(|user| user.login)
+                .collect(),
+            reviews: reviews
+                .into_iter()
+                .filter_map(|review| {
+                    Some(Review {
+                        reviewer: review.user?.login,
+                        verdict: Verdict::from_github(&review.state),
+                        commit: review.commit_id,
+                    })
+                })
+                .collect(),
+            created_at: detail.created_at,
+        })
+    }
+
+    /// Paths a PR changes.
+    pub async fn list_pr_files(&self, repo: &str, number: i64) -> Result<Vec<String>> {
+        let files: Vec<ChangedFile> = self
+            .get_pages(&format!(
+                "https://api.github.com/repos/{repo}/pulls/{number}/files"
+            ))
+            .await?;
+        Ok(files.into_iter().map(|file| file.filename).collect())
+    }
+
+    /// The repository's CODEOWNERS file on its default branch, if it has one.
+    pub async fn get_codeowners(&self, repo: &str) -> Result<Option<String>> {
+        let mut headers = self.build_headers(self.require_token()?);
+        for header in headers.iter_mut() {
+            if header.0 == "Accept" {
+                header.1 = RAW_MEDIA_TYPE.to_string();
+            }
+        }
+        for path in CODEOWNERS_PATHS {
+            let url = format!("https://api.github.com/repos/{repo}/contents/{path}");
+            let response = self.http.get(&url, headers.clone()).await?;
+            if response.is_not_found() {
+                continue;
+            }
+            if !response.is_success() {
+                return Err(Error::Other(format!(
+                    "Failed to fetch {path} for {repo} ({}): {}",
+                    response.status, response.body
+                )));
+            }
+            return Ok(Some(response.body));
+        }
+        Ok(None)
+    }
+
+    /// GitHub logins authoring recent commits to `path`, or to the whole
+    /// repository when `path` is `None`, newest first. Commits whose author
+    /// has no GitHub account are left out.
+    pub async fn list_commit_authors(&self, repo: &str, path: Option<&str>) -> Result<Vec<String>> {
+        let headers = self.build_headers(self.require_token()?);
+        let url = match path {
+            Some(path) => format!(
+                "https://api.github.com/repos/{repo}/commits?path={}&per_page={RECENT_FILE_COMMITS}",
+                urlencoding::encode(path)
+            ),
+            None => format!(
+                "https://api.github.com/repos/{repo}/commits?per_page={RECENT_REPOSITORY_COMMITS}"
+            ),
+        };
+        let response = self.http.get(&url, headers).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to list commits for {repo} ({}): {}",
+                response.status, response.body
+            )));
+        }
+        let commits: Vec<CommitSummary> = response.json()?;
+        Ok(commits
+            .into_iter()
+            .filter_map(|commit| commit.author.map(|author| author.login))
+            .collect())
+    }
+}
+
+#[async_trait]
+impl<H: HttpClient> crate::distribution::PullRequestHost for GitHubClient<H> {
+    async fn pull_request(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> Result<claudear_analysis::distribution::PullRequest> {
+        self.get_pull_request(repo, number).await
+    }
+
+    async fn changed_files(&self, repo: &str, number: i64) -> Result<Vec<String>> {
+        self.list_pr_files(repo, number).await
+    }
+
+    async fn codeowners(&self, repo: &str) -> Result<Option<String>> {
+        self.get_codeowners(repo).await
+    }
+
+    async fn commit_authors(&self, repo: &str, path: Option<&str>) -> Result<Vec<String>> {
+        self.list_commit_authors(repo, path).await
     }
 }
 
@@ -3581,6 +3969,188 @@ mod tests {
         let result = client.list_org_repos("test-org").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("token"));
+    }
+
+    fn distribution_client(mock: MockHttpClient) -> GitHubClient<MockHttpClient> {
+        GitHubClient::with_http_client(
+            GitHubConfig {
+                token: Some("test_token".into()),
+                ..Default::default()
+            },
+            mock,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_get_pull_request_reads_state_review_requests_and_reviews() {
+        use claudear_analysis::distribution::PullRequestState;
+        use claudear_analysis::distribution::Verdict;
+
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/5",
+            200,
+            r#"{
+                "html_url": "https://github.com/owner/repo/pull/5",
+                "title": "Fix it",
+                "state": "open",
+                "merged": false,
+                "draft": true,
+                "auto_merge": {"merge_method": "squash"},
+                "head": {"ref": "fix", "sha": "abc"},
+                "requested_reviewers": [{"login": "amy"}],
+                "created_at": "2026-11-01T10:00:00Z"
+            }"#,
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/5/reviews?per_page=100&page=1",
+            200,
+            r#"[
+                {"user": {"login": "bob"}, "state": "APPROVED", "commit_id": "abc"},
+                {"user": null, "state": "COMMENTED", "commit_id": "abc"}
+            ]"#,
+        );
+
+        let pull_request = distribution_client(mock)
+            .get_pull_request("owner/repo", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(pull_request.url, "https://github.com/owner/repo/pull/5");
+        assert_eq!(pull_request.title, "Fix it");
+        assert_eq!(pull_request.state, PullRequestState::Open);
+        assert!(pull_request.draft);
+        assert!(pull_request.auto_merge);
+        assert_eq!(pull_request.head.as_deref(), Some("abc"));
+        assert_eq!(pull_request.requested_reviewers, vec!["amy".to_string()]);
+        assert_eq!(pull_request.reviews.len(), 1);
+        assert_eq!(pull_request.reviews[0].reviewer, "bob");
+        assert_eq!(pull_request.reviews[0].verdict, Verdict::Approved);
+        assert_eq!(pull_request.reviews[0].commit.as_deref(), Some("abc"));
+        assert_eq!(
+            pull_request.created_at.unwrap().to_rfc3339(),
+            "2026-11-01T10:00:00+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_pull_request_reports_merged_and_closed() {
+        use claudear_analysis::distribution::PullRequestState;
+
+        let mock = MockHttpClient::new();
+        for (number, state, merged) in [(1, "closed", true), (2, "closed", false)] {
+            mock.mock_response(
+                format!("https://api.github.com/repos/owner/repo/pulls/{number}"),
+                200,
+                format!(
+                    r#"{{"html_url": "u", "title": "t", "state": "{state}", "merged": {merged}, "auto_merge": null}}"#
+                ),
+            );
+            mock.mock_response(
+                format!(
+                    "https://api.github.com/repos/owner/repo/pulls/{number}/reviews?per_page=100&page=1"
+                ),
+                200,
+                "[]",
+            );
+        }
+        let client = distribution_client(mock);
+
+        let merged = client.get_pull_request("owner/repo", 1).await.unwrap();
+        let closed = client.get_pull_request("owner/repo", 2).await.unwrap();
+
+        assert_eq!(merged.state, PullRequestState::Merged);
+        assert_eq!(closed.state, PullRequestState::Closed);
+        assert!(!closed.auto_merge);
+        assert!(!closed.draft);
+    }
+
+    #[tokio::test]
+    async fn test_list_pr_files_reads_every_page() {
+        let mock = MockHttpClient::new();
+        let first: Vec<serde_json::Value> = (0..100)
+            .map(|index| serde_json::json!({ "filename": format!("src/{index}.rs") }))
+            .collect();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/5/files?per_page=100&page=1",
+            200,
+            serde_json::to_string(&first).unwrap(),
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/5/files?per_page=100&page=2",
+            200,
+            r#"[{"filename": "README.md"}]"#,
+        );
+
+        let files = distribution_client(mock)
+            .list_pr_files("owner/repo", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(files.len(), 101);
+        assert_eq!(files[0], "src/0.rs");
+        assert_eq!(files[100], "README.md");
+    }
+
+    #[tokio::test]
+    async fn test_get_codeowners_follows_githubs_lookup_order_as_raw_text() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/contents/CODEOWNERS",
+            200,
+            "* @amy",
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/contents/docs/CODEOWNERS",
+            200,
+            "* @never-read",
+        );
+        let client = distribution_client(mock);
+
+        let codeowners = client.get_codeowners("owner/repo").await.unwrap();
+
+        assert_eq!(codeowners.as_deref(), Some("* @amy"));
+        let requests = client.http.get_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].0.ends_with("/contents/.github/CODEOWNERS"));
+        assert!(requests[1]
+            .1
+            .iter()
+            .any(|(name, value)| name == "Accept" && value == RAW_MEDIA_TYPE));
+    }
+
+    #[tokio::test]
+    async fn test_get_codeowners_is_none_when_the_repository_has_none() {
+        let client = distribution_client(MockHttpClient::new());
+        assert!(client.get_codeowners("owner/repo").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_commit_authors_encodes_the_path_and_skips_unlinked_authors() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/commits?path=src%2Fmy%20file.rs&per_page=30",
+            200,
+            r#"[{"author": {"login": "amy"}}, {"author": null}, {"author": {"login": "bob"}}]"#,
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/commits?per_page=100",
+            200,
+            r#"[{"author": {"login": "cat"}}]"#,
+        );
+        let client = distribution_client(mock);
+
+        let file = client
+            .list_commit_authors("owner/repo", Some("src/my file.rs"))
+            .await
+            .unwrap();
+        let repository = client
+            .list_commit_authors("owner/repo", None)
+            .await
+            .unwrap();
+
+        assert_eq!(file, vec!["amy".to_string(), "bob".to_string()]);
+        assert_eq!(repository, vec!["cat".to_string()]);
     }
 
     #[tokio::test]

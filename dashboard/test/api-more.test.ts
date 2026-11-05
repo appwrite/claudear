@@ -6,6 +6,7 @@ import {
   fetchIssues,
   fetchRepoLearning,
   getUser,
+  revokeToken,
   saveConfig,
   setOnUnauthorized,
   updateExperiment,
@@ -228,10 +229,11 @@ describe("additional api coverage", () => {
     mockFetchResponse({ status: 500, data: { error: "server" } });
 
     await expect(createExperiment({ experiment_name: "x", variant: "y", prompt_template: "z" })).rejects.toThrow(
-      "Failed to post /api/experiments: 500"
+      "server"
     );
-    await expect(saveConfig("abc")).rejects.toThrow("Failed to put /api/config: 500");
-    await expect(deleteUser(1)).rejects.toThrow("Failed to delete /api/users/1: 500");
+    await expect(saveConfig("abc")).rejects.toThrow("server");
+    await expect(deleteUser(1)).rejects.toThrow("server");
+    await expect(revokeToken("t1")).rejects.toThrow("server");
     await expect(uploadAvatar(new File(["x"], "a.png", { type: "image/png" }))).rejects.toThrow(
       "Failed to upload avatar: 500"
     );

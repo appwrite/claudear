@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, unlinkSync, renameSync, existsSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import { createHash } from "crypto";
 
 const outdir = join(import.meta.dir, "dist");
@@ -66,13 +66,34 @@ if (tailwindResult.exitCode !== 0) {
   process.exit(1);
 }
 
-// 4. Hash the CSS filename for cache-busting
+// 4. Copy the self-hosted font files the CSS references
 const cssContent = readFileSync(join(outdir, "assets/index.css"));
+const fontDirectories = ["@fontsource/inter", "@fontsource/jetbrains-mono"].map((fontPackage) =>
+  join(dirname(Bun.resolveSync(`${fontPackage}/package.json`, srcdir)), "files"),
+);
+const fontFiles = new Set(
+  [...cssContent.toString().matchAll(/url\(\.\/files\/([^)]+)\)/g)].map((match) => match[1]),
+);
+if (fontFiles.size === 0) {
+  console.error("No font files referenced by the CSS");
+  process.exit(1);
+}
+mkdirSync(join(outdir, "assets/files"));
+for (const fontFile of fontFiles) {
+  const source = fontDirectories.map((directory) => join(directory, fontFile)).find(existsSync);
+  if (!source) {
+    console.error(`Font file ${fontFile} not found in ${fontDirectories.join(", ")}`);
+    process.exit(1);
+  }
+  cpSync(source, join(outdir, "assets/files", fontFile));
+}
+
+// 5. Hash the CSS filename for cache-busting
 const cssHash = createHash("md5").update(cssContent).digest("hex").slice(0, 8);
 const cssFilename = `index-${cssHash}.css`;
 renameSync(join(outdir, "assets/index.css"), join(outdir, "assets", cssFilename));
 
-// 5. Find generated JS entry file
+// 6. Find generated JS entry file
 const jsEntry = result.outputs.find(
   (o) => o.kind === "entry-point" && o.path.endsWith(".js"),
 );
@@ -83,11 +104,11 @@ if (!jsEntry) {
 
 const jsFilename = jsEntry.path.split("/").pop()!;
 
-// 6. Process index.html — inject CSS in <head>, JS in <body>
+// 7. Process index.html — inject CSS in <head>, JS in <body>
 let html = readFileSync(join(srcdir, "index.html"), "utf-8");
 html = html
   .replace(
-    '<link rel="icon" type="image/svg+xml" href="/vite.svg" />',
+    '<link rel="icon" type="image/svg+xml" href="/favicon.svg" />',
     `<link rel="icon" type="image/svg+xml" href="/favicon.svg" />\n    <link rel="stylesheet" href="/assets/${cssFilename}">`,
   )
   .replace(
@@ -97,7 +118,7 @@ html = html
 
 writeFileSync(join(outdir, "index.html"), html);
 
-// 7. Copy static assets
+// 8. Copy static assets
 const publicDir = join(srcdir, "public");
 if (existsSync(publicDir)) {
   cpSync(publicDir, outdir, { recursive: true });
@@ -110,7 +131,7 @@ for (const output of result.outputs) {
 }
 console.log(`  dist/assets/${cssFilename} (${(cssContent.length / 1024).toFixed(1)} KB)`);
 
-// 8. Upload source maps to Sentry (if configured), then strip them from dist
+// 9. Upload source maps to Sentry (if configured), then strip them from dist
 const sentryToken = process.env.CLAUDEAR_SENTRY_AUTH_TOKEN;
 const sentryOrg = process.env.CLAUDEAR_SENTRY_ORG;
 const sentryProject = process.env.CLAUDEAR_SENTRY_PROJECT;

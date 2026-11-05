@@ -28,7 +28,6 @@ pub async fn serve_with_tls(tls_config: &TlsConfig, bind_address: &str, app: Rou
         );
     }
 
-    // --- macOS port forwarding for privileged ports ---
     let mut redirects = Vec::new();
 
     let actual_https_port = if port_forward::needs_port_forward(tls_config.https_port) {
@@ -58,7 +57,6 @@ pub async fn serve_with_tls(tls_config: &TlsConfig, bind_address: &str, app: Rou
     } else {
         None
     };
-    // --- end port forwarding ---
 
     let domains = tls_config.domains.clone();
     let cache_dir = tls_config.cache_dir.clone();
@@ -163,7 +161,6 @@ pub async fn serve_with_tls(tls_config: &TlsConfig, bind_address: &str, app: Rou
 
 /// Serve an Axum app over plain HTTP.
 pub async fn serve_plain_http(bind_address: &str, port: u16, app: Router) -> Result<()> {
-    // Set up port forwarding if needed (macOS + privileged port + non-root).
     let (actual_port, _pf_guard) = if port_forward::needs_port_forward(port) {
         let high = port_forward::forwarded_port(port);
         let guard = port_forward::setup_port_forward(&[(port, high)], bind_address)

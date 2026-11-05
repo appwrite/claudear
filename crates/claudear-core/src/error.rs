@@ -36,6 +36,10 @@ pub enum Error {
     #[error("Notifier error ({notifier}): {message}")]
     Notifier { notifier: String, message: String },
 
+    /// The service refused the request for lack of access or permissions.
+    #[error("Access denied ({service}): {message}")]
+    Forbidden { service: String, message: String },
+
     #[error("Issue not found: {source_name}:{issue_id}")]
     IssueNotFound {
         source_name: String,
@@ -84,6 +88,13 @@ impl Error {
     pub fn notifier(notifier: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Notifier {
             notifier: notifier.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn forbidden(service: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Forbidden {
+            service: service.into(),
             message: message.into(),
         }
     }

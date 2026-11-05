@@ -1,7 +1,10 @@
 //! Discord webhook notifier.
 
+use super::Delivery;
+use super::DigestDelivery;
 use super::Notifier;
 use crate::ask_reply_inbox;
+use crate::discord::AllowedMentions;
 use crate::discord::CreateMessageParams;
 use crate::discord::DiscordClient;
 use crate::discord::DiscordMessageReference;
@@ -12,7 +15,14 @@ use abnegate_http::HttpResponse;
 use async_trait::async_trait;
 use chrono::DateTime;
 use chrono::Utc;
+use claudear_analysis::distribution::AssignmentNotice;
+use claudear_analysis::distribution::Developer;
+use claudear_analysis::distribution::Digest;
+use claudear_analysis::distribution::DigestGroup;
+use claudear_analysis::distribution::Markup;
+use claudear_analysis::distribution::PlainText;
 use claudear_config::config::DiscordConfig;
+use claudear_config::users::NotificationChannel;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Error;
 use claudear_core::error::Result;
@@ -189,8 +199,21 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     }
 
     async fn send(&self, message: DiscordMessage) -> Result<Option<SentMessageInfo>> {
+        self.send_allowing(message, None).await
+    }
+
+    /// Send a message, letting it ping only what `allowed_mentions` permits
+    /// when set.
+    async fn send_allowing(
+        &self,
+        message: DiscordMessage,
+        allowed_mentions: Option<AllowedMentions>,
+    ) -> Result<Option<SentMessageInfo>> {
         if let Some(ref webhook_url) = self.config.webhook_url {
-            let body = serde_json::to_value(&message)?;
+            let mut body = serde_json::to_value(&message)?;
+            if let Some(allowed_mentions) = &allowed_mentions {
+                body["allowed_mentions"] = serde_json::to_value(allowed_mentions)?;
+            }
             let url_with_wait = if webhook_url.expose().contains('?') {
                 format!("{}&wait=true", webhook_url.expose())
             } else {
@@ -221,7 +244,8 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         if let Some(ref client) = self.bot_client {
             if let Some(ref channel_id) = self.config.channel_id {
                 if !channel_id.is_empty() {
-                    let params = Self::to_create_message_params(&message);
+                    let mut params = Self::to_create_message_params(&message);
+                    params.allowed_mentions = allowed_mentions;
                     let sent = client.send_message(channel_id, params).await?;
                     return Ok(Some(SentMessageInfo {
                         message_id: sent.id,
@@ -347,35 +371,32 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
             tts: None,
             embeds,
             message_reference: None,
+            allowed_mentions: None,
         }
+    }
+
+    fn configured_user_id(&self) -> Option<String> {
+        self.config.user_id.as_deref().map(|reference| {
+            self.user_registry
+                .resolve_reference(NotificationChannel::Discord, reference)
+        })
     }
 
     fn get_user_mention(&self) -> Option<String> {
-        self.config.user_id.as_ref().map(|id| format!("<@{}>", id))
+        self.configured_user_id().map(|id| format!("<@{}>", id))
     }
 
     fn get_user_mention_for_issue(&self, issue: &Issue) -> Option<String> {
-        // Check for resolved user first
-        if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
-            if let Some(user) = self.user_registry.get_by_slug(&slug) {
-                if let Some(ref discord_id) = user.discord_id {
-                    return Some(format!("<@{}>", discord_id));
-                }
-            }
-        }
-        // Fall back to global config
-        self.config.user_id.as_ref().map(|id| format!("<@{}>", id))
+        self.get_target_discord_id_for_issue(issue)
+            .map(|id| format!("<@{}>", id))
     }
 
     fn get_target_discord_id_for_issue(&self, issue: &Issue) -> Option<String> {
-        if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
-            if let Some(user) = self.user_registry.get_by_slug(&slug) {
-                if let Some(ref discord_id) = user.discord_id {
-                    return Some(discord_id.clone());
-                }
-            }
-        }
-        self.config.user_id.clone()
+        issue
+            .get_metadata::<String>("resolved_user")
+            .and_then(|slug| self.user_registry.get_by_slug(&slug))
+            .and_then(|user| user.discord_id)
+            .or_else(|| self.configured_user_id())
     }
 
     fn extract_reply_text(content: &str) -> Option<String> {
@@ -1311,6 +1332,88 @@ pub(crate) fn build_support_digest_message(
     })
 }
 
+/// Longest Discord message content, in characters.
+const MESSAGE_CHARACTER_LIMIT: usize = 2000;
+
+/// Discord markup: `<@id>` mentions, falling back to the GitHub handle for a
+/// developer without a Discord id, and masked links that do not unfurl.
+pub(crate) struct DiscordMarkup;
+
+impl Markup for DiscordMarkup {
+    fn mention(&self, developer: &Developer) -> String {
+        developer
+            .discord_id
+            .as_ref()
+            .map_or_else(|| developer.handle(), |id| format!("<@{id}>"))
+    }
+
+    fn link(&self, text: &str, url: &str) -> String {
+        format!("[{text}](<{url}>)")
+    }
+
+    fn text(&self, value: &str) -> String {
+        PlainText::break_mentions(value)
+    }
+}
+
+/// Mentions a PR message may ping: only `developer`, never `@everyone`,
+/// `@here`, roles or anyone named in a PR title.
+fn pr_allowed_mentions(developer: Option<&Developer>) -> AllowedMentions {
+    AllowedMentions::users(developer.and_then(|developer| developer.discord_id.clone()))
+}
+
+/// Build the Discord message telling a developer they own a PR, with the
+/// mentions it may ping. The text is the message content, not an embed, so
+/// the mention pings.
+pub(crate) fn build_pr_assignment_message(
+    notice: &AssignmentNotice,
+) -> (DiscordMessage, AllowedMentions) {
+    (
+        DiscordMessage {
+            content: Some(truncate_string(
+                &notice.render(&DiscordMarkup),
+                MESSAGE_CHARACTER_LIMIT,
+            )),
+            embeds: None,
+        },
+        pr_allowed_mentions(Some(&notice.developer)),
+    )
+}
+
+/// Build the Discord messages for the PR digest, each with the mentions it
+/// may ping: the title, then each assignee's PRs, split to fit Discord's
+/// content limit with the mention on the first page. Empty when no PR needs
+/// anyone.
+fn build_pr_digest_title() -> (DiscordMessage, AllowedMentions) {
+    (
+        DiscordMessage {
+            content: Some(Digest::TITLE.to_string()),
+            embeds: None,
+        },
+        pr_allowed_mentions(None),
+    )
+}
+
+/// The messages that tell one assignee of a PR digest what waits on them.
+fn build_pr_digest_group_messages(
+    group: &DigestGroup,
+    generated_at: DateTime<Utc>,
+) -> Vec<(DiscordMessage, AllowedMentions)> {
+    group
+        .pages(&DiscordMarkup, generated_at, MESSAGE_CHARACTER_LIMIT)
+        .into_iter()
+        .map(|page| {
+            (
+                DiscordMessage {
+                    content: Some(page),
+                    embeds: None,
+                },
+                pr_allowed_mentions(Some(&group.developer)),
+            )
+        })
+        .collect()
+}
+
 /// Build the Discord message for a human-in-the-loop question.
 pub(crate) fn build_ask_question_message(
     issue: &Issue,
@@ -1520,6 +1623,40 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         Ok(true)
     }
 
+    async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<Delivery> {
+        let (message, allowed_mentions) = build_pr_assignment_message(notice);
+        let _ = self.send_allowing(message, Some(allowed_mentions)).await?;
+        Ok(Delivery::Delivered)
+    }
+
+    async fn notify_pr_digest(&self, digest: &Digest) -> Result<DigestDelivery> {
+        if digest.is_empty() {
+            return Ok(DigestDelivery::default());
+        }
+        let (title, allowed_mentions) = build_pr_digest_title();
+        self.send_allowing(title, Some(allowed_mentions)).await?;
+        let groups = digest
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group,
+                    build_pr_digest_group_messages(group, digest.generated_at),
+                )
+            })
+            .collect();
+        super::send_each(
+            self.name(),
+            groups,
+            |(message, allowed_mentions)| async move {
+                self.send_allowing(message, Some(allowed_mentions))
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+    }
+
     async fn ask_question(
         &self,
         issue: &Issue,
@@ -1687,6 +1824,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifier::test_support::{console_person, registry_with};
 
     fn empty_registry() -> claudear_config::users::UserRegistry {
         claudear_config::users::UserRegistry::new(std::collections::HashMap::new())
@@ -2098,6 +2236,7 @@ mod tests {
         response_body: String,
         call_count: AtomicUsize,
         last_calls: Mutex<Vec<(String, serde_json::Value)>>,
+        failing_call: Option<usize>,
     }
 
     impl MockDiscordWebhookClient {
@@ -2107,7 +2246,14 @@ mod tests {
                 response_body: body.to_string(),
                 call_count: AtomicUsize::new(0),
                 last_calls: Mutex::new(Vec::new()),
+                failing_call: None,
             }
+        }
+
+        /// Fail the `call`th request (counting from 1) with a server error.
+        fn failing_on(mut self, call: usize) -> Self {
+            self.failing_call = Some(call);
+            self
         }
 
         fn success() -> Self {
@@ -2130,11 +2276,14 @@ mod tests {
     #[async_trait]
     impl DiscordWebhookClient for MockDiscordWebhookClient {
         async fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<HttpResponse> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
             self.last_calls
                 .lock()
                 .unwrap()
                 .push((url.to_string(), body.clone()));
+            if self.failing_call == Some(call) {
+                return Ok(HttpResponse::new(500, "unavailable".to_string()));
+            }
 
             Ok(HttpResponse::new(
                 self.response_status,
@@ -4164,6 +4313,269 @@ mod tests {
         }
     }
 
+    fn pr_summary(number: i64) -> claudear_analysis::distribution::PullRequestSummary {
+        claudear_analysis::distribution::PullRequestSummary {
+            url: format!("https://github.com/org/repo/pull/{number}"),
+            repo: "org/repo".to_string(),
+            number,
+            title: format!("Fix {number}"),
+            opened_at: None,
+        }
+    }
+
+    fn pr_developer(login: &str, discord_id: Option<&str>) -> Developer {
+        Developer {
+            login: login.to_string(),
+            discord_id: discord_id.map(str::to_string),
+            slack_id: Some("U_IGNORED".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_pr_assignment_message_pings_the_discord_user_in_content() {
+        let (message, allowed_mentions) = build_pr_assignment_message(&AssignmentNotice {
+            developer: pr_developer("amy", Some("42")),
+            pull_request: pr_summary(7),
+            reason: claudear_core::types::AssignmentReason::CodeOwner,
+            previous: None,
+        });
+
+        assert!(message.embeds.is_none());
+        assert_eq!(
+            message.content.as_deref(),
+            Some(
+                "<@42> you're responsible for getting \
+                 [org/repo#7](<https://github.com/org/repo/pull/7>) over the line: Fix 7\n\
+                 You own the changed code."
+            )
+        );
+        assert_eq!(allowed_mentions, AllowedMentions::users(["42".to_string()]));
+    }
+
+    #[test]
+    fn test_pr_assignment_message_never_pings_from_the_title() {
+        let mut pull_request = pr_summary(7);
+        pull_request.title = "@everyone <@&99> ping <@123> and @here".to_string();
+
+        let (message, allowed_mentions) = build_pr_assignment_message(&AssignmentNotice {
+            developer: pr_developer("amy", Some("42")),
+            pull_request,
+            reason: claudear_core::types::AssignmentReason::Requester,
+            previous: None,
+        });
+
+        let content = message.content.unwrap();
+        assert!(content.starts_with("<@42> "));
+        for mention in ["@everyone", "@here", "<@&99>", "<@123>"] {
+            assert!(!content.contains(mention), "{mention} in {content}");
+        }
+        assert!(allowed_mentions.parse.is_empty());
+        assert_eq!(allowed_mentions.users, vec!["42".to_string()]);
+    }
+
+    #[test]
+    fn test_pr_assignment_message_falls_back_to_the_github_handle() {
+        let (message, allowed_mentions) = build_pr_assignment_message(&AssignmentNotice {
+            developer: pr_developer("amy", None),
+            pull_request: pr_summary(7),
+            reason: claudear_core::types::AssignmentReason::Load,
+            previous: None,
+        });
+
+        assert!(message
+            .content
+            .unwrap()
+            .starts_with("@amy you're responsible"));
+        assert_eq!(allowed_mentions, AllowedMentions::users([]));
+    }
+
+    fn digest_messages(digest: &Digest) -> Vec<(DiscordMessage, AllowedMentions)> {
+        std::iter::once(build_pr_digest_title())
+            .chain(
+                digest
+                    .groups
+                    .iter()
+                    .flat_map(|group| build_pr_digest_group_messages(group, digest.generated_at)),
+            )
+            .collect()
+    }
+
+    #[test]
+    fn test_pr_digest_messages_mention_each_assignee() {
+        let digest = Digest {
+            groups: vec![
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("amy", Some("1")),
+                    pull_requests: vec![pr_summary(1), pr_summary(2)],
+                },
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("bob", Some("2")),
+                    pull_requests: vec![pr_summary(3)],
+                },
+            ],
+            generated_at: Utc::now(),
+        };
+
+        let messages = digest_messages(&digest);
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|(message, _)| message.content.clone().unwrap())
+            .collect();
+        let pinged: Vec<Vec<String>> = messages
+            .iter()
+            .map(|(_, allowed_mentions)| allowed_mentions.users.clone())
+            .collect();
+        assert_eq!(
+            pinged,
+            vec![Vec::new(), vec!["1".to_string()], vec!["2".to_string()]]
+        );
+
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0], Digest::TITLE);
+        assert!(contents[1].starts_with("<@1> 2 Claudear PRs waiting on you:\n"));
+        assert!(contents[1].contains("[org/repo#2](<https://github.com/org/repo/pull/2>) Fix 2"));
+        assert!(contents[2].starts_with("<@2> 1 Claudear PR waiting on you:\n"));
+    }
+
+    #[test]
+    fn test_pr_digest_messages_fit_discords_limit() {
+        let digest = Digest {
+            groups: vec![claudear_analysis::distribution::DigestGroup {
+                developer: pr_developer("amy", Some("1")),
+                pull_requests: (1..=100).map(pr_summary).collect(),
+            }],
+            generated_at: Utc::now(),
+        };
+
+        let messages = digest_messages(&digest);
+
+        assert!(messages.len() > 2);
+        assert!(messages.iter().all(|(message, _)| message
+            .content
+            .as_ref()
+            .unwrap()
+            .chars()
+            .count()
+            <= MESSAGE_CHARACTER_LIMIT));
+        assert!(messages[1]
+            .0
+            .content
+            .as_ref()
+            .unwrap()
+            .starts_with("<@1> 100 Claudear PRs"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_pr_digest_empty_digest_sends_nothing() {
+        let notifier = DiscordNotifier::with_http_client(
+            enabled_config(),
+            MockDiscordWebhookClient::success(),
+        );
+        let digest = Digest {
+            groups: Vec::new(),
+            generated_at: Utc::now(),
+        };
+
+        assert!(notifier.notify_pr_digest(&digest).await.unwrap().is_empty());
+        assert_eq!(notifier.http.get_call_count(), 0);
+    }
+
+    fn two_group_digest() -> Digest {
+        Digest {
+            groups: vec![
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("amy", Some("1")),
+                    pull_requests: vec![pr_summary(1)],
+                },
+                claudear_analysis::distribution::DigestGroup {
+                    developer: pr_developer("bob", Some("2")),
+                    pull_requests: vec![pr_summary(2)],
+                },
+            ],
+            generated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notify_pr_digest_delivers_past_a_failed_assignee() {
+        let notifier = DiscordNotifier::with_http_client(
+            enabled_config(),
+            MockDiscordWebhookClient::success().failing_on(2),
+        );
+
+        let delivery = notifier
+            .notify_pr_digest(&two_group_digest())
+            .await
+            .expect("a digest that reached one assignee must not be resent");
+
+        assert!(
+            delivery.contains("https://github.com/org/repo/pull/2"),
+            "bob was reached"
+        );
+        assert!(
+            !delivery.contains("https://github.com/org/repo/pull/1"),
+            "amy was not reached, so her PR must not count as delivered"
+        );
+
+        assert_eq!(notifier.http.get_call_count(), 3);
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        assert!(body["content"].as_str().unwrap().starts_with("<@2> "));
+    }
+
+    #[tokio::test]
+    async fn test_notify_pr_digest_fails_when_no_assignee_was_reached() {
+        let notifier = DiscordNotifier::with_http_client(
+            enabled_config(),
+            MockDiscordWebhookClient::success().failing_on(1),
+        );
+        assert!(notifier
+            .notify_pr_digest(&two_group_digest())
+            .await
+            .is_err());
+        assert_eq!(
+            notifier.http.get_call_count(),
+            1,
+            "a digest whose title failed sends nothing more"
+        );
+
+        let notifier = DiscordNotifier::with_http_client(
+            enabled_config(),
+            MockDiscordWebhookClient::error(500, "unavailable"),
+        );
+        assert!(notifier
+            .notify_pr_digest(&two_group_digest())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_notify_pr_digest_posts_every_message_to_the_webhook() {
+        let notifier = DiscordNotifier::with_http_client(
+            enabled_config(),
+            MockDiscordWebhookClient::success(),
+        );
+        let digest = Digest {
+            groups: vec![claudear_analysis::distribution::DigestGroup {
+                developer: pr_developer("amy", Some("1")),
+                pull_requests: vec![pr_summary(1)],
+            }],
+            generated_at: Utc::now(),
+        };
+
+        notifier.notify_pr_digest(&digest).await.unwrap();
+
+        assert_eq!(notifier.http.get_call_count(), 2);
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        assert!(body["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("<@1> 1 Claudear PR"));
+        assert_eq!(
+            body["allowed_mentions"],
+            serde_json::json!({ "parse": [], "users": ["1"] })
+        );
+    }
+
     #[test]
     fn test_build_repetitive_digest_message_empty_is_none() {
         let digest = test_digest(vec![]);
@@ -5360,5 +5772,188 @@ mod tests {
         let conf = fields.iter().find(|f| f.name == "Fix Confidence").unwrap();
         assert!(conf.value.contains("90/100"));
         assert!(conf.value.contains("Straightforward port"));
+    }
+
+    fn discord_person(discord_id: Option<&str>) -> claudear_config::config::UserConfig {
+        claudear_config::config::UserConfig {
+            linear_names: vec!["Jake B".to_string()],
+            discord_id: discord_id.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn discord_config_for(user_id: &str) -> DiscordConfig {
+        DiscordConfig {
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
+            user_id: Some(user_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn sent_content(notifier: &DiscordNotifier<MockDiscordWebhookClient>) -> Option<String> {
+        notifier
+            .http
+            .get_last_call()
+            .and_then(|(_, body)| body["content"].as_str().map(str::to_string))
+    }
+
+    fn repetitive_entry() -> crate::reports::RepetitiveEntry {
+        crate::reports::RepetitiveEntry {
+            issue_id: "A".to_string(),
+            short_id: "SENTRY-A".to_string(),
+            title: "Pool exhausted".to_string(),
+            url: "https://sentry.io/A".to_string(),
+            event_count: 1200,
+            is_escalating: true,
+            last_error: None,
+            repo: None,
+        }
+    }
+
+    #[test]
+    fn test_configured_user_id_person_key_resolves_to_discord_id() {
+        let registry = registry_with("jake", discord_person(Some("123456789")));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry,
+        );
+        assert_eq!(
+            notifier.get_user_mention(),
+            Some("<@123456789>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_configured_user_id_unknown_reference_stays_literal() {
+        let registry = registry_with("jake", discord_person(Some("123456789")));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("999888777"),
+            MockDiscordWebhookClient::success(),
+            registry,
+        );
+        assert_eq!(
+            notifier.get_user_mention(),
+            Some("<@999888777>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_configured_user_id_person_without_discord_id_stays_literal() {
+        let registry = registry_with("jake", discord_person(None));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry,
+        );
+        assert_eq!(notifier.get_user_mention(), Some("<@jake>".to_string()));
+    }
+
+    #[test]
+    fn test_issue_fallbacks_resolve_configured_person_key() {
+        let registry = registry_with("jake", discord_person(Some("123456789")));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry,
+        );
+        let issue = Issue::new("1", "P-1", "Test", "https://example.com", "linear");
+        assert_eq!(
+            notifier.get_user_mention_for_issue(&issue),
+            Some("<@123456789>".to_string())
+        );
+        assert_eq!(
+            notifier.get_target_discord_id_for_issue(&issue),
+            Some("123456789".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repetitive_digest_mention_follows_console_edit_without_rebuild() {
+        let registry = registry_with("jake", discord_person(Some("111111111")));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry.clone(),
+        );
+        let digest = test_digest(vec![repetitive_entry()]);
+
+        notifier.notify_repetitive_digest(&digest).await.unwrap();
+        assert_eq!(sent_content(&notifier).as_deref(), Some("<@111111111>"));
+
+        registry.replace_console(vec![console_person(
+            "jake",
+            claudear_core::identity::Identities {
+                discord_id: Some("222222222".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        notifier.notify_repetitive_digest(&digest).await.unwrap();
+        assert_eq!(sent_content(&notifier).as_deref(), Some("<@222222222>"));
+    }
+
+    #[tokio::test]
+    async fn test_instrumented_repetitive_digest_pings_the_registry_on_call_user() {
+        let registry = registry_with("jake", discord_person(Some("111111111")));
+        let discord = std::sync::Arc::new(DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry.clone(),
+        ));
+        let notifier = crate::telemetry::InstrumentedNotifier::wrap(discord.clone());
+        let digest = test_digest(vec![repetitive_entry()]);
+
+        notifier.notify_repetitive_digest(&digest).await.unwrap();
+        assert_eq!(sent_content(&discord).as_deref(), Some("<@111111111>"));
+
+        registry.replace_console(vec![console_person(
+            "jake",
+            claudear_core::identity::Identities {
+                discord_id: Some("222222222".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        notifier.notify_repetitive_digest(&digest).await.unwrap();
+        assert_eq!(sent_content(&discord).as_deref(), Some("<@222222222>"));
+    }
+
+    #[tokio::test]
+    async fn test_urgent_mention_follows_console_edit_without_rebuild() {
+        let registry = registry_with("jake", discord_person(Some("111111111")));
+        let notifier = DiscordNotifier::with_http_client_and_registry(
+            discord_config_for("jake"),
+            MockDiscordWebhookClient::success(),
+            registry.clone(),
+        );
+        let issues = vec![Issue::new(
+            "1",
+            "P-1",
+            "Urgent",
+            "https://example.com",
+            "linear",
+        )];
+
+        registry.replace_console(vec![console_person(
+            "jake",
+            claudear_core::identity::Identities {
+                discord_id: Some("222222222".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        notifier.notify_urgent_issues(&issues).await.unwrap();
+        assert_eq!(sent_content(&notifier).as_deref(), Some("<@222222222>"));
+        assert_eq!(
+            notifier.get_target_discord_id_for_issue(&issues[0]),
+            Some("222222222".to_string())
+        );
+
+        registry.replace_console(Vec::new());
+        assert_eq!(
+            notifier.get_user_mention(),
+            Some("<@111111111>".to_string())
+        );
     }
 }

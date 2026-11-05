@@ -1,6 +1,7 @@
 import { Cpu, AlertCircle, Loader2, Download } from 'lucide-react'
 import useSWR from 'swr'
-import { fetchChatModels } from '../../lib/chat'
+import { fetchChatModels, isChatDisabled, useChatAvailability } from '../../lib/chat'
+import { ChatDisabledBadge } from './ChatDisabledNotice'
 import { useAuth } from '../../lib/auth'
 import { useRouter } from '../../router'
 
@@ -9,11 +10,16 @@ export function ModelStatus() {
   const { navigate } = useRouter()
   const isAdmin = user?.role === 'admin'
 
-  const { data, error } = useSWR('chat-models', fetchChatModels, {
+  const chat = useChatAvailability()
+  const { data, error } = useSWR(chat.enabled ? 'chat-models' : null, fetchChatModels, {
     refreshInterval: (latestData) => latestData?.models?.[0]?.status === 'downloading' ? 2000 : 30000,
   })
 
   const model = data?.models?.[0]
+
+  if (chat.disabled || isChatDisabled(error)) {
+    return <ChatDisabledBadge />
+  }
 
   if (error || !model) {
     return (

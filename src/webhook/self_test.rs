@@ -5,7 +5,7 @@
 
 use claudear_config::config::Config;
 use claudear_core::secret::{OptionalSecretExt, SecretValue};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Client;
 use sha2::Sha256;
 use std::fmt;

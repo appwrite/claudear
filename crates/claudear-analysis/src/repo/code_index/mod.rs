@@ -309,23 +309,27 @@ impl CodeIndexer {
                     .collect();
 
                 let model_name = self.embedding_client.model();
-                self.tracker
-                    .save_code_chunk_embeddings(&pairs, model_name)?;
+                if let Err(error) = self.tracker.save_code_chunk_embeddings(&pairs, model_name) {
+                    self.discard_chunks(&chunk_ids);
+                    chunks.clear();
+                    return Err(error);
+                }
                 stats.embeddings_generated += pairs.len();
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to generate code chunk embeddings");
-                // Delete the chunks that failed to embed so they get
-                // re-processed on the next indexing run instead of
-                // remaining as ghost chunks with no embeddings.
-                if let Err(del_err) = self.tracker.delete_code_chunks_by_ids(&chunk_ids) {
-                    tracing::warn!(error = %del_err, "Failed to delete unembed code chunks");
-                }
+                self.discard_chunks(&chunk_ids);
             }
         }
 
         chunks.clear();
         Ok(())
+    }
+
+    fn discard_chunks(&self, chunk_ids: &[i64]) {
+        if let Err(delete_error) = self.tracker.delete_code_chunks_by_ids(chunk_ids) {
+            tracing::warn!(%delete_error, "Failed to delete code chunks without embeddings");
+        }
     }
 
     /// Walk the repo and collect source files with their detected language.
@@ -1758,6 +1762,53 @@ fn helper() -> i32 {
         let stats = indexer.index_repo("test-repo", dir.path()).await.unwrap();
         assert!(stats.files_processed >= 1, "Should process at least 1 file");
         assert!(stats.chunks_created >= 1, "Should create at least 1 chunk");
+    }
+
+    #[tokio::test]
+    async fn test_index_repo_deletes_chunks_when_embeddings_fail_to_save() {
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("tracker.db");
+        let repository_path = directory.path().join("repository");
+        std::fs::create_dir(&repository_path).unwrap();
+        std::fs::write(
+            repository_path.join("main.rs"),
+            "fn main() {\n    println!(\"Hello, world!\");\n}\n",
+        )
+        .unwrap();
+
+        let tracker: Arc<dyn claudear_storage::FixAttemptTracker> =
+            Arc::new(claudear_storage::SqliteTracker::new(&database_path).unwrap());
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER abort_embeddings BEFORE INSERT ON code_chunk_embeddings \
+                 BEGIN SELECT RAISE(ABORT, 'forced embedding failure'); END",
+            )
+            .unwrap();
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let result = indexer.index_repo("test-repo", &repository_path).await;
+        assert!(
+            result.is_err(),
+            "A failed embedding save must fail the index run"
+        );
+
+        let orphans: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM code_chunks c \
+                 LEFT JOIN code_chunk_embeddings e ON e.chunk_id = c.id \
+                 WHERE e.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphans, 0,
+            "Chunks whose embeddings failed to save must be deleted"
+        );
     }
 
     #[tokio::test]

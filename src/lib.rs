@@ -230,12 +230,13 @@ pub async fn build_app(
     tracker: Arc<dyn storage::FixAttemptTracker>,
 ) -> anyhow::Result<AppComponents> {
     let user_registry = UserRegistry::new(config.users.clone());
+    claudear_engine::registry::reload(&user_registry, tracker.as_ref());
 
     // Notifier
     let notifier = build_notifier(&config, user_registry.clone());
 
     let mut sources = build_sources(&config);
-    if let Some(source) = build_deploy_qa_source(&config, tracker.clone()) {
+    if let Some(source) = build_deploy_qa_source(&config, tracker.clone(), user_registry.clone()) {
         sources.push(telemetry::InstrumentedSource::wrap(source));
     }
 
@@ -349,9 +350,13 @@ fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notif
 /// reporter that fails to build only degrades reporting, so the source is still
 /// returned. Every failure is logged. The source is returned unwrapped; callers
 /// add telemetry instrumentation.
+///
+/// FAIL `@releaser` looks the releaser up in `registry` first, live, and only
+/// then in the GitHub↔Discord map.
 pub fn build_deploy_qa_source(
     config: &Config,
     tracker: Arc<dyn storage::FixAttemptTracker>,
+    registry: UserRegistry,
 ) -> Option<Arc<dyn source::IssueSource>> {
     if !config.deploy_qa.enabled {
         return None;
@@ -362,7 +367,7 @@ pub fn build_deploy_qa_source(
             tracing::warn!(
                 error = %e,
                 path,
-                "Failed to load deploy_qa GitHub↔Discord map; FAIL @releaser disabled"
+                "Failed to load deploy_qa GitHub↔Discord map; FAIL @releaser uses the user directory only"
             );
             deploy_qa::GitHubDiscordMap::default()
         }),
@@ -378,6 +383,7 @@ pub fn build_deploy_qa_source(
     let discord = claudear_integrations::deploy_qa::try_build_discord(
         bot_token.as_deref(),
         config.deploy_qa.discord_channel_id.as_deref(),
+        registry,
         map,
         deploy_qa_redactor(config, environment),
     )
@@ -396,6 +402,55 @@ pub fn build_deploy_qa_source(
             None
         }
     }
+}
+
+/// Build the GitHub Issues source.
+///
+/// Returns `None` when `[scm.github]` has no repos or trigger labels, or there is
+/// no token to authenticate with. Trigger labels are required so the source never
+/// picks up every open issue in a repository.
+/// The source is returned unwrapped; callers add telemetry instrumentation.
+pub fn build_github_issues_source(config: &Config) -> Option<Arc<dyn source::IssueSource>> {
+    let github = config.github();
+    if github.repos.is_empty() {
+        return None;
+    }
+    let has_github_token = github.token.as_ref().is_some_and(|token| !token.is_empty());
+    if !has_github_token || github.trigger_labels.is_empty() {
+        tracing::warn!(
+            "scm.github.repos set but missing scm.github.token or trigger_labels; skipping GitHub Issues source"
+        );
+        return None;
+    }
+
+    tracing::info!("GitHub Issues source initialized");
+    Some(Arc::new(source::GitHubSource::new(github.clone())))
+}
+
+/// Build the GitHub code-scanning alerts issue source.
+///
+/// Returns `None` when `[issues.github_code_scanning]` is absent or disabled, or
+/// when it has no repos or there is no `[scm.github]` token to authenticate with.
+/// The source is returned unwrapped; callers add telemetry instrumentation.
+pub fn build_github_code_scanning_source(config: &Config) -> Option<Arc<dyn source::IssueSource>> {
+    let code_scanning = config.github_code_scanning().filter(|c| c.enabled)?;
+    let has_github_token = config
+        .github()
+        .token
+        .as_ref()
+        .is_some_and(|token| !token.is_empty());
+    if !has_github_token || code_scanning.repos.is_empty() {
+        tracing::warn!(
+            "GitHub code-scanning enabled but missing scm.github.token or repos; skipping"
+        );
+        return None;
+    }
+
+    tracing::info!("GitHub code-scanning source initialized");
+    Some(Arc::new(source::GitHubCodeScanningSource::new(
+        code_scanning.clone(),
+        config.github().clone(),
+    )))
 }
 
 /// Redactor for live-QA reports. Masks every credential in `config` and the
@@ -497,6 +552,14 @@ fn build_sources(config: &Config) -> Vec<Arc<dyn source::IssueSource>> {
         if jira_config.enabled {
             sources.push(Arc::new(JiraSource::new(jira_config.clone())));
         }
+    }
+
+    if let Some(source) = build_github_issues_source(config) {
+        sources.push(source);
+    }
+
+    if let Some(source) = build_github_code_scanning_source(config) {
+        sources.push(source);
     }
 
     let discord = config.discord_merged();
@@ -669,6 +732,74 @@ mod tests {
         assert_eq!(sources.len(), 1);
     }
 
+    fn github_issues_config(token: Option<&str>, repos: &[&str], labels: &[&str]) -> Config {
+        let mut config = Config::default();
+        let github = config.github_mut();
+        github.token = token.map(secret::SecretValue::new);
+        github.repos = repos.iter().map(|repo| repo.to_string()).collect();
+        github.trigger_labels = labels.iter().map(|label| label.to_string()).collect();
+        config
+    }
+
+    #[test]
+    fn build_sources_with_github_issues_enabled() {
+        let config = github_issues_config(
+            Some("ghp_token"),
+            &["appwrite-labs/cloud"],
+            &["security-review"],
+        );
+        let sources = build_sources(&config);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name(), "github_issues");
+    }
+
+    #[test]
+    fn build_sources_skips_github_issues_without_token_repos_or_labels() {
+        let without_token =
+            github_issues_config(None, &["appwrite-labs/cloud"], &["security-review"]);
+        assert!(build_sources(&without_token).is_empty());
+
+        let without_repos = github_issues_config(Some("ghp_token"), &[], &["security-review"]);
+        assert!(build_sources(&without_repos).is_empty());
+
+        let without_labels = github_issues_config(Some("ghp_token"), &["appwrite-labs/cloud"], &[]);
+        assert!(build_sources(&without_labels).is_empty());
+    }
+
+    fn github_code_scanning_config(token: Option<&str>, repos: &[&str]) -> Config {
+        let mut config = Config::default();
+        config.github_mut().token = token.map(secret::SecretValue::new);
+        config.issues.github_code_scanning = Some(config::GitHubCodeScanningConfig {
+            enabled: true,
+            repos: repos.iter().map(|repo| repo.to_string()).collect(),
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    fn build_sources_with_github_code_scanning_enabled() {
+        let config = github_code_scanning_config(Some("ghp_token"), &["appwrite/appwrite"]);
+        let sources = build_sources(&config);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name(), "github_code_scanning");
+    }
+
+    #[test]
+    fn build_sources_skips_github_code_scanning_without_token_or_repos() {
+        let without_token = github_code_scanning_config(None, &["appwrite/appwrite"]);
+        assert!(build_sources(&without_token).is_empty());
+
+        let without_repos = github_code_scanning_config(Some("ghp_token"), &[]);
+        assert!(build_sources(&without_repos).is_empty());
+
+        let mut disabled = github_code_scanning_config(Some("ghp_token"), &["appwrite/appwrite"]);
+        if let Some(code_scanning) = disabled.issues.github_code_scanning.as_mut() {
+            code_scanning.enabled = false;
+        }
+        assert!(build_sources(&disabled).is_empty());
+    }
+
     #[test]
     fn build_sources_multiple_enabled() {
         let mut config = Config::default();
@@ -785,14 +916,22 @@ mod tests {
 
     #[test]
     fn build_deploy_qa_source_none_when_disabled() {
-        let source = build_deploy_qa_source(&Config::default(), in_memory_tracker());
+        let source = build_deploy_qa_source(
+            &Config::default(),
+            in_memory_tracker(),
+            UserRegistry::default(),
+        );
         assert!(source.is_none());
     }
 
     #[test]
     fn build_deploy_qa_source_without_discord() {
-        let source = build_deploy_qa_source(&deploy_qa_config(), in_memory_tracker())
-            .expect("enabled deploy_qa should build without Discord");
+        let source = build_deploy_qa_source(
+            &deploy_qa_config(),
+            in_memory_tracker(),
+            UserRegistry::default(),
+        )
+        .expect("enabled deploy_qa should build without Discord");
         assert_eq!(source.name(), deploy_qa::DEPLOY_QA_SOURCE);
     }
 
@@ -800,7 +939,7 @@ mod tests {
     fn build_deploy_qa_source_none_when_playbook_missing() {
         let mut config = deploy_qa_config();
         config.deploy_qa.instructions_path = Some("/nonexistent/deploy_qa_playbook.md".to_string());
-        let source = build_deploy_qa_source(&config, in_memory_tracker());
+        let source = build_deploy_qa_source(&config, in_memory_tracker(), UserRegistry::default());
         assert!(
             source.is_none(),
             "an unreadable playbook must disable the source"
@@ -812,10 +951,10 @@ mod tests {
         let mut config = deploy_qa_config();
         config.deploy_qa.github_discord_map_path =
             Some("/nonexistent/github-discord-map.json".to_string());
-        let source = build_deploy_qa_source(&config, in_memory_tracker());
+        let source = build_deploy_qa_source(&config, in_memory_tracker(), UserRegistry::default());
         assert!(
             source.is_some(),
-            "a missing GitHub↔Discord map only disables FAIL @releaser mentions"
+            "a missing GitHub↔Discord map only narrows FAIL @releaser to the user directory"
         );
     }
 

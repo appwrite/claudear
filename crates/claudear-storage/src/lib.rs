@@ -3,37 +3,55 @@
 pub mod analytics;
 #[cfg(feature = "sqlite")]
 pub(crate) mod migrator;
+pub mod scope;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod tenant;
 pub mod types;
+#[cfg(feature = "sqlite")]
+pub(crate) mod vector_index;
 #[cfg(feature = "sqlite")]
 pub mod vectorlite;
 
 pub use analytics::{
     classify_error, compute_error_hash, AnalyticsService, TimePeriod, TrendAnalysis, TrendDirection,
 };
+pub use scope::AttemptScope;
 #[cfg(feature = "sqlite")]
-pub use sqlite::SqliteTracker;
+pub use sqlite::{SqliteTracker, VectorIndexRebuilder};
 pub use types::{
-    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
-    DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,
-    PurgeResult, StoredDependency, StoredDiscordChannel, StoredIndexedRepo, StoredRepository,
-    UserRow,
+    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts, DirectoryUser,
+    DirectoryWrite, DiscordKnowledgebaseStats, IdentityWrite, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, InviteRow, InviteWrite, PurgeResult, StoredDependency,
+    StoredDiscordChannel, StoredIndexedRepo, StoredRepository, UserRow,
 };
 #[cfg(feature = "sqlite")]
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 
 use chrono::{DateTime, Utc};
-use claudear_core::error::Result;
+use claudear_core::error::{Error, Result};
+use claudear_core::identity::{ConsoleIdentity, Role};
+use claudear_core::security::{
+    AwardStatus, DeliveryStatus, NewSecurityAward, NewSecurityEvent, NewSecurityReport,
+    NewSecurityVulnerability, ReportTransition, SecurityAward, SecurityEvent, SecurityEventKind,
+    SecurityReply, SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportFilter,
+    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityCandidate,
+    SecurityVulnerabilityChanges, VulnerabilityState,
+};
 use claudear_core::types::{
-    ActivityLogEntry, AgentExecution, AnalyticsSummary, DeployQaTip, DeployQaTipStatus,
-    ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, IssueTimeline,
-    PrAnalytics, PrRecord, PrReviewRecord, ProcessingMetric, PromptExperiment, QaKnowledgeEntry,
-    QaMatch, RegressionCheck, RegressionWatch, RegressionWatchStatus, SimilarIssue,
+    ActivityLogEntry, AgentExecution, AnalyticsSummary, AssignmentStatus, DeployQaTip,
+    DeployQaTipStatus, ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding,
+    IssueTimeline, PrAnalytics, PrAssignment, PrRecord, PrReviewRecord, ProcessingMetric,
+    PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck, RegressionWatch,
+    RegressionWatchStatus, SimilarIssue,
 };
 use claudear_core::types::{CrossRepoCorrelation, FixOutcome};
 use std::collections::{HashMap, HashSet};
+
+/// Contained in the [`claudear_core::error::Error::Database`] message of an identity write
+/// that would give a person a source login, Discord id or Slack id another person already
+/// claims; the whole write is rolled back.
+pub const DUPLICATE_HANDLE: &str = "UNIQUE constraint failed: user_handles";
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -190,6 +208,13 @@ pub trait AttemptTracker: Send + Sync {
 
     /// Get statistics about fix attempts.
     fn get_stats(&self) -> Result<FixAttemptStats>;
+
+    /// Statistics about the fix attempts within `scope`.
+    fn get_scoped_stats(&self, scope: AttemptScope) -> Result<FixAttemptStats> {
+        let mut stats = self.get_stats()?;
+        scope.scrub(&mut stats);
+        Ok(stats)
+    }
 
     /// Increment retry count and set last retry timestamp.
     fn increment_retry(&self, source: &str, issue_id: &str) -> Result<()>;
@@ -390,8 +415,8 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Get analytics summary.
-    fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
+    /// Analytics summary over the attempts within `_scope`.
+    fn get_analytics_summary(&self, _scope: AttemptScope) -> Result<AnalyticsSummary> {
         Ok(AnalyticsSummary::default())
     }
 
@@ -400,13 +425,14 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Get PR analytics.
-    fn get_pr_analytics(&self) -> Result<PrAnalytics> {
+    /// Analytics over the PRs within `_scope`.
+    fn get_pr_analytics(&self, _scope: AttemptScope) -> Result<PrAnalytics> {
         Ok(PrAnalytics::default())
     }
 
-    /// Average time from issue attempt to PR creation in minutes.
-    fn get_avg_time_to_pr(&self) -> Result<Option<f64>> {
+    /// Average time from issue attempt to PR creation in minutes, over the
+    /// attempts within `_scope`.
+    fn get_avg_time_to_pr(&self, _scope: AttemptScope) -> Result<Option<f64>> {
         Ok(None)
     }
 
@@ -418,35 +444,47 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Count Claude agent spawns since a given ISO timestamp.
-    fn get_agent_spawn_count(&self, _since_iso: &str) -> Result<i64> {
+    /// Count Claude agent spawns for attempts within `_scope` since a given ISO
+    /// timestamp.
+    fn get_agent_spawn_count(&self, _since_iso: &str, _scope: AttemptScope) -> Result<i64> {
         Ok(0)
     }
 
-    /// Compute cost estimate from Claude execution data.
+    /// Compute cost estimate from the Claude executions of attempts within
+    /// `_scope`.
     fn get_cost_estimate(
         &self,
         _since_iso: &str,
         _max_plan_monthly_cost: f64,
         _period_label: &str,
+        _scope: AttemptScope,
     ) -> Result<claudear_core::types::CostEstimate> {
         Ok(claudear_core::types::CostEstimate::default())
     }
 
-    /// MTTR trend grouped by week.
-    fn get_mttr_trend(&self, _weeks: usize) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
+    /// MTTR trend of the attempts within `_scope`, grouped by week.
+    fn get_mttr_trend(
+        &self,
+        _weeks: usize,
+        _scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
         Ok(Vec::new())
     }
 
-    /// Per-repository leaderboard.
-    fn get_repo_leaderboard(&self) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
+    /// Per-repository leaderboard of the attempts within `_scope`.
+    fn get_repo_leaderboard(
+        &self,
+        _scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
         Ok(Vec::new())
     }
 
-    /// Daily commit-production trend over the last `_days` days.
+    /// Daily commit-production trend of the attempts within `_scope` over the
+    /// last `_days` days.
     fn get_commit_trend(
         &self,
         _days: usize,
+        _scope: AttemptScope,
     ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
         Ok(Vec::new())
     }
@@ -475,21 +513,24 @@ pub trait ActivityStore: Send + Sync {
         Ok(claudear_core::types::SupportRatingSummary::default())
     }
 
-    /// Complexity-based engineering time savings estimate.
+    /// Complexity-based engineering time savings estimate over the attempts
+    /// within `_scope`.
     fn get_complexity_time_savings(
         &self,
         _since_iso: &str,
         _hourly_rate: f64,
         _period_label: &str,
+        _scope: AttemptScope,
     ) -> Result<claudear_core::types::TimeSavings> {
         Ok(claudear_core::types::TimeSavings::default())
     }
 
-    /// List all PRs with optional status and limit filters.
+    /// The newest `limit` PRs within `scope`, optionally with `status`.
     fn list_prs(
         &self,
         _status: Option<&str>,
         _limit: usize,
+        _scope: AttemptScope,
     ) -> Result<Vec<claudear_core::types::PrRecord>> {
         Ok(Vec::new())
     }
@@ -545,9 +586,26 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Count fix attempts with optional filters.
-    fn count_attempts(&self, _status: Option<&str>, _source: Option<&str>) -> Result<usize> {
+    /// Count the fix attempts within `_scope` with optional filters.
+    fn count_attempts(
+        &self,
+        _status: Option<&str>,
+        _source: Option<&str>,
+        _scope: AttemptScope,
+    ) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Like [`Self::list_attempts`] across every source within `_scope`, so a
+    /// page skips excluded attempts without scanning.
+    fn list_scoped_attempts(
+        &self,
+        _status: Option<&str>,
+        _scope: AttemptScope,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<FixAttempt>> {
+        Ok(Vec::new())
     }
 
     /// List the most recent fix attempts.
@@ -555,8 +613,12 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// List fix attempts created since a timestamp.
-    fn list_attempts_since(&self, _since: DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+    /// List the fix attempts within `_scope` created since a timestamp.
+    fn list_attempts_since(
+        &self,
+        _since: DateTime<Utc>,
+        _scope: AttemptScope,
+    ) -> Result<Vec<FixAttempt>> {
         Ok(Vec::new())
     }
 
@@ -626,37 +688,42 @@ pub trait ActivityStore: Send + Sync {
         Ok(0)
     }
 
-    /// Get activity type counts since a timestamp.
+    /// Get counts by type of the activity within `_scope` since a timestamp.
     fn get_activity_type_counts_since(
         &self,
         _since: DateTime<Utc>,
+        _scope: AttemptScope,
     ) -> Result<HashMap<String, i64>> {
         Ok(HashMap::new())
     }
 
-    /// Get metric counts for named metrics since a timestamp.
+    /// Get counts of the named metrics within `_scope` since a timestamp.
     fn get_metric_counts_since(
         &self,
         _metric_names: &[&str],
         _since: DateTime<Utc>,
+        _scope: AttemptScope,
     ) -> Result<HashMap<String, i64>> {
         Ok(HashMap::new())
     }
 
-    /// Get metric sums for named metrics since a timestamp.
+    /// Get sums of the named metrics within `_scope` since a timestamp.
     fn get_metric_sums_since(
         &self,
         _metric_names: &[&str],
         _since: DateTime<Utc>,
+        _scope: AttemptScope,
     ) -> Result<HashMap<String, f64>> {
         Ok(HashMap::new())
     }
 
-    /// Get metric sums grouped by source for named metrics since a timestamp.
+    /// Get sums grouped by source of the named metrics within `_scope` since a
+    /// timestamp.
     fn get_metric_sums_by_source_since(
         &self,
         _metric_names: &[&str],
         _since: DateTime<Utc>,
+        _scope: AttemptScope,
     ) -> Result<HashMap<(String, String), f64>> {
         Ok(HashMap::new())
     }
@@ -1223,9 +1290,20 @@ pub trait EmbeddingStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Count issues with optional source filter.
-    fn count_issues(&self, _source: Option<&str>) -> Result<usize> {
+    /// Count the issues within `_scope` with optional source filter.
+    fn count_issues(&self, _source: Option<&str>, _scope: AttemptScope) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Like [`Self::list_issues`] across every source within `_scope`, so a page
+    /// skips excluded issues without scanning.
+    fn list_scoped_issues(
+        &self,
+        _scope: AttemptScope,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<IssueEmbedding>> {
+        Ok(Vec::new())
     }
 
     /// Record (upsert) the observed recurrence signal for an issue.
@@ -1726,8 +1804,8 @@ pub trait DiscordStore: Send + Sync {
     }
 }
 
-/// User management, sessions, channels, regression, experiments, diagnostics,
-/// User CRUD, sessions, and channel cursors (all defaulted).
+/// User CRUD, sessions, API tokens, the identity directory, invites and channel
+/// cursors (all defaulted).
 pub trait UserStore: Send + Sync {
     /// Retrieve a channel cursor value.
     fn get_channel_cursor(&self, _channel: &str, _cursor_key: &str) -> Result<Option<String>> {
@@ -1744,18 +1822,20 @@ pub trait UserStore: Send + Sync {
         Ok(())
     }
 
-    /// Create a new user.
+    /// Create a new user. The login email is stored normalized (see
+    /// [`claudear_core::identity::normalize_login_email`]); one that matches another
+    /// user's case-insensitively is a `UNIQUE` violation.
     fn create_user(
         &self,
         _email: &str,
         _password_hash: &str,
         _name: &str,
-        _role: &str,
+        _role: Role,
     ) -> Result<i64> {
         Ok(0)
     }
 
-    /// Get a user by email.
+    /// Get a user by login email, compared case-insensitively.
     fn get_user_by_email(&self, _email: &str) -> Result<Option<UserRow>> {
         Ok(None)
     }
@@ -1770,14 +1850,15 @@ pub trait UserStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Update user fields. Returns true if a row was modified.
+    /// Update user fields. Returns true if a row was modified. A new email is stored
+    /// normalized and must not match another user's case-insensitively.
     fn update_user(
         &self,
         _id: i64,
         _email: Option<&str>,
         _password_hash: Option<&str>,
         _name: Option<&str>,
-        _role: Option<&str>,
+        _role: Option<Role>,
         _avatar_url: Option<&str>,
     ) -> Result<bool> {
         Ok(false)
@@ -1861,6 +1942,86 @@ pub trait UserStore: Send + Sync {
     fn delete_api_token(&self, _id: &str, _user_id: Option<i64>) -> Result<bool> {
         Ok(false)
     }
+
+    /// Every console user with saved identities, invited users included, joined
+    /// with their login email and name, ordered by user id.
+    fn list_user_identities(&self) -> Result<Vec<ConsoleIdentity>> {
+        Ok(Vec::new())
+    }
+
+    /// One console user's saved identities joined with their login email and name;
+    /// `None` when the user has no identities row.
+    fn get_user_identities(&self, _user_id: i64) -> Result<Option<ConsoleIdentity>> {
+        Ok(None)
+    }
+
+    /// Remove a user's identities, freeing their handles, so the person falls back to
+    /// config. Returns whether a row was deleted.
+    fn delete_user_identities(&self, _user_id: i64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Apply every write in one transaction (all or nothing): create or update
+    /// each user, replace their identities and issue their invite. Returns the
+    /// user id of each entry, in order. An `Active` new user with an invite is
+    /// rejected, and a new user's login email is normalized and must not match an
+    /// existing (or earlier in the batch) user's case-insensitively. A handle another
+    /// person keeps after the batch fails it with [`DUPLICATE_HANDLE`].
+    fn save_directory(&self, _writes: &[DirectoryWrite]) -> Result<Vec<i64>> {
+        Err(claudear_core::error::Error::Other(
+            "save_directory not supported".to_string(),
+        ))
+    }
+
+    /// Revoke the user's open invite (if any) and insert a new one, in one
+    /// transaction. `expires_at` is UTC `%Y-%m-%d %H:%M:%S`.
+    fn issue_invite(
+        &self,
+        _user_id: i64,
+        _token_hash: &str,
+        _expires_at: &str,
+        _created_by: i64,
+    ) -> Result<InviteRow> {
+        Err(claudear_core::error::Error::Other(
+            "issue_invite not supported".to_string(),
+        ))
+    }
+
+    /// Revoke the user's open invite, expired or not. Returns whether one was
+    /// revoked.
+    fn revoke_invite(&self, _user_id: i64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// The user's newest invite that is neither accepted nor revoked, including
+    /// an expired one so callers can report it as expired.
+    fn get_open_invite_for_user(&self, _user_id: i64) -> Result<Option<InviteRow>> {
+        Ok(None)
+    }
+
+    /// The expiry of every user's newest open invite, keyed by user id, in one query;
+    /// the bulk form of [`Self::get_open_invite_for_user`].
+    fn open_invite_expiries(&self) -> Result<HashMap<i64, String>> {
+        Ok(HashMap::new())
+    }
+
+    /// The invite behind a token hash if it is open: not accepted, not revoked,
+    /// not expired, and its user is still invited.
+    fn find_open_invite(&self, _token_hash: &str) -> Result<Option<(InviteRow, UserRow)>> {
+        Ok(None)
+    }
+
+    /// Consume an open invite (single-use), set the password, activate the user
+    /// and revoke their other invites. `None` if the invite is not open.
+    fn accept_invite(&self, _token_hash: &str, _password_hash: &str) -> Result<Option<UserRow>> {
+        Ok(None)
+    }
+
+    /// Set the password and status active, and revoke open invites. Returns
+    /// whether the user exists.
+    fn activate_user(&self, _user_id: i64, _password_hash: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Persist last-seen `[deploy_qa]` tips and attempt status (all defaulted).
@@ -1890,6 +2051,12 @@ pub trait DeployQaStore: Send + Sync {
     /// Most recently recorded tip for a track (last-seen).
     fn get_last_seen_deploy_qa_tip(&self, _track: &str) -> Result<Option<DeployQaTip>> {
         Ok(None)
+    }
+
+    /// Most recent tips first, across every track or only `track`, at most
+    /// `limit` of them.
+    fn list_deploy_qa_tips(&self, _track: Option<&str>, _limit: usize) -> Result<Vec<DeployQaTip>> {
+        Ok(Vec::new())
     }
 
     /// Pending tips waiting to be enqueued / picked up by the `deploy_qa` source.
@@ -1949,6 +2116,286 @@ pub trait DeployQaStore: Send + Sync {
     }
 }
 
+/// The developer responsible for each open Claudear PR (all defaulted).
+pub trait PrAssignmentStore: Send + Sync {
+    /// Every active assignment, oldest first.
+    fn active_pr_assignments(&self) -> Result<Vec<PrAssignment>> {
+        Ok(Vec::new())
+    }
+
+    /// The active assignment of `pr_url`, if it has one.
+    fn active_pr_assignment(&self, _pr_url: &str) -> Result<Option<PrAssignment>> {
+        Ok(None)
+    }
+
+    /// Record `assignment` as its PR's active assignment.
+    ///
+    /// Returns the stored row, or `None` when the PR already has an active
+    /// assignment, so of two processes assigning the same PR only one wins.
+    fn record_pr_assignment(&self, _assignment: &PrAssignment) -> Result<Option<PrAssignment>> {
+        Ok(None)
+    }
+
+    /// End the active assignment `id` with `status`, returning whether it was
+    /// still active.
+    fn end_pr_assignment(&self, _id: i64, _status: AssignmentStatus) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Record that a ping reached the assignee of the active assignment `id`,
+    /// returning whether it was still active and not yet notified.
+    fn mark_pr_assignment_notified(&self, _id: i64) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+/// Security inbox reports, canonical vulnerabilities, reply ledger and awards.
+///
+/// Every state change writes its event row in the same transaction, and every
+/// transition is a compare-and-set on the expected state, so concurrent
+/// pollers and admins never apply the same step twice.
+pub trait SecurityReportStore: Send + Sync {
+    /// Insert a `Received` report (with its `Received` event), or return the
+    /// existing row for `(source, conversation_id)` unchanged.
+    fn upsert_security_report(&self, _report: &NewSecurityReport) -> Result<SecurityReport> {
+        Err(Error::Other("unsupported".to_string()))
+    }
+
+    fn get_security_report(&self, _id: i64) -> Result<Option<SecurityReport>> {
+        Ok(None)
+    }
+
+    fn get_security_report_by_conversation(
+        &self,
+        _source: &str,
+        _conversation_id: &str,
+    ) -> Result<Option<SecurityReport>> {
+        Ok(None)
+    }
+
+    /// Newest first; at most `filter.limit` rows (default 100).
+    fn list_security_reports(&self, _filter: &SecurityReportFilter) -> Result<Vec<SecurityReport>> {
+        Ok(Vec::new())
+    }
+
+    /// Oldest first.
+    fn list_reports_for_vulnerability(
+        &self,
+        _vulnerability_id: i64,
+    ) -> Result<Vec<SecurityReport>> {
+        Ok(Vec::new())
+    }
+
+    /// Move a report from `expected` to `next`, applying `changes`, returning
+    /// whether it moved. Nothing is written when the edge is not allowed or
+    /// the report is no longer in `expected`.
+    fn transition_security_report(
+        &self,
+        _id: i64,
+        _expected: SecurityReportState,
+        _next: SecurityReportState,
+        _changes: &SecurityReportChanges,
+        _event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Return every report left `Assessing` for longer than `stale_after` to
+    /// `Received`, counting the abandoned attempt.
+    fn release_stale_security_assessments(&self, _stale_after: Duration) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Record a reporter follow-up when the stored thread count is still
+    /// `expected_count` and `new_count` is higher.
+    fn record_security_follow_up(
+        &self,
+        _id: i64,
+        _expected_count: u32,
+        _new_count: u32,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn record_security_event(
+        &self,
+        _report_id: Option<i64>,
+        _vulnerability_id: Option<i64>,
+        _event: &NewSecurityEvent,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// The report's events plus its vulnerability's, oldest first.
+    fn list_security_timeline(&self, _report_id: i64) -> Result<Vec<SecurityEvent>> {
+        Ok(Vec::new())
+    }
+
+    fn last_security_event(
+        &self,
+        _vulnerability_id: i64,
+        _kind: SecurityEventKind,
+    ) -> Result<Option<SecurityEvent>> {
+        Ok(None)
+    }
+
+    /// Reports in `Registering`, each with its latest `AdminConfirmed` event.
+    fn list_admin_confirmed_reports(&self) -> Result<Vec<(SecurityReport, SecurityEvent)>> {
+        Ok(Vec::new())
+    }
+
+    /// Reports in `state` that have no event of `kind`, oldest first.
+    fn list_security_reports_without_event(
+        &self,
+        _state: SecurityReportState,
+        _kind: SecurityEventKind,
+    ) -> Result<Vec<SecurityReport>> {
+        Ok(Vec::new())
+    }
+
+    /// Create a vulnerability in an initial state (with its
+    /// `VulnerabilityCreated` event).
+    fn create_security_vulnerability(
+        &self,
+        _vulnerability: &NewSecurityVulnerability,
+    ) -> Result<SecurityVulnerability> {
+        Err(Error::Other("unsupported".to_string()))
+    }
+
+    fn get_security_vulnerability(&self, _id: i64) -> Result<Option<SecurityVulnerability>> {
+        Ok(None)
+    }
+
+    fn find_security_vulnerability_by_first_report(
+        &self,
+        _report_id: i64,
+    ) -> Result<Option<SecurityVulnerability>> {
+        Ok(None)
+    }
+
+    /// Deduplication fields of the newest `limit` vulnerabilities, newest first.
+    fn list_security_vulnerability_candidates(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<SecurityVulnerabilityCandidate>> {
+        Ok(Vec::new())
+    }
+
+    /// Oldest first, optionally only those in `state`.
+    fn list_security_vulnerabilities(
+        &self,
+        _state: Option<VulnerabilityState>,
+    ) -> Result<Vec<SecurityVulnerability>> {
+        Ok(Vec::new())
+    }
+
+    /// Move a vulnerability from `expected` to `next`, applying `changes`,
+    /// returning whether it moved.
+    fn transition_security_vulnerability(
+        &self,
+        _id: i64,
+        _expected: VulnerabilityState,
+        _next: VulnerabilityState,
+        _changes: &SecurityVulnerabilityChanges,
+        _event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Make `report_id` the first reporter while `expected_first_report_id`
+    /// still is, `reported_at` is earlier (or the same second with a lower
+    /// report id), and no award exists.
+    fn replace_first_reporter(
+        &self,
+        _vulnerability_id: i64,
+        _expected_first_report_id: i64,
+        _report_id: i64,
+        _reported_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Claim a reply for sending, recording `event` in the same transaction:
+    /// true for a new claim or a re-claim of a `Failed` reply (counting the
+    /// attempt and keeping its last error); false while one is sending, sent
+    /// or unconfirmed, or when the report already has the other fix-live kind.
+    fn claim_security_reply(
+        &self,
+        _report_id: i64,
+        _kind: SecurityReplyKind,
+        _event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Finish a claimed reply as `Sent`, `Failed` or `Unconfirmed`, recording
+    /// `event` and applying `transition` to the report in the same
+    /// transaction. Returns whether the report moved.
+    fn complete_security_reply(
+        &self,
+        _report_id: i64,
+        _kind: SecurityReplyKind,
+        _status: DeliveryStatus,
+        _error: Option<&str>,
+        _event: &NewSecurityEvent,
+        _transition: Option<ReportTransition>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Resolve an `Unconfirmed` reply after an admin checked the mailbox.
+    fn confirm_security_reply(
+        &self,
+        _report_id: i64,
+        _kind: SecurityReplyKind,
+        _delivered: bool,
+        _actor: &str,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn list_security_replies(&self, _report_id: i64) -> Result<Vec<SecurityReply>> {
+        Ok(Vec::new())
+    }
+
+    /// Ids of reports with at least one `Unconfirmed` reply, ascending.
+    fn list_reports_with_unconfirmed_replies(&self) -> Result<Vec<i64>> {
+        Ok(Vec::new())
+    }
+
+    /// Prepare the vulnerability's only award, and only for its current
+    /// first reporter, addressed to that report's reporter email.
+    fn prepare_security_award(
+        &self,
+        _vulnerability_id: i64,
+        _report_id: i64,
+        _award: &NewSecurityAward,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Move the award to `next` when its status is one of `expected` and the
+    /// edge is allowed, recording `next`'s event.
+    fn update_security_award_status(
+        &self,
+        _vulnerability_id: i64,
+        _expected: &[AwardStatus],
+        _next: AwardStatus,
+        _actor: Option<&str>,
+        _note: Option<&str>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn get_security_award(&self, _vulnerability_id: i64) -> Result<Option<SecurityAward>> {
+        Ok(None)
+    }
+
+    fn list_security_awards(&self, _status: Option<AwardStatus>) -> Result<Vec<SecurityAward>> {
+        Ok(Vec::new())
+    }
+}
+
 /// Regression watches and checks (all defaulted).
 pub trait RegressionStore: Send + Sync {
     /// Get regression watches by status.
@@ -2001,39 +2448,65 @@ pub trait RegressionStore: Send + Sync {
 
 /// Chat sessions and messages (all defaulted).
 pub trait ChatStore: Send + Sync {
-    /// Create a new chat session.
-    fn create_chat_session(&self, _id: &str, _repo_id: Option<i64>) -> Result<()> {
+    /// Create a new chat session belonging to `owner_user_id`.
+    fn create_chat_session(
+        &self,
+        _id: &str,
+        _repo_id: Option<i64>,
+        _owner_user_id: Option<i64>,
+    ) -> Result<()> {
         Ok(())
     }
 
-    /// Save a chat message to a session.
+    /// The chat session `id`, with its owner and without its messages, if it
+    /// is in `scope`.
+    fn get_chat_session(
+        &self,
+        _id: &str,
+        _scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Option<claudear_core::types::ChatSession>> {
+        Ok(None)
+    }
+
+    /// Append a message to the session, checked to be in `scope` by the same
+    /// statement; `None` when no such session is in scope.
     fn save_chat_message(
         &self,
         _session_id: &str,
+        _scope: &claudear_core::types::ChatSessionScope,
         _role: &str,
         _content: &str,
         _sources_json: Option<&str>,
-    ) -> Result<i64> {
-        Ok(0)
+    ) -> Result<Option<i64>> {
+        Ok(None)
     }
 
-    /// Get chat message history for a session.
+    /// The most recent `limit` messages of the session, if it is in `scope`.
     fn get_chat_history(
         &self,
         _session_id: &str,
+        _scope: &claudear_core::types::ChatSessionScope,
         _limit: usize,
     ) -> Result<Vec<claudear_core::types::ChatMessage>> {
         Ok(Vec::new())
     }
 
-    /// List all chat sessions.
-    fn list_chat_sessions(&self) -> Result<Vec<claudear_core::types::ChatSession>> {
+    /// List the chat sessions in `scope`, most recently updated first.
+    fn list_chat_sessions(
+        &self,
+        _scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Vec<claudear_core::types::ChatSession>> {
         Ok(Vec::new())
     }
 
-    /// Delete a chat session and all its messages.
-    fn delete_chat_session(&self, _session_id: &str) -> Result<()> {
-        Ok(())
+    /// Delete the session and its messages if it is in `scope`, returning
+    /// whether it was.
+    fn delete_chat_session(
+        &self,
+        _session_id: &str,
+        _scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Cleanup expired chat sessions older than the given number of days.
@@ -2042,7 +2515,7 @@ pub trait ChatStore: Send + Sync {
     }
 }
 
-/// Supertrait combining all 12 sub-traits. Auto-implemented for any type
+/// Supertrait combining all sub-traits. Auto-implemented for any type
 /// that implements all sub-traits via the blanket impl below.
 pub trait FixAttemptTracker:
     AttemptTracker
@@ -2057,6 +2530,8 @@ pub trait FixAttemptTracker:
     + UserStore
     + RegressionStore
     + DeployQaStore
+    + PrAssignmentStore
+    + SecurityReportStore
     + ChatStore
     + DiscordStore
 {
@@ -2075,6 +2550,8 @@ impl<T> FixAttemptTracker for T where
         + UserStore
         + RegressionStore
         + DeployQaStore
+        + PrAssignmentStore
+        + SecurityReportStore
         + ChatStore
         + DiscordStore
 {
@@ -2166,6 +2643,8 @@ impl RepoStore for NoopTracker {}
 impl UserStore for NoopTracker {}
 impl RegressionStore for NoopTracker {}
 impl DeployQaStore for NoopTracker {}
+impl PrAssignmentStore for NoopTracker {}
+impl SecurityReportStore for NoopTracker {}
 impl ChatStore for NoopTracker {}
 impl DiscordStore for NoopTracker {}
 
@@ -2351,6 +2830,8 @@ mod tests {
         impl UserStore for FullTracker {}
         impl RegressionStore for FullTracker {}
         impl DeployQaStore for FullTracker {}
+        impl PrAssignmentStore for FullTracker {}
+        impl SecurityReportStore for FullTracker {}
         impl ChatStore for FullTracker {}
         impl DiscordStore for FullTracker {}
 
@@ -2408,7 +2889,7 @@ mod tests {
         #[test]
         fn test_default_get_analytics_summary_returns_default() {
             let t = MockActivity;
-            let summary = t.get_analytics_summary().unwrap();
+            let summary = t.get_analytics_summary(AttemptScope::All).unwrap();
             assert_eq!(summary.success_rate, 0.0);
         }
 
@@ -2421,7 +2902,7 @@ mod tests {
         #[test]
         fn test_default_get_pr_analytics_returns_default() {
             let t = MockActivity;
-            let analytics = t.get_pr_analytics().unwrap();
+            let analytics = t.get_pr_analytics(AttemptScope::All).unwrap();
             assert_eq!(analytics.total, 0);
         }
 
@@ -2503,7 +2984,7 @@ mod tests {
         #[test]
         fn test_default_get_avg_time_to_pr_returns_none() {
             let t = MockActivity;
-            assert!(t.get_avg_time_to_pr().unwrap().is_none());
+            assert!(t.get_avg_time_to_pr(AttemptScope::All).unwrap().is_none());
         }
 
         #[test]
@@ -2515,14 +2996,18 @@ mod tests {
         #[test]
         fn test_default_get_agent_spawn_count_returns_zero() {
             let t = MockActivity;
-            assert_eq!(t.get_agent_spawn_count("2024-01-01T00:00:00Z").unwrap(), 0);
+            assert_eq!(
+                t.get_agent_spawn_count("2024-01-01T00:00:00Z", AttemptScope::All)
+                    .unwrap(),
+                0
+            );
         }
 
         #[test]
         fn test_default_get_cost_estimate_returns_default() {
             let t = MockActivity;
             let est = t
-                .get_cost_estimate("2024-01-01T00:00:00Z", 100.0, "month")
+                .get_cost_estimate("2024-01-01T00:00:00Z", 100.0, "month", AttemptScope::All)
                 .unwrap();
             assert_eq!(est.total_cost, 0.0);
             assert_eq!(est.avg_cost_per_fix, 0.0);
@@ -2532,20 +3017,28 @@ mod tests {
         #[test]
         fn test_default_get_mttr_trend_returns_empty() {
             let t = MockActivity;
-            assert!(t.get_mttr_trend(4).unwrap().is_empty());
+            assert!(t.get_mttr_trend(4, AttemptScope::All).unwrap().is_empty());
         }
 
         #[test]
         fn test_default_get_repo_leaderboard_returns_empty() {
             let t = MockActivity;
-            assert!(t.get_repo_leaderboard().unwrap().is_empty());
+            assert!(t
+                .get_repo_leaderboard(AttemptScope::All)
+                .unwrap()
+                .is_empty());
         }
 
         #[test]
         fn test_default_get_complexity_time_savings_returns_default() {
             let t = MockActivity;
             let savings = t
-                .get_complexity_time_savings("2024-01-01T00:00:00Z", 150.0, "month")
+                .get_complexity_time_savings(
+                    "2024-01-01T00:00:00Z",
+                    150.0,
+                    "month",
+                    AttemptScope::All,
+                )
                 .unwrap();
             assert_eq!(savings.merged_count, 0);
             assert_eq!(savings.hours_saved, 0.0);
@@ -2555,8 +3048,11 @@ mod tests {
         #[test]
         fn test_default_list_prs_returns_empty() {
             let t = MockActivity;
-            assert!(t.list_prs(None, 50).unwrap().is_empty());
-            assert!(t.list_prs(Some("open"), 10).unwrap().is_empty());
+            assert!(t.list_prs(None, 50, AttemptScope::All).unwrap().is_empty());
+            assert!(t
+                .list_prs(Some("open"), 10, AttemptScope::All)
+                .unwrap()
+                .is_empty());
         }
     }
 
@@ -2973,6 +3469,22 @@ mod tests {
             // set_channel_cursor should succeed silently
             assert!(t.set_channel_cursor("ch", "key", "val").is_ok());
         }
+
+        #[test]
+        fn test_default_directory_reads_are_empty_and_writes_fail_loudly() {
+            let store = MockUser;
+            assert!(store.list_user_identities().unwrap().is_empty());
+            assert!(!store.delete_user_identities(1).unwrap());
+            assert!(!store.revoke_invite(1).unwrap());
+            assert!(store.get_open_invite_for_user(1).unwrap().is_none());
+            assert!(store.find_open_invite("hash").unwrap().is_none());
+            assert!(store.accept_invite("hash", "password").unwrap().is_none());
+            assert!(!store.activate_user(1, "password").unwrap());
+            assert!(store.save_directory(&[]).is_err());
+            assert!(store
+                .issue_invite(1, "hash", "2099-01-01 00:00:00", 1)
+                .is_err());
+        }
     }
 
     mod regression_store_defaults {
@@ -3058,6 +3570,150 @@ mod tests {
         }
     }
 
+    mod security_report_store_defaults {
+        use super::*;
+
+        mock_for_subtrait!(MockSecurity, SecurityReportStore);
+
+        fn new_report() -> NewSecurityReport {
+            NewSecurityReport {
+                source: "helpscout".to_string(),
+                conversation_id: "1".to_string(),
+                short_id: "HS-1".to_string(),
+                mailbox_id: "249891".to_string(),
+                url: String::new(),
+                subject: String::new(),
+                reporter_email: None,
+                reporter_customer_id: None,
+                reported_at: Utc::now(),
+                customer_thread_count: 1,
+            }
+        }
+
+        #[test]
+        fn test_default_creators_are_unsupported() {
+            let store = MockSecurity;
+            assert!(store.upsert_security_report(&new_report()).is_err());
+            let vulnerability = NewSecurityVulnerability {
+                title: String::new(),
+                summary: String::new(),
+                embedding: Vec::new(),
+                repository: None,
+                severity: None,
+                state: VulnerabilityState::AwaitingFix,
+                first_report_id: 1,
+                first_reported_at: Utc::now(),
+                merge_commit: None,
+                merged_at: None,
+            };
+            assert!(store.create_security_vulnerability(&vulnerability).is_err());
+        }
+
+        #[test]
+        fn test_default_reads_are_empty() {
+            let store = MockSecurity;
+            assert!(store.get_security_report(1).unwrap().is_none());
+            assert!(store
+                .get_security_report_by_conversation("helpscout", "1")
+                .unwrap()
+                .is_none());
+            assert!(store
+                .list_security_reports(&SecurityReportFilter::default())
+                .unwrap()
+                .is_empty());
+            assert!(store.list_reports_for_vulnerability(1).unwrap().is_empty());
+            assert!(store.list_security_timeline(1).unwrap().is_empty());
+            assert!(store
+                .last_security_event(1, SecurityEventKind::Live)
+                .unwrap()
+                .is_none());
+            assert!(store.list_admin_confirmed_reports().unwrap().is_empty());
+            assert!(store.get_security_vulnerability(1).unwrap().is_none());
+            assert!(store
+                .find_security_vulnerability_by_first_report(1)
+                .unwrap()
+                .is_none());
+            assert!(store
+                .list_security_vulnerability_candidates(10)
+                .unwrap()
+                .is_empty());
+            assert!(store
+                .list_security_vulnerabilities(None)
+                .unwrap()
+                .is_empty());
+            assert!(store.list_security_replies(1).unwrap().is_empty());
+            assert!(store
+                .list_reports_with_unconfirmed_replies()
+                .unwrap()
+                .is_empty());
+            assert!(store.get_security_award(1).unwrap().is_none());
+            assert!(store.list_security_awards(None).unwrap().is_empty());
+        }
+
+        #[test]
+        fn test_default_writes_change_nothing() {
+            let store = MockSecurity;
+            let event = NewSecurityEvent::new(SecurityEventKind::AssessmentStarted);
+            assert!(!store
+                .transition_security_report(
+                    1,
+                    SecurityReportState::Received,
+                    SecurityReportState::Assessing,
+                    &SecurityReportChanges::default(),
+                    &event,
+                )
+                .unwrap());
+            assert!(!store
+                .transition_security_vulnerability(
+                    1,
+                    VulnerabilityState::AwaitingFix,
+                    VulnerabilityState::Fixing,
+                    &SecurityVulnerabilityChanges::default(),
+                    &event,
+                )
+                .unwrap());
+            assert_eq!(
+                store
+                    .release_stale_security_assessments(Duration::from_secs(1))
+                    .unwrap(),
+                0
+            );
+            assert!(!store.record_security_follow_up(1, 1, 2).unwrap());
+            assert!(store.record_security_event(Some(1), None, &event).is_ok());
+            assert!(!store.replace_first_reporter(1, 1, 2, Utc::now()).unwrap());
+            assert!(!store
+                .claim_security_reply(1, SecurityReplyKind::Confirmed, &event)
+                .unwrap());
+            assert!(!store
+                .complete_security_reply(
+                    1,
+                    SecurityReplyKind::Confirmed,
+                    DeliveryStatus::Sent,
+                    None,
+                    &event,
+                    None,
+                )
+                .unwrap());
+            assert!(!store
+                .confirm_security_reply(1, SecurityReplyKind::Confirmed, true, "admin")
+                .unwrap());
+            let award = NewSecurityAward {
+                campaign: "SecurityResearchers".to_string(),
+                credits: 100,
+            };
+            assert!(!store.prepare_security_award(1, 1, &award).unwrap());
+            assert!(!store
+                .update_security_award_status(
+                    1,
+                    &[AwardStatus::Prepared],
+                    AwardStatus::Awarded,
+                    None,
+                    None,
+                )
+                .unwrap());
+        }
+    }
+
     mod chat_store_defaults {
         use super::*;
 
@@ -3066,41 +3722,49 @@ mod tests {
         #[test]
         fn test_default_create_chat_session_succeeds() {
             let t = MockChat;
-            assert!(t.create_chat_session("session-1", None).is_ok());
-            assert!(t.create_chat_session("session-2", Some(42)).is_ok());
+            assert!(t.create_chat_session("session-1", None, None).is_ok());
+            assert!(t
+                .create_chat_session("session-2", Some(42), Some(7))
+                .is_ok());
+        }
+
+        const SCOPE: claudear_core::types::ChatSessionScope =
+            claudear_core::types::ChatSessionScope::OWNERLESS;
+
+        #[test]
+        fn test_default_get_chat_session_returns_none() {
+            let t = MockChat;
+            assert!(t.get_chat_session("session-1", &SCOPE).unwrap().is_none());
         }
 
         #[test]
-        fn test_default_save_chat_message_returns_zero() {
+        fn test_default_save_chat_message_saves_nothing() {
             let t = MockChat;
-            assert_eq!(
-                t.save_chat_message("session-1", "user", "hello", None)
-                    .unwrap(),
-                0
-            );
-            assert_eq!(
-                t.save_chat_message("session-1", "assistant", "hi", Some("[]"))
-                    .unwrap(),
-                0
-            );
+            assert!(t
+                .save_chat_message("session-1", &SCOPE, "user", "hello", None)
+                .unwrap()
+                .is_none());
         }
 
         #[test]
         fn test_default_get_chat_history_returns_empty() {
             let t = MockChat;
-            assert!(t.get_chat_history("session-1", 50).unwrap().is_empty());
+            assert!(t
+                .get_chat_history("session-1", &SCOPE, 50)
+                .unwrap()
+                .is_empty());
         }
 
         #[test]
         fn test_default_list_chat_sessions_returns_empty() {
             let t = MockChat;
-            assert!(t.list_chat_sessions().unwrap().is_empty());
+            assert!(t.list_chat_sessions(&SCOPE).unwrap().is_empty());
         }
 
         #[test]
-        fn test_default_delete_chat_session_succeeds() {
+        fn test_default_delete_chat_session_deletes_nothing() {
             let t = MockChat;
-            assert!(t.delete_chat_session("session-1").is_ok());
+            assert!(!t.delete_chat_session("session-1", &SCOPE).unwrap());
         }
 
         #[test]
@@ -3270,7 +3934,7 @@ mod tests {
         fn test_default_create_user_returns_zero() {
             let t = MockUserExt;
             assert_eq!(
-                t.create_user("user@example.com", "hash", "User", "admin")
+                t.create_user("user@example.com", "hash", "User", Role::Admin)
                     .unwrap(),
                 0
             );
@@ -3307,7 +3971,7 @@ mod tests {
                     None,
                     Some("hash"),
                     Some("Name"),
-                    Some("user"),
+                    Some(Role::Viewer),
                     Some("url")
                 )
                 .unwrap());
@@ -3463,8 +4127,11 @@ mod tests {
         #[test]
         fn test_default_count_issues_returns_zero() {
             let t = MockEmbeddingExt;
-            assert_eq!(t.count_issues(None).unwrap(), 0);
-            assert_eq!(t.count_issues(Some("source")).unwrap(), 0);
+            assert_eq!(t.count_issues(None, AttemptScope::All).unwrap(), 0);
+            assert_eq!(
+                t.count_issues(Some("source"), AttemptScope::All).unwrap(),
+                0
+            );
         }
 
         #[test]
@@ -3554,8 +4221,12 @@ mod tests {
         #[test]
         fn test_default_count_attempts_returns_zero() {
             let t = MockActivityExt;
-            assert_eq!(t.count_attempts(None, None).unwrap(), 0);
-            assert_eq!(t.count_attempts(Some("failed"), Some("sentry")).unwrap(), 0);
+            assert_eq!(t.count_attempts(None, None, AttemptScope::All).unwrap(), 0);
+            assert_eq!(
+                t.count_attempts(Some("failed"), Some("sentry"), AttemptScope::All)
+                    .unwrap(),
+                0
+            );
         }
 
         #[test]
@@ -3567,7 +4238,10 @@ mod tests {
         #[test]
         fn test_default_list_attempts_since_returns_empty() {
             let t = MockActivityExt;
-            assert!(t.list_attempts_since(Utc::now()).unwrap().is_empty());
+            assert!(t
+                .list_attempts_since(Utc::now(), AttemptScope::All)
+                .unwrap()
+                .is_empty());
         }
 
         #[test]
@@ -3607,7 +4281,7 @@ mod tests {
         fn test_default_get_activity_type_counts_since_returns_empty() {
             let t = MockActivityExt;
             assert!(t
-                .get_activity_type_counts_since(Utc::now())
+                .get_activity_type_counts_since(Utc::now(), AttemptScope::All)
                 .unwrap()
                 .is_empty());
         }
@@ -3616,7 +4290,7 @@ mod tests {
         fn test_default_get_metric_counts_since_returns_empty() {
             let t = MockActivityExt;
             assert!(t
-                .get_metric_counts_since(&["queue_depth"], Utc::now())
+                .get_metric_counts_since(&["queue_depth"], Utc::now(), AttemptScope::All)
                 .unwrap()
                 .is_empty());
         }
@@ -3625,7 +4299,7 @@ mod tests {
         fn test_default_get_metric_sums_since_returns_empty() {
             let t = MockActivityExt;
             assert!(t
-                .get_metric_sums_since(&["processing_time"], Utc::now())
+                .get_metric_sums_since(&["processing_time"], Utc::now(), AttemptScope::All)
                 .unwrap()
                 .is_empty());
         }
@@ -3634,7 +4308,7 @@ mod tests {
         fn test_default_get_metric_sums_by_source_since_returns_empty() {
             let t = MockActivityExt;
             assert!(t
-                .get_metric_sums_by_source_since(&["queue_depth"], Utc::now())
+                .get_metric_sums_by_source_since(&["queue_depth"], Utc::now(), AttemptScope::All)
                 .unwrap()
                 .is_empty());
         }
@@ -3909,10 +4583,6 @@ mod tests {
             assert!(t.add_dependency("upstream", "downstream", "npm").is_ok());
         }
     }
-
-    // -------------------------------------------------------------------
-    // parse_pr_url tests
-    // -------------------------------------------------------------------
 
     #[test]
     fn test_parse_pr_url_github() {

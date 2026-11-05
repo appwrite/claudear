@@ -24,7 +24,10 @@ jobs:
       FASTEMBED_CACHE_DIR: /home/runner/.cache/fastembed
       HF_HOME: /home/runner/.cache/fastembed
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
 
       - name: Install system dependencies
         run: sudo apt-get install -y mold
@@ -41,7 +44,7 @@ jobs:
         run: cargo binstall --no-confirm cargo-tarpaulin
 
       - name: Restore cargo cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
@@ -58,7 +61,7 @@ jobs:
         run: cargo tarpaulin --workspace --all-features --skip-clean --no-run
 
       - name: Save compiled cache
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: |
             ~/.cargo/bin
@@ -72,7 +75,10 @@ jobs:
     needs: [compile]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
 
       - name: Install system dependencies
         run: sudo apt-get install -y mold
@@ -83,7 +89,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Restore compiled cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/bin
@@ -104,6 +110,7 @@ jobs:
     name: Test (${{ matrix.crate }})
     needs: [compile]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -116,7 +123,10 @@ jobs:
           - claudear-integrations
           - claudear
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
 
       - name: Install system dependencies
         run: sudo apt-get install -y mold
@@ -125,7 +135,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Restore compiled cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/bin
@@ -139,7 +149,7 @@ jobs:
       - name: Cache fastembed model
         if: matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
         id: fastembed-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
           key: fastembed-nomic-embed-text-v1.5
@@ -166,7 +176,7 @@ jobs:
       # the prebuilt .so from the vectorlite-py wheel and point the loader at it
       # so the semantic-search tests exercise real, populated results.
       - name: Install vectorlite extension
-        if: matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
+        if: matrix.crate == 'claudear-storage' || matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
         run: |
           python3 -m pip install -q vectorlite-py
           # vectorlite_path() returns the path without a file extension, but the
@@ -184,7 +194,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: env.CODECOV_TOKEN != ''
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           fail_ci_if_error: true
           flags: ${{ matrix.crate }}
@@ -199,6 +209,9 @@ jobs:
       # The workflow-level RUSTFLAGS ask rustc for clang + mold, which neither
       # the macOS nor the MSVC toolchain has.
       RUSTFLAGS: "-Dwarnings"
+      # llama.cpp's vendored cpp-httplib does not compile against Homebrew's
+      # OpenSSL 4 (const X509_NAME), and Claudear never needs its HTTPS client.
+      CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -212,13 +225,13 @@ jobs:
             artifact: claudear-windows
             binary_path: target/release/claudear.exe
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -261,13 +274,13 @@ jobs:
       - name: Configure git
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -278,7 +291,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Cache fastembed model
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}\.cache\fastembed
           key: fastembed-nomic-v15-windows
@@ -307,7 +320,7 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2

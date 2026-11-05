@@ -5,12 +5,15 @@
 //! HMAC-SHA1 (base64) in the `X-HelpScout-Signature` header.
 
 use super::WebhookHandler;
+use crate::source::helpscout_matches_trigger_tags;
 use async_trait::async_trait;
 use base64::Engine;
 use claudear_config::config::HelpScoutConfig;
+use claudear_config::config::HELPSCOUT_SOURCE;
+use claudear_config::config::MAILBOX_ID_METADATA_KEY;
 use claudear_core::error::Result;
-use claudear_core::types::{Issue, MatchPriority, MatchResult};
-use hmac::{Hmac, Mac};
+use claudear_core::types::{Issue, MatchResult};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
@@ -48,7 +51,7 @@ impl HelpScoutWebhookHandler {
 #[async_trait]
 impl WebhookHandler for HelpScoutWebhookHandler {
     fn source_name(&self) -> &str {
-        "helpscout"
+        HELPSCOUT_SOURCE
     }
 
     fn verify_signature(&self, payload: &[u8], headers: &HashMap<String, String>) -> bool {
@@ -56,7 +59,7 @@ impl WebhookHandler for HelpScoutWebhookHandler {
             Some(s) => s,
             None => {
                 tracing::error!(
-                    source = "helpscout",
+                    source = HELPSCOUT_SOURCE,
                     "No webhook secret configured - rejecting request for security"
                 );
                 return false;
@@ -96,7 +99,7 @@ impl WebhookHandler for HelpScoutWebhookHandler {
             .unwrap_or_else(|| format!("Conversation {number}"));
         let url = format!("https://secure.helpscout.net/conversation/{id}");
 
-        let mut issue = Issue::new(id.to_string(), short_id, title, url, "helpscout");
+        let mut issue = Issue::new(id.to_string(), short_id, title, url, HELPSCOUT_SOURCE);
 
         // Latest customer thread body, else the preview.
         let body = payload
@@ -126,7 +129,7 @@ impl WebhookHandler for HelpScoutWebhookHandler {
 
         let tags = Self::extract_tags(payload);
         if let Some(mailbox_id) = payload.get("mailboxId").and_then(|v| v.as_u64()) {
-            issue.set_metadata("mailbox_id", mailbox_id.to_string());
+            issue.set_metadata(MAILBOX_ID_METADATA_KEY, mailbox_id.to_string());
         }
         issue.set_metadata("tags", &tags);
         issue.set_metadata("labels", &tags);
@@ -146,20 +149,17 @@ impl WebhookHandler for HelpScoutWebhookHandler {
     }
 
     fn matches_criteria(&self, issue: &Issue) -> MatchResult {
-        if self.config.trigger_tags.is_empty() {
-            return MatchResult::matched("No trigger tags configured", MatchPriority::Normal);
+        let mailbox_id: Option<String> = issue.get_metadata(MAILBOX_ID_METADATA_KEY);
+        if self.config.treats_as_security(mailbox_id.as_deref()) {
+            return MatchResult::not_matched(
+                "Security mailbox conversations are only handled by the security inbox",
+            );
         }
-        let tags: Vec<String> = issue.get_metadata("tags").unwrap_or_default();
-        let matched = self
-            .config
-            .trigger_tags
-            .iter()
-            .any(|trigger| tags.iter().any(|t| t.eq_ignore_ascii_case(trigger)));
-        if matched {
-            MatchResult::matched("Matches trigger tags", MatchPriority::Normal)
-        } else {
-            MatchResult::not_matched("No matching trigger tags")
-        }
+        let trigger_tags = match mailbox_id.as_deref() {
+            Some(mailbox) => self.config.trigger_tags_for(mailbox),
+            None => &self.config.trigger_tags,
+        };
+        helpscout_matches_trigger_tags(trigger_tags, issue)
     }
 
     async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
@@ -183,6 +183,7 @@ impl WebhookHandler for HelpScoutWebhookHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claudear_config::config::{HelpScoutMailboxConfig, MailboxProfile};
 
     fn config(secret: Option<&str>) -> HelpScoutConfig {
         HelpScoutConfig {
@@ -216,6 +217,96 @@ mod tests {
             Some("1")
         );
         assert!(handler.matches_criteria(&issue).matches);
+    }
+
+    fn security_config() -> HelpScoutConfig {
+        HelpScoutConfig {
+            mailbox_ids: vec!["249877".to_string()],
+            mailboxes: vec![
+                HelpScoutMailboxConfig {
+                    id: "249891".to_string(),
+                    profile: MailboxProfile::Security,
+                    reply_as: None,
+                    trigger_tags: Some(vec![]),
+                    trigger_status: None,
+                },
+                HelpScoutMailboxConfig {
+                    id: "300".to_string(),
+                    profile: MailboxProfile::Support,
+                    reply_as: None,
+                    trigger_tags: Some(vec!["vip".to_string()]),
+                    trigger_status: None,
+                },
+            ],
+            ..config(None)
+        }
+    }
+
+    fn conversation(mailbox_id: Option<&str>, tags: &[&str]) -> Issue {
+        let mut issue = Issue::new("42", "HS-7", "t", "u", "helpscout");
+        if let Some(mailbox_id) = mailbox_id {
+            issue.set_metadata("mailbox_id", mailbox_id);
+        }
+        let tags: Vec<String> = tags.iter().map(|tag| tag.to_string()).collect();
+        issue.set_metadata("tags", tags);
+        issue
+    }
+
+    #[test]
+    fn test_security_mailbox_conversation_is_not_matched() {
+        let handler = HelpScoutWebhookHandler::new(security_config());
+        assert!(
+            !handler
+                .matches_criteria(&conversation(Some("249891"), &["bug"]))
+                .matches
+        );
+        assert!(
+            !handler
+                .matches_criteria(&conversation(Some("249891"), &[]))
+                .matches
+        );
+    }
+
+    #[test]
+    fn test_missing_mailbox_id_fails_closed_with_security_mailbox() {
+        let handler = HelpScoutWebhookHandler::new(security_config());
+        assert!(
+            !handler
+                .matches_criteria(&conversation(None, &["bug"]))
+                .matches
+        );
+
+        let support_only = HelpScoutWebhookHandler::new(config(None));
+        assert!(
+            support_only
+                .matches_criteria(&conversation(None, &["bug"]))
+                .matches
+        );
+    }
+
+    #[test]
+    fn test_per_mailbox_trigger_tags() {
+        let handler = HelpScoutWebhookHandler::new(security_config());
+        assert!(
+            handler
+                .matches_criteria(&conversation(Some("249877"), &["bug"]))
+                .matches
+        );
+        assert!(
+            !handler
+                .matches_criteria(&conversation(Some("249877"), &["vip"]))
+                .matches
+        );
+        assert!(
+            handler
+                .matches_criteria(&conversation(Some("300"), &["VIP"]))
+                .matches
+        );
+        assert!(
+            !handler
+                .matches_criteria(&conversation(Some("300"), &["bug"]))
+                .matches
+        );
     }
 
     #[tokio::test]

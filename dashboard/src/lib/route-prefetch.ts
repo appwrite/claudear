@@ -1,14 +1,18 @@
 import { preload } from 'swr'
 import {
+  ADMIN_ROLE,
   fetchActivity,
   fetchAnalyticsSummary,
   fetchAttempts,
   fetchConfig,
+  fetchDeployQaStatus,
+  fetchDeployQaTips,
   fetchDependencies,
   fetchDiscordChannels,
   fetchDiscordChannelStats,
   fetchErrors,
   fetchExperiments,
+  fetchFeatures,
   fetchFeedback,
   fetchInferenceHistory,
   fetchInferenceStats,
@@ -20,12 +24,15 @@ import {
   fetchRegressions,
   fetchRepos,
   fetchRepoStats,
+  fetchSecurityReports,
+  fetchSecuritySummary,
   fetchTelemetryLatency,
   fetchTelemetryOverview,
   fetchTelemetryPipeline,
   fetchTelemetryTimeseries,
   fetchUsers,
   getRetries,
+  type Role,
 } from './api'
 
 const prefetchedRoutes = new Set<string>()
@@ -61,6 +68,10 @@ const routePrefetchers: Record<string, () => void> = {
       queuePreload(['prs', status], () => fetchPrs({ status: status || undefined }))
     }
   },
+  '/security': () => {
+    queuePreload('security-summary', fetchSecuritySummary)
+    queuePreload(['security-reports', '', ''], () => fetchSecurityReports())
+  },
   '/analytics': () => {
     queuePreload('analytics-summary', fetchAnalyticsSummary)
     queuePreload('processing-time-metrics', () =>
@@ -78,6 +89,10 @@ const routePrefetchers: Record<string, () => void> = {
       queuePreload(['regressions', status], () => fetchRegressions(status))
     }
   },
+  '/deploy-qa': () => {
+    queuePreload('deploy-qa-status', fetchDeployQaStatus)
+    queuePreload(['deploy-qa-tips', ''], () => fetchDeployQaTips(''))
+  },
   '/experiments': () => {
     queuePreload('experiments', fetchExperiments)
   },
@@ -89,6 +104,9 @@ const routePrefetchers: Record<string, () => void> = {
   '/channels': () => {
     queuePreload('discord-channels', fetchDiscordChannels)
     queuePreload('discord-channel-stats', fetchDiscordChannelStats)
+  },
+  '/integrations': () => {
+    queuePreload('features', fetchFeatures)
   },
   '/learning': () => {
     queuePreload('repos', fetchRepos)
@@ -122,9 +140,12 @@ const routePrefetchers: Record<string, () => void> = {
   },
 }
 
-export function prefetchRouteData(path: string) {
+const adminRoutes = new Set<string>(['/config', '/users'])
+
+export function prefetchRouteData(path: string, role?: Role) {
   const prefetch = routePrefetchers[path]
   if (!prefetch || prefetchedRoutes.has(path)) return
+  if (adminRoutes.has(path) && role !== ADMIN_ROLE) return
 
   prefetchedRoutes.add(path)
   prefetch()

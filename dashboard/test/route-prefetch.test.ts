@@ -127,7 +127,20 @@ function mockPrefetchPayload(requestUrl: string): unknown {
   if (requestUrl.includes("/api/telemetry/latency")) {
     return { period: "hour", buckets: [], summary: { p50_ms: null, p95_ms: null, p99_ms: null } };
   }
+  if (requestUrl.includes("/api/security/summary")) {
+    return {
+      reports_by_state: {},
+      reports_by_outcome: {},
+      vulnerabilities_by_state: {},
+      pending_awards: 0,
+      unconfirmed_replies: 0,
+    };
+  }
+  if (requestUrl.includes("/api/security/reports?")) return [];
   if (requestUrl.includes("/api/users")) return [];
+  if (requestUrl.includes("/api/deploy-qa/tips")) return { tips: [] };
+  if (requestUrl.endsWith("/api/deploy-qa")) return { enabled: false, tracks: [] };
+  if (requestUrl.endsWith("/api/features")) return { features: [] };
   return { ok: true };
 }
 
@@ -178,24 +191,27 @@ describe("prefetchRouteData", () => {
     prefetchRouteData!("/issues");
     prefetchRouteData!("/attempts");
     prefetchRouteData!("/prs");
+    prefetchRouteData!("/security");
     prefetchRouteData!("/analytics");
     prefetchRouteData!("/errors");
     prefetchRouteData!("/feedback");
     prefetchRouteData!("/regressions");
+    prefetchRouteData!("/deploy-qa");
+    prefetchRouteData!("/integrations");
     prefetchRouteData!("/experiments");
     prefetchRouteData!("/learning");
     prefetchRouteData!("/repos");
     prefetchRouteData!("/inference");
     prefetchRouteData!("/activity");
     prefetchRouteData!("/telemetry");
-    prefetchRouteData!("/config");
-    prefetchRouteData!("/users");
+    prefetchRouteData!("/config", "admin");
+    prefetchRouteData!("/users", "admin");
     prefetchRouteData!("/does-not-exist");
 
     await flushAsync();
 
     const initialUserCalls = calls.filter((call) => call.url.includes("/api/users")).length;
-    prefetchRouteData!("/users");
+    prefetchRouteData!("/users", "admin");
     prefetchRouteData!("/");
     prefetchRouteData!("/does-not-exist");
     await flushAsync();
@@ -208,6 +224,8 @@ describe("prefetchRouteData", () => {
     expect(calls.some((call) => call.url.includes("/api/issues?"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/attempts?"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/prs/analytics"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/api/security/summary"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/api/security/reports?"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/analytics/summary"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/metrics?"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/errors?limit=50"))).toBe(true);
@@ -220,6 +238,9 @@ describe("prefetchRouteData", () => {
     expect(calls.some((call) => call.url.includes("/api/inference/history?limit=50"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/activity?limit=200"))).toBe(true);
     expect(calls.some((call) => call.url.includes("/api/config"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/api/deploy-qa"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/api/deploy-qa/tips"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/api/features"))).toBe(true);
 
     const prsCalls = calls.filter((call) => call.url.includes("/api/prs?"));
     expect(prsCalls.length).toBe(4);
@@ -246,5 +267,34 @@ describe("prefetchRouteData", () => {
     expect(telemetryLatencyCalls.length).toBe(4);
     expect(telemetryTimeseriesCalls.some((call) => call.url.includes("period=hour"))).toBe(true);
     expect(telemetryTimeseriesCalls.some((call) => call.url.includes("bucket_minutes=360"))).toBe(true);
+  });
+
+  test("skips admin-only routes for viewers and anonymous users, then prefetches once an admin hovers", async () => {
+    prefetchRouteData!("/config", "viewer");
+    prefetchRouteData!("/users", "viewer");
+    prefetchRouteData!("/config");
+    prefetchRouteData!("/users");
+    prefetchRouteData!("/", "viewer");
+    await flushAsync();
+
+    expect(calls.some((call) => call.url.includes("/api/config"))).toBe(false);
+    expect(calls.some((call) => call.url.includes("/api/users"))).toBe(false);
+    expect(calls.some((call) => call.url.includes("/api/stats/overview"))).toBe(true);
+
+    prefetchRouteData!("/config", "admin");
+    prefetchRouteData!("/users", "admin");
+    await flushAsync();
+
+    expect(calls.filter((call) => call.url.includes("/api/config")).length).toBe(1);
+    expect(calls.filter((call) => call.url.includes("/api/users")).length).toBe(1);
+  });
+
+  test("preloads deploy qa status and tips for a viewer without touching the admin config", async () => {
+    prefetchRouteData!("/deploy-qa", "viewer");
+    await flushAsync();
+
+    expect(calls.filter((call) => call.url.endsWith("/api/deploy-qa")).length).toBe(1);
+    expect(calls.filter((call) => call.url.endsWith("/api/deploy-qa/tips")).length).toBe(1);
+    expect(calls.some((call) => call.url.includes("/api/deploy-qa/config"))).toBe(false);
   });
 });

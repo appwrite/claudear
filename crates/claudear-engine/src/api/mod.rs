@@ -3,16 +3,34 @@
 //! Provides REST API for the analytics dashboard.
 
 pub mod auth;
+mod chat;
+mod config_file;
+mod deploy_qa;
+mod directory;
 pub(crate) mod embedded;
+pub mod error;
+mod features;
+#[cfg(test)]
+pub(crate) mod fixture;
+mod identities;
+mod invites;
+mod rate_limit;
 mod routes;
 mod security;
+mod security_reports;
+#[cfg(test)]
+mod test_support;
 mod tokens;
+mod visibility;
 
+pub use chat::chat_state;
 pub use routes::{create_api_router, create_api_router_full, create_api_router_with_dashboard};
 
 use axum::http;
 use claudear_config::config::Config;
+use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
+use claudear_integrations::chat::ChatState;
 use claudear_storage::FixAttemptTracker;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use std::path::PathBuf;
@@ -35,15 +53,7 @@ pub fn apply_dashboard_middleware(router: axum::Router, tls_enabled: bool) -> ax
     // In production behind a reverse proxy, the proxy should handle CORS.
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin, _| {
-            if let Ok(origin_str) = origin.to_str() {
-                // Allow localhost and 127.0.0.1 on any port (common dev/local setup)
-                origin_str.starts_with("http://localhost")
-                    || origin_str.starts_with("https://localhost")
-                    || origin_str.starts_with("http://127.0.0.1")
-                    || origin_str.starts_with("https://127.0.0.1")
-            } else {
-                false
-            }
+            origin.to_str().is_ok_and(is_local_origin)
         }))
         .allow_methods([
             http::Method::GET,
@@ -69,6 +79,24 @@ pub fn apply_dashboard_middleware(router: axum::Router, tls_enabled: bool) -> ax
         .layer(CookieManagerLayer::new())
 }
 
+const LOCAL_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+
+/// Whether `origin` is `http(s)://` a loopback host on any port. The host must match
+/// exactly, so `http://localhost.attacker.com` is not local.
+fn is_local_origin(origin: &str) -> bool {
+    let Ok(uri) = origin.parse::<http::Uri>() else {
+        return false;
+    };
+    let scheme_is_web = matches!(uri.scheme_str(), Some("http" | "https"));
+    let bare_origin = uri.path_and_query().is_none_or(|path| path.as_str() == "/");
+    uri.authority().is_some_and(|authority| {
+        scheme_is_web
+            && bare_origin
+            && !authority.as_str().contains('@')
+            && LOCAL_HOSTS.contains(&authority.host())
+    })
+}
+
 /// API server configuration.
 pub struct ApiServer {
     config: Config,
@@ -76,6 +104,8 @@ pub struct ApiServer {
     port: u16,
     dashboard_dir: Option<PathBuf>,
     config_path: PathBuf,
+    registry: UserRegistry,
+    chat: Option<ChatState>,
 }
 
 impl ApiServer {
@@ -83,11 +113,13 @@ impl ApiServer {
     pub fn new(config: Config, tracker: Arc<dyn FixAttemptTracker>, config_path: PathBuf) -> Self {
         let port = config.webhook_port; // Reuse webhook port for now
         Self {
+            registry: UserRegistry::new(config.users.clone()),
             config,
             tracker,
             port,
             dashboard_dir: None,
             config_path,
+            chat: None,
         }
     }
 
@@ -99,11 +131,13 @@ impl ApiServer {
         config_path: PathBuf,
     ) -> Self {
         Self {
+            registry: UserRegistry::new(config.users.clone()),
             config,
             tracker,
             port,
             dashboard_dir: None,
             config_path,
+            chat: None,
         }
     }
 
@@ -116,33 +150,48 @@ impl ApiServer {
         config_path: PathBuf,
     ) -> Self {
         Self {
+            registry: UserRegistry::new(config.users.clone()),
             config,
             tracker,
             port,
             dashboard_dir: Some(dashboard_dir),
             config_path,
+            chat: None,
         }
+    }
+
+    /// Serve the given registry instead of one built from config, so the dashboard
+    /// shares the daemon's person directory and identity edits reach every consumer.
+    pub fn with_registry(mut self, registry: UserRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Serve the chat routes from `chat`; without it they are not mounted.
+    pub fn with_chat(mut self, chat: Option<ChatState>) -> Self {
+        self.chat = chat;
+        self
+    }
+
+    fn router(&self) -> axum::Router {
+        create_api_router_full(
+            self.config.clone(),
+            self.tracker.clone(),
+            self.config_path.clone(),
+            self.tracker.subscribe_indexing_progress(),
+            self.dashboard_dir.clone(),
+            self.chat.clone(),
+            self.registry.clone(),
+        )
     }
 
     /// Start the API server.
     pub async fn start(self) -> Result<()> {
-        // Subscribe to indexing progress from the tracker's watch channel
-        let indexing_rx = self.tracker.subscribe_indexing_progress();
-
         let tls_enabled = self.config.tls.enabled;
-        let app = apply_dashboard_middleware(
-            create_api_router_with_dashboard(
-                self.config.clone(),
-                self.tracker.clone(),
-                self.config_path,
-                indexing_rx,
-                self.dashboard_dir.clone(),
-            ),
-            tls_enabled,
-        )
-        // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
-        .layer(SentryHttpLayer::new().enable_transaction())
-        .layer(NewSentryLayer::new_from_top());
+        let app = apply_dashboard_middleware(self.router(), tls_enabled)
+            // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
+            .layer(SentryHttpLayer::new().enable_transaction())
+            .layer(NewSentryLayer::new_from_top());
 
         let tls_enabled = self.config.tls.enabled;
         let scheme = if tls_enabled { "https" } else { "http" };
@@ -215,5 +264,147 @@ impl ApiServer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use claudear_config::config::UserConfig;
+    use claudear_core::identity::Role;
+    use claudear_storage::SqliteTracker;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+
+    fn server(users: HashMap<String, UserConfig>) -> ApiServer {
+        let tracker: Arc<dyn FixAttemptTracker> =
+            Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
+        let config = Config {
+            users,
+            storage_dir: std::env::temp_dir().join("claudear-api-server-tests"),
+            ..Config::default()
+        };
+        ApiServer::with_port(config, tracker, 0, PathBuf::from("claudear.toml"))
+    }
+
+    #[tokio::test]
+    async fn identity_edits_through_the_server_reach_the_injected_registry() {
+        let server = server(HashMap::new());
+        let tracker = server.tracker.clone();
+        let admin = tracker
+            .create_user("admin@example.com", "unused-hash", "Admin", Role::Admin)
+            .expect("create admin");
+        let token = tracker
+            .create_session(admin, "2099-12-31 23:59:59")
+            .expect("create session");
+        let registry = UserRegistry::new(HashMap::new());
+        let notifier_view = registry.clone();
+        let router = server
+            .with_registry(registry.clone())
+            .router()
+            .layer(CookieManagerLayer::new());
+        assert!(notifier_view.resolve("github", "admin-gh").is_none());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/users/{admin}/identities"))
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={token}"))
+                    .body(Body::from(
+                        serde_json::json!({"github_usernames": ["admin-gh"]}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let resolved = notifier_view
+            .resolve("github", "admin-gh")
+            .expect("an HTTP identity edit must reach every holder of the registry");
+        assert_eq!(resolved.slug, format!("console-{admin}"));
+    }
+
+    #[test]
+    fn server_without_an_injected_registry_serves_config_people() {
+        let server = server(HashMap::from([(
+            "jake".to_string(),
+            UserConfig {
+                github_usernames: vec!["jakebarnby".to_string()],
+                ..UserConfig::default()
+            },
+        )]));
+
+        assert_eq!(
+            server
+                .registry
+                .resolve("github", "jakebarnby")
+                .map(|resolved| resolved.slug),
+            Some("jake".to_string())
+        );
+    }
+
+    #[test]
+    fn only_exact_loopback_hosts_are_local_origins() {
+        for origin in [
+            "http://localhost",
+            "http://localhost:5173",
+            "https://localhost:8443",
+            "http://127.0.0.1:3100",
+            "https://127.0.0.1",
+            "http://[::1]:3000",
+        ] {
+            assert!(is_local_origin(origin), "{origin} is local");
+        }
+        for origin in [
+            "http://localhost.attacker.com",
+            "https://127.0.0.1.attacker.com",
+            "http://localhostattacker.com",
+            "http://127.0.0.10",
+            "http://attacker.com",
+            "ftp://localhost",
+            "http://user@localhost",
+            "http://localhost/path",
+            "localhost:5173",
+            "null",
+            "",
+        ] {
+            assert!(!is_local_origin(origin), "{origin} is not local");
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_allows_credentials_only_for_loopback_origins() {
+        let router = apply_dashboard_middleware(
+            axum::Router::new().route("/api/ping", axum::routing::get(|| async { "pong" })),
+            false,
+        );
+        for (origin, allowed) in [
+            ("http://localhost:5173", true),
+            ("http://localhost.attacker.com", false),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("OPTIONS")
+                        .uri("/api/ping")
+                        .header("origin", origin)
+                        .header("access-control-request-method", "GET")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            let allowed_origin = response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok());
+            assert_eq!(allowed_origin, allowed.then_some(origin), "{origin}");
+        }
     }
 }

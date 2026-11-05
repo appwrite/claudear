@@ -32,7 +32,7 @@ jobs:
             binary_name: claudear.exe
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set version from tag (Unix)
         if: runner.os != 'Windows'
@@ -84,7 +84,7 @@ jobs:
           SENTRY_RELEASE: "claudear-dashboard@${{ steps.version.outputs.version }}"
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -104,6 +104,10 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          # llama.cpp's vendored cpp-httplib does not compile against Homebrew's
+          # OpenSSL 4 (const X509_NAME), and Claudear never needs its HTTPS client.
+          CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: ${{ matrix.os == 'macos-latest' }}
 
       - name: Package binary (Unix)
         if: runner.os != 'Windows'
@@ -137,7 +141,7 @@ jobs:
     name: Publish Docker Image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set version from tag
         id: version
@@ -193,7 +197,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(github.ref_name, '-') }}  # Skip prereleases
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Get version
         id: version
@@ -249,7 +253,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             arch: arm64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set version from tag
         id: version
@@ -303,7 +307,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(github.ref_name, '-') }}  # Skip prereleases
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install APT repository tools
         run: |

@@ -14,15 +14,18 @@ use claudear_analysis::qa::{
 };
 use claudear_analysis::repo::code_index::CodeSearchService;
 use claudear_analysis::repo::{worktree_path, GitOps};
-use claudear_config::config::Config;
+use claudear_config::config::{Config, MAILBOX_ID_METADATA_KEY};
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
+use claudear_core::security::{security_fix_worktree_key, SECURITY_FIX_SOURCE};
 use claudear_core::types::{
-    ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
+    ActionKind, ActivityLogEntry, AgentResult, AskRequest, ErrorPattern, Issue, ProcessingMetric,
     QaKnowledgeEntry, ReplyKind, RetrievalUsageRecord, TimelineEventStatus, TriageVerdict,
     VerifyResult,
 };
 use claudear_integrations::discord::DiscordClient;
+use claudear_integrations::distribution::Distributor;
+use claudear_integrations::distribution::PullRequestHost;
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
 use claudear_integrations::runner::{self, AgentRunner};
@@ -30,10 +33,12 @@ use claudear_integrations::scm::{PrReviewState, ReviewWatcher};
 use claudear_storage::{classify_error, compute_error_hash, FixAttemptTracker};
 use serde_json::json;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::intent::{Intent, IntentClassifier};
+use crate::security::{belongs_to_security_inbox, scrub_internal};
 
 /// Max concurrent agent calls when scoring retrieved chunks with the (opt-in)
 /// relevance judge — each call spawns an agent process, so keep the fan-out small.
@@ -157,6 +162,76 @@ pub(crate) fn refuse_live_qa_action(action: ActionKind) -> ProcessingOutcome {
     ProcessingOutcome::Failed {
         error: format!("{DEPLOY_QA_SOURCE} issues only run live QA; {action} is not permitted"),
     }
+}
+
+pub(crate) const SECURITY_REFUSAL: &str = "security reports are handled by the security inbox";
+
+/// Why a security fix stops before its agent runs when the fix prompt names
+/// the fix.
+const SECURITY_FIX_PROMPT_NOT_NEUTRAL: &str =
+    "The fix prompt names the security fix, so the fix agent was not run";
+
+/// Why a security fix stops when its agent asks for human input.
+const SECURITY_FIX_NEEDS_HUMAN: &str =
+    "The security fix agent needs human input, which security fixes never request";
+
+/// The outcome of refusing a security conversation or security fix on a
+/// generic path: only the security inbox may act on them.
+pub(crate) fn refuse_security_issue() -> ProcessingOutcome {
+    ProcessingOutcome::CompletedNoPr {
+        reason: SECURITY_REFUSAL.to_string(),
+    }
+}
+
+/// Whether `issue` is a security fix run, whose details must stay out of
+/// every generic side channel.
+fn is_security_fix(issue: &Issue) -> bool {
+    issue.source == SECURITY_FIX_SOURCE
+}
+
+/// The worktree `issue` is fixed in. A security fix's directory is named
+/// neutrally, because the fix agent sees it and may reuse it in a branch
+/// name on a public repository.
+fn issue_worktree_path(workspace: &Path, repo_name: &str, issue: &Issue) -> PathBuf {
+    if is_security_fix(issue) {
+        worktree_path(
+            workspace,
+            repo_name,
+            &security_fix_worktree_key(&issue.short_id),
+        )
+    } else {
+        worktree_path(workspace, repo_name, &issue.short_id)
+    }
+}
+
+/// Whether the fix `prompt` for the security fix `issue` names it, so the
+/// name could reach the pull request.
+fn names_security_fix(issue: &Issue, prompt: &str) -> bool {
+    let short_id = issue.short_id.trim();
+    !short_id.is_empty() && prompt.contains(short_id)
+}
+
+/// `text` as it may be stored or notified for `issue`: scrubbed of secrets
+/// and internal references for a security fix, unchanged otherwise.
+fn shareable_text(issue: &Issue, text: &str) -> String {
+    if is_security_fix(issue) {
+        scrub_internal(text)
+    } else {
+        text.to_string()
+    }
+}
+
+/// The title and body of a pull request opened from a pushed branch. A
+/// security fix gets neutral text that names neither the fix nor its source.
+fn pull_request_text(issue: &Issue, source_name: &str, head: &str) -> (String, String) {
+    let opened = format!("_PR opened automatically by claudear from pushed branch `{head}`._");
+    if is_security_fix(issue) {
+        return ("fix: apply hardening changes".to_string(), opened);
+    }
+    (
+        format!("Fix: {}", issue.title),
+        format!("Resolves {} ({}).\n\n{opened}", issue.short_id, source_name),
+    )
 }
 
 /// [`QA_SCRATCH_DIRECTORY`] under the system temp dir, created if missing.
@@ -621,12 +696,39 @@ fn build_verification_note(
     out
 }
 
-/// Prompt for the red phase: write a failing test only, no fix.
+/// Record the fix run's changelog and confidence on `issue` for the success
+/// notification. A security fix keeps only the confidence score: its
+/// changelog and reasoning are agent free text about the vulnerability.
+fn record_notification_details(issue: &mut Issue, result: &AgentResult) {
+    if result.confidence > 0 {
+        issue.set_metadata("confidence", result.confidence);
+    }
+    if is_security_fix(issue) {
+        return;
+    }
+    if let Some(ref changelog) = result.changelog {
+        issue.set_metadata("changelog", changelog.clone());
+    }
+    if let Some(ref reasoning) = result.confidence_reasoning {
+        issue.set_metadata("confidence_reasoning", reasoning.clone());
+    }
+}
+
+/// Prompt for the red phase: write a failing test only, no fix. A security
+/// fix names neither its source nor its id and title.
 fn build_failing_test_prompt(issue: &Issue, context: &str) -> String {
+    let (source, heading) = if is_security_fix(issue) {
+        (String::new(), String::new())
+    } else {
+        (
+            format!(" from {}", issue.source),
+            format!("Issue: {} - {}\n\n", issue.short_id, issue.title),
+        )
+    };
     format!(
-        "You are reproducing a bug from {source} by writing a FAILING test. Do NOT fix it yet.\n\n\
+        "You are reproducing a bug{source} by writing a FAILING test. Do NOT fix it yet.\n\n\
          {context}\n\n\
-         Issue: {short_id} - {title}\n\n\
+         {heading}\
          Instructions:\n\
          1. Analyze the issue and locate the relevant code.\n\
          2. Add a single new test that reproduces the bug. It MUST fail against the current, \
@@ -634,10 +736,9 @@ fn build_failing_test_prompt(issue: &Issue, context: &str) -> String {
          3. Do NOT modify any application/source code — only add the test.\n\
          4. Do NOT open a PR, commit, or push.\n\
          Stop once the failing test is written.",
-        source = issue.source,
+        source = source,
         context = context,
-        short_id = issue.short_id,
-        title = issue.title,
+        heading = heading,
     )
 }
 
@@ -774,6 +875,15 @@ impl IssueProcessor {
         input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
+        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &input.issue) {
+            tracing::warn!(
+                short_id = %input.issue.short_id,
+                source = %input.source_name,
+                "Refusing a security issue outside the security inbox"
+            );
+            return refuse_security_issue();
+        }
+
         // Release QA only reports: it must never enter the action, fix, or
         // customer-reply pipelines, whatever `[reply]` says.
         if AnswerRun::for_issue(&input.issue) == AnswerRun::LiveQa {
@@ -853,6 +963,55 @@ impl IssueProcessor {
         }
     }
 
+    /// Run the fix pipeline for a neutral security fix built by the security
+    /// inbox. Anything other than a [`SECURITY_FIX_SOURCE`] issue is refused,
+    /// and the outcome's free text is scrubbed before it leaves.
+    pub async fn run_security_fix(
+        &self,
+        input: ProcessingInput,
+        context_provider: &dyn ContextProvider,
+    ) -> ProcessingOutcome {
+        if !is_security_fix(&input.issue) {
+            return ProcessingOutcome::Failed {
+                error: format!(
+                    "run_security_fix only runs {SECURITY_FIX_SOURCE} issues, not {}",
+                    input.issue.source
+                ),
+            };
+        }
+        let outcome = match self.run_inner(input, context_provider).await {
+            Ok(ProcessingOutcome::WrongRepo {
+                original_repo,
+                suggested_repo,
+            }) => ProcessingOutcome::Failed {
+                error: format!(
+                    "Wrong repo detected (was: {}, suggested: {:?}), not retried",
+                    original_repo, suggested_repo
+                ),
+            },
+            Ok(outcome) => outcome,
+            Err(e) => ProcessingOutcome::Failed {
+                error: e.to_string(),
+            },
+        };
+        match outcome {
+            ProcessingOutcome::Failed { error } => ProcessingOutcome::Failed {
+                error: scrub_internal(&error),
+            },
+            ProcessingOutcome::CompletedNoPr { reason } => ProcessingOutcome::CompletedNoPr {
+                reason: scrub_internal(&reason),
+            },
+            outcome => outcome,
+        }
+    }
+
+    /// Record `issue`'s attempt as failed with `error`, scrubbed for a
+    /// security fix.
+    fn mark_failed(&self, source_name: &str, issue: &Issue, error: &str) -> Result<()> {
+        self.tracker
+            .mark_failed(source_name, &issue.id, &shareable_text(issue, error))
+    }
+
     async fn run_inner(
         &self,
         mut input: ProcessingInput,
@@ -877,9 +1036,7 @@ impl IssueProcessor {
             RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
             RepoResolution::Skip { reason } => {
                 let error = format!("Repository resolution failed: {}", reason);
-                self.tracker
-                    .mark_failed(source_name, &issue.id, &error)
-                    .ok();
+                self.mark_failed(source_name, issue, &error).ok();
                 return Ok(ProcessingOutcome::Failed { error });
             }
         };
@@ -900,9 +1057,7 @@ impl IssueProcessor {
                     Ok(branch) => branch,
                     Err(e) => {
                         let error = format!("Failed to fetch repository: {}", e);
-                        self.tracker
-                            .mark_failed(source_name, &issue.id, &error)
-                            .ok();
+                        self.mark_failed(source_name, issue, &error).ok();
                         return Ok(ProcessingOutcome::Failed { error });
                     }
                 };
@@ -946,7 +1101,7 @@ impl IssueProcessor {
             // Create per-issue worktree.
             // For review reruns, check out the actual PR branch so Claude can push
             // to it. For initial runs, use detached HEAD (Claude creates a new branch).
-            let wt_path = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
+            let wt_path = issue_worktree_path(&self.config.workspace, repo_name, issue);
             let wt_result = if let Some(ref branch) = existing_pr_branch {
                 GitOps::create_worktree_on_branch(&project_dir, &wt_path, branch, &checkout_ref)
                     .await
@@ -955,9 +1110,7 @@ impl IssueProcessor {
             };
             if let Err(e) = wt_result {
                 let error = format!("Failed to create worktree: {}", e);
-                self.tracker
-                    .mark_failed(source_name, &issue.id, &error)
-                    .ok();
+                self.mark_failed(source_name, issue, &error).ok();
                 return Ok(ProcessingOutcome::Failed { error });
             }
 
@@ -986,12 +1139,10 @@ impl IssueProcessor {
 
         // Build effective project dir (worktree or fallback)
         let effective_project_dir = if let Some(repo_name) = resolution.repo_name() {
-            let wt = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
+            let wt = issue_worktree_path(&self.config.workspace, repo_name, issue);
             if !wt.exists() {
                 let error = format!("Worktree disappeared after creation: {:?}", wt);
-                self.tracker
-                    .mark_failed(source_name, &issue.id, &error)
-                    .ok();
+                self.mark_failed(source_name, issue, &error).ok();
                 return Ok(ProcessingOutcome::Failed { error });
             }
             wt
@@ -1054,9 +1205,7 @@ impl IssueProcessor {
                     error.clone(),
                     json!({}),
                 );
-                self.tracker
-                    .mark_failed(source_name, &issue.id, &error)
-                    .ok();
+                self.mark_failed(source_name, issue, &error).ok();
                 self.cleanup_worktree(resolution, issue, &project_dir).await;
                 return Ok(ProcessingOutcome::Failed { error });
             } else {
@@ -1072,7 +1221,12 @@ impl IssueProcessor {
                     format!("Red phase: authoring failing test for {}", issue.short_id),
                     json!({}),
                 );
-                let (context, _discord_refs) = self.build_rag_context(issue, attempt_id).await;
+                let (mut context, _discord_refs) = self.build_rag_context(issue, attempt_id).await;
+                if is_security_fix(issue) {
+                    if let Ok(brief) = context_provider.build_issue_context(issue).await {
+                        context = format!("{brief}\n\n{context}");
+                    }
+                }
                 let context = self.prepend_operator_instructions(context, resolution.repo_name());
                 let prompt = build_failing_test_prompt(issue, &context);
                 match self
@@ -1113,9 +1267,7 @@ impl IssueProcessor {
                                 error.clone(),
                                 json!({}),
                             );
-                            self.tracker
-                                .mark_failed(source_name, &issue.id, &error)
-                                .ok();
+                            self.mark_failed(source_name, issue, &error).ok();
                             self.cleanup_worktree(resolution, issue, &project_dir).await;
                             return Ok(ProcessingOutcome::Failed { error });
                         }
@@ -1168,9 +1320,7 @@ impl IssueProcessor {
                             error.clone(),
                             json!({}),
                         );
-                        self.tracker
-                            .mark_failed(source_name, &issue.id, &error)
-                            .ok();
+                        self.mark_failed(source_name, issue, &error).ok();
                         self.cleanup_worktree(resolution, issue, &project_dir).await;
                         return Ok(ProcessingOutcome::Failed { error });
                     }
@@ -1186,7 +1336,7 @@ impl IssueProcessor {
         }
 
         // Semantic duplicate detection
-        if let Some(ref embedding_service) = self.issue_embedding_service {
+        if let Some(embedding_service) = self.embedding_service_for(issue) {
             if let Ok(Some(duplicate)) = embedding_service.check_duplicate(issue, source_name).await
             {
                 let similar_id = duplicate
@@ -1211,9 +1361,7 @@ impl IssueProcessor {
                     "Semantic duplicate of {} ({:.0}% similar)",
                     similar_id, similarity_pct
                 );
-                self.tracker
-                    .mark_failed(source_name, &issue.id, &error)
-                    .ok();
+                self.mark_failed(source_name, issue, &error).ok();
 
                 // Cleanup worktree before returning
                 self.cleanup_worktree(resolution, issue, &project_dir).await;
@@ -1333,11 +1481,8 @@ impl IssueProcessor {
                                 self.reindex_repo(repo_name, &new_project_dir).await;
 
                                 let checkout_ref = format!("origin/{}", detected_branch);
-                                let wt_path = worktree_path(
-                                    &self.config.workspace,
-                                    repo_name,
-                                    &issue.short_id,
-                                );
+                                let wt_path =
+                                    issue_worktree_path(&self.config.workspace, repo_name, issue);
                                 if let Err(e) = GitOps::create_worktree(
                                     &new_project_dir,
                                     &wt_path,
@@ -1370,10 +1515,8 @@ impl IssueProcessor {
 
         // Handle pipeline errors
         if let Err(ref e) = result {
-            let error_str = e.to_string();
-            self.tracker
-                .mark_failed(source_name, &issue.id, &error_str)
-                .ok();
+            let error_str = shareable_text(issue, &e.to_string());
+            self.mark_failed(source_name, issue, &error_str).ok();
             if let Some(id) = attempt_id {
                 let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, false);
             }
@@ -1478,7 +1621,7 @@ impl IssueProcessor {
                         }
 
                         // Post evaluation comment on PR
-                        if self.config.evaluation.post_pr_comment {
+                        if self.posts_pull_request_comments(issue) {
                             let pr_url = match &result {
                                 Ok(ProcessingOutcome::Success { pr_url }) => Some(pr_url.as_str()),
                                 _ => None,
@@ -1522,9 +1665,7 @@ impl IssueProcessor {
                     regression_reason.clone()
                 };
                 tracing::warn!(short_id = %issue.short_id, pr_url = %pr_url, "{}", error);
-                self.tracker
-                    .mark_failed(source_name, &issue.id, &error)
-                    .ok();
+                self.mark_failed(source_name, issue, &error).ok();
                 result = Ok(ProcessingOutcome::Failed { error });
             }
         }
@@ -1579,7 +1720,7 @@ impl IssueProcessor {
 
         // Find similar issues for context
         let similar_issues_context =
-            if let Some(ref embedding_service) = self.issue_embedding_service {
+            if let Some(embedding_service) = self.embedding_service_for(issue) {
                 match embedding_service.find_similar(issue, source_name).await {
                     Ok(similar) => {
                         self.record_timeline_event(
@@ -1723,7 +1864,7 @@ impl IssueProcessor {
         let mut used_qa_ids: Vec<i64> = Vec::new();
 
         // Preload reusable Q&A context
-        if self.config.ask.enabled {
+        if self.config.ask.enabled && !is_security_fix(issue) {
             let preload_query = format!("{} {}", issue.title, context);
             let preload_norm = normalize_text(&preload_query);
             let preload_embedding =
@@ -1786,7 +1927,7 @@ impl IssueProcessor {
 
         // Start the fix from the verify stage's diagnosis when it has real findings.
         // An unreproduced verdict is framed as proof otherwise and steers the fix off course.
-        if let Some(verdict) = diagnosis {
+        if let Some(verdict) = diagnosis.filter(|_| !is_security_fix(issue)) {
             if verdict.reproduced && diagnosis_has_details(verdict) {
                 context = format!("{}\n{}", build_diagnosis_context(verdict), context);
             }
@@ -1835,6 +1976,13 @@ impl IssueProcessor {
                 resolution.repo_name(),
             );
 
+            if is_security_fix(issue) && names_security_fix(issue, &prompt) {
+                let error = SECURITY_FIX_PROMPT_NOT_NEUTRAL.to_string();
+                tracing::error!(short_id = %issue.short_id, "{error}");
+                self.mark_failed(source_name, issue, &error).ok();
+                return Ok(ProcessingOutcome::Failed { error });
+            }
+
             let mut run_result = self
                 .agent
                 .execute_with_attempt(&prompt, Some(issue), attempt_id, effective_project_dir)
@@ -1848,6 +1996,10 @@ impl IssueProcessor {
                 (true, Some(q)) => q,
                 _ => break run_result,
             };
+
+            if is_security_fix(issue) {
+                return Ok(self.refuse_security_question(issue, source_name));
+            }
 
             if rounds >= self.config.ask.max_rounds_per_attempt {
                 run_result.success = false;
@@ -2180,18 +2332,11 @@ impl IssueProcessor {
             if let Some(ref pr_url) = effective_pr_url {
                 tracing::info!(short_id = %issue.short_id, pr_url = %pr_url, "Success! PR created");
                 self.tracker.mark_success(source_name, &issue.id, pr_url)?;
-                if existing_pr_branch.is_some() || review_feedback.is_some() {
+                let is_pr_update = existing_pr_branch.is_some() || review_feedback.is_some();
+                if is_pr_update {
                     issue.set_metadata("is_pr_update", true);
                 }
-                if let Some(ref changelog) = claude_result.changelog {
-                    issue.set_metadata("changelog", changelog.clone());
-                }
-                if claude_result.confidence > 0 {
-                    issue.set_metadata("confidence", claude_result.confidence);
-                }
-                if let Some(ref reasoning) = claude_result.confidence_reasoning {
-                    issue.set_metadata("confidence_reasoning", reasoning.clone());
-                }
+                record_notification_details(issue, &claude_result);
                 self.notifier.notify_success(issue, pr_url).await?;
                 if let Some(id) = attempt_id {
                     let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, true);
@@ -2239,8 +2384,12 @@ impl IssueProcessor {
                     }
                 }
 
+                if !is_pr_update {
+                    self.assign_opened_pr(pr_url, issue).await;
+                }
+
                 // Post confidence comment on PR
-                if self.config.evaluation.post_pr_comment && claude_result.confidence > 0 {
+                if self.posts_pull_request_comments(issue) && claude_result.confidence > 0 {
                     if let Some((ref repo, pr_number)) = claudear_storage::parse_pr_url(pr_url) {
                         if let Some(ref gh) = self.github_client {
                             let mut comment =
@@ -2261,7 +2410,7 @@ impl IssueProcessor {
                 }
 
                 // Store embedding for future similarity lookups
-                if let Some(ref embedding_service) = self.issue_embedding_service {
+                if let Some(embedding_service) = self.embedding_service_for(issue) {
                     if embedding_service
                         .embed_issue(issue, source_name)
                         .await
@@ -2321,11 +2470,12 @@ impl IssueProcessor {
                 } else {
                     claude_result.output.clone()
                 };
+                let reason = shareable_text(issue, &reason);
                 tracing::info!(short_id = %issue.short_id, reason = %reason, "Completed without PR");
                 issue.set_metadata("completion_reason", reason.clone());
-                self.tracker.mark_failed(
+                self.mark_failed(
                     source_name,
-                    &issue.id,
+                    issue,
                     &format!("Claude completed without creating a PR: {}", reason),
                 )?;
                 self.notifier.notify_completed(issue).await?;
@@ -2381,8 +2531,9 @@ impl IssueProcessor {
         } else {
             base_error.to_string()
         };
+        let error = shareable_text(issue, &error);
         tracing::error!(short_id = %issue.short_id, error = %error, "Failed");
-        self.tracker.mark_failed(source_name, &issue.id, &error)?;
+        self.mark_failed(source_name, issue, &error)?;
         self.record_timeline_event(
             issue,
             TimelineEventStatus::FixFailed,
@@ -2410,6 +2561,43 @@ impl IssueProcessor {
         record_error_pattern(&self.tracker, source_name, &issue.id, &error);
 
         Ok(ProcessingOutcome::Failed { error })
+    }
+
+    /// The issue-embedding service for `issue`: none for a security fix, so
+    /// its brief is never embedded, matched against or stored.
+    /// Whether evaluation and confidence comments are posted on `issue`'s
+    /// pull request. A security fix's pull request carries none.
+    fn posts_pull_request_comments(&self, issue: &Issue) -> bool {
+        self.config.evaluation.post_pr_comment && !is_security_fix(issue)
+    }
+
+    fn embedding_service_for(&self, issue: &Issue) -> Option<&IssueEmbeddingService> {
+        if is_security_fix(issue) {
+            return None;
+        }
+        self.issue_embedding_service.as_deref()
+    }
+
+    /// End a security fix whose agent asked for human input. Stored answers
+    /// and the ask-humans channel are never used for one, so the attempt
+    /// cannot be fixed automatically.
+    fn refuse_security_question(&self, issue: &Issue, source_name: &str) -> ProcessingOutcome {
+        let error = SECURITY_FIX_NEEDS_HUMAN.to_string();
+        tracing::warn!(short_id = %issue.short_id, "{error}");
+        if let Err(mark_error) = self.tracker.mark_cannot_fix(source_name, &issue.id, &error) {
+            tracing::warn!(
+                short_id = %issue.short_id,
+                error = %mark_error,
+                "Failed to mark a security fix as unfixable"
+            );
+        }
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::FixFailed,
+            format!("Fix failed for {}", issue.short_id),
+            json!({ "error": error }),
+        );
+        ProcessingOutcome::Failed { error }
     }
 
     /// Re-index a repository after fetching latest changes.
@@ -2452,7 +2640,7 @@ impl IssueProcessor {
         project_dir: &std::path::Path,
     ) {
         if let Some(repo_name) = resolution.repo_name() {
-            let wt_path = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
+            let wt_path = issue_worktree_path(&self.config.workspace, repo_name, issue);
             if wt_path.exists() {
                 if let Err(e) = GitOps::remove_worktree(project_dir, &wt_path).await {
                     tracing::warn!(
@@ -2938,6 +3126,14 @@ impl IssueProcessor {
         input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
+        if belongs_to_security_inbox(&self.config, self.tracker.as_ref(), &input.issue) {
+            tracing::warn!(
+                short_id = %input.issue.short_id,
+                %action,
+                "Refusing a manual action on a security issue"
+            );
+            return refuse_security_issue();
+        }
         if AnswerRun::for_issue(&input.issue) == AnswerRun::LiveQa {
             return refuse_live_qa_action(action);
         }
@@ -3067,6 +3263,32 @@ impl IssueProcessor {
         }
     }
 
+    /// Make a developer responsible for the PR just opened for `issue`,
+    /// logging any failure: the scheduled `[pr_distribution]` run assigns it
+    /// later instead.
+    async fn assign_opened_pr(&self, pr_url: &str, issue: &Issue) {
+        let Some(distributor) = Distributor::from_config(
+            &self.config,
+            &self.user_registry,
+            self.tracker.clone(),
+            self.github_client
+                .clone()
+                .map(|client| client as Arc<dyn PullRequestHost>),
+            self.notifier.clone(),
+        ) else {
+            return;
+        };
+        if let Err(error) = distributor.assign_opened(pr_url, issue).await {
+            tracing::warn!(
+                component = "pr_distribution",
+                short_id = %issue.short_id,
+                pr_url,
+                error = %error,
+                "Failed to assign opened PR"
+            );
+        }
+    }
+
     /// Turn a "create a PR" diff/compare link (branch pushed, no PR opened) into
     /// a real PR by opening it via the GitHub API. Returns the real PR URL, or
     /// `None` if it can't (no GitHub client/token, the link isn't a recognizable
@@ -3093,11 +3315,7 @@ impl IssueProcessor {
             },
         };
 
-        let title = format!("Fix: {}", issue.title);
-        let body = format!(
-            "Resolves {} ({}).\n\n_PR opened automatically by claudear from pushed branch `{}`._",
-            issue.short_id, source_name, intent.head
-        );
+        let (title, body) = pull_request_text(issue, source_name, &intent.head);
 
         match gh
             .create_pr(&intent.repo, &intent.head, &base, &title, &body)
@@ -3398,7 +3616,7 @@ impl IssueProcessor {
 
         // The inbox key is the HelpScout mailbox id when present, else the source.
         let inbox_key = issue
-            .get_metadata::<String>("mailbox_id")
+            .get_metadata::<String>(MAILBOX_ID_METADATA_KEY)
             .unwrap_or_else(|| source_name.to_string());
         let guideline = self.config.reply().template_for(Some(&inbox_key));
 
@@ -3704,43 +3922,55 @@ impl IssueProcessor {
                     }
                 }
             } else {
-                // Agent-based judge (external provider) via structured output. Each
-                // call spawns an agent process, so score chunks with a bounded
-                // concurrent fan-out rather than sequentially.
-                use futures::StreamExt;
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                let scored = AtomicUsize::new(0);
-                {
-                    let issue_summary = &issue_summary;
-                    let tracker = &tracker;
-                    let agent = agent.as_ref();
-                    let scored = &scored;
-                    futures::stream::iter(items.iter())
-                        .for_each_concurrent(RETRIEVAL_JUDGE_CONCURRENCY, |item| async move {
-                            if let Some(score) =
-                                crate::agent_classifier::score_chunk_relevance_via_agent(
-                                    agent,
-                                    issue_summary,
-                                    &item.text,
-                                )
-                                .await
-                            {
-                                match tracker.set_retrieval_quality(
-                                    attempt_id,
-                                    &item.source_kind,
-                                    &item.chunk_ref,
-                                    score,
-                                ) {
-                                    Ok(()) => {
-                                        scored.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    Err(e) => tracing::warn!(error = %e, "Failed to persist retrieval quality score"),
-                                }
-                            }
-                        })
-                        .await;
+                let chunks: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+                let judgment = crate::agent_classifier::judge_relevance_via_agent(
+                    agent.as_ref(),
+                    &issue_summary,
+                    &chunks,
+                    RETRIEVAL_JUDGE_CONCURRENCY,
+                )
+                .await;
+                let mut scored = 0usize;
+                for (index, score) in judgment.scores {
+                    let item = &items[index];
+                    match tracker.set_retrieval_quality(
+                        attempt_id,
+                        &item.source_kind,
+                        &item.chunk_ref,
+                        score,
+                    ) {
+                        Ok(()) => scored += 1,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to persist retrieval quality score")
+                        }
+                    }
                 }
-                scored.into_inner()
+                if let Some(error) = judgment.failure {
+                    tracing::warn!(
+                        short_id = %short_id,
+                        scored,
+                        total,
+                        error = %error,
+                        "Agent retrieval relevance judge failed; skipping the remaining chunks"
+                    );
+                    record_scoring_event(
+                        &tracker,
+                        &source,
+                        &issue_id,
+                        &short_id,
+                        TimelineEventStatus::RetrievalScoringFailed,
+                        format!("Retrieval scoring failed for {short_id}: {error}"),
+                        json!({
+                            "backend": backend,
+                            "reason": "agent_error",
+                            "error": error.to_string(),
+                            "scored": scored,
+                            "total": total,
+                        }),
+                    );
+                    return;
+                }
+                scored
             };
 
             record_scoring_event(
@@ -4015,6 +4245,9 @@ pub fn record_error_pattern(
     issue_id: &str,
     error_msg: &str,
 ) {
+    if source == SECURITY_FIX_SOURCE {
+        return;
+    }
     let error_type = classify_error(error_msg);
     let pattern_hash = compute_error_hash(error_msg);
 
@@ -4036,6 +4269,7 @@ pub async fn notify_failed_with_escalation(
     issue: &Issue,
     error: &str,
 ) -> Result<()> {
+    let error = &shareable_text(issue, error);
     if runner::is_hard_error(error) {
         let mut global_issue = issue.clone();
         global_issue.metadata.remove("resolved_user");
@@ -4088,6 +4322,9 @@ pub async fn record_feedback_outcome(
     issue: &Issue,
     outcome: Outcome,
 ) {
+    if source_name == SECURITY_FIX_SOURCE || is_security_fix(issue) {
+        return;
+    }
     let attempt = match tracker.get_attempt(source_name, &issue.id) {
         Ok(Some(attempt)) => attempt,
         _ => return,
@@ -4124,6 +4361,9 @@ pub async fn record_feedback_outcome(
         tracing::warn!(error = %e, "Failed to record feedback outcome in memory");
     }
 }
+
+#[cfg(test)]
+mod security_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7215,6 +7455,23 @@ mod tests {
         assert!(
             !directories[0].exists(),
             "a dropped run's directory must be removed with it: {directories:?}"
+        );
+    }
+
+    #[test]
+    fn test_deploy_qa_directory_name_flattens_a_slashed_tag() {
+        for short_id in ["console-apps/console/1.2.141", "console-../../etc"] {
+            let prefix = live_qa_directory_prefix(short_id);
+            assert!(
+                !prefix.contains('/'),
+                "a tag's '/' must never nest or escape the run directory: {prefix}"
+            );
+            let base = std::path::Path::new("/workspace").join(LIVE_QA_DIRECTORY);
+            assert_eq!(base.join(&prefix).parent(), Some(base.as_path()));
+        }
+        assert_eq!(
+            live_qa_directory_prefix("console-apps/console/1.2.141"),
+            "console-apps_console_1.2.141-"
         );
     }
 

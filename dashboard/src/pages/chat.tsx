@@ -4,24 +4,36 @@ import { ChatMessage } from '../components/chat/ChatMessage'
 import { ChatInput } from '../components/chat/ChatInput'
 import { ChatSessions } from '../components/chat/ChatSessions'
 import { ModelStatus } from '../components/chat/ModelStatus'
-import { useChat, fetchChatSessions, deleteChatSession, type ChatSession } from '../lib/chat'
+import { ChatDisabledNotice } from '../components/chat/ChatDisabledNotice'
+import {
+  useChat,
+  useChatAvailability,
+  fetchChatSessions,
+  deleteChatSession,
+  isChatDisabled,
+  type ChatSession,
+} from '../lib/chat'
 import { MessageSquareCode, PanelLeftClose, PanelLeft } from 'lucide-react'
 
 export default function ChatPage() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
-  const { messages, sendMessage, stopStreaming, isStreaming, isConnected, error, sessionId, clearMessages } =
-    useChat()
-
+  const chat = useChatAvailability()
   const {
     data: sessions,
+    error: sessionsError,
     mutate: mutateSessions,
-  } = useSWR<ChatSession[]>('chat-sessions', fetchChatSessions, {
+  } = useSWR<ChatSession[]>(chat.enabled ? 'chat-sessions' : null, fetchChatSessions, {
     refreshInterval: 10000,
   })
+  const disabled = chat.disabled || isChatDisabled(sessionsError)
+  const available = sessions !== undefined && !disabled
+  const failed = !available && !disabled && (chat.error ?? sessionsError) !== undefined
 
-  // Auto-scroll on new messages
+  const { messages, sendMessage, stopStreaming, isStreaming, isConnected, error, sessionId, clearMessages } =
+    useChat(undefined, available)
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
@@ -46,7 +58,6 @@ export default function ChatPage() {
 
   return (
     <div className="h-[calc(100vh-theme(spacing.14)-theme(spacing.12))] flex flex-col -m-6">
-      {/* Header */}
       <div className="flex items-center justify-between px-6 py-3 border-b bg-card">
         <div className="flex items-center gap-3">
           <button
@@ -60,61 +71,66 @@ export default function ChatPage() {
             <MessageSquareCode className="h-5 w-5" />
             Chat
           </h1>
-          {!isConnected && (
+          {available && !isConnected && (
             <span className="text-xs text-destructive">Disconnected</span>
           )}
         </div>
         <ModelStatus />
       </div>
 
-      {/* Body */}
-      <div className="flex-1 flex min-h-0">
-        {/* Sessions sidebar */}
-        {sidebarOpen && (
-          <div className="w-56 border-r bg-card shrink-0">
-            <ChatSessions
-              sessions={sessions ?? []}
-              activeSessionId={sessionId}
-              onSelectSession={handleSelectSession}
-              onNewSession={handleNewSession}
-              onDeleteSession={handleDeleteSession}
+      {disabled ? (
+        <div className="flex-1 flex items-center justify-center">
+          <ChatDisabledNotice />
+        </div>
+      ) : failed ? (
+        <div className="flex-1 flex items-center justify-center">
+          <div className="text-destructive text-sm">Failed to load chat sessions.</div>
+        </div>
+      ) : (
+        <div className="flex-1 flex min-h-0">
+          {sidebarOpen && (
+            <div className="w-56 border-r bg-card shrink-0">
+              <ChatSessions
+                sessions={sessions ?? []}
+                activeSessionId={sessionId}
+                onSelectSession={handleSelectSession}
+                onNewSession={handleNewSession}
+                onDeleteSession={handleDeleteSession}
+              />
+            </div>
+          )}
+
+          <div className="flex-1 flex flex-col min-w-0">
+            <div className="flex-1 overflow-y-auto p-6 space-y-4">
+              {messages.length === 0 ? (
+                <EmptyChat />
+              ) : (
+                messages.map((msg, i) => (
+                  <ChatMessage
+                    key={i}
+                    message={msg}
+                    isStreaming={isStreaming && i === messages.length - 1 && msg.role === 'assistant'}
+                  />
+                ))
+              )}
+              {error && (
+                <div className="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-2 text-sm text-destructive">
+                  {error}
+                </div>
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+
+            <ChatInput
+              onSend={sendMessage}
+              onStop={stopStreaming}
+              isStreaming={isStreaming}
+              disabled={!isConnected}
+              placeholder={isConnected ? 'Ask about your code...' : 'Connecting...'}
             />
           </div>
-        )}
-
-        {/* Chat area */}
-        <div className="flex-1 flex flex-col min-w-0">
-          {/* Messages */}
-          <div className="flex-1 overflow-y-auto p-6 space-y-4">
-            {messages.length === 0 ? (
-              <EmptyChat />
-            ) : (
-              messages.map((msg, i) => (
-                <ChatMessage
-                  key={i}
-                  message={msg}
-                  isStreaming={isStreaming && i === messages.length - 1 && msg.role === 'assistant'}
-                />
-              ))
-            )}
-            {error && (
-              <div className="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-2 text-sm text-destructive">
-                {error}
-              </div>
-            )}
-            <div ref={messagesEndRef} />
-          </div>
-
-          {/* Input */}
-          <ChatInput
-            onSend={sendMessage}
-            onStop={stopStreaming}
-            isStreaming={isStreaming}
-            disabled={!isConnected}
-            placeholder={isConnected ? 'Ask about your code...' : 'Connecting...'}
-          />
         </div>
-      </div>
+      )}
     </div>
   )
 }

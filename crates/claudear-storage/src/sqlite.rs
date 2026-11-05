@@ -1,64 +1,80 @@
 //! SQLite-based fix attempt tracker and analytics storage.
 
 use super::types::{
-    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
-    DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,
-    PurgeResult, StoredDependency, StoredDiscordChannel, StoredIndexedRepo, StoredPrReviewComment,
-    StoredRepository, UserRow,
+    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts, DirectoryUser,
+    DirectoryWrite, DiscordKnowledgebaseStats, IdentityWrite, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, InviteRow, PurgeResult, StoredDependency,
+    StoredDiscordChannel, StoredIndexedRepo, StoredPrReviewComment, StoredRepository, UserRow,
 };
 use super::{
-    is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
-    DeployQaStore, DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
-    RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
+    ActivityStore, AttemptScope, AttemptTracker, ChatStore, DeployQaStore, DiscordStore,
+    EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore, PrAssignmentStore,
+    RegressionStore, RepoStore, SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
 };
+use crate::vector_index::catalog::Catalog;
+use crate::vector_index::progress::Progress;
+use crate::vector_index::{embedding_blob, embedding_from_blob, REBUILD_BATCH_SIZE};
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
+use claudear_core::identity::{
+    normalize_login_email, ConsoleIdentity, Identities, IdentityField, Role, UserStatus,
+};
+use claudear_core::security::{
+    AwardStatus, DeliveryStatus, NewSecurityAward, NewSecurityEvent, NewSecurityReport,
+    NewSecurityVulnerability, ReportTransition, SecurityAward, SecurityEvent, SecurityEventKind,
+    SecurityReply, SecurityReplyKind, SecurityReport, SecurityReportChanges, SecurityReportFilter,
+    SecurityReportState, SecurityVulnerability, SecurityVulnerabilityCandidate,
+    SecurityVulnerabilityChanges, VulnerabilityState,
+};
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
     ExperimentProviderStats, FixAttempt, FixAttemptStats, FixAttemptStatus, FixOutcome,
     IssueEmbedding, IssueTimeline, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment,
-    QaKnowledgeEntry, QaMatch, RetrievalUsageRecord, SimilarIssue, SourceStats, TimelineEvent,
+    QaKnowledgeEntry, QaMatch, RetrievalUsageRecord, SimilarIssue, TimelineEvent,
 };
+use parking_lot::{Mutex, MutexGuard};
 use rand::RngExt;
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod scope;
+mod security_reports;
+mod vector_index_rebuilder;
+
+pub use vector_index_rebuilder::VectorIndexRebuilder;
 
 const DEFAULT_LOG_DIR: &str = "./logs";
 const AUDIT_LOG_SUBDIR: &str = "audit";
-const QA_VECTOR_TABLE: &str = "qa_question_embeddings";
 const QA_VECTOR_EF_SEARCH: usize = 200;
 const QA_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const ISSUE_VECTOR_TABLE: &str = "issue_embedding_vectors";
 const ISSUE_VECTOR_EF_SEARCH: usize = 200;
 const ISSUE_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const OUTCOME_VECTOR_TABLE: &str = "outcome_embedding_vectors";
 const OUTCOME_VECTOR_EF_SEARCH: usize = 200;
 const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
 const CODE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-const DISCORD_MESSAGE_CHUNK_VECTOR_TABLE: &str = "discord_message_chunk_vectors";
 const DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
-/// Maximum allowed embedding dimension to prevent malformed data from generating
-/// unbounded DDL strings. Covers all common embedding models (up to 8192-dim).
-const MAX_EMBEDDING_DIMENSION: usize = 16384;
-
-/// Validate that an embedding dimension is within safe bounds for SQL DDL interpolation.
-fn validate_dimension(dimension: usize) -> Result<()> {
-    if dimension == 0 || dimension > MAX_EMBEDDING_DIMENSION {
-        return Err(claudear_core::error::Error::storage(format!(
-            "Embedding dimension {} is out of valid range (1..={})",
-            dimension, MAX_EMBEDDING_DIMENSION
-        )));
-    }
-    Ok(())
-}
+/// Every column [`UserRow::from_row`] reads, in order.
+const USER_COLUMNS: &str =
+    "id, email, password_hash, name, role, avatar_url, created_at, updated_at, status";
+/// [`USER_COLUMNS`] qualified with the `u` alias, for joins.
+const QUALIFIED_USER_COLUMNS: &str =
+    "u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at, u.status";
+/// Every column [`InviteRow::from_row_at`] reads, in order, qualified with the `i` alias.
+const QUALIFIED_INVITE_COLUMNS: &str =
+    "i.id, i.user_id, i.token_hash, i.created_by, i.created_at, i.expires_at, i.accepted_at, i.revoked_at";
+/// Number of columns in [`USER_COLUMNS`], where invite columns start after a user join.
+const USER_COLUMN_COUNT: usize = 9;
+/// `chat_sessions` rows within a `ChatSessionScope` bound as
+/// `:owner_user_id`, `:include_ownerless` and `:include_other_owners`.
+const CHAT_SESSION_IN_SCOPE: &str = "(owner_user_id = :owner_user_id \
+     OR (:include_ownerless AND owner_user_id IS NULL) \
+     OR (:include_other_owners AND owner_user_id IS NOT NULL))";
 
 impl UserRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -67,12 +83,285 @@ impl UserRow {
             email: row.get(1)?,
             password_hash: row.get(2)?,
             name: row.get(3)?,
-            role: row.get(4)?,
+            role: read_role(row, 4)?,
             avatar_url: row.get(5)?,
             created_at: row.get(6)?,
             updated_at: row.get(7)?,
+            status: read_status(row, 8)?,
         })
     }
+}
+
+impl InviteRow {
+    fn from_row_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(offset)?,
+            user_id: row.get(offset + 1)?,
+            token_hash: row.get(offset + 2)?,
+            created_by: row.get(offset + 3)?,
+            created_at: row.get(offset + 4)?,
+            expires_at: row.get(offset + 5)?,
+            accepted_at: row.get(offset + 6)?,
+            revoked_at: row.get(offset + 7)?,
+        })
+    }
+}
+
+fn read_status(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<UserStatus> {
+    let value: String = row.get(index)?;
+    value.parse().map_err(|error: String| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, error.into())
+    })
+}
+
+/// A stored role this build does not know is read as a viewer, so a corrupt or
+/// future value can never grant admin.
+fn read_role(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Role> {
+    let value: String = row.get(index)?;
+    Ok(value.parse().unwrap_or_else(|_| {
+        tracing::warn!("Unknown stored role; treating the user as a viewer");
+        Role::Viewer
+    }))
+}
+
+fn read_list(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Vec<String>> {
+    let value: String = row.get(index)?;
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+/// Read the twelve identity columns starting at `offset`, in `user_identities` order.
+fn read_identities(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Identities> {
+    Ok(Identities {
+        linear_names: read_list(row, offset)?,
+        github_usernames: read_list(row, offset + 1)?,
+        sentry_usernames: read_list(row, offset + 2)?,
+        jira_usernames: read_list(row, offset + 3)?,
+        gitlab_usernames: read_list(row, offset + 4)?,
+        discord_id: row.get(offset + 5)?,
+        slack_id: row.get(offset + 6)?,
+        email: row.get(offset + 7)?,
+        push_user_key: row.get(offset + 8)?,
+        sms_number: row.get(offset + 9)?,
+        whatsapp_number: row.get(offset + 10)?,
+        telegram_chat_id: row.get(offset + 11)?,
+    })
+}
+
+fn read_user(connection: &Connection, user_id: i64) -> rusqlite::Result<UserRow> {
+    connection.query_row(
+        &format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?1"),
+        params![user_id],
+        UserRow::from_row,
+    )
+}
+
+/// The error a write gets when another user already has the login email, worded like
+/// SQLite's own `UNIQUE` violation so callers detect both the same way.
+const DUPLICATE_LOGIN_EMAIL: &str = "UNIQUE constraint failed: users.email";
+
+/// Fail with [`DUPLICATE_LOGIN_EMAIL`] when a user other than `except` has `email`,
+/// compared case-insensitively so rows stored before normalization still collide.
+fn ensure_login_email_available(
+    connection: &Connection,
+    email: &str,
+    except: Option<i64>,
+) -> Result<()> {
+    let taken: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM users WHERE lower(email) = lower(?1) AND (?2 IS NULL OR id != ?2)
+         )",
+        params![email, except],
+        |row| row.get(0),
+    )?;
+    if taken {
+        return Err(claudear_core::error::Error::Database(
+            DUPLICATE_LOGIN_EMAIL.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+const CONSOLE_IDENTITY_SELECT: &str = "SELECT ui.user_id, u.email, u.name, ui.slug,
+            ui.linear_names, ui.github_usernames, ui.sentry_usernames, ui.jira_usernames,
+            ui.gitlab_usernames, ui.discord_id, ui.slack_id, ui.email, ui.push_user_key,
+            ui.sms_number, ui.whatsapp_number, ui.telegram_chat_id, ui.updated_at
+     FROM user_identities ui
+     JOIN users u ON u.id = ui.user_id";
+
+fn read_console_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConsoleIdentity> {
+    Ok(ConsoleIdentity {
+        user_id: row.get(0)?,
+        login_email: row.get(1)?,
+        name: row.get(2)?,
+        slug: row.get(3)?,
+        identities: read_identities(row, 4)?,
+        updated_at: row.get(16)?,
+    })
+}
+
+fn read_invite(connection: &Connection, id: &str) -> rusqlite::Result<InviteRow> {
+    connection.query_row(
+        &format!("SELECT {QUALIFIED_INVITE_COLUMNS} FROM user_invites i WHERE i.id = ?1"),
+        params![id],
+        |row| InviteRow::from_row_at(row, 0),
+    )
+}
+
+/// Create the user or apply its sparse update, returning the user id.
+fn write_directory_user(connection: &Connection, user: &DirectoryUser) -> Result<i64> {
+    match user {
+        DirectoryUser::Existing {
+            user_id,
+            name,
+            role,
+        } => {
+            let updated = connection.execute(
+                "UPDATE users SET name = COALESCE(?2, name), role = COALESCE(?3, role),
+                     updated_at = CASE WHEN ?2 IS NULL AND ?3 IS NULL THEN updated_at ELSE datetime('now') END
+                 WHERE id = ?1",
+                params![user_id, name, role.map(Role::as_str)],
+            )?;
+            if updated == 0 {
+                return Err(claudear_core::error::Error::Database(format!(
+                    "user {user_id} does not exist"
+                )));
+            }
+            Ok(*user_id)
+        }
+        DirectoryUser::New {
+            email,
+            name,
+            role,
+            password_hash,
+            status,
+        } => {
+            let email = normalize_login_email(email);
+            ensure_login_email_available(connection, &email, None)?;
+            connection.execute(
+                "INSERT INTO users (email, password_hash, name, role, status) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![email, password_hash, name, role.as_str(), status.as_str()],
+            )?;
+            Ok(connection.last_insert_rowid())
+        }
+    }
+}
+
+/// Replace the user's identities row, bumping `updated_at`.
+fn write_identities(connection: &Connection, user_id: i64, write: &IdentityWrite) -> Result<()> {
+    let identities = &write.identities;
+    connection.execute(
+        "INSERT INTO user_identities (
+             user_id, slug, linear_names, github_usernames, sentry_usernames, jira_usernames,
+             gitlab_usernames, discord_id, slack_id, email, push_user_key, sms_number,
+             whatsapp_number, telegram_chat_id, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, datetime('now'))
+         ON CONFLICT(user_id) DO UPDATE SET
+             slug = excluded.slug,
+             linear_names = excluded.linear_names,
+             github_usernames = excluded.github_usernames,
+             sentry_usernames = excluded.sentry_usernames,
+             jira_usernames = excluded.jira_usernames,
+             gitlab_usernames = excluded.gitlab_usernames,
+             discord_id = excluded.discord_id,
+             slack_id = excluded.slack_id,
+             email = excluded.email,
+             push_user_key = excluded.push_user_key,
+             sms_number = excluded.sms_number,
+             whatsapp_number = excluded.whatsapp_number,
+             telegram_chat_id = excluded.telegram_chat_id,
+             updated_at = excluded.updated_at",
+        params![
+            user_id,
+            write.slug,
+            serde_json::to_string(&identities.linear_names)?,
+            serde_json::to_string(&identities.github_usernames)?,
+            serde_json::to_string(&identities.sentry_usernames)?,
+            serde_json::to_string(&identities.jira_usernames)?,
+            serde_json::to_string(&identities.gitlab_usernames)?,
+            identities.discord_id,
+            identities.slack_id,
+            identities.email,
+            identities.push_user_key,
+            identities.sms_number,
+            identities.whatsapp_number,
+            identities.telegram_chat_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Drop every handle the user claims, so a rewrite can claim its new set.
+fn release_handles(connection: &Connection, user_id: i64) -> rusqlite::Result<usize> {
+    connection.execute(
+        "DELETE FROM user_handles WHERE user_id = ?1",
+        params![user_id],
+    )
+}
+
+/// Claim the user's exclusive handles in comparison form. A handle another user holds
+/// fails with [`crate::DUPLICATE_HANDLE`].
+fn claim_handles(connection: &Connection, user_id: i64, identities: &Identities) -> Result<()> {
+    let handles: HashSet<(IdentityField, String)> = IdentityField::EXCLUSIVE
+        .into_iter()
+        .flat_map(|field| {
+            identities
+                .values(field)
+                .into_iter()
+                .map(move |value| (field, field.comparison_key(value)))
+        })
+        .collect();
+    let mut statement = connection
+        .prepare_cached("INSERT INTO user_handles (user_id, field, value) VALUES (?1, ?2, ?3)")?;
+    for (field, value) in &handles {
+        statement.execute(params![user_id, field.as_str(), value])?;
+    }
+    Ok(())
+}
+
+/// Revoke every open invite of the user, expired or not.
+fn revoke_open_invites(connection: &Connection, user_id: i64) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE user_invites SET revoked_at = datetime('now')
+         WHERE user_id = ?1 AND accepted_at IS NULL AND revoked_at IS NULL",
+        params![user_id],
+    )
+}
+
+/// Revoke the user's open invite and insert a new one, returning its id.
+fn replace_invite(
+    connection: &Connection,
+    user_id: i64,
+    token_hash: &str,
+    expires_at: &str,
+    created_by: i64,
+) -> rusqlite::Result<String> {
+    revoke_open_invites(connection, user_id)?;
+    let id = generate_row_id();
+    connection.execute(
+        "INSERT INTO user_invites (id, user_id, token_hash, created_by, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, user_id, token_hash, created_by, expires_at],
+    )?;
+    Ok(id)
+}
+
+/// Set the password and status active, and revoke open invites. False if the user is missing.
+fn activate(connection: &Connection, user_id: i64, password_hash: &str) -> rusqlite::Result<bool> {
+    let updated = connection.execute(
+        "UPDATE users SET password_hash = ?2, status = ?3, updated_at = datetime('now') WHERE id = ?1",
+        params![user_id, password_hash, UserStatus::Active.as_str()],
+    )?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    revoke_open_invites(connection, user_id)?;
+    Ok(true)
 }
 
 impl ApiTokenRow {
@@ -97,8 +386,8 @@ fn generate_session_token() -> String {
     hex::encode(bytes)
 }
 
-/// Generate a short random id (32 hex chars = 16 bytes) for an API token row.
-fn generate_token_id() -> String {
+/// Generate a short random id (32 hex chars = 16 bytes) for an API token or invite row.
+fn generate_row_id() -> String {
     let mut bytes = [0u8; 16];
     rand::rng().fill(&mut bytes);
     hex::encode(bytes)
@@ -108,7 +397,7 @@ fn generate_token_id() -> String {
 ///
 /// # Async Safety
 ///
-/// This implementation uses `std::sync::Mutex` which is appropriate for:
+/// This implementation uses `parking_lot::Mutex` which is appropriate for:
 /// - Short-duration locks (SQLite in-process operations are typically fast)
 /// - Operations that don't hold the lock across `.await` points
 ///
@@ -116,18 +405,64 @@ fn generate_token_id() -> String {
 /// from async contexts without risking thread starvation. The mutex is never
 /// held across await points since all trait methods are synchronous.
 pub struct SqliteTracker {
-    conn: Mutex<Connection>,
-    indexing_tx: tokio::sync::watch::Sender<IndexingProgress>,
+    connection: Mutex<Connection>,
+    indexing_sender: tokio::sync::watch::Sender<IndexingProgress>,
+    vector_indexes: Catalog,
 }
 
 impl SqliteTracker {
+    /// Rows of `select` over the named metrics within `scope` recorded since
+    /// `since`, grouped by `group`.
+    fn aggregate_metrics<T>(
+        &self,
+        select: &str,
+        group: &str,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+        scope: AttemptScope,
+        map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>> {
+        if metric_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..metric_names.len())
+            .map(|index| format!("?{}", index + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT {select}
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND {}
+              AND metric_name IN ({placeholders})
+            GROUP BY {group}
+            "#,
+            scope::metric_source("source", 2)
+        );
+        let since = since.format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(metric_names.len() + 2);
+        bindings.push(&since);
+        let excluded = scope.excluded_source();
+        bindings.push(&excluded);
+        for metric_name in metric_names {
+            bindings.push(metric_name);
+        }
+
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bindings.as_slice(), map)?;
+        Ok(rows.flatten().collect())
+    }
+
     /// Create a new SQLite tracker with the given database path.
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
-        let (indexing_tx, _) = tokio::sync::watch::channel(IndexingProgress::default());
+        let connection = Connection::open(db_path)?;
+        let (indexing_sender, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
-            conn: Mutex::new(conn),
-            indexing_tx,
+            connection: Mutex::new(connection),
+            indexing_sender,
+            vector_indexes: Catalog::new(),
         };
         tracker.init()?;
         Ok(tracker)
@@ -135,11 +470,12 @@ impl SqliteTracker {
 
     /// Create an in-memory SQLite tracker (for testing).
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let (indexing_tx, _) = tokio::sync::watch::channel(IndexingProgress::default());
+        let connection = Connection::open_in_memory()?;
+        let (indexing_sender, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
-            conn: Mutex::new(conn),
-            indexing_tx,
+            connection: Mutex::new(connection),
+            indexing_sender,
+            vector_indexes: Catalog::new(),
         };
         tracker.init()?;
         Ok(tracker)
@@ -147,7 +483,7 @@ impl SqliteTracker {
 
     /// Subscribe to real-time indexing progress updates.
     pub fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
-        self.indexing_tx.subscribe()
+        self.indexing_sender.subscribe()
     }
 
     /// Whether the vectorlite extension can be loaded for this tracker (and, as a
@@ -155,26 +491,99 @@ impl SqliteTracker {
     /// results without it, so callers/tests can gate on this.
     pub fn vectorlite_available(&self) -> bool {
         match self.acquire_lock() {
-            Ok(conn) => try_load_vectorlite(&conn).unwrap_or(false),
+            Ok(connection) => self.vector_indexes.load_extension(&connection),
             Err(_) => false,
         }
     }
 
-    /// Acquire a lock on the database connection, handling poisoned mutex gracefully.
-    fn acquire_lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|e| {
-            claudear_core::error::Error::Storage(format!("Failed to acquire database lock: {}", e))
-        })
+    /// Rebuild every vector index on this connection from its embedding table, handing the
+    /// connection lock to any waiting thread between bounded batches so other database work
+    /// interleaves instead of stalling behind the whole rebuild.
+    pub fn rebuild_vector_indexes(&self) {
+        for index in self.vector_indexes.all() {
+            let started = Instant::now();
+            let mut batches: usize = 0;
+            let mut rows: usize = 0;
+            loop {
+                if self.vector_indexes.is_stopped() {
+                    return;
+                }
+                let connection = match self.acquire_lock() {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to lock the database to rebuild vector indexes");
+                        return;
+                    }
+                };
+                let step = index.rebuild_step(&connection, REBUILD_BATCH_SIZE);
+                MutexGuard::unlock_fair(connection);
+                batches += 1;
+                match step {
+                    Ok(Progress::Pending { rows: batch }) => {
+                        rows += batch;
+                    }
+                    Ok(Progress::Complete { rows: batch }) => {
+                        rows += batch;
+                        tracing::info!(
+                            table = index.table(),
+                            rows,
+                            batches,
+                            batch_size = REBUILD_BATCH_SIZE,
+                            elapsed = ?started.elapsed(),
+                            "Rebuilt vector index"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Skipped) => {
+                        tracing::debug!(
+                            table = index.table(),
+                            "Skipped vector index rebuild; no usable embeddings"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Deferred) => {
+                        tracing::debug!(
+                            table = index.table(),
+                            "Deferred vector index rebuild; it rebuilds on next use"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Unavailable) => {
+                        tracing::debug!(
+                            table = index.table(),
+                            "Skipped vector index rebuild; the index is unavailable on this connection"
+                        );
+                        break;
+                    }
+                    Ok(Progress::Current) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            table = index.table(),
+                            rows,
+                            batches,
+                            elapsed = ?started.elapsed(),
+                            %error,
+                            "Failed to rebuild vector index; it rebuilds on next use"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn acquire_lock(&self) -> Result<MutexGuard<'_, Connection>> {
+        Ok(self.connection.lock())
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
         // These settings optimize SQLite for better throughput in our use case:
         // - Concurrent reads/writes from webhook server and watcher
         // - Moderate write workload with analytics/metrics
         // - BLOB storage for embeddings
-        conn.execute_batch(
+        connection.execute_batch(
             r#"
             -- WAL mode: biggest win for concurrent reads + writes
             -- Note: In-memory DBs will stay in "memory" mode which is fine
@@ -201,16 +610,16 @@ impl SqliteTracker {
         )?;
 
         // Run versioned SQL migrations (tracked in schema_migrations table).
-        super::migrator::run(&conn).map_err(claudear_core::error::Error::Database)?;
+        super::migrator::run(&connection).map_err(claudear_core::error::Error::Database)?;
 
         // Reset any stuck "running" indexing progress rows from a previous crash
-        conn.execute(
+        connection.execute(
             "UPDATE indexing_progress SET status = 'idle' WHERE status = 'running'",
             [],
         )?;
 
         // Update query planner statistics after schema creation
-        conn.execute("ANALYZE", [])?;
+        connection.execute("ANALYZE", [])?;
 
         Ok(())
     }
@@ -239,22 +648,13 @@ impl SqliteTracker {
         match bytes {
             None => Ok(None),
             Some(b) if b.is_empty() => Ok(None),
-            Some(b) => {
-                if b.len() % 4 != 0 {
-                    return Err(rusqlite::Error::InvalidColumnType(
-                        col,
-                        "embedding".to_string(),
-                        rusqlite::types::Type::Blob,
-                    ));
-                }
-                let embedding: Vec<f32> = b
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|chunk| f32::from_le_bytes(*chunk))
-                    .collect();
-                Ok(Some(embedding))
-            }
+            Some(b) => embedding_from_blob(&b).map(Some).ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(
+                    col,
+                    "embedding".to_string(),
+                    rusqlite::types::Type::Blob,
+                )
+            }),
         }
     }
 
@@ -376,305 +776,36 @@ impl SqliteTracker {
     }
 
     fn embedding_to_blob(embedding: Option<&[f32]>) -> Option<Vec<u8>> {
-        embedding.map(|values| {
-            let mut blob = Vec::with_capacity(values.len() * 4);
-            for f in values {
-                blob.extend_from_slice(&f.to_le_bytes());
-            }
-            blob
-        })
+        embedding.map(embedding_blob)
     }
 
     fn blob_to_embedding(blob: Option<Vec<u8>>) -> Option<Vec<f32>> {
-        let blob = blob?;
-        if !blob.len().is_multiple_of(4) {
-            return None;
-        }
-        Some(
-            blob.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
-                .collect(),
-        )
-    }
-
-    fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
-        let exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1 LIMIT 1",
-                params![table_name],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(exists.is_some())
-    }
-
-    fn ensure_qa_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite extension for Q&A search");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, QA_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=10000, ef_construction=200, M=16)
-            )
-            "#,
-            table = QA_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                let backfill_sql = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, question_embedding
-                    FROM qa_knowledge
-                    WHERE question_embedding IS NOT NULL
-                      AND length(question_embedding) = ?1
-                    "#,
-                    table = QA_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill Q&A vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create Q&A vector table");
-                Ok(false)
-            }
-        }
-    }
-
-    fn upsert_qa_vector_embedding(conn: &Connection, qa_id: i64, embedding: &[f32]) -> Result<()> {
-        if embedding.is_empty() {
-            return Ok(());
-        }
-
-        if !Self::ensure_qa_vector_table(conn, embedding.len())? {
-            return Ok(());
-        }
-
-        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", QA_VECTOR_TABLE);
-        let insert_sql = format!(
-            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-            QA_VECTOR_TABLE
-        );
-
-        conn.execute(&delete_sql, params![qa_id])?;
-        conn.execute(&insert_sql, params![qa_id, vector_blob])?;
-        Ok(())
-    }
-
-    /// Ensure the HNSW vector table for issue embeddings exists.
-    /// Returns `true` if the table is available, `false` if vectorlite is not installed.
-    fn ensure_issue_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite extension for issue embeddings");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, ISSUE_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=10000, ef_construction=200, M=16)
-            )
-            "#,
-            table = ISSUE_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                let backfill_sql = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM issues
-                    WHERE embedding IS NOT NULL
-                      AND length(embedding) = ?1
-                    "#,
-                    table = ISSUE_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill issue vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create issue vector table");
-                Ok(false)
-            }
-        }
-    }
-
-    /// Upsert an issue embedding into the HNSW vector table.
-    fn upsert_issue_vector_embedding(
-        conn: &Connection,
-        issue_emb_id: i64,
-        embedding: &[f32],
-    ) -> Result<()> {
-        if embedding.is_empty() {
-            return Ok(());
-        }
-
-        if !Self::ensure_issue_vector_table(conn, embedding.len())? {
-            return Ok(());
-        }
-
-        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", ISSUE_VECTOR_TABLE);
-        let insert_sql = format!(
-            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-            ISSUE_VECTOR_TABLE
-        );
-
-        conn.execute(&delete_sql, params![issue_emb_id])?;
-        conn.execute(&insert_sql, params![issue_emb_id, vector_blob])?;
-        Ok(())
-    }
-
-    /// Ensure the HNSW vector table for outcome embeddings exists.
-    fn ensure_outcome_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite extension for outcome embeddings");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, OUTCOME_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=10000, ef_construction=200, M=16)
-            )
-            "#,
-            table = OUTCOME_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                let backfill_sql = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM feedback_outcomes
-                    WHERE embedding IS NOT NULL
-                      AND length(embedding) = ?1
-                    "#,
-                    table = OUTCOME_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill outcome vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create outcome vector table");
-                Ok(false)
-            }
-        }
-    }
-
-    /// Upsert an outcome embedding into the HNSW vector table.
-    fn upsert_outcome_vector_embedding(
-        conn: &Connection,
-        outcome_id: i64,
-        embedding: &[f32],
-    ) -> Result<()> {
-        if embedding.is_empty() {
-            return Ok(());
-        }
-
-        if !Self::ensure_outcome_vector_table(conn, embedding.len())? {
-            return Ok(());
-        }
-
-        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", OUTCOME_VECTOR_TABLE);
-        let insert_sql = format!(
-            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-            OUTCOME_VECTOR_TABLE
-        );
-
-        conn.execute(&delete_sql, params![outcome_id])?;
-        conn.execute(&insert_sql, params![outcome_id, vector_blob])?;
-        Ok(())
+        embedding_from_blob(&blob?)
     }
 
     fn query_qa_matches_vector_scoped(
-        conn: &Connection,
+        &self,
+        connection: &Connection,
         source: &str,
         repo: Option<&str>,
         question_embedding: &[f32],
         threshold: f64,
         limit: usize,
-        candidate_limit: usize,
     ) -> Result<Option<Vec<QaMatch>>> {
-        if question_embedding.is_empty() || limit == 0 || candidate_limit == 0 {
+        if question_embedding.is_empty() || limit == 0 {
             return Ok(Some(Vec::new()));
         }
 
-        if !Self::ensure_qa_vector_table(conn, question_embedding.len())? {
+        if !self
+            .vector_indexes
+            .qa
+            .prepare_search(connection, question_embedding.len())?
+        {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = question_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(question_embedding);
+        let candidate_limit = limit.saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER);
 
         let sql = format!(
             r#"
@@ -719,18 +850,18 @@ impl SqliteTracker {
             ORDER BY final_score DESC, answered_at DESC
             LIMIT ?7
             "#,
-            table = QA_VECTOR_TABLE
+            table = self.vector_indexes.qa.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare scoped Q&A vector ranking query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare scoped Q&A vector ranking query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -743,8 +874,8 @@ impl SqliteTracker {
             Self::row_to_qa_match,
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Scoped Q&A vector ranking query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Scoped Q&A vector ranking query failed");
                 return Ok(None);
             }
         };
@@ -752,8 +883,8 @@ impl SqliteTracker {
         let mut matches = Vec::new();
         for row in rows {
             match row {
-                Ok(m) => matches.push(m),
-                Err(e) => tracing::debug!(error = %e, "Failed to read scoped Q&A vector row"),
+                Ok(qa_match) => matches.push(qa_match),
+                Err(error) => tracing::debug!(%error, "Failed to read scoped Q&A vector row"),
             }
         }
 
@@ -761,24 +892,26 @@ impl SqliteTracker {
     }
 
     fn query_qa_matches_vector_global(
-        conn: &Connection,
+        &self,
+        connection: &Connection,
         question_embedding: &[f32],
         threshold: f64,
         limit: usize,
-        candidate_limit: usize,
     ) -> Result<Option<Vec<QaMatch>>> {
-        if question_embedding.is_empty() || limit == 0 || candidate_limit == 0 {
+        if question_embedding.is_empty() || limit == 0 {
             return Ok(Some(Vec::new()));
         }
 
-        if !Self::ensure_qa_vector_table(conn, question_embedding.len())? {
+        if !self
+            .vector_indexes
+            .qa
+            .prepare_search(connection, question_embedding.len())?
+        {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = question_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(question_embedding);
+        let candidate_limit = limit.saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER);
 
         let sql = format!(
             r#"
@@ -821,18 +954,18 @@ impl SqliteTracker {
             ORDER BY final_score DESC, answered_at DESC
             LIMIT ?5
             "#,
-            table = QA_VECTOR_TABLE
+            table = self.vector_indexes.qa.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare global Q&A vector ranking query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare global Q&A vector ranking query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -843,8 +976,8 @@ impl SqliteTracker {
             Self::row_to_qa_match,
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Global Q&A vector ranking query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Global Q&A vector ranking query failed");
                 return Ok(None);
             }
         };
@@ -852,8 +985,8 @@ impl SqliteTracker {
         let mut matches = Vec::new();
         for row in rows {
             match row {
-                Ok(m) => matches.push(m),
-                Err(e) => tracing::debug!(error = %e, "Failed to read global Q&A vector row"),
+                Ok(qa_match) => matches.push(qa_match),
+                Err(error) => tracing::debug!(%error, "Failed to read global Q&A vector row"),
             }
         }
 
@@ -1635,52 +1768,17 @@ impl AttemptTracker for SqliteTracker {
     }
 
     fn get_stats(&self) -> Result<FixAttemptStats> {
+        self.get_scoped_stats(AttemptScope::All)
+    }
+
+    fn get_scoped_stats(&self, scope: AttemptScope) -> Result<FixAttemptStats> {
         let conn = self.acquire_lock()?;
         let mut stats = FixAttemptStats::default();
-
-        // Overall stats
-        let mut stmt = conn.prepare_cached(
-            r#"
-            SELECT status, COUNT(*) as count
-            FROM fix_attempts
-            GROUP BY status
-            "#,
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
-        })?;
-
-        for row in rows {
-            match row {
-                Ok((status, count)) => {
-                    stats.total += count;
-                    match status.as_str() {
-                        "pending" => stats.pending = count,
-                        "success" => stats.success = count,
-                        "failed" => stats.failed = count,
-                        "merged" => stats.merged = count,
-                        "closed" => stats.closed = count,
-                        "cannot_fix" => stats.cannot_fix = count,
-                        _ => {}
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to read stats row");
-                }
-            }
-        }
-
-        // Stats by source
-        let mut stmt = conn.prepare_cached(
-            r#"
-            SELECT source, status, COUNT(*) as count
-            FROM fix_attempts
-            GROUP BY source, status
-            "#,
-        )?;
-
-        let rows = stmt.query_map([], |row| {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT source, status, COUNT(*) FROM fix_attempts WHERE {} GROUP BY source, status",
+            scope::source("source", 1)
+        ))?;
+        let rows = stmt.query_map(params![scope.excluded_source()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1688,29 +1786,42 @@ impl AttemptTracker for SqliteTracker {
             ))
         })?;
 
-        let mut by_source: HashMap<String, SourceStats> = HashMap::new();
-
         for row in rows {
-            match row {
-                Ok((source, status, count)) => {
-                    let entry = by_source.entry(source).or_default();
-                    entry.total += count;
-                    match status.as_str() {
-                        "success" => entry.success = count,
-                        "failed" => entry.failed = count,
-                        "merged" => entry.merged = count,
-                        "closed" => entry.closed = count,
-                        "cannot_fix" => entry.cannot_fix = count,
-                        _ => {}
-                    }
-                }
+            let (source, status, count) = match row {
+                Ok(row) => row,
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to read source stats row");
+                    tracing::warn!(error = %e, "Failed to read stats row");
+                    continue;
                 }
+            };
+            stats.total += count;
+            let entry = stats.by_source.entry(source).or_default();
+            entry.total += count;
+            match status.as_str() {
+                "pending" => stats.pending += count,
+                "success" => {
+                    stats.success += count;
+                    entry.success += count;
+                }
+                "failed" => {
+                    stats.failed += count;
+                    entry.failed += count;
+                }
+                "merged" => {
+                    stats.merged += count;
+                    entry.merged += count;
+                }
+                "closed" => {
+                    stats.closed += count;
+                    entry.closed += count;
+                }
+                "cannot_fix" => {
+                    stats.cannot_fix += count;
+                    entry.cannot_fix += count;
+                }
+                _ => {}
             }
         }
-
-        stats.by_source = by_source;
 
         Ok(stats)
     }
@@ -1761,8 +1872,8 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::record_metric(self, metric)
     }
 
-    fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
-        SqliteTracker::get_analytics_summary(self)
+    fn get_analytics_summary(&self, scope: AttemptScope) -> Result<AnalyticsSummary> {
+        SqliteTracker::get_analytics_summary(self, scope)
     }
 
     fn get_recent_activities_filtered(
@@ -1810,12 +1921,12 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::get_open_prs(self)
     }
 
-    fn get_pr_analytics(&self) -> Result<claudear_core::types::PrAnalytics> {
-        SqliteTracker::get_pr_analytics(self)
+    fn get_pr_analytics(&self, scope: AttemptScope) -> Result<claudear_core::types::PrAnalytics> {
+        SqliteTracker::get_pr_analytics(self, scope)
     }
 
-    fn get_avg_time_to_pr(&self) -> Result<Option<f64>> {
-        SqliteTracker::get_avg_time_to_pr(self)
+    fn get_avg_time_to_pr(&self, scope: AttemptScope) -> Result<Option<f64>> {
+        SqliteTracker::get_avg_time_to_pr(self, scope)
     }
 
     fn get_rejection_reasons(
@@ -1825,8 +1936,8 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::get_rejection_reasons(self, limit)
     }
 
-    fn get_agent_spawn_count(&self, since_iso: &str) -> Result<i64> {
-        SqliteTracker::get_agent_spawn_count(self, since_iso)
+    fn get_agent_spawn_count(&self, since_iso: &str, scope: AttemptScope) -> Result<i64> {
+        SqliteTracker::get_agent_spawn_count(self, since_iso, scope)
     }
 
     fn get_cost_estimate(
@@ -1834,20 +1945,38 @@ impl ActivityStore for SqliteTracker {
         since_iso: &str,
         max_plan_monthly_cost: f64,
         period_label: &str,
+        scope: AttemptScope,
     ) -> Result<claudear_core::types::CostEstimate> {
-        SqliteTracker::get_cost_estimate(self, since_iso, max_plan_monthly_cost, period_label)
+        SqliteTracker::get_cost_estimate(
+            self,
+            since_iso,
+            max_plan_monthly_cost,
+            period_label,
+            scope,
+        )
     }
 
-    fn get_mttr_trend(&self, weeks: usize) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
-        SqliteTracker::get_mttr_trend(self, weeks)
+    fn get_mttr_trend(
+        &self,
+        weeks: usize,
+        scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
+        SqliteTracker::get_mttr_trend(self, weeks, scope)
     }
 
-    fn get_repo_leaderboard(&self) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
-        SqliteTracker::get_repo_leaderboard(self)
+    fn get_repo_leaderboard(
+        &self,
+        scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
+        SqliteTracker::get_repo_leaderboard(self, scope)
     }
 
-    fn get_commit_trend(&self, days: usize) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
-        SqliteTracker::get_commit_trend(self, days)
+    fn get_commit_trend(
+        &self,
+        days: usize,
+        scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
+        SqliteTracker::get_commit_trend(self, days, scope)
     }
 
     fn list_support_replies(
@@ -1876,16 +2005,24 @@ impl ActivityStore for SqliteTracker {
         since_iso: &str,
         hourly_rate: f64,
         period_label: &str,
+        scope: AttemptScope,
     ) -> Result<claudear_core::types::TimeSavings> {
-        SqliteTracker::get_complexity_time_savings(self, since_iso, hourly_rate, period_label)
+        SqliteTracker::get_complexity_time_savings(
+            self,
+            since_iso,
+            hourly_rate,
+            period_label,
+            scope,
+        )
     }
 
     fn list_prs(
         &self,
         status: Option<&str>,
         limit: usize,
+        scope: AttemptScope,
     ) -> Result<Vec<claudear_core::types::PrRecord>> {
-        SqliteTracker::list_prs(self, status, limit)
+        SqliteTracker::list_prs(self, status, limit, scope)
     }
 
     fn update_pr_fix_quality_score(&self, pr_url: &str, score: f64) -> Result<()> {
@@ -1948,19 +2085,24 @@ impl ActivityStore for SqliteTracker {
     }
 
     /// Count activity events grouped by type since a timestamp.
-    fn get_activity_type_counts_since(&self, since: DateTime<Utc>) -> Result<HashMap<String, i64>> {
+    fn get_activity_type_counts_since(
+        &self,
+        since: DateTime<Utc>,
+        scope: AttemptScope,
+    ) -> Result<HashMap<String, i64>> {
         let conn = self.acquire_lock()?;
         let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT activity_type, COUNT(*)
             FROM activity_log
-            WHERE timestamp >= ?1
+            WHERE timestamp >= ?1 AND {}
             GROUP BY activity_type
             "#,
-        )?;
+            scope::source("source", 2)
+        ))?;
 
-        let rows = stmt.query_map(params![since_str], |row| {
+        let rows = stmt.query_map(params![since_str, scope.excluded_source()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
 
@@ -2290,46 +2432,17 @@ impl ActivityStore for SqliteTracker {
         &self,
         metric_names: &[&str],
         since: DateTime<Utc>,
+        scope: AttemptScope,
     ) -> Result<HashMap<String, i64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, COUNT(*)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-
-        let mut counts = HashMap::new();
-        for row in rows.flatten() {
-            counts.insert(row.0, row.1);
-        }
-        Ok(counts)
+        let rows = self.aggregate_metrics(
+            "metric_name, COUNT(*)",
+            "metric_name",
+            metric_names,
+            since,
+            scope,
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Get metric sums grouped by name since a timestamp.
@@ -2337,101 +2450,48 @@ impl ActivityStore for SqliteTracker {
         &self,
         metric_names: &[&str],
         since: DateTime<Utc>,
+        scope: AttemptScope,
     ) -> Result<HashMap<String, f64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, SUM(metric_value)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-            ))
-        })?;
-
-        let mut sums = HashMap::new();
-        for row in rows.flatten() {
-            sums.insert(row.0, row.1);
-        }
-        Ok(sums)
+        let rows = self.aggregate_metrics(
+            "metric_name, SUM(metric_value)",
+            "metric_name",
+            metric_names,
+            since,
+            scope,
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                ))
+            },
+        )?;
+        Ok(rows.into_iter().collect())
     }
 
     fn get_metric_sums_by_source_since(
         &self,
         metric_names: &[&str],
         since: DateTime<Utc>,
+        scope: AttemptScope,
     ) -> Result<HashMap<(String, String), f64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, source, SUM(metric_value)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name, source
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-            ))
-        })?;
-
-        let mut sums = HashMap::new();
-        for row in rows.flatten() {
-            if let Some(source) = row.1 {
-                sums.insert((row.0, source), row.2);
-            }
-        }
-        Ok(sums)
+        let rows = self.aggregate_metrics(
+            "metric_name, source, SUM(metric_value)",
+            "metric_name, source",
+            metric_names,
+            since,
+            scope,
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                ))
+            },
+        )?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(name, source, sum)| source.map(|source| ((name, source), sum)))
+            .collect())
     }
 
     /// Prune old activity logs to prevent unbounded growth.
@@ -3026,29 +3086,55 @@ impl ActivityStore for SqliteTracker {
     }
 
     /// Count fix attempts with optional status/source filters.
-    fn count_attempts(&self, status: Option<&str>, source: Option<&str>) -> Result<usize> {
+    fn count_attempts(
+        &self,
+        status: Option<&str>,
+        source: Option<&str>,
+        scope: AttemptScope,
+    ) -> Result<usize> {
         let conn = self.acquire_lock()?;
-        let count: i64 = match (status, source) {
-            (Some(status), Some(source)) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1 AND source = ?2",
-                params![status, source],
-                |row| row.get(0),
-            )?,
-            (Some(status), None) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1",
-                params![status],
-                |row| row.get(0),
-            )?,
-            (None, Some(source)) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE source = ?1",
-                params![source],
-                |row| row.get(0),
-            )?,
-            (None, None) => {
-                conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?
-            }
-        };
+        let count: i64 = conn.query_row(
+            &format!(
+                r#"
+                SELECT COUNT(*) FROM fix_attempts
+                WHERE (?1 IS NULL OR status = ?1)
+                  AND (?2 IS NULL OR source = ?2)
+                  AND {}
+                "#,
+                scope::source("source", 3)
+            ),
+            params![status, source, scope.excluded_source()],
+            |row| row.get(0),
+        )?;
         Ok(count as usize)
+    }
+
+    fn list_scoped_attempts(
+        &self,
+        status: Option<&str>,
+        scope: AttemptScope,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare_cached(&format!(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE {}
+              AND (?2 IS NULL OR status = ?2)
+            ORDER BY attempted_at DESC
+            LIMIT ?3 OFFSET ?4
+            "#,
+            scope::source("source", 1)
+        ))?;
+        let rows = stmt.query_map(
+            params![scope.excluded_source(), status, limit as i64, offset as i64],
+            Self::row_to_fix_attempt,
+        )?;
+        Ok(rows.flatten().collect())
     }
 
     /// List recent attempts ordered by attempted time descending.
@@ -3057,20 +3143,28 @@ impl ActivityStore for SqliteTracker {
     }
 
     /// List attempts since a timestamp, ordered by attempted time descending.
-    fn list_attempts_since(&self, since: DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+    fn list_attempts_since(
+        &self,
+        since: DateTime<Utc>,
+        scope: AttemptScope,
+    ) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
         let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
                    scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
-            WHERE attempted_at >= ?1
+            WHERE attempted_at >= ?1 AND {}
             ORDER BY attempted_at DESC
             "#,
+            scope::source("source", 2)
+        ))?;
+        let rows = stmt.query_map(
+            params![since_str, scope.excluded_source()],
+            Self::row_to_fix_attempt,
         )?;
-        let rows = stmt.query_map(params![since_str], Self::row_to_fix_attempt)?;
         Ok(rows.flatten().collect())
     }
 
@@ -3229,8 +3323,6 @@ impl ActivityStore for SqliteTracker {
             events: rows.into_iter().map(TimelineEvent::from).collect(),
         })
     }
-
-    // --- Code Indexing ---
 }
 
 impl KnowledgeStore for SqliteTracker {
@@ -3525,22 +3617,15 @@ impl EmbeddingStore for SqliteTracker {
 
     /// Store an issue embedding.
     fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
-        // Serialize the embedding vector to bytes if present
-        let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|emb| {
-            let mut bytes = Vec::with_capacity(emb.len() * 4);
-            for f in emb {
-                bytes.extend_from_slice(&f.to_le_bytes());
-            }
-            bytes
-        });
+        let embedding_bytes = embedding.embedding.as_deref().map(embedding_blob);
 
-        let updated_at_str = embedding
+        let updated_at = embedding
             .updated_at
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+            .map(|date| date.format("%Y-%m-%d %H:%M:%S").to_string());
 
-        conn.execute(
+        connection.execute(
             r#"
             INSERT INTO issues (source, issue_id, short_id, title, description, url, priority, status, labels, embedding, embedding_model, created_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -3569,20 +3654,19 @@ impl EmbeddingStore for SqliteTracker {
                 embedding_bytes,
                 embedding.embedding_model,
                 embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                updated_at_str,
+                updated_at,
             ],
         )?;
 
-        // Dual-write: upsert into HNSW vector table (get row ID reliably via SELECT)
-        let row_id: i64 = conn.query_row(
+        let row_id: i64 = connection.query_row(
             "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
             params![embedding.source, embedding.issue_id],
             |row| row.get(0),
         )?;
-        if let Some(ref emb) = embedding.embedding {
-            if let Err(e) = Self::upsert_issue_vector_embedding(&conn, row_id, emb) {
-                tracing::debug!(error = %e, "Failed to upsert issue vector embedding");
-            }
+        if let Some(values) = &embedding.embedding {
+            self.vector_indexes
+                .issue
+                .upsert(&connection, row_id, values);
         }
 
         Ok(row_id)
@@ -3596,11 +3680,12 @@ impl EmbeddingStore for SqliteTracker {
         if embeddings.is_empty() {
             return Ok(());
         }
-        let mut conn = self.acquire_lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut vectors: Vec<(i64, &[f32])> = Vec::new();
 
         {
-            let mut stmt = tx.prepare_cached(
+            let mut statement = transaction.prepare_cached(
                 r#"
                 INSERT INTO issues (source, issue_id, short_id, title, description, url, priority, status, labels, embedding, embedding_model, created_at, updated_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -3619,19 +3704,13 @@ impl EmbeddingStore for SqliteTracker {
             )?;
 
             for embedding in embeddings {
-                let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|emb| {
-                    let mut bytes = Vec::with_capacity(emb.len() * 4);
-                    for f in emb {
-                        bytes.extend_from_slice(&f.to_le_bytes());
-                    }
-                    bytes
-                });
+                let embedding_bytes = embedding.embedding.as_deref().map(embedding_blob);
 
-                let updated_at_str = embedding
+                let updated_at = embedding
                     .updated_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                    .map(|date| date.format("%Y-%m-%d %H:%M:%S").to_string());
 
-                stmt.execute(params![
+                statement.execute(params![
                     embedding.source,
                     embedding.issue_id,
                     embedding.short_id,
@@ -3644,24 +3723,26 @@ impl EmbeddingStore for SqliteTracker {
                     embedding_bytes,
                     embedding.embedding_model,
                     embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    updated_at_str,
+                    updated_at,
                 ])?;
 
-                // Dual-write: upsert into HNSW vector table
-                let row_id: i64 = tx.query_row(
-                    "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
-                    params![embedding.source, embedding.issue_id],
-                    |row| row.get(0),
-                )?;
-                if let Some(ref emb) = embedding.embedding {
-                    if let Err(e) = Self::upsert_issue_vector_embedding(&tx, row_id, emb) {
-                        tracing::debug!(error = %e, "Failed to upsert issue vector embedding in batch");
-                    }
+                if let Some(values) = &embedding.embedding {
+                    let row_id: i64 = transaction.query_row(
+                        "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
+                        params![embedding.source, embedding.issue_id],
+                        |row| row.get(0),
+                    )?;
+                    vectors.push((row_id, values));
                 }
             }
         }
 
-        tx.commit()?;
+        transaction.commit()?;
+        for (row_id, values) in vectors {
+            self.vector_indexes
+                .issue
+                .upsert(&connection, row_id, values);
+        }
         Ok(())
     }
 
@@ -3768,16 +3849,14 @@ impl EmbeddingStore for SqliteTracker {
             return Ok(Some(Vec::new()));
         }
 
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.issue;
 
-        if !Self::ensure_issue_vector_table(&conn, query_embedding.len())? {
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * ISSUE_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
@@ -3799,18 +3878,18 @@ impl EmbeddingStore for SqliteTracker {
             ORDER BY c.similarity DESC
             LIMIT ?7
             "#,
-            table = ISSUE_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare issue vector search query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare issue vector search query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -3821,14 +3900,14 @@ impl EmbeddingStore for SqliteTracker {
                 limit as i64
             ],
             |row| {
-                let ie = Self::row_to_issue_embedding(row, 9)?;
+                let issue = Self::row_to_issue_embedding(row, 9)?;
                 let similarity: f64 = row.get(8)?;
-                Ok((ie, similarity))
+                Ok((issue, similarity))
             },
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Issue vector search query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Issue vector search query failed");
                 return Ok(None);
             }
         };
@@ -3836,8 +3915,8 @@ impl EmbeddingStore for SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read issue vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read issue vector row"),
             }
         }
 
@@ -3858,16 +3937,14 @@ impl EmbeddingStore for SqliteTracker {
             return Ok(Some(Vec::new()));
         }
 
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.outcome;
 
-        if !Self::ensure_outcome_vector_table(&conn, query_embedding.len())? {
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(None);
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * OUTCOME_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
@@ -3887,18 +3964,18 @@ impl EmbeddingStore for SqliteTracker {
             ORDER BY c.similarity DESC
             LIMIT ?5
             "#,
-            table = OUTCOME_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare outcome vector search query");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare outcome vector search query");
                 return Ok(None);
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -3907,48 +3984,36 @@ impl EmbeddingStore for SqliteTracker {
                 limit as i64
             ],
             |row| {
-                let outcome_str: String = row.get(6)?;
-                let keywords_str: Option<String> = row.get(9)?;
-                let created_at_str: String = row.get(10)?;
+                let outcome: String = row.get(6)?;
+                let keywords: Option<String> = row.get(9)?;
+                let created_at: String = row.get(10)?;
 
-                // Deserialize embedding BLOB if present
-                let embedding_blob: Option<Vec<u8>> = row.get(11)?;
-                let embedding = embedding_blob.and_then(|blob| {
-                    if blob.len() % 4 != 0 {
-                        return None;
-                    }
-                    Some(
-                        blob.as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|chunk| f32::from_le_bytes(*chunk))
-                            .collect(),
-                    )
-                });
+                let blob: Option<Vec<u8>> = row.get(11)?;
+                let embedding = blob.as_deref().and_then(embedding_from_blob);
 
-                let fo = FixOutcome {
+                let fix_outcome = FixOutcome {
                     id: row.get(0)?,
                     attempt_id: row.get(1)?,
                     source: row.get(2)?,
                     issue_id: row.get(3)?,
                     issue_text: row.get(4)?,
                     prompt_used: row.get(5)?,
-                    outcome: Outcome::parse(&outcome_str).unwrap_or(Outcome::Failed),
+                    outcome: Outcome::parse(&outcome).unwrap_or(Outcome::Failed),
                     error_type: row.get(7)?,
                     learnings: row.get(8)?,
-                    keywords: keywords_str
-                        .and_then(|s| serde_json::from_str(&s).ok())
+                    keywords: keywords
+                        .and_then(|keywords| serde_json::from_str(&keywords).ok())
                         .unwrap_or_default(),
                     embedding,
-                    created_at: Self::parse_datetime(&created_at_str)?,
+                    created_at: Self::parse_datetime(&created_at)?,
                 };
                 let similarity: f64 = row.get(12)?;
-                Ok((fo, similarity))
+                Ok((fix_outcome, similarity))
             },
         ) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::debug!(error = %e, "Outcome vector search query failed");
+            Err(error) => {
+                tracing::debug!(%error, "Outcome vector search query failed");
                 return Ok(None);
             }
         };
@@ -3956,8 +4021,8 @@ impl EmbeddingStore for SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read outcome vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read outcome vector row"),
             }
         }
 
@@ -4074,17 +4139,45 @@ impl EmbeddingStore for SqliteTracker {
             })
     }
 
-    /// Count issues, optionally filtered by source.
-    fn count_issues(&self, source: Option<&str>) -> Result<usize> {
+    fn list_scoped_issues(
+        &self,
+        scope: AttemptScope,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IssueEmbedding>> {
         let conn = self.acquire_lock()?;
-        let count: i64 = match source {
-            Some(s) => conn.query_row(
-                "SELECT COUNT(*) FROM issues WHERE source = ?",
-                params![s],
-                |row| row.get(0),
-            )?,
-            None => conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?,
-        };
+        let mut stmt = conn.prepare(&format!(
+            r#"
+            SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                   description, url, priority, status, labels, updated_at
+            FROM issues
+            WHERE {}
+            ORDER BY COALESCE(updated_at, created_at) DESC
+            LIMIT ?2 OFFSET ?3
+            "#,
+            scope::source("source", 1)
+        ))?;
+        let rows = stmt.query_map(
+            params![scope.excluded_source(), limit as i64, offset as i64],
+            |row| Self::row_to_issue_embedding(row, 8),
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                claudear_core::error::Error::Storage(format!("Failed to list issues: {error}"))
+            })
+    }
+
+    /// Count issues, optionally filtered by source.
+    fn count_issues(&self, source: Option<&str>, scope: AttemptScope) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let count: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM issues WHERE (?1 IS NULL OR source = ?1) AND {}",
+                scope::source("source", 2)
+            ),
+            params![source, scope.excluded_source()],
+            |row| row.get(0),
+        )?;
         Ok(count as usize)
     }
 
@@ -4283,8 +4376,6 @@ impl RepoStore for SqliteTracker {
         Ok(rows)
     }
 
-    // --- Analytics ---
-
     fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
         SqliteTracker::get_or_create_repo_id(self, name)
     }
@@ -4362,41 +4453,49 @@ impl UserStore for SqliteTracker {
         SqliteTracker::set_channel_cursor(self, channel, cursor_key, cursor_value)
     }
 
-    fn create_user(&self, email: &str, password_hash: &str, name: &str, role: &str) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
+    fn create_user(&self, email: &str, password_hash: &str, name: &str, role: Role) -> Result<i64> {
+        let email = normalize_login_email(email);
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_login_email_available(&transaction, &email, None)?;
+        transaction.execute(
             "INSERT INTO users (email, password_hash, name, role) VALUES (?1, ?2, ?3, ?4)",
-            params![email, password_hash, name, role],
+            params![email, password_hash, name, role.as_str()],
         )?;
-        Ok(conn.last_insert_rowid())
+        let user_id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(user_id)
     }
 
     fn get_user_by_email(&self, email: &str) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE email = ?1"
-        )?;
-        let user = stmt
+        let email = normalize_login_email(email);
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {USER_COLUMNS} FROM users WHERE lower(email) = lower(?1)
+             ORDER BY email = ?1 DESC, id
+             LIMIT 1"
+        ))?;
+        let user = statement
             .query_row(params![email], UserRow::from_row)
             .optional()?;
         Ok(user)
     }
 
     fn get_user_by_id(&self, id: i64) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE id = ?1"
-        )?;
-        let user = stmt.query_row(params![id], UserRow::from_row).optional()?;
+        let connection = self.acquire_lock()?;
+        let mut statement =
+            connection.prepare(&format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?1"))?;
+        let user = statement
+            .query_row(params![id], UserRow::from_row)
+            .optional()?;
         Ok(user)
     }
 
     fn list_users(&self) -> Result<Vec<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users ORDER BY id"
-        )?;
-        let users = stmt
+        let connection = self.acquire_lock()?;
+        let mut statement =
+            connection.prepare(&format!("SELECT {USER_COLUMNS} FROM users ORDER BY id"))?;
+        let users = statement
             .query_map([], UserRow::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(users)
@@ -4408,32 +4507,35 @@ impl UserStore for SqliteTracker {
         email: Option<&str>,
         password_hash: Option<&str>,
         name: Option<&str>,
-        role: Option<&str>,
+        role: Option<Role>,
         avatar_url: Option<&str>,
     ) -> Result<bool> {
-        let conn = self.acquire_lock()?;
+        let email = email.map(normalize_login_email);
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut sets = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        if let Some(e) = email {
+        if let Some(email) = email {
+            ensure_login_email_available(&transaction, &email, Some(id))?;
             sets.push("email = ?");
-            values.push(Box::new(e.to_string()));
+            values.push(Box::new(email));
         }
-        if let Some(p) = password_hash {
+        if let Some(password_hash) = password_hash {
             sets.push("password_hash = ?");
-            values.push(Box::new(p.to_string()));
+            values.push(Box::new(password_hash.to_string()));
         }
-        if let Some(n) = name {
+        if let Some(name) = name {
             sets.push("name = ?");
-            values.push(Box::new(n.to_string()));
+            values.push(Box::new(name.to_string()));
         }
-        if let Some(r) = role {
+        if let Some(role) = role {
             sets.push("role = ?");
-            values.push(Box::new(r.to_string()));
+            values.push(Box::new(role.as_str()));
         }
-        if let Some(a) = avatar_url {
+        if let Some(avatar_url) = avatar_url {
             sets.push("avatar_url = ?");
-            values.push(Box::new(a.to_string()));
+            values.push(Box::new(avatar_url.to_string()));
         }
 
         if sets.is_empty() {
@@ -4444,27 +4546,30 @@ impl UserStore for SqliteTracker {
         values.push(Box::new(id));
 
         let sql = format!("UPDATE users SET {} WHERE id = ?", sets.join(", "));
-        let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
-        let rows = conn.execute(&sql, params.as_slice())?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            values.iter().map(|value| value.as_ref()).collect();
+        let rows = transaction.execute(&sql, params.as_slice())?;
+        transaction.commit()?;
         Ok(rows > 0)
     }
 
     fn delete_user(&self, id: i64) -> Result<bool> {
-        let conn = self.acquire_lock()?;
-        let rows = conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+        let connection = self.acquire_lock()?;
+        let rows = connection.execute("DELETE FROM users WHERE id = ?1", params![id])?;
         Ok(rows > 0)
     }
 
     fn count_users(&self) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        let connection = self.acquire_lock()?;
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
         Ok(count)
     }
 
     fn create_session(&self, user_id: i64, expires_at: &str) -> Result<String> {
         let token = generate_session_token();
-        let conn = self.acquire_lock()?;
-        conn.execute(
+        let connection = self.acquire_lock()?;
+        connection.execute(
             "INSERT INTO sessions (id, user_id, expires_at, last_active_at) VALUES (?1, ?2, ?3, datetime('now'))",
             params![token, user_id, expires_at],
         )?;
@@ -4472,28 +4577,32 @@ impl UserStore for SqliteTracker {
     }
 
     fn get_session_user(&self, token: &str) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {QUALIFIED_USER_COLUMNS}
              FROM sessions s
              JOIN users u ON s.user_id = u.id
-             WHERE s.id = ?1 AND s.expires_at > datetime('now') AND s.last_active_at > datetime('now', '-30 minutes')",
-        )?;
-        let user = stmt
-            .query_row(params![token], UserRow::from_row)
+             WHERE s.id = ?1 AND s.expires_at > datetime('now') AND s.last_active_at > datetime('now', '-30 minutes')
+               AND u.status = ?2"
+        ))?;
+        let user = statement
+            .query_row(
+                params![token, UserStatus::Active.as_str()],
+                UserRow::from_row,
+            )
             .optional()?;
         Ok(user)
     }
 
     fn delete_session(&self, token: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![token])?;
+        let connection = self.acquire_lock()?;
+        connection.execute("DELETE FROM sessions WHERE id = ?1", params![token])?;
         Ok(())
     }
 
     fn cleanup_expired_sessions(&self) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-        let deleted = conn.execute(
+        let connection = self.acquire_lock()?;
+        let deleted = connection.execute(
             "DELETE FROM sessions WHERE expires_at <= datetime('now') OR last_active_at <= datetime('now', '-30 minutes')",
             [],
         )?;
@@ -4501,8 +4610,8 @@ impl UserStore for SqliteTracker {
     }
 
     fn touch_session(&self, token: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
+        let connection = self.acquire_lock()?;
+        connection.execute(
             "UPDATE sessions SET last_active_at = datetime('now') WHERE id = ?1",
             params![token],
         )?;
@@ -4510,8 +4619,8 @@ impl UserStore for SqliteTracker {
     }
 
     fn delete_user_sessions(&self, user_id: i64) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
+        let connection = self.acquire_lock()?;
+        connection.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
         Ok(())
     }
 
@@ -4523,14 +4632,14 @@ impl UserStore for SqliteTracker {
         token_prefix: &str,
         expires_at: Option<&str>,
     ) -> Result<ApiTokenRow> {
-        let id = generate_token_id();
-        let conn = self.acquire_lock()?;
-        conn.execute(
+        let id = generate_row_id();
+        let connection = self.acquire_lock()?;
+        connection.execute(
             "INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, user_id, name, token_hash, token_prefix, expires_at],
         )?;
-        conn.query_row(
+        connection.query_row(
             "SELECT id, user_id, name, token_hash, token_prefix, created_at, last_used_at, expires_at
              FROM api_tokens WHERE id = ?1",
             params![id],
@@ -4540,20 +4649,23 @@ impl UserStore for SqliteTracker {
     }
 
     fn get_user_by_api_token_hash(&self, token_hash: &str) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let user = conn
+        let connection = self.acquire_lock()?;
+        let user = connection
             .query_row(
-                "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at
-                 FROM api_tokens t
-                 JOIN users u ON t.user_id = u.id
-                 WHERE t.token_hash = ?1
-                   AND (t.expires_at IS NULL OR datetime(t.expires_at) > datetime('now'))",
-                params![token_hash],
+                &format!(
+                    "SELECT {QUALIFIED_USER_COLUMNS}
+                     FROM api_tokens t
+                     JOIN users u ON t.user_id = u.id
+                     WHERE t.token_hash = ?1
+                       AND (t.expires_at IS NULL OR datetime(t.expires_at) > datetime('now'))
+                       AND u.status = ?2"
+                ),
+                params![token_hash, UserStatus::Active.as_str()],
                 UserRow::from_row,
             )
             .optional()?;
         if user.is_some() {
-            conn.execute(
+            connection.execute(
                 "UPDATE api_tokens SET last_used_at = datetime('now') WHERE token_hash = ?1",
                 params![token_hash],
             )?;
@@ -4562,25 +4674,25 @@ impl UserStore for SqliteTracker {
     }
 
     fn list_api_tokens(&self, user_id: i64) -> Result<Vec<ApiTokenRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(
             "SELECT id, user_id, name, token_hash, token_prefix, created_at, last_used_at, expires_at
              FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
         )?;
-        let rows = stmt
+        let rows = statement
             .query_map(params![user_id], ApiTokenRow::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     fn list_all_api_tokens(&self) -> Result<Vec<ApiTokenWithOwner>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(
             "SELECT t.id, t.user_id, t.name, t.token_hash, t.token_prefix, t.created_at, t.last_used_at, t.expires_at, u.email, u.name
              FROM api_tokens t JOIN users u ON t.user_id = u.id
              ORDER BY t.last_used_at DESC NULLS LAST, t.created_at DESC",
         )?;
-        let rows = stmt
+        let rows = statement
             .query_map([], |row| {
                 Ok(ApiTokenWithOwner {
                     token: ApiTokenRow::from_row(row)?,
@@ -4593,15 +4705,211 @@ impl UserStore for SqliteTracker {
     }
 
     fn delete_api_token(&self, id: &str, user_id: Option<i64>) -> Result<bool> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         let affected = match user_id {
-            Some(uid) => conn.execute(
+            Some(owner) => connection.execute(
                 "DELETE FROM api_tokens WHERE id = ?1 AND user_id = ?2",
-                params![id, uid],
+                params![id, owner],
             )?,
-            None => conn.execute("DELETE FROM api_tokens WHERE id = ?1", params![id])?,
+            None => connection.execute("DELETE FROM api_tokens WHERE id = ?1", params![id])?,
         };
         Ok(affected > 0)
+    }
+
+    fn list_user_identities(&self) -> Result<Vec<ConsoleIdentity>> {
+        let connection = self.acquire_lock()?;
+        let mut statement =
+            connection.prepare(&format!("{CONSOLE_IDENTITY_SELECT} ORDER BY ui.user_id"))?;
+        let identities = statement
+            .query_map([], read_console_identity)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(identities)
+    }
+
+    fn get_user_identities(&self, user_id: i64) -> Result<Option<ConsoleIdentity>> {
+        let connection = self.acquire_lock()?;
+        let identity = connection
+            .query_row(
+                &format!("{CONSOLE_IDENTITY_SELECT} WHERE ui.user_id = ?1"),
+                params![user_id],
+                read_console_identity,
+            )
+            .optional()?;
+        Ok(identity)
+    }
+
+    fn delete_user_identities(&self, user_id: i64) -> Result<bool> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        release_handles(&transaction, user_id)?;
+        let deleted = transaction.execute(
+            "DELETE FROM user_identities WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        transaction.commit()?;
+        Ok(deleted > 0)
+    }
+
+    fn save_directory(&self, writes: &[DirectoryWrite]) -> Result<Vec<i64>> {
+        let invites_active_user = writes.iter().any(|write| {
+            write.invite.is_some()
+                && matches!(
+                    write.user,
+                    DirectoryUser::New {
+                        status: UserStatus::Active,
+                        ..
+                    }
+                )
+        });
+        if invites_active_user {
+            return Err(claudear_core::error::Error::Database(
+                "an active user cannot be created with an invite".to_string(),
+            ));
+        }
+
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut user_ids = Vec::with_capacity(writes.len());
+        let mut claims: BTreeMap<i64, &Identities> = BTreeMap::new();
+        for write in writes {
+            let user_id = write_directory_user(&transaction, &write.user)?;
+            if let Some(identities) = &write.identities {
+                write_identities(&transaction, user_id, identities)?;
+                release_handles(&transaction, user_id)?;
+                claims.insert(user_id, &identities.identities);
+            }
+            if let Some(invite) = &write.invite {
+                replace_invite(
+                    &transaction,
+                    user_id,
+                    &invite.token_hash,
+                    &invite.expires_at,
+                    invite.created_by,
+                )?;
+            }
+            user_ids.push(user_id);
+        }
+        // Claimed only after every user released theirs, so one batch can move a handle
+        // between people whatever order their entries come in.
+        for (user_id, identities) in claims {
+            claim_handles(&transaction, user_id, identities)?;
+        }
+        transaction.commit()?;
+        Ok(user_ids)
+    }
+
+    fn issue_invite(
+        &self,
+        user_id: i64,
+        token_hash: &str,
+        expires_at: &str,
+        created_by: i64,
+    ) -> Result<InviteRow> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = replace_invite(&transaction, user_id, token_hash, expires_at, created_by)?;
+        let invite = read_invite(&transaction, &id)?;
+        transaction.commit()?;
+        Ok(invite)
+    }
+
+    fn revoke_invite(&self, user_id: i64) -> Result<bool> {
+        let connection = self.acquire_lock()?;
+        Ok(revoke_open_invites(&connection, user_id)? > 0)
+    }
+
+    fn get_open_invite_for_user(&self, user_id: i64) -> Result<Option<InviteRow>> {
+        let connection = self.acquire_lock()?;
+        let invite = connection
+            .query_row(
+                &format!(
+                    "SELECT {QUALIFIED_INVITE_COLUMNS} FROM user_invites i
+                     WHERE i.user_id = ?1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL
+                     ORDER BY i.created_at DESC, i.rowid DESC
+                     LIMIT 1"
+                ),
+                params![user_id],
+                |row| InviteRow::from_row_at(row, 0),
+            )
+            .optional()?;
+        Ok(invite)
+    }
+
+    fn open_invite_expiries(&self) -> Result<HashMap<i64, String>> {
+        let connection = self.acquire_lock()?;
+        let mut statement = connection.prepare(
+            "SELECT i.user_id, i.expires_at FROM user_invites i
+             WHERE i.accepted_at IS NULL AND i.revoked_at IS NULL
+             ORDER BY i.created_at, i.rowid",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut expiries = HashMap::new();
+        for row in rows {
+            let (user_id, expires_at): (i64, String) = row?;
+            expiries.insert(user_id, expires_at);
+        }
+        Ok(expiries)
+    }
+
+    fn find_open_invite(&self, token_hash: &str) -> Result<Option<(InviteRow, UserRow)>> {
+        let connection = self.acquire_lock()?;
+        let found = connection
+            .query_row(
+                &format!(
+                    "SELECT {QUALIFIED_USER_COLUMNS}, {QUALIFIED_INVITE_COLUMNS}
+                     FROM user_invites i
+                     JOIN users u ON u.id = i.user_id
+                     WHERE i.token_hash = ?1
+                       AND i.accepted_at IS NULL
+                       AND i.revoked_at IS NULL
+                       AND datetime(i.expires_at) > datetime('now')
+                       AND u.status = ?2"
+                ),
+                params![token_hash, UserStatus::Invited.as_str()],
+                |row| {
+                    Ok((
+                        InviteRow::from_row_at(row, USER_COLUMN_COUNT)?,
+                        UserRow::from_row(row)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    fn accept_invite(&self, token_hash: &str, password_hash: &str) -> Result<Option<UserRow>> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // One conditional UPDATE claims the invite, so of two concurrent accepts
+        // (even from separate processes) only one can match the open row.
+        let claimed: Option<i64> = transaction
+            .query_row(
+                "UPDATE user_invites SET accepted_at = datetime('now')
+                 WHERE token_hash = ?1
+                   AND accepted_at IS NULL
+                   AND revoked_at IS NULL
+                   AND datetime(expires_at) > datetime('now')
+                   AND user_id IN (SELECT id FROM users WHERE status = ?2)
+                 RETURNING user_id",
+                params![token_hash, UserStatus::Invited.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(user_id) = claimed else {
+            return Ok(None);
+        };
+        activate(&transaction, user_id, password_hash)?;
+        let user = read_user(&transaction, user_id)?;
+        transaction.commit()?;
+        Ok(Some(user))
+    }
+
+    fn activate_user(&self, user_id: i64, password_hash: &str) -> Result<bool> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let activated = activate(&transaction, user_id, password_hash)?;
+        transaction.commit()?;
+        Ok(activated)
     }
 }
 
@@ -4688,6 +4996,14 @@ impl DeployQaStore for SqliteTracker {
         SqliteTracker::get_last_seen_deploy_qa_tip(self, track)
     }
 
+    fn list_deploy_qa_tips(
+        &self,
+        track: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::list_deploy_qa_tips(self, track, limit)
+    }
+
     fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
         SqliteTracker::list_pending_deploy_qa_tips(self)
     }
@@ -4729,35 +5045,307 @@ impl DeployQaStore for SqliteTracker {
     }
 }
 
+impl PrAssignmentStore for SqliteTracker {
+    fn active_pr_assignments(&self) -> Result<Vec<claudear_core::types::PrAssignment>> {
+        SqliteTracker::active_pr_assignments(self)
+    }
+
+    fn active_pr_assignment(
+        &self,
+        pr_url: &str,
+    ) -> Result<Option<claudear_core::types::PrAssignment>> {
+        SqliteTracker::active_pr_assignment(self, pr_url)
+    }
+
+    fn record_pr_assignment(
+        &self,
+        assignment: &claudear_core::types::PrAssignment,
+    ) -> Result<Option<claudear_core::types::PrAssignment>> {
+        SqliteTracker::record_pr_assignment(self, assignment)
+    }
+
+    fn end_pr_assignment(
+        &self,
+        id: i64,
+        status: claudear_core::types::AssignmentStatus,
+    ) -> Result<bool> {
+        SqliteTracker::end_pr_assignment(self, id, status)
+    }
+
+    fn mark_pr_assignment_notified(&self, id: i64) -> Result<bool> {
+        SqliteTracker::mark_pr_assignment_notified(self, id)
+    }
+}
+
+impl SecurityReportStore for SqliteTracker {
+    fn upsert_security_report(&self, report: &NewSecurityReport) -> Result<SecurityReport> {
+        SqliteTracker::upsert_security_report(self, report)
+    }
+
+    fn get_security_report(&self, id: i64) -> Result<Option<SecurityReport>> {
+        SqliteTracker::get_security_report(self, id)
+    }
+
+    fn get_security_report_by_conversation(
+        &self,
+        source: &str,
+        conversation_id: &str,
+    ) -> Result<Option<SecurityReport>> {
+        SqliteTracker::get_security_report_by_conversation(self, source, conversation_id)
+    }
+
+    fn list_security_reports(&self, filter: &SecurityReportFilter) -> Result<Vec<SecurityReport>> {
+        SqliteTracker::list_security_reports(self, filter)
+    }
+
+    fn list_reports_for_vulnerability(&self, vulnerability_id: i64) -> Result<Vec<SecurityReport>> {
+        SqliteTracker::list_reports_for_vulnerability(self, vulnerability_id)
+    }
+
+    fn transition_security_report(
+        &self,
+        id: i64,
+        expected: SecurityReportState,
+        next: SecurityReportState,
+        changes: &SecurityReportChanges,
+        event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        SqliteTracker::transition_security_report(self, id, expected, next, changes, event)
+    }
+
+    fn release_stale_security_assessments(&self, stale_after: Duration) -> Result<usize> {
+        SqliteTracker::release_stale_security_assessments(self, stale_after)
+    }
+
+    fn record_security_follow_up(
+        &self,
+        id: i64,
+        expected_count: u32,
+        new_count: u32,
+    ) -> Result<bool> {
+        SqliteTracker::record_security_follow_up(self, id, expected_count, new_count)
+    }
+
+    fn record_security_event(
+        &self,
+        report_id: Option<i64>,
+        vulnerability_id: Option<i64>,
+        event: &NewSecurityEvent,
+    ) -> Result<()> {
+        SqliteTracker::record_security_event(self, report_id, vulnerability_id, event)
+    }
+
+    fn list_security_timeline(&self, report_id: i64) -> Result<Vec<SecurityEvent>> {
+        SqliteTracker::list_security_timeline(self, report_id)
+    }
+
+    fn last_security_event(
+        &self,
+        vulnerability_id: i64,
+        kind: SecurityEventKind,
+    ) -> Result<Option<SecurityEvent>> {
+        SqliteTracker::last_security_event(self, vulnerability_id, kind)
+    }
+
+    fn list_admin_confirmed_reports(&self) -> Result<Vec<(SecurityReport, SecurityEvent)>> {
+        SqliteTracker::list_admin_confirmed_reports(self)
+    }
+
+    fn list_security_reports_without_event(
+        &self,
+        state: SecurityReportState,
+        kind: SecurityEventKind,
+    ) -> Result<Vec<SecurityReport>> {
+        SqliteTracker::list_security_reports_without_event(self, state, kind)
+    }
+
+    fn create_security_vulnerability(
+        &self,
+        vulnerability: &NewSecurityVulnerability,
+    ) -> Result<SecurityVulnerability> {
+        SqliteTracker::create_security_vulnerability(self, vulnerability)
+    }
+
+    fn get_security_vulnerability(&self, id: i64) -> Result<Option<SecurityVulnerability>> {
+        SqliteTracker::get_security_vulnerability(self, id)
+    }
+
+    fn find_security_vulnerability_by_first_report(
+        &self,
+        report_id: i64,
+    ) -> Result<Option<SecurityVulnerability>> {
+        SqliteTracker::find_security_vulnerability_by_first_report(self, report_id)
+    }
+
+    fn list_security_vulnerability_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SecurityVulnerabilityCandidate>> {
+        SqliteTracker::list_security_vulnerability_candidates(self, limit)
+    }
+
+    fn list_security_vulnerabilities(
+        &self,
+        state: Option<VulnerabilityState>,
+    ) -> Result<Vec<SecurityVulnerability>> {
+        SqliteTracker::list_security_vulnerabilities(self, state)
+    }
+
+    fn transition_security_vulnerability(
+        &self,
+        id: i64,
+        expected: VulnerabilityState,
+        next: VulnerabilityState,
+        changes: &SecurityVulnerabilityChanges,
+        event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        SqliteTracker::transition_security_vulnerability(self, id, expected, next, changes, event)
+    }
+
+    fn replace_first_reporter(
+        &self,
+        vulnerability_id: i64,
+        expected_first_report_id: i64,
+        report_id: i64,
+        reported_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        SqliteTracker::replace_first_reporter(
+            self,
+            vulnerability_id,
+            expected_first_report_id,
+            report_id,
+            reported_at,
+        )
+    }
+
+    fn claim_security_reply(
+        &self,
+        report_id: i64,
+        kind: SecurityReplyKind,
+        event: &NewSecurityEvent,
+    ) -> Result<bool> {
+        SqliteTracker::claim_security_reply(self, report_id, kind, event)
+    }
+
+    fn complete_security_reply(
+        &self,
+        report_id: i64,
+        kind: SecurityReplyKind,
+        status: DeliveryStatus,
+        error: Option<&str>,
+        event: &NewSecurityEvent,
+        transition: Option<ReportTransition>,
+    ) -> Result<bool> {
+        SqliteTracker::complete_security_reply(
+            self, report_id, kind, status, error, event, transition,
+        )
+    }
+
+    fn confirm_security_reply(
+        &self,
+        report_id: i64,
+        kind: SecurityReplyKind,
+        delivered: bool,
+        actor: &str,
+    ) -> Result<bool> {
+        SqliteTracker::confirm_security_reply(self, report_id, kind, delivered, actor)
+    }
+
+    fn list_security_replies(&self, report_id: i64) -> Result<Vec<SecurityReply>> {
+        SqliteTracker::list_security_replies(self, report_id)
+    }
+
+    fn list_reports_with_unconfirmed_replies(&self) -> Result<Vec<i64>> {
+        SqliteTracker::list_reports_with_unconfirmed_replies(self)
+    }
+
+    fn prepare_security_award(
+        &self,
+        vulnerability_id: i64,
+        report_id: i64,
+        award: &NewSecurityAward,
+    ) -> Result<bool> {
+        SqliteTracker::prepare_security_award(self, vulnerability_id, report_id, award)
+    }
+
+    fn update_security_award_status(
+        &self,
+        vulnerability_id: i64,
+        expected: &[AwardStatus],
+        next: AwardStatus,
+        actor: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        SqliteTracker::update_security_award_status(
+            self,
+            vulnerability_id,
+            expected,
+            next,
+            actor,
+            note,
+        )
+    }
+
+    fn get_security_award(&self, vulnerability_id: i64) -> Result<Option<SecurityAward>> {
+        SqliteTracker::get_security_award(self, vulnerability_id)
+    }
+
+    fn list_security_awards(&self, status: Option<AwardStatus>) -> Result<Vec<SecurityAward>> {
+        SqliteTracker::list_security_awards(self, status)
+    }
+}
+
 impl ChatStore for SqliteTracker {
-    fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
-        SqliteTracker::create_chat_session(self, id, repo_id)
+    fn create_chat_session(
+        &self,
+        id: &str,
+        repo_id: Option<i64>,
+        owner_user_id: Option<i64>,
+    ) -> Result<()> {
+        SqliteTracker::create_chat_session(self, id, repo_id, owner_user_id)
+    }
+
+    fn get_chat_session(
+        &self,
+        id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Option<claudear_core::types::ChatSession>> {
+        SqliteTracker::get_chat_session(self, id, scope)
     }
 
     fn save_chat_message(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         role: &str,
         content: &str,
         sources_json: Option<&str>,
-    ) -> Result<i64> {
-        SqliteTracker::save_chat_message(self, session_id, role, content, sources_json)
+    ) -> Result<Option<i64>> {
+        SqliteTracker::save_chat_message(self, session_id, scope, role, content, sources_json)
     }
 
     fn get_chat_history(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         limit: usize,
     ) -> Result<Vec<claudear_core::types::ChatMessage>> {
-        SqliteTracker::get_chat_history(self, session_id, limit)
+        SqliteTracker::get_chat_history(self, session_id, scope, limit)
     }
 
-    fn list_chat_sessions(&self) -> Result<Vec<claudear_core::types::ChatSession>> {
-        SqliteTracker::list_chat_sessions(self)
+    fn list_chat_sessions(
+        &self,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Vec<claudear_core::types::ChatSession>> {
+        SqliteTracker::list_chat_sessions(self, scope)
     }
 
-    fn delete_chat_session(&self, session_id: &str) -> Result<()> {
-        SqliteTracker::delete_chat_session(self, session_id)
+    fn delete_chat_session(
+        &self,
+        session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<bool> {
+        SqliteTracker::delete_chat_session(self, session_id, scope)
     }
 
     fn cleanup_expired_chat_sessions(&self, max_age_days: u32) -> Result<usize> {
@@ -5738,16 +6326,12 @@ impl SqliteTracker {
 
     /// Store a feedback outcome to the database.
     pub fn store_feedback_outcome(&self, outcome: &FixOutcome) -> Result<i64> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         let keywords_json = serde_json::to_string(&outcome.keywords).unwrap_or_default();
 
-        // Serialize embedding to BLOB if present
-        let embedding_blob: Option<Vec<u8>> = outcome
-            .embedding
-            .as_ref()
-            .map(|emb| emb.iter().flat_map(|f| f.to_le_bytes()).collect());
+        let blob = outcome.embedding.as_deref().map(embedding_blob);
 
-        conn.execute(
+        connection.execute(
             r#"
             INSERT INTO feedback_outcomes (attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at, embedding)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -5763,16 +6347,15 @@ impl SqliteTracker {
                 outcome.learnings,
                 keywords_json,
                 outcome.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                embedding_blob,
+                blob,
             ],
         )?;
-        let row_id = conn.last_insert_rowid();
+        let row_id = connection.last_insert_rowid();
 
-        // Dual-write: upsert into HNSW vector table if embedding is present
-        if let Some(ref emb) = outcome.embedding {
-            if let Err(e) = Self::upsert_outcome_vector_embedding(&conn, row_id, emb) {
-                tracing::debug!(error = %e, "Failed to upsert outcome vector embedding");
-            }
+        if let Some(values) = &outcome.embedding {
+            self.vector_indexes
+                .outcome
+                .upsert(&connection, row_id, values);
         }
 
         Ok(row_id)
@@ -5838,9 +6421,9 @@ impl SqliteTracker {
 
     /// Store a Q&A knowledge entry.
     pub fn store_qa_knowledge(&self, entry: &QaKnowledgeEntry) -> Result<i64> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
-        conn.execute(
+        connection.execute(
             r#"
             INSERT INTO qa_knowledge (
                 source, repo, issue_id, short_id, question_text, question_norm, question_embedding,
@@ -5868,21 +6451,17 @@ impl SqliteTracker {
                 entry.failure_count,
                 entry
                     .last_used_at
-                    .map(|v| v.format("%Y-%m-%d %H:%M:%S").to_string()),
-                entry.metadata.as_ref().map(|m| m.to_string()),
+                    .map(|date| date.format("%Y-%m-%d %H:%M:%S").to_string()),
+                entry.metadata.as_ref().map(|metadata| metadata.to_string()),
             ],
         )?;
 
-        let qa_id = conn.last_insert_rowid();
+        let qa_id = connection.last_insert_rowid();
 
         if let Some(question_embedding) = entry.question_embedding.as_deref() {
-            if let Err(e) = Self::upsert_qa_vector_embedding(&conn, qa_id, question_embedding) {
-                tracing::debug!(
-                    qa_id = qa_id,
-                    error = %e,
-                    "Failed to sync Q&A vector embedding; falling back to SQL ranking"
-                );
-            }
+            self.vector_indexes
+                .qa
+                .upsert(&connection, qa_id, question_embedding);
         }
 
         Ok(qa_id)
@@ -5898,20 +6477,16 @@ impl SqliteTracker {
         threshold: f64,
         limit: usize,
     ) -> Result<Vec<QaMatch>> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
         if let Some(query_embedding) = question_embedding {
-            let candidate_limit = limit
-                .saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER)
-                .max(limit);
-            if let Some(vector_matches) = Self::query_qa_matches_vector_scoped(
-                &conn,
+            if let Some(vector_matches) = self.query_qa_matches_vector_scoped(
+                &connection,
                 source,
                 repo,
                 query_embedding,
                 threshold,
                 limit,
-                candidate_limit,
             )? {
                 if !vector_matches.is_empty() {
                     return Ok(vector_matches);
@@ -5919,7 +6494,14 @@ impl SqliteTracker {
             }
         }
 
-        Self::query_qa_matches_exact_scoped(&conn, source, repo, question_norm, threshold, limit)
+        Self::query_qa_matches_exact_scoped(
+            &connection,
+            source,
+            repo,
+            question_norm,
+            threshold,
+            limit,
+        )
     }
 
     /// Find semantically similar Q&A entries globally.
@@ -5930,26 +6512,19 @@ impl SqliteTracker {
         threshold: f64,
         limit: usize,
     ) -> Result<Vec<QaMatch>> {
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
 
         if let Some(query_embedding) = question_embedding {
-            let candidate_limit = limit
-                .saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER)
-                .max(limit);
-            if let Some(vector_matches) = Self::query_qa_matches_vector_global(
-                &conn,
-                query_embedding,
-                threshold,
-                limit,
-                candidate_limit,
-            )? {
+            if let Some(vector_matches) =
+                self.query_qa_matches_vector_global(&connection, query_embedding, threshold, limit)?
+            {
                 if !vector_matches.is_empty() {
                     return Ok(vector_matches);
                 }
             }
         }
 
-        Self::query_qa_matches_exact_global(&conn, question_norm, threshold, limit)
+        Self::query_qa_matches_exact_global(&connection, question_norm, threshold, limit)
     }
 
     /// Record usage of a Q&A entry for an attempt.
@@ -6186,20 +6761,8 @@ impl SqliteTracker {
         let keywords_str: Option<String> = row.get(9)?;
         let created_at_str: String = row.get(10)?;
 
-        // Deserialize embedding BLOB if present (column 11)
-        let embedding_blob: Option<Vec<u8>> = row.get(11).unwrap_or(None);
-        let embedding = embedding_blob.and_then(|blob| {
-            if blob.len() % 4 != 0 {
-                return None;
-            }
-            Some(
-                blob.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|chunk| f32::from_le_bytes(*chunk))
-                    .collect(),
-            )
-        });
+        let blob: Option<Vec<u8>> = row.get(11).unwrap_or(None);
+        let embedding = blob.as_deref().and_then(embedding_from_blob);
 
         Ok(FixOutcome {
             id: row.get(0)?,
@@ -6418,22 +6981,26 @@ impl SqliteTracker {
     }
 
     /// Get a comprehensive analytics summary.
-    pub fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
+    pub fn get_analytics_summary(&self, scope: AttemptScope) -> Result<AnalyticsSummary> {
         let conn = self.acquire_lock()?;
+        let excluded = scope.excluded_source();
 
-        // Get basic stats
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN status IN ('success', 'merged') THEN 1 ELSE 0 END) as successful,
-                SUM(CASE WHEN status = 'merged' THEN 1 ELSE 0 END) as merged
+                COALESCE(SUM(CASE WHEN status IN ('success', 'merged') THEN 1 ELSE 0 END), 0) as successful,
+                COALESCE(SUM(CASE WHEN status = 'merged' THEN 1 ELSE 0 END), 0) as merged
             FROM fix_attempts
+            WHERE {}
             "#,
-        )?;
+            scope::source("source", 1)
+        ))?;
 
         let (total, successful, merged): (i64, i64, i64) = stmt
-            .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_row(params![excluded], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .unwrap_or((0, 0, 0));
 
         let success_rate = if total > 0 {
@@ -6442,35 +7009,38 @@ impl SqliteTracker {
             0.0
         };
 
-        // Get average processing time
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT AVG(duration_secs) FROM claude_executions WHERE duration_secs IS NOT NULL
-            "#,
-        )?;
-        let avg_processing_time: Option<f64> = stmt.query_row([], |row| row.get(0)).ok();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT AVG(duration_secs) FROM claude_executions WHERE duration_secs IS NOT NULL AND {}",
+            scope::attempt("attempt_id", 1)
+        ))?;
+        let avg_processing_time: Option<f64> = stmt
+            .query_row(params![excluded], |row| row.get(0))
+            .ok()
+            .flatten();
 
-        // Get most common error
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT error_type FROM error_patterns ORDER BY occurrence_count DESC LIMIT 1
-            "#,
-        )?;
-        let most_common_error: Option<String> = stmt.query_row([], |row| row.get(0)).ok();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT error_type FROM error_patterns WHERE {} ORDER BY occurrence_count DESC LIMIT 1",
+            scope::sources("sources", 1)
+        ))?;
+        let most_common_error: Option<String> = stmt
+            .query_row(params![excluded], |row| row.get(0))
+            .ok()
+            .flatten();
 
-        // Get success rate by source
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT source,
                    CAST(SUM(CASE WHEN status IN ('success', 'merged') THEN 1 ELSE 0 END) AS REAL) /
                    NULLIF(CAST(COUNT(*) AS REAL), 0) as rate
             FROM fix_attempts
+            WHERE {}
             GROUP BY source
             "#,
-        )?;
+            scope::source("source", 1)
+        ))?;
 
         let mut success_rate_by_source = HashMap::new();
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![excluded], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
         })?;
 
@@ -6651,13 +7221,14 @@ impl SqliteTracker {
 
     /// Clear all repositories and dependencies from the database.
     pub fn clear_repositories(&self) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute_batch(
+        let connection = self.acquire_lock()?;
+        connection.execute_batch(
             r#"
             DELETE FROM repository_dependencies;
             DELETE FROM repositories;
             "#,
         )?;
+        self.vector_indexes.code_chunk.reset(&connection);
         Ok(())
     }
 
@@ -6903,8 +7474,8 @@ impl SqliteTracker {
     /// Start indexing progress tracking.
     pub fn start_indexing_progress(&self, total_repos: usize) -> Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let conn = self.acquire_lock()?;
-        conn.execute(
+        let connection = self.acquire_lock()?;
+        connection.execute(
             r#"
             UPDATE indexing_progress SET
                 status = 'running',
@@ -6919,7 +7490,7 @@ impl SqliteTracker {
             "#,
             params![total_repos as i64, &now],
         )?;
-        drop(conn);
+        drop(connection);
         let new_value = IndexingProgress {
             status: "running".to_string(),
             total_repos,
@@ -6927,7 +7498,7 @@ impl SqliteTracker {
             updated_at: Some(now),
             ..Default::default()
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -6947,15 +7518,15 @@ impl SqliteTracker {
         total_files_indexed: usize,
     ) -> Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         // Read total_repos and started_at from DB (avoid borrowing the watch channel
-        // while the conn lock is held).
-        let (db_total_repos, db_started_at): (i64, Option<String>) = conn.query_row(
+        // while the connection lock is held).
+        let (db_total_repos, db_started_at): (i64, Option<String>) = connection.query_row(
             "SELECT total_repos, started_at FROM indexing_progress WHERE id = 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        conn.execute(
+        connection.execute(
             r#"
             UPDATE indexing_progress SET
                 indexed_repos = ?1,
@@ -6973,7 +7544,7 @@ impl SqliteTracker {
                 &now,
             ],
         )?;
-        drop(conn);
+        drop(connection);
         let new_value = IndexingProgress {
             status: "running".to_string(),
             total_repos: db_total_repos as usize,
@@ -6984,7 +7555,7 @@ impl SqliteTracker {
             started_at: db_started_at,
             updated_at: Some(now),
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -6998,15 +7569,15 @@ impl SqliteTracker {
     /// Mark indexing as complete.
     pub fn finish_indexing_progress(&self) -> Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
         // Read values from DB before the UPDATE (avoid borrowing the watch channel
-        // while the conn lock is held).
-        let db_total_repos: i64 = conn.query_row(
+        // while the connection lock is held).
+        let db_total_repos: i64 = connection.query_row(
             "SELECT total_repos FROM indexing_progress WHERE id = 1",
             [],
             |row| row.get(0),
         )?;
-        conn.execute(
+        connection.execute(
             r#"
             UPDATE indexing_progress SET
                 status = 'idle',
@@ -7020,7 +7591,7 @@ impl SqliteTracker {
             "#,
             params![&now],
         )?;
-        drop(conn);
+        drop(connection);
         let new_value = IndexingProgress {
             status: "idle".to_string(),
             total_repos: db_total_repos as usize,
@@ -7029,7 +7600,7 @@ impl SqliteTracker {
             updated_at: Some(now),
             ..Default::default()
         };
-        self.indexing_tx.send_if_modified(|current| {
+        self.indexing_sender.send_if_modified(|current| {
             if *current != new_value {
                 *current = new_value;
                 true
@@ -7190,44 +7761,42 @@ impl SqliteTracker {
         Ok(rows.flatten().collect())
     }
 
-    /// Get PR analytics.
-    pub fn get_pr_analytics(&self) -> Result<claudear_core::types::PrAnalytics> {
+    /// Analytics over the PRs within `scope`.
+    pub fn get_pr_analytics(
+        &self,
+        scope: AttemptScope,
+    ) -> Result<claudear_core::types::PrAnalytics> {
         let conn = self.acquire_lock()?;
+        let excluded = scope.excluded_source();
+        let scoped = scope::pull_request("prs", 1);
 
-        let total: i64 = conn.query_row("SELECT COUNT(*) FROM prs", [], |row| row.get(0))?;
-        let open: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM prs WHERE status = 'open'",
-            [],
-            |row| row.get(0),
+        let (total, open, merged, closed): (i64, i64, i64, i64) = conn.query_row(
+            &format!(
+                r#"
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'merged' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END), 0)
+                FROM prs
+                WHERE {scoped}
+                "#
+            ),
+            params![excluded],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        let merged: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM prs WHERE status = 'merged'",
-            [],
-            |row| row.get(0),
+
+        let (avg_time_to_first_review_mins, avg_time_to_merge_mins, avg_review_cycles): (
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        ) = conn.query_row(
+            &format!(
+                "SELECT AVG(time_to_first_review_mins), AVG(time_to_merge_mins), AVG(review_cycles) FROM prs WHERE {scoped}"
+            ),
+            params![excluded],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let closed: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM prs WHERE status = 'closed'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        let avg_time_to_first_review_mins: Option<f64> = conn.query_row(
-            "SELECT AVG(time_to_first_review_mins) FROM prs WHERE time_to_first_review_mins IS NOT NULL",
-            [],
-            |row| row.get(0),
-        ).ok();
-
-        let avg_time_to_merge_mins: Option<f64> = conn
-            .query_row(
-                "SELECT AVG(time_to_merge_mins) FROM prs WHERE time_to_merge_mins IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-
-        let avg_review_cycles: Option<f64> = conn
-            .query_row("SELECT AVG(review_cycles) FROM prs", [], |row| row.get(0))
-            .ok();
 
         let merge_rate = if merged + closed > 0 {
             Some(merged as f64 / (merged + closed) as f64)
@@ -7235,10 +7804,11 @@ impl SqliteTracker {
             None
         };
 
-        // Get counts by repository
         let mut by_repo = HashMap::new();
-        let mut stmt = conn.prepare("SELECT scm_repo, COUNT(*) FROM prs GROUP BY scm_repo")?;
-        let rows = stmt.query_map([], |row| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT scm_repo, COUNT(*) FROM prs WHERE {scoped} GROUP BY scm_repo"
+        ))?;
+        let rows = stmt.query_map(params![excluded], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
         for row in rows.flatten() {
@@ -7261,17 +7831,22 @@ impl SqliteTracker {
     }
 
     /// Average time from issue attempt to PR creation in minutes.
-    pub fn get_avg_time_to_pr(&self) -> Result<Option<f64>> {
+    pub fn get_avg_time_to_pr(&self, scope: AttemptScope) -> Result<Option<f64>> {
         let conn = self.acquire_lock()?;
         let result: Option<f64> = conn
             .query_row(
-                r#"
-                SELECT AVG((julianday(p.created_at) - julianday(fa.attempted_at)) * 24.0 * 60.0)
-                FROM prs p
-                JOIN fix_attempts fa ON fa.id = p.attempt_id
-                WHERE p.created_at IS NOT NULL AND fa.attempted_at IS NOT NULL
-                "#,
-                [],
+                &format!(
+                    r#"
+                    SELECT AVG((julianday(p.created_at) - julianday(fa.attempted_at)) * 24.0 * 60.0)
+                    FROM prs p
+                    JOIN fix_attempts fa ON fa.id = p.attempt_id
+                    WHERE p.created_at IS NOT NULL AND fa.attempted_at IS NOT NULL
+                      AND {} AND {}
+                    "#,
+                    scope::source("fa.source", 1),
+                    scope::pull_request("p", 1)
+                ),
+                params![scope.excluded_source()],
                 |row| row.get(0),
             )
             .ok()
@@ -7304,11 +7879,14 @@ impl SqliteTracker {
     }
 
     /// Count agent (Claude) spawns since a given ISO timestamp.
-    pub fn get_agent_spawn_count(&self, since_iso: &str) -> Result<i64> {
+    pub fn get_agent_spawn_count(&self, since_iso: &str, scope: AttemptScope) -> Result<i64> {
         let conn = self.acquire_lock()?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM claude_executions WHERE started_at >= ?1",
-            params![since_iso],
+            &format!(
+                "SELECT COUNT(*) FROM claude_executions WHERE started_at >= ?1 AND {}",
+                scope::attempt("attempt_id", 2)
+            ),
+            params![since_iso, scope.excluded_source()],
             |row| row.get(0),
         )?;
         Ok(count)
@@ -7323,29 +7901,36 @@ impl SqliteTracker {
         since_iso: &str,
         max_plan_monthly_cost: f64,
         period_label: &str,
+        scope: AttemptScope,
     ) -> Result<claudear_core::types::CostEstimate> {
         let conn = self.acquire_lock()?;
+        let excluded = scope.excluded_source();
+        let scoped_executions = scope::attempt("attempt_id", 2);
 
-        // Try actual API cost first
         let (api_cost_sum, api_cost_count): (f64, i64) = conn
             .query_row(
-                r#"
-                SELECT COALESCE(SUM(total_cost_usd), 0.0), COUNT(total_cost_usd)
-                FROM claude_executions
-                WHERE started_at >= ?1 AND total_cost_usd IS NOT NULL
-                "#,
-                params![since_iso],
+                &format!(
+                    r#"
+                    SELECT COALESCE(SUM(total_cost_usd), 0.0), COUNT(total_cost_usd)
+                    FROM claude_executions
+                    WHERE started_at >= ?1 AND total_cost_usd IS NOT NULL AND {scoped_executions}
+                    "#
+                ),
+                params![since_iso, excluded],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap_or((0.0, 0));
 
         let fix_count: i64 = conn
             .query_row(
-                r#"
-                SELECT COUNT(*) FROM fix_attempts
-                WHERE status IN ('success', 'merged') AND attempted_at >= ?1
-                "#,
-                params![since_iso],
+                &format!(
+                    r#"
+                    SELECT COUNT(*) FROM fix_attempts
+                    WHERE status IN ('success', 'merged') AND attempted_at >= ?1 AND {}
+                    "#,
+                    scope::source("source", 2)
+                ),
+                params![since_iso, excluded],
                 |row| row.get(0),
             )
             .unwrap_or(0);
@@ -7356,24 +7941,30 @@ impl SqliteTracker {
             // Estimate from plan cost: amortize over total minutes used this month
             let monthly_total_mins: f64 = conn
                 .query_row(
-                    r#"
-                    SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
-                    FROM claude_executions
-                    WHERE started_at >= datetime('now', '-30 days') AND duration_secs IS NOT NULL
-                    "#,
-                    [],
+                    &format!(
+                        r#"
+                        SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
+                        FROM claude_executions
+                        WHERE started_at >= datetime('now', '-30 days') AND duration_secs IS NOT NULL
+                          AND {}
+                        "#,
+                        scope::attempt("attempt_id", 1)
+                    ),
+                    params![excluded],
                     |row| row.get(0),
                 )
                 .unwrap_or(0.0);
 
             let period_mins: f64 = conn
                 .query_row(
-                    r#"
-                    SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
-                    FROM claude_executions
-                    WHERE started_at >= ?1 AND duration_secs IS NOT NULL
-                    "#,
-                    params![since_iso],
+                    &format!(
+                        r#"
+                        SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
+                        FROM claude_executions
+                        WHERE started_at >= ?1 AND duration_secs IS NOT NULL AND {scoped_executions}
+                        "#
+                    ),
+                    params![since_iso, excluded],
                     |row| row.get(0),
                 )
                 .unwrap_or(0.0);
@@ -7388,12 +7979,14 @@ impl SqliteTracker {
             // Fallback: duration-based estimate at $0.05/min
             let total_duration_mins: f64 = conn
                 .query_row(
-                    r#"
-                    SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
-                    FROM claude_executions
-                    WHERE started_at >= ?1 AND duration_secs IS NOT NULL
-                    "#,
-                    params![since_iso],
+                    &format!(
+                        r#"
+                        SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
+                        FROM claude_executions
+                        WHERE started_at >= ?1 AND duration_secs IS NOT NULL AND {scoped_executions}
+                        "#
+                    ),
+                    params![since_iso, excluded],
                     |row| row.get(0),
                 )
                 .unwrap_or(0.0);
@@ -7416,10 +8009,14 @@ impl SqliteTracker {
     }
 
     /// MTTR trend grouped by ISO week buckets.
-    pub fn get_mttr_trend(&self, weeks: usize) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
+    pub fn get_mttr_trend(
+        &self,
+        weeks: usize,
+        scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::MttrDataPoint>> {
         let conn = self.acquire_lock()?;
         let modifier = format!("-{} days", weeks * 7);
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 date(fa.merged_at, 'weekday 0', '-6 days') as week_start,
@@ -7430,11 +8027,13 @@ impl SqliteTracker {
               AND fa.merged_at IS NOT NULL
               AND fa.attempted_at IS NOT NULL
               AND fa.merged_at >= datetime('now', ?1)
+              AND {}
             GROUP BY week_start
             ORDER BY week_start ASC
             "#,
-        )?;
-        let rows = stmt.query_map(params![modifier], |row| {
+            scope::source("fa.source", 2)
+        ))?;
+        let rows = stmt.query_map(params![modifier, scope.excluded_source()], |row| {
             Ok(claudear_core::types::MttrDataPoint {
                 period_start: row.get(0)?,
                 mttr_minutes: row.get(1)?,
@@ -7445,9 +8044,12 @@ impl SqliteTracker {
     }
 
     /// Per-repository leaderboard.
-    pub fn get_repo_leaderboard(&self) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
+    pub fn get_repo_leaderboard(
+        &self,
+        scope: AttemptScope,
+    ) -> Result<Vec<claudear_core::types::RepoLeaderboardEntry>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 fa.scm_repo,
@@ -7459,11 +8061,13 @@ impl SqliteTracker {
             FROM fix_attempts fa
             LEFT JOIN prs p ON p.attempt_id = fa.id
             WHERE fa.scm_repo IS NOT NULL AND fa.scm_repo != ''
+              AND {}
             GROUP BY fa.scm_repo
             ORDER BY total DESC
             "#,
-        )?;
-        let rows = stmt.query_map([], |row| {
+            scope::source("fa.source", 1)
+        ))?;
+        let rows = stmt.query_map(params![scope.excluded_source()], |row| {
             Ok(claudear_core::types::RepoLeaderboardEntry {
                 repo: row.get(0)?,
                 total: row.get(1)?,
@@ -7484,10 +8088,11 @@ impl SqliteTracker {
     pub fn get_commit_trend(
         &self,
         days: usize,
+        scope: AttemptScope,
     ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
         let conn = self.acquire_lock()?;
         let modifier = format!("-{} days", days);
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 date(started_at) as day,
@@ -7497,11 +8102,13 @@ impl SqliteTracker {
               AND started_at >= datetime('now', ?1)
               AND git_commit_after IS NOT NULL
               AND (git_commit_before IS NULL OR git_commit_after != git_commit_before)
+              AND {}
             GROUP BY day
             ORDER BY day ASC
             "#,
-        )?;
-        let rows = stmt.query_map(params![modifier], |row| {
+            scope::attempt("attempt_id", 2)
+        ))?;
+        let rows = stmt.query_map(params![modifier, scope.excluded_source()], |row| {
             Ok(claudear_core::types::CommitTrendPoint {
                 period_start: row.get(0)?,
                 commits: row.get(1)?,
@@ -7665,9 +8272,10 @@ impl SqliteTracker {
         since_iso: &str,
         hourly_rate: f64,
         period_label: &str,
+        scope: AttemptScope,
     ) -> Result<claudear_core::types::TimeSavings> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 fa.id,
@@ -7679,11 +8287,12 @@ impl SqliteTracker {
             FROM fix_attempts fa
             LEFT JOIN prs p ON p.attempt_id = fa.id
             LEFT JOIN claude_executions ce ON ce.attempt_id = fa.id
-            WHERE fa.status = 'merged' AND fa.merged_at >= ?1
+            WHERE fa.status = 'merged' AND fa.merged_at >= ?1 AND {}
             "#,
-        )?;
+            scope::source("fa.source", 2)
+        ))?;
 
-        let rows = stmt.query_map(params![since_iso], |row| {
+        let rows = stmt.query_map(params![since_iso, scope.excluded_source()], |row| {
             Ok((
                 row.get::<_, i64>(0)?, // id
                 row.get::<_, f64>(1)?, // total_lines
@@ -7731,49 +8340,32 @@ impl SqliteTracker {
         })
     }
 
-    /// List PRs with optional status filter and limit.
+    /// The newest `limit` PRs within `scope`, optionally with `status`.
     pub fn list_prs(
         &self,
         status: Option<&str>,
         limit: usize,
+        scope: AttemptScope,
     ) -> Result<Vec<claudear_core::types::PrRecord>> {
         let conn = self.acquire_lock()?;
-        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
-            Some(s) => (
-                r#"
-                    SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
-                           title, description, author, head_branch, base_branch, status,
-                           created_at, updated_at, merged_at, closed_at,
-                           approvals_count, changes_requested_count, comments_count, last_review_at,
-                           time_to_first_review_mins, time_to_merge_mins, review_cycles,
-                           files_changed, lines_added, lines_removed
-                    FROM prs WHERE status = ?1
-                    ORDER BY created_at DESC LIMIT ?2
-                "#
-                .to_string(),
-                vec![
-                    Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>,
-                    Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>,
-                ],
-            ),
-            None => (
-                r#"
-                    SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
-                           title, description, author, head_branch, base_branch, status,
-                           created_at, updated_at, merged_at, closed_at,
-                           approvals_count, changes_requested_count, comments_count, last_review_at,
-                           time_to_first_review_mins, time_to_merge_mins, review_cycles,
-                           files_changed, lines_added, lines_removed
-                    FROM prs ORDER BY created_at DESC LIMIT ?1
-                "#
-                .to_string(),
-                vec![Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>],
-            ),
-        };
-        let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt.query_map(param_refs.as_slice(), Self::row_to_pr_record)?;
+        let mut statement = conn.prepare(&format!(
+            r#"
+                SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
+                       title, description, author, head_branch, base_branch, status,
+                       created_at, updated_at, merged_at, closed_at,
+                       approvals_count, changes_requested_count, comments_count, last_review_at,
+                       time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                       files_changed, lines_added, lines_removed
+                FROM prs
+                WHERE (?1 IS NULL OR status = ?1) AND {}
+                ORDER BY created_at DESC LIMIT ?2
+            "#,
+            scope::pull_request("prs", 3)
+        ))?;
+        let rows = statement.query_map(
+            params![status, limit as i64, scope.excluded_source()],
+            Self::row_to_pr_record,
+        )?;
         Ok(rows.flatten().collect())
     }
 
@@ -8209,6 +8801,33 @@ impl SqliteTracker {
             .optional()?)
     }
 
+    /// Most recent tips first, across every track or only `track`, at most
+    /// `limit` of them.
+    pub fn list_deploy_qa_tips(
+        &self,
+        track: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE (?1 IS NULL OR track = ?1)
+            ORDER BY CAST(COALESCE(strftime('%s', published_at), strftime('%s', created_at)) AS INTEGER) DESC,
+                     id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let tips = stmt
+            .query_map(params![track, limit], Self::row_to_deploy_qa_tip)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tips)
+    }
+
     /// Tips waiting to be picked up by the `deploy_qa` source.
     pub fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
         use claudear_core::types::DeployQaTipStatus;
@@ -8341,7 +8960,132 @@ impl SqliteTracker {
     }
 }
 
+const PR_ASSIGNMENT_COLUMNS: &str =
+    "id, pr_url, repo, pr_number, assignee, previous, reason, score, status, assigned_at, \
+     ended_at, notified_at";
+
 impl SqliteTracker {
+    fn row_to_pr_assignment(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<claudear_core::types::PrAssignment> {
+        fn parse<T: std::str::FromStr<Err = String>>(
+            row: &rusqlite::Row<'_>,
+            column: usize,
+        ) -> rusqlite::Result<T> {
+            row.get::<_, String>(column)?.parse::<T>().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })
+        }
+        Ok(claudear_core::types::PrAssignment {
+            id: row.get(0)?,
+            pr_url: row.get(1)?,
+            repo: row.get(2)?,
+            pr_number: row.get(3)?,
+            assignee: row.get(4)?,
+            previous: row.get(5)?,
+            reason: parse(row, 6)?,
+            score: row.get(7)?,
+            status: parse(row, 8)?,
+            assigned_at: Self::parse_datetime(&row.get::<_, String>(9)?)?,
+            ended_at: Self::parse_optional_datetime(row.get(10)?)?,
+            notified_at: Self::parse_optional_datetime(row.get(11)?)?,
+        })
+    }
+
+    /// Every active PR assignment, oldest first.
+    pub fn active_pr_assignments(&self) -> Result<Vec<claudear_core::types::PrAssignment>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PR_ASSIGNMENT_COLUMNS} FROM pr_assignments \
+             WHERE status = 'active' ORDER BY assigned_at, id"
+        ))?;
+        let rows = stmt.query_map([], Self::row_to_pr_assignment)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The active assignment of `pr_url`, if it has one.
+    pub fn active_pr_assignment(
+        &self,
+        pr_url: &str,
+    ) -> Result<Option<claudear_core::types::PrAssignment>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PR_ASSIGNMENT_COLUMNS} FROM pr_assignments \
+             WHERE pr_url = ?1 AND status = 'active'"
+        ))?;
+        Ok(stmt
+            .query_row(params![pr_url], Self::row_to_pr_assignment)
+            .optional()?)
+    }
+
+    /// Record `assignment` as its PR's active assignment, or return `None`
+    /// when the PR already has one.
+    pub fn record_pr_assignment(
+        &self,
+        assignment: &claudear_core::types::PrAssignment,
+    ) -> Result<Option<claudear_core::types::PrAssignment>> {
+        let conn = self.acquire_lock()?;
+        let inserted = conn.execute(
+            r#"
+            INSERT OR IGNORE INTO pr_assignments
+                (pr_url, repo, pr_number, assignee, previous, reason, score, status, assigned_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8)
+            "#,
+            params![
+                assignment.pr_url,
+                assignment.repo,
+                assignment.pr_number,
+                assignment.assignee,
+                assignment.previous,
+                assignment.reason.to_string(),
+                assignment.score,
+                assignment.assigned_at.to_rfc3339(),
+            ],
+        )?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PR_ASSIGNMENT_COLUMNS} FROM pr_assignments WHERE id = ?1"
+        ))?;
+        Ok(Some(stmt.query_row(
+            params![conn.last_insert_rowid()],
+            Self::row_to_pr_assignment,
+        )?))
+    }
+
+    /// End the active assignment `id` with `status`, returning whether it was
+    /// still active.
+    pub fn end_pr_assignment(
+        &self,
+        id: i64,
+        status: claudear_core::types::AssignmentStatus,
+    ) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let ended = conn.execute(
+            "UPDATE pr_assignments SET status = ?1, ended_at = ?2 \
+             WHERE id = ?3 AND status = 'active'",
+            params![status.to_string(), Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(ended > 0)
+    }
+
+    /// Record that a ping reached the assignee of the active assignment `id`,
+    /// returning whether it was still active and not yet notified.
+    pub fn mark_pr_assignment_notified(&self, id: i64) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let marked = conn.execute(
+            "UPDATE pr_assignments SET notified_at = ?1 \
+             WHERE id = ?2 AND status = 'active' AND notified_at IS NULL",
+            params![Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(marked > 0)
+    }
+
     /// System 1: Update learnings text on a feedback outcome.
     pub fn update_feedback_learnings(&self, outcome_id: i64, learnings: &str) -> Result<()> {
         let conn = self.acquire_lock()?;
@@ -9265,18 +10009,21 @@ impl SqliteTracker {
 
     /// Delete all code symbols, chunks, and embeddings for a specific file.
     pub fn delete_code_data_for_file(&self, repo_id: i64, file_path: &str) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Embeddings are CASCADE-deleted via code_chunks FK.
-        tx.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids = Self::code_chunk_embedding_ids(&transaction, repo_id, Some(file_path))?;
+        transaction.execute(
             "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
             params![repo_id, file_path],
         )?;
-        tx.execute(
+        transaction.execute(
             "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
             params![repo_id, file_path],
         )?;
-        tx.commit()?;
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
@@ -9285,75 +10032,119 @@ impl SqliteTracker {
         if chunk_ids.is_empty() {
             return Ok(());
         }
-        let conn = self.acquire_lock()?;
-        let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
-        let sql = format!(
-            "DELETE FROM code_chunks WHERE id IN ({})",
-            placeholders.join(", ")
-        );
-        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        conn.execute(&sql, params.as_slice())?;
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids = Self::code_chunk_embedding_ids_for_chunks(&transaction, chunk_ids)?;
+        {
+            let mut statement =
+                transaction.prepare_cached("DELETE FROM code_chunks WHERE id = ?1")?;
+            for chunk_id in chunk_ids {
+                statement.execute(params![chunk_id])?;
+            }
+        }
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
     /// Remove code data for files that no longer exist in the repository.
     pub fn cleanup_stale_code_data(&self, repo_id: i64, current_paths: &[String]) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-
         if current_paths.is_empty() {
-            // No source files found — delete ALL code data for this repo.
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "DELETE FROM code_symbols WHERE repo_id = ?1",
-                params![repo_id],
-            )?;
-            tx.execute(
-                "DELETE FROM code_chunks WHERE repo_id = ?1",
-                params![repo_id],
-            )?;
-            tx.commit()?;
+            return self.delete_all_code_data_for_repo(repo_id);
+        }
+
+        let current: HashSet<&str> = current_paths.iter().map(String::as_str).collect();
+        let mut connection = self.acquire_lock()?;
+        if Self::stale_code_file_paths(&connection, repo_id, &current)?.is_empty() {
             return Ok(());
         }
 
-        // Get all file paths we have indexed for this repo.
-        // code_chunks is the primary artifact; stale symbols are cleaned up
-        // via delete_code_data_for_file which deletes both tables.
-        let indexed_paths: Vec<String> = {
-            let mut stmt =
-                conn.prepare("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
-            let rows: Vec<String> = stmt
-                .query_map(params![repo_id], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        };
-
-        let current_set: std::collections::HashSet<&str> =
-            current_paths.iter().map(|s| s.as_str()).collect();
-
-        let stale_paths: Vec<&String> = indexed_paths
-            .iter()
-            .filter(|p| !current_set.contains(p.as_str()))
-            .collect();
-
-        if !stale_paths.is_empty() {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_paths = Self::stale_code_file_paths(&transaction, repo_id, &current)?;
+        let mut embedding_ids = Vec::new();
+        {
+            let mut delete_symbols = transaction
+                .prepare_cached("DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2")?;
+            let mut delete_chunks = transaction
+                .prepare_cached("DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2")?;
             for path in &stale_paths {
-                tx.execute(
-                    "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
-                    params![repo_id, path],
-                )?;
-                tx.execute(
-                    "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
-                    params![repo_id, path],
-                )?;
+                embedding_ids.extend(Self::code_chunk_embedding_ids(
+                    &transaction,
+                    repo_id,
+                    Some(path),
+                )?);
+                delete_symbols.execute(params![repo_id, path])?;
+                delete_chunks.execute(params![repo_id, path])?;
             }
-            tx.commit()?;
         }
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
+    }
+
+    fn stale_code_file_paths(
+        connection: &Connection,
+        repository_id: i64,
+        current_paths: &HashSet<&str>,
+    ) -> Result<Vec<String>> {
+        let mut statement = connection
+            .prepare_cached("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
+        let mut stale = Vec::new();
+        for path in statement.query_map(params![repository_id], |row| row.get::<_, String>(0))? {
+            let path = path?;
+            if !current_paths.contains(path.as_str()) {
+                stale.push(path);
+            }
+        }
+        Ok(stale)
+    }
+
+    fn code_chunk_embedding_ids(
+        connection: &Connection,
+        repository_id: i64,
+        file_path: Option<&str>,
+    ) -> Result<Vec<i64>> {
+        let (sql, parameters) = match file_path {
+            Some(_) => (
+                "SELECT e.id FROM code_chunk_embeddings e
+                 JOIN code_chunks c ON c.id = e.chunk_id
+                 WHERE c.repo_id = ?1 AND c.file_path = ?2",
+                params![repository_id, file_path],
+            ),
+            None => (
+                "SELECT e.id FROM code_chunk_embeddings e
+                 JOIN code_chunks c ON c.id = e.chunk_id
+                 WHERE c.repo_id = ?1",
+                params![repository_id],
+            ),
+        };
+        let ids = connection
+            .prepare_cached(sql)?
+            .query_map(parameters, |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
+
+    fn code_chunk_embedding_ids_for_chunks(
+        connection: &Connection,
+        chunk_ids: &[i64],
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection
+            .prepare_cached("SELECT id FROM code_chunk_embeddings WHERE chunk_id = ?1")?;
+        let mut ids = Vec::with_capacity(chunk_ids.len());
+        for chunk_id in chunk_ids {
+            if let Some(id) = statement
+                .query_row(params![chunk_id], |row| row.get(0))
+                .optional()?
+            {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     /// Batch-save extracted code symbols.
@@ -9434,99 +10225,26 @@ impl SqliteTracker {
             return Ok(());
         }
 
-        let mut conn = self.acquire_lock()?;
-
-        let dimension = pairs[0].1.len();
-        let _ = Self::ensure_code_chunk_vector_table(&conn, dimension);
-
-        let has_vector_table = Self::table_exists(&conn, CODE_CHUNK_VECTOR_TABLE)?;
-
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut embedding_ids = Vec::with_capacity(pairs.len());
         {
-            let mut stmt = tx.prepare(
+            let mut statement = transaction.prepare(
                 "INSERT INTO code_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
             )?;
-
             for &(chunk_id, embedding) in pairs {
-                let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-                stmt.execute(params![chunk_id, blob, model_name])?;
-
-                if has_vector_table {
-                    let emb_id = tx.last_insert_rowid();
-                    let insert_sql = format!(
-                        "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-                        CODE_CHUNK_VECTOR_TABLE
-                    );
-                    if let Err(e) = tx.execute(&insert_sql, params![emb_id, blob]) {
-                        tracing::warn!(error = %e, chunk_id, "Failed to insert into code chunk vector table — aborting batch");
-                        // Drop tx without commit to roll back the entire batch,
-                        // so embeddings and vector index stay consistent.
-                        return Err(e.into());
-                    }
-                }
+                statement.execute(params![chunk_id, embedding_blob(embedding), model_name])?;
+                embedding_ids.push(transaction.last_insert_rowid());
             }
         }
+        transaction.commit()?;
 
-        tx.commit()?;
+        for (embedding_id, &(_, embedding)) in embedding_ids.into_iter().zip(pairs) {
+            self.vector_indexes
+                .code_chunk
+                .upsert(&connection, embedding_id, embedding);
+        }
         Ok(())
-    }
-
-    /// Lazily create the HNSW vector table for code chunk embeddings.
-    fn ensure_code_chunk_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
-
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite for code chunk search");
-                    return Ok(false);
-                }
-            }
-        }
-
-        if Self::table_exists(conn, CODE_CHUNK_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=100000, ef_construction=200, M=16)
-            )
-            "#,
-            table = CODE_CHUNK_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                // Backfill existing embeddings.
-                let backfill = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM code_chunk_embeddings
-                    WHERE length(embedding) = ?1
-                    "#,
-                    table = CODE_CHUNK_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill code chunk vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create code chunk vector table");
-                Ok(false)
-            }
-        }
     }
 
     /// Search code chunks by vector similarity using HNSW index.
@@ -9545,23 +10263,20 @@ impl SqliteTracker {
         // Clamp limit to prevent excessive memory usage from the HNSW candidate multiplier.
         let limit = limit.min(1000);
 
-        let conn = self.acquire_lock()?;
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.code_chunk;
 
-        if !Self::ensure_code_chunk_vector_table(&conn, query_embedding.len())? {
-            // Vectorlite unavailable — fall back to empty results.
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(Vec::new());
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
             r#"
             WITH candidates AS (
-                SELECT rowid AS emb_id,
+                SELECT rowid AS embedding_id,
                        MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
                 FROM {table}
                 WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
@@ -9571,24 +10286,24 @@ impl SqliteTracker {
                    ch.language, ch.start_line, ch.end_line, ch.chunk_text,
                    ch.context_text, ch.file_hash
             FROM candidates c
-            JOIN code_chunk_embeddings e ON e.id = c.emb_id
+            JOIN code_chunk_embeddings e ON e.id = c.embedding_id
             JOIN code_chunks ch ON ch.id = e.chunk_id
             WHERE (?4 IS NULL OR ch.repo_id = ?4)
             ORDER BY c.similarity DESC
             LIMIT ?5
             "#,
-            table = CODE_CHUNK_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare code chunk vector search");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare code chunk vector search");
                 return Ok(Vec::new());
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -9598,7 +10313,7 @@ impl SqliteTracker {
             ],
             |row| {
                 let similarity: f64 = row.get(0)?;
-                let lang_str: String = row.get(6)?;
+                let language: String = row.get(6)?;
                 let chunk_text: String = row.get(9)?;
                 let stored_prefix: String = row.get(10)?;
                 // Reconstruct full context_text from stored prefix + chunk_text.
@@ -9611,7 +10326,7 @@ impl SqliteTracker {
                         file_path: row.get(3)?,
                         chunk_type: row.get(4)?,
                         symbol_name: row.get(5)?,
-                        language: parse_language(&lang_str),
+                        language: parse_language(&language),
                         start_line: row.get::<_, i64>(7)? as usize,
                         end_line: row.get::<_, i64>(8)? as usize,
                         chunk_text,
@@ -9623,9 +10338,9 @@ impl SqliteTracker {
                 })
             },
         ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(error = %e, "Code chunk vector search failed");
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(%error, "Code chunk vector search failed");
                 return Ok(Vec::new());
             }
         };
@@ -9633,8 +10348,8 @@ impl SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read code chunk vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read code chunk vector row"),
             }
         }
 
@@ -9692,124 +10407,58 @@ impl SqliteTracker {
             return Ok(());
         }
 
-        let mut conn = self.acquire_lock()?;
-
-        let dimension = pairs[0].1.len();
-        let _ = Self::ensure_discord_chunk_vector_table(&conn, dimension);
-
-        let has_vector_table = Self::table_exists(&conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)?;
-
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut saved = Vec::with_capacity(pairs.len());
         {
-            let mut stmt = tx.prepare(
+            let mut statement = transaction.prepare(
                 "INSERT INTO discord_message_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
             )?;
-
             for &(chunk_id, embedding) in pairs {
-                let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-                stmt.execute(params![chunk_id, blob, model_name])?;
-
-                if has_vector_table {
-                    let emb_id = tx.last_insert_rowid();
-                    let insert_sql = format!(
-                        "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
-                        DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-                    );
-                    if let Err(e) = tx.execute(&insert_sql, params![emb_id, blob]) {
-                        tracing::warn!(error = %e, chunk_id, "Failed to insert into discord chunk vector table — aborting batch");
-                        // Drop tx without commit to roll back the entire batch,
-                        // so embeddings and vector index stay consistent.
-                        return Err(e.into());
-                    }
-                }
+                statement.execute(params![chunk_id, embedding_blob(embedding), model_name])?;
+                saved.push((transaction.last_insert_rowid(), embedding));
             }
         }
+        transaction.commit()?;
 
-        tx.commit()?;
+        for (embedding_id, embedding) in saved {
+            self.vector_indexes
+                .discord_message_chunk
+                .upsert(&connection, embedding_id, embedding);
+        }
         Ok(())
     }
 
-    /// Lazily create the HNSW vector table for Discord message chunk embeddings.
-    fn ensure_discord_chunk_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
-        if dimension == 0 {
-            return Ok(false);
-        }
-        validate_dimension(dimension)?;
+    fn discord_message_chunk_embedding_ids_for_channel(
+        connection: &Connection,
+        channel_id: &str,
+    ) -> Result<Vec<i64>> {
+        let ids = connection
+            .prepare_cached(
+                "SELECT e.id FROM discord_message_chunk_embeddings e JOIN discord_message_chunks c ON c.id = e.chunk_id WHERE c.channel_id = ?1",
+            )?
+            .query_map(params![channel_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
 
-        if !is_vectorlite_available(conn) {
-            match try_load_vectorlite(conn) {
-                Ok(true) => {}
-                Ok(false) => return Ok(false),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Unable to load vectorlite for discord chunk search");
-                    return Ok(false);
-                }
+    fn discord_message_chunk_embedding_ids_for_chunks(
+        connection: &Connection,
+        chunk_ids: &[i64],
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection.prepare_cached(
+            "SELECT id FROM discord_message_chunk_embeddings WHERE chunk_id = ?1",
+        )?;
+        let mut ids = Vec::with_capacity(chunk_ids.len());
+        for chunk_id in chunk_ids {
+            if let Some(id) = statement
+                .query_row(params![chunk_id], |row| row.get(0))
+                .optional()?
+            {
+                ids.push(id);
             }
         }
-
-        if Self::table_exists(conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)? {
-            // Reuse the existing table only if its declared dimension matches.
-            // After an embedding-model upgrade the vector length can change, so a
-            // stale `float32[N]` table must be dropped and recreated — otherwise
-            // inserts of the new blobs fail and searches see stale vectors.
-            let existing_sql: Option<String> = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    params![DISCORD_MESSAGE_CHUNK_VECTOR_TABLE],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            let matches = existing_sql
-                .as_deref()
-                .map(|sql| sql.contains(&format!("float32[{}]", dimension)))
-                .unwrap_or(false);
-            if matches {
-                return Ok(true);
-            }
-            tracing::info!(
-                dimension,
-                "Discord chunk vector table dimension changed — recreating"
-            );
-            conn.execute_batch(&format!(
-                "DROP TABLE IF EXISTS {}",
-                DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-            ))?;
-        }
-
-        let sql = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
-                embedding float32[{dimension}] cosine,
-                hnsw(max_elements=100000, ef_construction=200, M=16)
-            )
-            "#,
-            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE,
-            dimension = dimension
-        );
-
-        match conn.execute_batch(&sql) {
-            Ok(()) => {
-                // Backfill existing embeddings.
-                let backfill = format!(
-                    r#"
-                    INSERT INTO {table}(rowid, embedding)
-                    SELECT id, embedding
-                    FROM discord_message_chunk_embeddings
-                    WHERE length(embedding) = ?1
-                    "#,
-                    table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-                );
-                if let Err(e) = conn.execute(&backfill, params![(dimension * 4) as i64]) {
-                    tracing::debug!(error = %e, "Failed to backfill discord chunk vector embeddings");
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to create discord chunk vector table");
-                Ok(false)
-            }
-        }
+        Ok(ids)
     }
 
     /// Search Discord message chunks by vector similarity using the HNSW index.
@@ -9828,23 +10477,19 @@ impl SqliteTracker {
         // Clamp limit to prevent excessive memory usage from the HNSW candidate multiplier.
         let limit = limit.min(1000);
 
-        let conn = self.acquire_lock()?;
-
-        if !Self::ensure_discord_chunk_vector_table(&conn, query_embedding.len())? {
-            // Vectorlite unavailable — fall back to empty results.
+        let connection = self.acquire_lock()?;
+        let index = &self.vector_indexes.discord_message_chunk;
+        if !index.prepare_search(&connection, query_embedding.len())? {
             return Ok(Vec::new());
         }
 
-        let query_blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let query_blob = embedding_blob(query_embedding);
         let candidate_limit = limit * DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER;
 
         let sql = format!(
             r#"
             WITH candidates AS (
-                SELECT rowid AS emb_id,
+                SELECT rowid AS embedding_id,
                        MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
                 FROM {table}
                 WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
@@ -9855,24 +10500,24 @@ impl SqliteTracker {
                    ch.start_message_time, ch.end_message_time,
                    ch.chunk_text, ch.context_text, ch.content_hash
             FROM candidates c
-            JOIN discord_message_chunk_embeddings e ON e.id = c.emb_id
+            JOIN discord_message_chunk_embeddings e ON e.id = c.embedding_id
             JOIN discord_message_chunks ch ON ch.id = e.chunk_id
             WHERE (?4 IS NULL OR ch.channel_id = ?4)
             ORDER BY c.similarity DESC
             LIMIT ?5
             "#,
-            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+            table = index.table()
         );
 
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to prepare discord chunk vector search");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to prepare discord chunk vector search");
                 return Ok(Vec::new());
             }
         };
 
-        let rows = match stmt.query_map(
+        let rows = match statement.query_map(
             params![
                 query_blob,
                 candidate_limit as i64,
@@ -9882,19 +10527,20 @@ impl SqliteTracker {
             ],
             |row| {
                 let similarity: f64 = row.get(0)?;
-                let kind_int: i64 = row.get(4)?;
+                let kind: i64 = row.get(4)?;
                 let participants: Option<String> = row.get(7)?;
                 Ok(DiscordSearchResult {
                     chunk: DiscordMessageChunk {
                         id: row.get(1)?,
                         guild_id: row.get(2)?,
                         channel_id: row.get(3)?,
-                        channel_kind: DiscordChannelKind::from_i64(kind_int),
+                        channel_kind: DiscordChannelKind::from_i64(kind),
                         start_message_id: row.get(5)?,
                         end_message_id: row.get(6)?,
-                        participant_ids: participants.map(|s| {
-                            s.split(',')
-                                .filter(|x| !x.is_empty())
+                        participant_ids: participants.map(|participants| {
+                            participants
+                                .split(',')
+                                .filter(|participant| !participant.is_empty())
                                 .map(String::from)
                                 .collect()
                         }),
@@ -9908,9 +10554,9 @@ impl SqliteTracker {
                 })
             },
         ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(error = %e, "Discord chunk vector search failed");
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(%error, "Discord chunk vector search failed");
                 return Ok(Vec::new());
             }
         };
@@ -9918,8 +10564,8 @@ impl SqliteTracker {
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(r) => results.push(r),
-                Err(e) => tracing::debug!(error = %e, "Failed to read discord chunk vector row"),
+                Ok(result) => results.push(result),
+                Err(error) => tracing::debug!(%error, "Failed to read discord chunk vector row"),
             }
         }
 
@@ -9945,13 +10591,19 @@ impl SqliteTracker {
 
     /// Delete all indexed chunks (and CASCADE-deleted embeddings) for a channel/thread.
     pub fn delete_discord_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-
-        // embeddings will be deleted via the cascade delete
-        conn.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids =
+            Self::discord_message_chunk_embedding_ids_for_channel(&transaction, channel_id)?;
+        transaction.execute(
             "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        transaction.commit()?;
+
+        self.vector_indexes
+            .discord_message_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
@@ -9959,19 +10611,23 @@ impl SqliteTracker {
     pub fn delete_discord_message_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
         if chunk_ids.is_empty() {
             return Ok(());
-        };
-        let conn = self.acquire_lock()?;
-        let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
-        let sql = format!(
-            "DELETE FROM discord_message_chunks WHERE id IN ({})",
-            placeholders.join(", ")
-        );
-        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        // embeddings will be deleted via the cascade delete
-        conn.execute(&sql, params.as_slice())?;
+        }
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids =
+            Self::discord_message_chunk_embedding_ids_for_chunks(&transaction, chunk_ids)?;
+        {
+            let mut statement =
+                transaction.prepare_cached("DELETE FROM discord_message_chunks WHERE id = ?1")?;
+            for chunk_id in chunk_ids {
+                statement.execute(params![chunk_id])?;
+            }
+        }
+        transaction.commit()?;
+
+        self.vector_indexes
+            .discord_message_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
@@ -9981,67 +10637,65 @@ impl SqliteTracker {
         channel_id: &str,
         current_hashes: &[String],
     ) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-
         if current_hashes.is_empty() {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
-                params![channel_id],
-            )?;
-            tx.commit()?;
+            return self.delete_discord_message_data_for_channel(channel_id);
+        }
+
+        let current: HashSet<&str> = current_hashes.iter().map(String::as_str).collect();
+        let mut connection = self.acquire_lock()?;
+        if Self::stale_discord_message_chunk_ids(&connection, channel_id, &current)?.is_empty() {
             return Ok(());
         }
 
-        let indexed: Vec<(i64, Option<String>)> = {
-            let mut stmt = conn.prepare(
-                "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
-            )?;
-            let rows: Vec<(i64, Option<String>)> = stmt
-                .query_map(params![channel_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        };
-
-        let current_set: std::collections::HashSet<&str> =
-            current_hashes.iter().map(|s| s.as_str()).collect();
-
-        let stale_ids: Vec<i64> = indexed
-            .into_iter()
-            .filter_map(|(id, hash)| match hash {
-                Some(h) if !current_set.contains(h.as_str()) => Some(id),
-                _ => None,
-            })
-            .collect();
-
-        if !stale_ids.is_empty() {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_ids = Self::stale_discord_message_chunk_ids(&transaction, channel_id, &current)?;
+        let embedding_ids =
+            Self::discord_message_chunk_embedding_ids_for_chunks(&transaction, &stale_ids)?;
+        {
+            let mut statement =
+                transaction.prepare_cached("DELETE FROM discord_message_chunks WHERE id = ?1")?;
             for id in &stale_ids {
-                tx.execute(
-                    "DELETE FROM discord_message_chunks WHERE id = ?1",
-                    params![id],
-                )?;
+                statement.execute(params![id])?;
             }
-            tx.commit()?;
         }
+        transaction.commit()?;
+
+        self.vector_indexes
+            .discord_message_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
+    fn stale_discord_message_chunk_ids(
+        connection: &Connection,
+        channel_id: &str,
+        current_hashes: &HashSet<&str>,
+    ) -> Result<Vec<i64>> {
+        let mut statement = connection.prepare_cached(
+            "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
+        )?;
+        let mut stale = Vec::new();
+        for row in statement.query_map(params![channel_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })? {
+            let (id, hash) = row?;
+            if hash.is_some_and(|hash| !current_hashes.contains(hash.as_str())) {
+                stale.push(id);
+            }
+        }
+        Ok(stale)
+    }
+
     pub fn delete_all_discord_message_data(&self) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        // Embeddings CASCADE via the discord_message_chunks FK.
-        conn.execute("DELETE FROM discord_message_chunks", [])?;
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM discord_message_chunks", [])?;
         // Reset the channel registry/cursors so a forced full re-index re-backfills
         // history instead of resuming incrementally from a now-stale cursor.
-        conn.execute("DELETE FROM discord_channels", [])?;
-        // Drop the HNSW vector table so it is recreated fresh — clears stale vectors
-        // and lets a new embedding model's dimension take effect. Best-effort: it may
-        // not exist, or vectorlite may be unavailable on this connection.
-        let _ = conn.execute_batch(&format!(
-            "DROP TABLE IF EXISTS {}",
-            DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
-        ));
+        transaction.execute("DELETE FROM discord_channels", [])?;
+        transaction.commit()?;
+
+        self.vector_indexes.discord_message_chunk.reset(&connection);
         Ok(())
     }
 
@@ -10399,133 +11053,214 @@ impl SqliteTracker {
 
     /// Delete all code data (symbols, chunks, embeddings) for a repo.
     pub fn delete_all_code_data_for_repo(&self, repo_id: i64) -> Result<()> {
-        let mut conn = self.acquire_lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let embedding_ids = Self::code_chunk_embedding_ids(&transaction, repo_id, None)?;
+        transaction.execute(
             "DELETE FROM code_symbols WHERE repo_id = ?1",
             params![repo_id],
         )?;
-        // Embeddings are CASCADE-deleted via code_chunks FK.
-        tx.execute(
+        transaction.execute(
             "DELETE FROM code_chunks WHERE repo_id = ?1",
             params![repo_id],
         )?;
-        tx.commit()?;
+        transaction.commit()?;
+        self.vector_indexes
+            .code_chunk
+            .remove(&connection, &embedding_ids);
         Ok(())
     }
 
-    // --- Chat Session Store ---
-
-    /// Create a new chat session.
-    pub fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
+    /// Create a new chat session belonging to `owner_user_id`.
+    pub fn create_chat_session(
+        &self,
+        id: &str,
+        repo_id: Option<i64>,
+        owner_user_id: Option<i64>,
+    ) -> Result<()> {
         let conn = self.acquire_lock()?;
         conn.execute(
-            "INSERT INTO chat_sessions (id, repo_id) VALUES (?1, ?2)",
-            params![id, repo_id],
+            "INSERT INTO chat_sessions (id, repo_id, owner_user_id) VALUES (?1, ?2, ?3)",
+            params![id, repo_id, owner_user_id],
         )?;
         Ok(())
     }
 
-    /// Save a chat message to a session.
+    /// The chat session `id`, with its owner and without its messages, if it
+    /// is in `scope`.
+    pub fn get_chat_session(
+        &self,
+        id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Option<claudear_core::types::ChatSession>> {
+        let conn = self.acquire_lock()?;
+        let session = conn
+            .query_row(
+                &format!(
+                    "SELECT id, repo_id, owner_user_id, created_at, updated_at
+                     FROM chat_sessions
+                     WHERE id = :id AND {CHAT_SESSION_IN_SCOPE}"
+                ),
+                rusqlite::named_params! {
+                    ":id": id,
+                    ":owner_user_id": scope.owner_user_id,
+                    ":include_ownerless": scope.include_ownerless,
+                    ":include_other_owners": scope.include_other_owners,
+                },
+                Self::row_to_chat_session,
+            )
+            .optional()?;
+        Ok(session)
+    }
+
+    /// Append a message to the session, checked to be in `scope` by the same
+    /// statement; `None` when no such session is in scope.
     pub fn save_chat_message(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         role: &str,
         content: &str,
         sources_json: Option<&str>,
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
         let conn = self.acquire_lock()?;
-        conn.execute(
-            "INSERT INTO chat_messages (session_id, role, content, sources_json) VALUES (?1, ?2, ?3, ?4)",
-            params![session_id, role, content, sources_json],
+        let inserted = conn.execute(
+            &format!(
+                "INSERT INTO chat_messages (session_id, role, content, sources_json)
+                 SELECT id, :role, :content, :sources_json
+                 FROM chat_sessions
+                 WHERE id = :id AND {CHAT_SESSION_IN_SCOPE}"
+            ),
+            rusqlite::named_params! {
+                ":role": role,
+                ":content": content,
+                ":sources_json": sources_json,
+                ":id": session_id,
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+            },
         )?;
+        if inserted == 0 {
+            return Ok(None);
+        }
         let id = conn.last_insert_rowid();
-        // Update session's updated_at
         conn.execute(
             "UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?1",
             params![session_id],
         )?;
-        Ok(id)
+        Ok(Some(id))
     }
 
-    /// Get chat message history for a session (most recent N messages).
+    /// The most recent `limit` messages of the session, oldest first, if it is
+    /// in `scope`.
     pub fn get_chat_history(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         limit: usize,
     ) -> Result<Vec<claudear_core::types::ChatMessage>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, role, content, sources_json, created_at
+        let mut stmt = conn.prepare(&format!(
+            "SELECT chat_messages.id, role, content, sources_json, chat_messages.created_at
              FROM chat_messages
-             WHERE session_id = ?1
-             ORDER BY created_at DESC
-             LIMIT ?2",
+             JOIN chat_sessions ON chat_sessions.id = chat_messages.session_id
+             WHERE chat_messages.session_id = :id AND {CHAT_SESSION_IN_SCOPE}
+             ORDER BY chat_messages.created_at DESC, chat_messages.id DESC
+             LIMIT :limit"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::named_params! {
+                ":id": session_id,
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+                ":limit": i64::try_from(limit).unwrap_or(i64::MAX),
+            },
+            |row| {
+                let role_str: String = row.get(1)?;
+                let created_str: String = row.get(4)?;
+                Ok(claudear_core::types::ChatMessage {
+                    id: Some(row.get(0)?),
+                    role: claudear_core::types::ChatRole::parse(&role_str)
+                        .unwrap_or(claudear_core::types::ChatRole::User),
+                    content: row.get(2)?,
+                    sources_json: row.get(3)?,
+                    created_at: chrono::NaiveDateTime::parse_from_str(
+                        &created_str,
+                        "%Y-%m-%d %H:%M:%S",
+                    )
+                    .map(|dt| dt.and_utc())
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                })
+            },
         )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-            let role_str: String = row.get(1)?;
-            let created_str: String = row.get(4)?;
-            Ok(claudear_core::types::ChatMessage {
-                id: Some(row.get(0)?),
-                role: claudear_core::types::ChatRole::parse(&role_str)
-                    .unwrap_or(claudear_core::types::ChatRole::User),
-                content: row.get(2)?,
-                sources_json: row.get(3)?,
-                created_at: chrono::NaiveDateTime::parse_from_str(
-                    &created_str,
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .map(|dt| dt.and_utc())
-                .unwrap_or_else(|_| chrono::Utc::now()),
-            })
-        })?;
 
         let mut messages: Vec<_> = rows.filter_map(|r| r.ok()).collect();
-        messages.reverse(); // Return in chronological order
+        messages.reverse();
         Ok(messages)
     }
 
-    /// List all chat sessions.
-    pub fn list_chat_sessions(&self) -> Result<Vec<claudear_core::types::ChatSession>> {
+    /// List the chat sessions in `scope`, most recently updated first.
+    pub fn list_chat_sessions(
+        &self,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Vec<claudear_core::types::ChatSession>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, repo_id, created_at, updated_at
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, repo_id, owner_user_id, created_at, updated_at
              FROM chat_sessions
-             ORDER BY updated_at DESC",
+             WHERE {CHAT_SESSION_IN_SCOPE}
+             ORDER BY updated_at DESC"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::named_params! {
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+            },
+            Self::row_to_chat_session,
         )?;
-        let rows = stmt.query_map([], |row| {
-            let created_str: String = row.get(2)?;
-            let updated_str: String = row.get(3)?;
-            Ok(claudear_core::types::ChatSession {
-                id: row.get(0)?,
-                repo_id: row.get(1)?,
-                created_at: chrono::NaiveDateTime::parse_from_str(
-                    &created_str,
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .map(|dt| dt.and_utc())
-                .unwrap_or_else(|_| chrono::Utc::now()),
-                updated_at: chrono::NaiveDateTime::parse_from_str(
-                    &updated_str,
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .map(|dt| dt.and_utc())
-                .unwrap_or_else(|_| chrono::Utc::now()),
-                messages: Vec::new(),
-            })
-        })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Delete a chat session and all its messages.
-    pub fn delete_chat_session(&self, session_id: &str) -> Result<()> {
+    fn row_to_chat_session(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<claudear_core::types::ChatSession> {
+        let created_str: String = row.get(3)?;
+        let updated_str: String = row.get(4)?;
+        Ok(claudear_core::types::ChatSession {
+            id: row.get(0)?,
+            repo_id: row.get(1)?,
+            owner_user_id: row.get(2)?,
+            created_at: chrono::NaiveDateTime::parse_from_str(&created_str, "%Y-%m-%d %H:%M:%S")
+                .map(|dt| dt.and_utc())
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: chrono::NaiveDateTime::parse_from_str(&updated_str, "%Y-%m-%d %H:%M:%S")
+                .map(|dt| dt.and_utc())
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            messages: Vec::new(),
+        })
+    }
+
+    /// Delete the session and its messages (by cascade) if it is in `scope`,
+    /// returning whether it was.
+    pub fn delete_chat_session(
+        &self,
+        session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<bool> {
         let conn = self.acquire_lock()?;
-        // Messages are CASCADE-deleted via FK.
-        conn.execute(
-            "DELETE FROM chat_sessions WHERE id = ?1",
-            params![session_id],
+        let deleted = conn.execute(
+            &format!("DELETE FROM chat_sessions WHERE id = :id AND {CHAT_SESSION_IN_SCOPE}"),
+            rusqlite::named_params! {
+                ":id": session_id,
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+            },
         )?;
-        Ok(())
+        Ok(deleted > 0)
     }
 
     /// Cleanup expired chat sessions older than max_age_days. Returns count deleted.
@@ -11785,6 +12520,181 @@ mod tests {
     }
 
     #[test]
+    fn test_pr_assignment_round_trips() {
+        use claudear_core::types::{AssignmentReason, AssignmentStatus, PrAssignment};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let assignment = PrAssignment::new(
+            "https://github.com/org/repo/pull/7",
+            "org/repo",
+            7,
+            "alice",
+            AssignmentReason::CodeOwner,
+            32.5,
+        );
+
+        let stored = tracker.record_pr_assignment(&assignment).unwrap().unwrap();
+
+        assert!(stored.id > 0);
+        assert_eq!(stored.assignee, "alice");
+        assert_eq!(stored.reason, AssignmentReason::CodeOwner);
+        assert_eq!(stored.score, 32.5);
+        assert_eq!(stored.status, AssignmentStatus::Active);
+        assert_eq!(
+            stored.assigned_at.timestamp(),
+            assignment.assigned_at.timestamp()
+        );
+        assert_eq!(
+            tracker
+                .active_pr_assignment(&assignment.pr_url)
+                .unwrap()
+                .unwrap(),
+            stored
+        );
+        assert_eq!(tracker.active_pr_assignments().unwrap(), vec![stored]);
+    }
+
+    #[test]
+    fn test_pr_assignment_allows_one_active_per_pr() {
+        use claudear_core::types::{AssignmentReason, PrAssignment};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let url = "https://github.com/org/repo/pull/7";
+        let first = PrAssignment::new(url, "org/repo", 7, "alice", AssignmentReason::Load, 0.0);
+        let second = PrAssignment::new(url, "org/repo", 7, "bob", AssignmentReason::Load, 0.0);
+
+        assert!(tracker.record_pr_assignment(&first).unwrap().is_some());
+        assert!(tracker.record_pr_assignment(&second).unwrap().is_none());
+        assert_eq!(
+            tracker.active_pr_assignment(url).unwrap().unwrap().assignee,
+            "alice"
+        );
+    }
+
+    #[test]
+    fn test_ended_pr_assignment_frees_the_pr_and_keeps_history() {
+        use claudear_core::types::{AssignmentReason, AssignmentStatus, PrAssignment};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let url = "https://github.com/org/repo/pull/7";
+        let first = tracker
+            .record_pr_assignment(&PrAssignment::new(
+                url,
+                "org/repo",
+                7,
+                "alice",
+                AssignmentReason::Requester,
+                100.0,
+            ))
+            .unwrap()
+            .unwrap();
+
+        assert!(tracker
+            .end_pr_assignment(first.id, AssignmentStatus::Released)
+            .unwrap());
+        assert!(!tracker
+            .end_pr_assignment(first.id, AssignmentStatus::Closed)
+            .unwrap());
+        assert!(tracker.active_pr_assignment(url).unwrap().is_none());
+        assert!(tracker.active_pr_assignments().unwrap().is_empty());
+
+        let second = tracker
+            .record_pr_assignment(&PrAssignment::new(
+                url,
+                "org/repo",
+                7,
+                "bob",
+                AssignmentReason::Load,
+                0.0,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.assignee, "bob");
+
+        let (status, ended): (String, Option<String>) = tracker
+            .acquire_lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, ended_at FROM pr_assignments WHERE id = ?1",
+                params![first.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "released");
+        assert!(ended.is_some());
+    }
+
+    #[test]
+    fn test_pr_assignment_keeps_its_handover_and_is_marked_notified_once() {
+        use claudear_core::types::{AssignmentReason, AssignmentStatus, PrAssignment};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let url = "https://github.com/org/repo/pull/7";
+        let mut handover =
+            PrAssignment::new(url, "org/repo", 7, "bob", AssignmentReason::Load, 0.0);
+        handover.previous = Some("alice".to_string());
+        let stored = tracker.record_pr_assignment(&handover).unwrap().unwrap();
+
+        assert_eq!(stored.previous.as_deref(), Some("alice"));
+        assert!(stored.notified_at.is_none());
+
+        assert!(tracker.mark_pr_assignment_notified(stored.id).unwrap());
+        let notified = tracker.active_pr_assignment(url).unwrap().unwrap();
+        assert!(notified.notified_at.is_some());
+        assert!(!tracker.mark_pr_assignment_notified(stored.id).unwrap());
+        assert_eq!(
+            tracker
+                .active_pr_assignment(url)
+                .unwrap()
+                .unwrap()
+                .notified_at,
+            notified.notified_at
+        );
+
+        let unnotified = tracker
+            .record_pr_assignment(&PrAssignment::new(
+                "https://github.com/org/repo/pull/8",
+                "org/repo",
+                8,
+                "alice",
+                AssignmentReason::Load,
+                0.0,
+            ))
+            .unwrap()
+            .unwrap();
+        tracker
+            .end_pr_assignment(unnotified.id, AssignmentStatus::Closed)
+            .unwrap();
+        assert!(!tracker.mark_pr_assignment_notified(unnotified.id).unwrap());
+    }
+
+    #[test]
+    fn test_pr_assignment_unknown_reason_is_an_error() {
+        use claudear_core::types::{AssignmentReason, PrAssignment};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let url = "https://github.com/org/repo/pull/7";
+        tracker
+            .record_pr_assignment(&PrAssignment::new(
+                url,
+                "org/repo",
+                7,
+                "alice",
+                AssignmentReason::Load,
+                0.0,
+            ))
+            .unwrap();
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute("UPDATE pr_assignments SET reason = 'unrecognised'", [])
+            .unwrap();
+
+        assert!(tracker.active_pr_assignment(url).is_err());
+        assert!(tracker.active_pr_assignments().is_err());
+    }
+
+    #[test]
     fn test_deploy_qa_tip_last_seen_and_no_overwrite() {
         use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
 
@@ -11814,6 +12724,86 @@ mod tests {
         assert_eq!(stored.attempt_id, Some(9));
         assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
         assert_eq!(tracker.list_pending_deploy_qa_tips().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_list_deploy_qa_tips_newest_first_with_track_filter_and_limit() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for (track, tag, published_at) in [
+            ("cloud", "1.0.0", "2026-01-01T00:00:00Z"),
+            ("edge", "2.0.0", "2026-02-01T00:00:00Z"),
+            ("cloud", "1.1.0", "2026-03-01T00:00:00Z"),
+        ] {
+            let mut tip = DeployQaTip::new(track, format!("acme/{track}"), tag);
+            tip.published_at = Some(published_at.into());
+            tracker.upsert_deploy_qa_tip(&tip).unwrap();
+        }
+
+        let tags = |tips: Vec<DeployQaTip>| -> Vec<String> {
+            tips.into_iter().map(|tip| tip.tag).collect()
+        };
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(None, 10).unwrap()),
+            ["1.1.0", "2.0.0", "1.0.0"]
+        );
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(Some("cloud"), 10).unwrap()),
+            ["1.1.0", "1.0.0"]
+        );
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(None, 2).unwrap()),
+            ["1.1.0", "2.0.0"]
+        );
+        assert_eq!(
+            tags(
+                tracker
+                    .list_deploy_qa_tips(Some("edge"), usize::MAX)
+                    .unwrap()
+            ),
+            ["2.0.0"]
+        );
+        assert!(tracker
+            .list_deploy_qa_tips(Some("missing"), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_list_deploy_qa_tips_orders_unpublished_tips_by_created_at_epoch() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut published = DeployQaTip::new("cloud", "acme/cloud", "1.0.0");
+        published.published_at = Some("2026-03-01T08:00:00Z".into());
+        tracker.upsert_deploy_qa_tip(&published).unwrap();
+
+        let unpublished = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "acme/cloud", "1.1.0"))
+            .unwrap();
+        assert_eq!(unpublished.published_at, None);
+
+        let mut offset = DeployQaTip::new("cloud", "acme/cloud", "0.9.0");
+        offset.published_at = Some("2026-03-01T10:30:00+05:00".into());
+        tracker.upsert_deploy_qa_tip(&offset).unwrap();
+
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE deploy_qa_tips SET created_at = '2026-03-01 09:00:00' WHERE id = ?1",
+                params![unpublished.id],
+            )
+            .unwrap();
+
+        let tags: Vec<String> = tracker
+            .list_deploy_qa_tips(Some("cloud"), 10)
+            .unwrap()
+            .into_iter()
+            .map(|tip| tip.tag)
+            .collect();
+        assert_eq!(tags, ["1.1.0", "1.0.0", "0.9.0"]);
     }
 
     #[test]
@@ -12496,8 +13486,8 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init - verify by trying to query
-        let conn = tracker.conn.lock().unwrap();
-        let result = conn.execute("SELECT 1 FROM regression_watches LIMIT 1", []);
+        let connection = tracker.connection.lock();
+        let result = connection.execute("SELECT 1 FROM regression_watches LIMIT 1", []);
         // Should succeed (table exists) or return empty result, not error
         assert!(result.is_ok() || result.is_err());
     }
@@ -12507,8 +13497,8 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init
-        let conn = tracker.conn.lock().unwrap();
-        let result = conn.execute("SELECT 1 FROM release_tracking LIMIT 1", []);
+        let connection = tracker.connection.lock();
+        let result = connection.execute("SELECT 1 FROM release_tracking LIMIT 1", []);
         assert!(result.is_ok() || result.is_err());
     }
 
@@ -12517,8 +13507,8 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // The table should be created during init
-        let conn = tracker.conn.lock().unwrap();
-        let result = conn.execute("SELECT 1 FROM regression_checks LIMIT 1", []);
+        let connection = tracker.connection.lock();
+        let result = connection.execute("SELECT 1 FROM regression_checks LIMIT 1", []);
         assert!(result.is_ok() || result.is_err());
     }
 
@@ -13352,20 +14342,20 @@ mod tests {
     fn test_create_and_get_user() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("test@example.com", "$2b$12$hash", "Test User", "admin")
+            .create_user("test@example.com", "$2b$12$hash", "Test User", Role::Admin)
             .unwrap();
         assert!(id > 0);
         let user = tracker.get_user_by_id(id).unwrap().unwrap();
         assert_eq!(user.email, "test@example.com");
         assert_eq!(user.name, "Test User");
-        assert_eq!(user.role, "admin");
+        assert_eq!(user.role, Role::Admin);
     }
 
     #[test]
     fn test_get_user_by_email() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker
-            .create_user("alice@example.com", "$2b$12$hash", "Alice", "viewer")
+            .create_user("alice@example.com", "$2b$12$hash", "Alice", Role::Viewer)
             .unwrap();
         let user = tracker
             .get_user_by_email("alice@example.com")
@@ -13380,10 +14370,10 @@ mod tests {
     fn test_list_users() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker
-            .create_user("a@test.com", "hash", "A", "admin")
+            .create_user("a@test.com", "hash", "A", Role::Admin)
             .unwrap();
         tracker
-            .create_user("b@test.com", "hash", "B", "viewer")
+            .create_user("b@test.com", "hash", "B", Role::Viewer)
             .unwrap();
         let users = tracker.list_users().unwrap();
         assert_eq!(users.len(), 2);
@@ -13393,7 +14383,7 @@ mod tests {
     fn test_update_user() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("old@test.com", "hash", "Old Name", "viewer")
+            .create_user("old@test.com", "hash", "Old Name", Role::Viewer)
             .unwrap();
         tracker
             .update_user(
@@ -13401,21 +14391,21 @@ mod tests {
                 Some("new@test.com"),
                 None,
                 Some("New Name"),
-                Some("admin"),
+                Some(Role::Admin),
                 None,
             )
             .unwrap();
         let user = tracker.get_user_by_id(id).unwrap().unwrap();
         assert_eq!(user.email, "new@test.com");
         assert_eq!(user.name, "New Name");
-        assert_eq!(user.role, "admin");
+        assert_eq!(user.role, Role::Admin);
     }
 
     #[test]
     fn test_delete_user() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("del@test.com", "hash", "Delete Me", "viewer")
+            .create_user("del@test.com", "hash", "Delete Me", Role::Viewer)
             .unwrap();
         assert!(tracker.delete_user(id).unwrap());
         assert!(tracker.get_user_by_id(id).unwrap().is_none());
@@ -13426,9 +14416,9 @@ mod tests {
     fn test_duplicate_email_fails() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker
-            .create_user("dup@test.com", "hash", "First", "admin")
+            .create_user("dup@test.com", "hash", "First", Role::Admin)
             .unwrap();
-        let result = tracker.create_user("dup@test.com", "hash", "Second", "viewer");
+        let result = tracker.create_user("dup@test.com", "hash", "Second", Role::Viewer);
         assert!(result.is_err());
     }
 
@@ -13436,7 +14426,7 @@ mod tests {
     fn test_create_and_validate_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("sess@test.com", "hash", "Session User", "admin")
+            .create_user("sess@test.com", "hash", "Session User", Role::Admin)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31T23:59:59")
@@ -13451,7 +14441,7 @@ mod tests {
     fn test_expired_session_returns_none() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("exp@test.com", "hash", "Expired", "viewer")
+            .create_user("exp@test.com", "hash", "Expired", Role::Viewer)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2000-01-01T00:00:00")
@@ -13464,7 +14454,7 @@ mod tests {
     fn test_api_token_expiry_is_enforced_on_lookup() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("tok@test.com", "hash", "Tok", "viewer")
+            .create_user("tok@test.com", "hash", "Tok", Role::Viewer)
             .unwrap();
 
         // Past expiry → not resolvable.
@@ -13511,7 +14501,7 @@ mod tests {
     fn test_delete_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("delsess@test.com", "hash", "Del Sess", "admin")
+            .create_user("delsess@test.com", "hash", "Del Sess", Role::Admin)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31T23:59:59")
@@ -13525,7 +14515,7 @@ mod tests {
     fn test_cleanup_expired_sessions() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("clean@test.com", "hash", "Clean", "admin")
+            .create_user("clean@test.com", "hash", "Clean", Role::Admin)
             .unwrap();
         tracker
             .create_session(user_id, "2000-01-01T00:00:00")
@@ -13544,7 +14534,7 @@ mod tests {
     fn test_touch_session_updates_last_active() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
-            .create_user("touch@test.com", "hash", "Touch", "admin")
+            .create_user("touch@test.com", "hash", "Touch", Role::Admin)
             .unwrap();
         let token = tracker
             .create_session(user_id, "2099-12-31T23:59:59")
@@ -13560,10 +14550,10 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
         assert_eq!(tracker.count_users().unwrap(), 0);
         tracker
-            .create_user("c1@test.com", "hash", "C1", "admin")
+            .create_user("c1@test.com", "hash", "C1", Role::Admin)
             .unwrap();
         tracker
-            .create_user("c2@test.com", "hash", "C2", "viewer")
+            .create_user("c2@test.com", "hash", "C2", Role::Viewer)
             .unwrap();
         assert_eq!(tracker.count_users().unwrap(), 2);
     }
@@ -15396,7 +16386,7 @@ mod tests {
         tracker.record_attempt("sentry", "a2", "S1").unwrap();
         tracker.mark_failed("sentry", "a2", "build error").unwrap();
 
-        let summary = tracker.get_analytics_summary().unwrap();
+        let summary = tracker.get_analytics_summary(AttemptScope::All).unwrap();
         assert_eq!(summary.total_processed, 2);
         assert_eq!(summary.total_successful, 1);
         assert_eq!(summary.total_merged, 1);
@@ -15408,7 +16398,7 @@ mod tests {
     #[test]
     fn test_get_analytics_summary_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let summary = tracker.get_analytics_summary().unwrap();
+        let summary = tracker.get_analytics_summary(AttemptScope::All).unwrap();
         assert_eq!(summary.total_processed, 0);
         assert!((summary.success_rate - 0.0).abs() < f64::EPSILON);
     }
@@ -17785,7 +18775,7 @@ mod tests {
             .with_timezone(&Utc);
 
         let counts = tracker
-            .get_metric_counts_since(&["requests", "errors"], since)
+            .get_metric_counts_since(&["requests", "errors"], since, AttemptScope::All)
             .unwrap();
         assert_eq!(counts.get("requests"), Some(&2));
         assert_eq!(counts.get("errors"), Some(&1));
@@ -17795,7 +18785,9 @@ mod tests {
     fn test_get_metric_counts_since_empty_names() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let since = Utc::now();
-        let counts = tracker.get_metric_counts_since(&[], since).unwrap();
+        let counts = tracker
+            .get_metric_counts_since(&[], since, AttemptScope::All)
+            .unwrap();
         assert!(counts.is_empty());
     }
 
@@ -17831,7 +18823,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let counts = tracker
-            .get_metric_counts_since(&["old_count"], since)
+            .get_metric_counts_since(&["old_count"], since, AttemptScope::All)
             .unwrap();
         assert_eq!(counts.get("old_count"), Some(&1));
     }
@@ -17843,7 +18835,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let counts = tracker
-            .get_metric_counts_since(&["nonexistent"], since)
+            .get_metric_counts_since(&["nonexistent"], since, AttemptScope::All)
             .unwrap();
         assert!(counts.is_empty());
     }
@@ -17868,7 +18860,9 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let sums = tracker.get_metric_sums_since(&["cost_usd"], since).unwrap();
+        let sums = tracker
+            .get_metric_sums_since(&["cost_usd"], since, AttemptScope::All)
+            .unwrap();
         let total = sums.get("cost_usd").copied().unwrap_or(0.0);
         assert!((total - 36.0).abs() < 0.01);
     }
@@ -17877,7 +18871,9 @@ mod tests {
     fn test_get_metric_sums_since_empty_names() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let since = Utc::now();
-        let sums = tracker.get_metric_sums_since(&[], since).unwrap();
+        let sums = tracker
+            .get_metric_sums_since(&[], since, AttemptScope::All)
+            .unwrap();
         assert!(sums.is_empty());
     }
 
@@ -17901,7 +18897,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sums = tracker
-            .get_metric_sums_since(&["alpha", "beta"], since)
+            .get_metric_sums_since(&["alpha", "beta"], since, AttemptScope::All)
             .unwrap();
         assert!((sums.get("alpha").copied().unwrap_or(0.0) - 30.0).abs() < f64::EPSILON);
         assert!((sums.get("beta").copied().unwrap_or(0.0) - 5.0).abs() < f64::EPSILON);
@@ -17935,7 +18931,9 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let sums = tracker.get_metric_sums_since(&["cost"], since).unwrap();
+        let sums = tracker
+            .get_metric_sums_since(&["cost"], since, AttemptScope::All)
+            .unwrap();
         assert!((sums.get("cost").copied().unwrap_or(0.0) - 25.0).abs() < f64::EPSILON);
     }
 
@@ -17966,7 +18964,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sums = tracker
-            .get_metric_sums_by_source_since(&["cost", "latency"], since)
+            .get_metric_sums_by_source_since(&["cost", "latency"], since, AttemptScope::All)
             .unwrap();
 
         assert!(
@@ -18002,7 +19000,9 @@ mod tests {
     fn test_get_metric_sums_by_source_since_empty_names() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let since = Utc::now();
-        let sums = tracker.get_metric_sums_by_source_since(&[], since).unwrap();
+        let sums = tracker
+            .get_metric_sums_by_source_since(&[], since, AttemptScope::All)
+            .unwrap();
         assert!(sums.is_empty());
     }
 
@@ -18025,7 +19025,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sums = tracker
-            .get_metric_sums_by_source_since(&["no_src"], since)
+            .get_metric_sums_by_source_since(&["no_src"], since, AttemptScope::All)
             .unwrap();
         // source is NULL so the row is skipped by the `if let Some(source)` check
         assert!(sums.is_empty());
@@ -18060,7 +19060,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sums = tracker
-            .get_metric_sums_by_source_since(&["timed"], since)
+            .get_metric_sums_by_source_since(&["timed"], since, AttemptScope::All)
             .unwrap();
         let val = sums
             .get(&("timed".to_string(), "src".to_string()))
@@ -18268,7 +19268,7 @@ mod tests {
         let pr3 = make_pr_record("https://github.com/org/b/pull/1", "org/b", 1);
         tracker.upsert_pr(&pr3).unwrap();
 
-        let analytics = tracker.get_pr_analytics().unwrap();
+        let analytics = tracker.get_pr_analytics(AttemptScope::All).unwrap();
         assert_eq!(analytics.total, 3);
         assert_eq!(analytics.open, 1);
         assert_eq!(analytics.merged, 1);
@@ -18283,7 +19283,7 @@ mod tests {
     #[test]
     fn test_get_pr_analytics_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let analytics = tracker.get_pr_analytics().unwrap();
+        let analytics = tracker.get_pr_analytics(AttemptScope::All).unwrap();
         assert_eq!(analytics.total, 0);
         assert!(analytics.merge_rate.is_none());
         assert!(analytics.by_repo.is_empty());
@@ -18299,7 +19299,7 @@ mod tests {
             .upsert_pr(&make_pr_record("https://github.com/a/b/pull/2", "a/b", 2))
             .unwrap();
 
-        let all = tracker.list_prs(None, 100).unwrap();
+        let all = tracker.list_prs(None, 100, AttemptScope::All).unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -18315,11 +19315,15 @@ mod tests {
             .upsert_pr(&make_pr_record("https://github.com/a/b/pull/2", "a/b", 2))
             .unwrap();
 
-        let merged = tracker.list_prs(Some("merged"), 100).unwrap();
+        let merged = tracker
+            .list_prs(Some("merged"), 100, AttemptScope::All)
+            .unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].pr_url, "https://github.com/a/b/pull/1");
 
-        let open = tracker.list_prs(Some("open"), 100).unwrap();
+        let open = tracker
+            .list_prs(Some("open"), 100, AttemptScope::All)
+            .unwrap();
         assert_eq!(open.len(), 1);
     }
 
@@ -18335,8 +19339,54 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let prs = tracker.list_prs(None, 3).unwrap();
+        let prs = tracker.list_prs(None, 3, AttemptScope::All).unwrap();
         assert_eq!(prs.len(), 3);
+    }
+
+    #[test]
+    fn listing_prs_without_security_leaves_out_prs_of_security_issues_and_attempts() {
+        use claudear_core::security::SECURITY_FIX_SOURCE;
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt(SECURITY_FIX_SOURCE, "SEC-1", "SEC-1")
+            .unwrap();
+        let security_attempt = tracker
+            .get_attempt(SECURITY_FIX_SOURCE, "SEC-1")
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let mut by_issue = make_pr_record("https://github.com/a/b/pull/1", "a/b", 1);
+        by_issue.issue_source = Some(SECURITY_FIX_SOURCE.to_string());
+        let mut by_attempt = make_pr_record("https://github.com/a/b/pull/2", "a/b", 2);
+        by_attempt.issue_source = Some("linear".to_string());
+        by_attempt.attempt_id = Some(security_attempt);
+        let mut other = make_pr_record("https://github.com/a/b/pull/3", "a/b", 3);
+        other.issue_source = Some("linear".to_string());
+        for record in [&by_issue, &by_attempt, &other] {
+            tracker.upsert_pr(record).unwrap();
+        }
+
+        let urls = |status: Option<&str>, scope: AttemptScope| -> Vec<String> {
+            let mut urls: Vec<String> = tracker
+                .list_prs(status, 100, scope)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.pr_url)
+                .collect();
+            urls.sort();
+            urls
+        };
+        assert_eq!(
+            urls(None, AttemptScope::WithoutSecurity),
+            [other.pr_url.clone()]
+        );
+        assert_eq!(
+            urls(Some("open"), AttemptScope::WithoutSecurity),
+            [other.pr_url.clone()]
+        );
+        assert_eq!(urls(None, AttemptScope::All).len(), 3);
+        assert_eq!(urls(Some("merged"), AttemptScope::All).len(), 0);
     }
 
     #[test]
@@ -18398,7 +19448,7 @@ mod tests {
     #[test]
     fn test_get_avg_time_to_pr_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let result = tracker.get_avg_time_to_pr().unwrap();
+        let result = tracker.get_avg_time_to_pr(AttemptScope::All).unwrap();
         assert!(result.is_none());
     }
 
@@ -18459,12 +19509,12 @@ mod tests {
         tracker.record_execution(&exec).unwrap();
 
         let count = tracker
-            .get_agent_spawn_count("2020-01-01T00:00:00")
+            .get_agent_spawn_count("2020-01-01T00:00:00", AttemptScope::All)
             .unwrap();
         assert_eq!(count, 1);
 
         let count_future = tracker
-            .get_agent_spawn_count("2099-01-01T00:00:00")
+            .get_agent_spawn_count("2099-01-01T00:00:00", AttemptScope::All)
             .unwrap();
         assert_eq!(count_future, 0);
     }
@@ -18482,7 +19532,7 @@ mod tests {
         tracker.record_execution(&exec).unwrap();
 
         let estimate = tracker
-            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "7d")
+            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "7d", AttemptScope::All)
             .unwrap();
         assert_eq!(estimate.cost_source, "duration_estimate");
         assert_eq!(estimate.period, "7d");
@@ -18503,7 +19553,7 @@ mod tests {
         tracker.record_execution(&exec).unwrap();
 
         let estimate = tracker
-            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "30d")
+            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "30d", AttemptScope::All)
             .unwrap();
         assert_eq!(estimate.cost_source, "api");
         assert!((estimate.total_cost - 1.50).abs() < f64::EPSILON);
@@ -18513,7 +19563,7 @@ mod tests {
     fn test_get_cost_estimate_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let estimate = tracker
-            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "7d")
+            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "7d", AttemptScope::All)
             .unwrap();
         assert_eq!(estimate.cost_source, "duration_estimate");
         assert!((estimate.total_cost - 0.0).abs() < f64::EPSILON);
@@ -18522,7 +19572,7 @@ mod tests {
     #[test]
     fn test_get_mttr_trend_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let trend = tracker.get_mttr_trend(4).unwrap();
+        let trend = tracker.get_mttr_trend(4, AttemptScope::All).unwrap();
         assert!(trend.is_empty());
     }
 
@@ -18542,7 +19592,7 @@ mod tests {
             .mark_success("linear", "2", "https://github.com/org/repo-a/pull/2")
             .unwrap();
 
-        let board = tracker.get_repo_leaderboard().unwrap();
+        let board = tracker.get_repo_leaderboard(AttemptScope::All).unwrap();
         // Should have entries for org/repo-a
         assert!(!board.is_empty());
         assert_eq!(board[0].repo, "org/repo-a");
@@ -18552,7 +19602,7 @@ mod tests {
     #[test]
     fn test_get_repo_leaderboard_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let board = tracker.get_repo_leaderboard().unwrap();
+        let board = tracker.get_repo_leaderboard(AttemptScope::All).unwrap();
         assert!(board.is_empty());
     }
 
@@ -18578,7 +19628,7 @@ mod tests {
         let e3 = AgentExecution::new().with_attempt_id(attempt.id);
         tracker.record_execution(&e3).unwrap();
 
-        let trend = tracker.get_commit_trend(30).unwrap();
+        let trend = tracker.get_commit_trend(30, AttemptScope::All).unwrap();
         assert_eq!(trend.len(), 1, "all executions are today => one bucket");
         assert_eq!(trend[0].commits, 1, "only the hash-advancing exec counts");
     }
@@ -18586,7 +19636,10 @@ mod tests {
     #[test]
     fn test_get_commit_trend_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        assert!(tracker.get_commit_trend(30).unwrap().is_empty());
+        assert!(tracker
+            .get_commit_trend(30, AttemptScope::All)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -18657,7 +19710,7 @@ mod tests {
     fn test_get_complexity_time_savings_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let savings = tracker
-            .get_complexity_time_savings("2020-01-01T00:00:00", 100.0, "30d")
+            .get_complexity_time_savings("2020-01-01T00:00:00", 100.0, "30d", AttemptScope::All)
             .unwrap();
         assert_eq!(savings.merged_count, 0);
         assert!((savings.hours_saved - 0.0).abs() < f64::EPSILON);
@@ -18736,13 +19789,339 @@ mod tests {
         assert_eq!(page3.len(), 1);
     }
 
+    const SCOPE_EPOCH: &str = "2000-01-01 00:00:00";
+
+    fn seed_scoped_fix(tracker: &SqliteTracker, source: &str, number: i64) {
+        let issue_id = format!("{source}-{number}");
+        let pr_url = format!("https://github.com/org/{source}/pull/{number}");
+        tracker
+            .record_attempt(source, &issue_id, &issue_id)
+            .unwrap();
+        tracker.mark_success(source, &issue_id, &pr_url).unwrap();
+        tracker.mark_merged(source, &issue_id).unwrap();
+        let attempt = tracker.get_attempt(source, &issue_id).unwrap().unwrap();
+
+        let mut execution = AgentExecution::new();
+        execution.attempt_id = Some(attempt.id);
+        execution.duration_secs = Some(120.0);
+        execution.total_cost_usd = Some(3.0);
+        execution.git_commit_before = Some("before".to_string());
+        execution.git_commit_after = Some("after".to_string());
+        tracker.record_execution(&execution).unwrap();
+
+        let mut pull_request = make_pr_record(&pr_url, &format!("org/{source}"), number);
+        pull_request.attempt_id = Some(attempt.id);
+        pull_request.status = "merged".to_string();
+        pull_request.time_to_merge_mins = Some(30);
+        tracker.upsert_pr(&pull_request).unwrap();
+
+        tracker
+            .record_activity(
+                &ActivityLogEntry::new("pr_merged", format!("Merged {issue_id}"))
+                    .with_source(source)
+                    .with_issue(&issue_id, &issue_id),
+            )
+            .unwrap();
+        for name in ["issues_fetched", "pr_created"] {
+            tracker
+                .record_metric(&ProcessingMetric::new(name, 2.0).with_source(source))
+                .unwrap();
+        }
+        tracker
+            .record_error_pattern(&ErrorPattern {
+                id: 0,
+                pattern_hash: format!("{source}-hash"),
+                error_type: Some(format!("{source}_error")),
+                error_message: None,
+                first_seen: Utc::now(),
+                last_seen: Utc::now(),
+                occurrence_count: number as i32,
+                sources: Some(vec![source.to_uppercase()]),
+                example_issue_ids: None,
+                resolution_hints: None,
+            })
+            .unwrap();
+        tracker
+            .store_embedding(&IssueEmbedding {
+                id: 0,
+                source: source.to_string(),
+                issue_id,
+                short_id: None,
+                title: None,
+                embedding: None,
+                embedding_model: None,
+                created_at: Utc::now(),
+                description: None,
+                url: None,
+                priority: None,
+                status: None,
+                labels: None,
+                updated_at: None,
+            })
+            .unwrap();
+    }
+
+    fn seed_unattributed_security_work(tracker: &SqliteTracker) {
+        seed_scoped_fix(tracker, "security", 9);
+        tracker
+            .record_metric(&ProcessingMetric::new("pr_status_merged", 1.0))
+            .unwrap();
+    }
+
+    fn scoped_aggregates(tracker: &SqliteTracker, scope: AttemptScope) -> serde_json::Value {
+        let since = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let names = ["issues_fetched", "pr_created", "pr_status_merged"];
+        let mut source_sums: Vec<_> = tracker
+            .get_metric_sums_by_source_since(&names, since, scope)
+            .unwrap()
+            .into_iter()
+            .collect();
+        source_sums.sort_by(|left, right| left.0.cmp(&right.0));
+        let mttr: Vec<(String, i64)> = tracker
+            .get_mttr_trend(8, scope)
+            .unwrap()
+            .into_iter()
+            .map(|point| (point.period_start, point.sample_count))
+            .collect();
+        let mut attempts_since: Vec<String> = tracker
+            .list_attempts_since(since, scope)
+            .unwrap()
+            .into_iter()
+            .map(|attempt| attempt.short_id)
+            .collect();
+        attempts_since.sort();
+        serde_json::json!({
+            "stats": tracker.get_scoped_stats(scope).unwrap(),
+            "summary": tracker.get_analytics_summary(scope).unwrap(),
+            "pull_requests": tracker.get_pr_analytics(scope).unwrap(),
+            "time_to_pr": tracker.get_avg_time_to_pr(scope).unwrap().is_some(),
+            "spawns": tracker.get_agent_spawn_count(SCOPE_EPOCH, scope).unwrap(),
+            "api_cost": tracker.get_cost_estimate(SCOPE_EPOCH, 0.0, "all", scope).unwrap(),
+            "mttr": mttr,
+            "leaderboard": tracker.get_repo_leaderboard(scope).unwrap(),
+            "commits": tracker.get_commit_trend(30, scope).unwrap(),
+            "savings": tracker
+                .get_complexity_time_savings(SCOPE_EPOCH, 150.0, "all", scope)
+                .unwrap(),
+            "activity": tracker.get_activity_type_counts_since(since, scope).unwrap(),
+            "metric_counts": tracker.get_metric_counts_since(&names, since, scope).unwrap(),
+            "metric_sums": tracker.get_metric_sums_since(&names, since, scope).unwrap(),
+            "source_sums": source_sums,
+            "attempts": tracker.count_attempts(None, None, scope).unwrap(),
+            "merged_attempts": tracker.count_attempts(Some("merged"), None, scope).unwrap(),
+            "attempts_since": attempts_since,
+            "issues": tracker.count_issues(None, scope).unwrap(),
+        })
+    }
+
+    #[test]
+    fn scoped_aggregates_match_a_store_without_the_excluded_work() {
+        let other = SqliteTracker::in_memory().unwrap();
+        seed_scoped_fix(&other, "linear", 1);
+        let mixed = SqliteTracker::in_memory().unwrap();
+        seed_scoped_fix(&mixed, "linear", 1);
+        seed_unattributed_security_work(&mixed);
+
+        let expected = scoped_aggregates(&other, AttemptScope::All);
+        let scoped = scoped_aggregates(&mixed, AttemptScope::WithoutSecurity);
+        let everything = scoped_aggregates(&mixed, AttemptScope::All);
+        for (aggregate, value) in expected.as_object().unwrap() {
+            assert_eq!(
+                &scoped[aggregate], value,
+                "{aggregate} counted security work"
+            );
+            if aggregate != "time_to_pr" {
+                assert_ne!(
+                    &everything[aggregate], value,
+                    "{aggregate} left security work out of the unscoped read"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_pull_request_reads_exclude_security_attempts_without_an_issue_source() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("Security", "SEC-1", "SEC-1")
+            .unwrap();
+        let attempt = tracker.get_attempt("Security", "SEC-1").unwrap().unwrap();
+        let mut pull_request = make_pr_record("https://github.com/org/repo/pull/5", "org/repo", 5);
+        pull_request.attempt_id = Some(attempt.id);
+        tracker.upsert_pr(&pull_request).unwrap();
+        let mut unlinked = make_pr_record("https://github.com/org/repo/pull/6", "org/repo", 6);
+        unlinked.issue_source = Some("SECURITY".to_string());
+        tracker.upsert_pr(&unlinked).unwrap();
+
+        assert_eq!(
+            tracker
+                .get_pr_analytics(AttemptScope::WithoutSecurity)
+                .unwrap()
+                .total,
+            0
+        );
+        assert_eq!(
+            tracker.get_pr_analytics(AttemptScope::All).unwrap().total,
+            2
+        );
+    }
+
+    #[test]
+    fn scoped_executions_keep_executions_linked_to_no_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_execution(&AgentExecution::new()).unwrap();
+        assert_eq!(
+            tracker
+                .get_agent_spawn_count(SCOPE_EPOCH, AttemptScope::WithoutSecurity)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn scoped_metric_reads_drop_unattributed_rows_only_for_a_narrowed_scope() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_metric(&ProcessingMetric::new("pr_status_merged", 3.0))
+            .unwrap();
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let sums = |scope| {
+            tracker
+                .get_metric_sums_since(&["pr_status_merged"], since, scope)
+                .unwrap()
+        };
+        assert_eq!(sums(AttemptScope::All).get("pr_status_merged"), Some(&3.0));
+        assert!(sums(AttemptScope::WithoutSecurity).is_empty());
+    }
+
+    #[test]
+    fn scoped_plan_cost_amortizes_over_included_executions_only() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for source in ["linear", "security"] {
+            tracker.record_attempt(source, source, source).unwrap();
+            let attempt = tracker.get_attempt(source, source).unwrap().unwrap();
+            let mut execution = AgentExecution::new();
+            execution.attempt_id = Some(attempt.id);
+            execution.duration_secs = Some(120.0);
+            tracker.record_execution(&execution).unwrap();
+        }
+        let cost = |scope| {
+            tracker
+                .get_cost_estimate(SCOPE_EPOCH, 100.0, "all", scope)
+                .unwrap()
+                .total_cost
+        };
+        assert_eq!(cost(AttemptScope::WithoutSecurity), 100.0);
+        assert_eq!(cost(AttemptScope::All), 100.0);
+        let duration_cost = tracker
+            .get_cost_estimate(SCOPE_EPOCH, 0.0, "all", AttemptScope::WithoutSecurity)
+            .unwrap()
+            .total_cost;
+        assert!((duration_cost - 0.1).abs() < 1e-9, "{duration_cost}");
+    }
+
+    #[test]
+    fn scoped_stats_count_only_included_sources_in_any_case() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("SECURITY", "1", "S-1").unwrap();
+        tracker.record_attempt("linear", "2", "L-2").unwrap();
+        tracker.mark_failed("linear", "2", "boom").unwrap();
+
+        let stats = tracker
+            .get_scoped_stats(AttemptScope::WithoutSecurity)
+            .unwrap();
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.by_source.keys().collect::<Vec<_>>(), ["linear"]);
+        let all = tracker.get_stats().unwrap();
+        assert_eq!(all.total, 2);
+        assert_eq!(all.pending, 1);
+    }
+
+    #[test]
+    fn list_scoped_attempts_pages_over_the_included_sources() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for index in 0..12 {
+            let source = match index % 3 {
+                0 => "security",
+                1 => "SECURITY",
+                _ => "linear",
+            };
+            tracker
+                .record_attempt(source, &index.to_string(), &format!("I-{index}"))
+                .unwrap();
+        }
+        tracker.mark_failed("linear", "2", "error").unwrap();
+
+        let all = tracker
+            .list_scoped_attempts(None, AttemptScope::WithoutSecurity, 100, 0)
+            .unwrap();
+        assert_eq!(all.len(), 4);
+        assert!(all.iter().all(|attempt| attempt.source == "linear"));
+        let second_page = tracker
+            .list_scoped_attempts(None, AttemptScope::WithoutSecurity, 2, 2)
+            .unwrap();
+        let ids = |attempts: &[FixAttempt]| -> Vec<i64> {
+            attempts.iter().map(|attempt| attempt.id).collect()
+        };
+        assert_eq!(ids(&second_page), ids(&all[2..4]));
+        let failed = tracker
+            .list_scoped_attempts(Some("failed"), AttemptScope::WithoutSecurity, 100, 0)
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].issue_id, "2");
+    }
+
+    #[test]
+    fn list_scoped_issues_pages_over_the_included_sources() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for (index, source) in ["security", "linear", "Security", "sentry", "linear"]
+            .into_iter()
+            .enumerate()
+        {
+            tracker
+                .store_embedding(&IssueEmbedding {
+                    id: 0,
+                    source: source.to_string(),
+                    issue_id: index.to_string(),
+                    short_id: None,
+                    title: None,
+                    embedding: None,
+                    embedding_model: None,
+                    created_at: Utc::now() - chrono::Duration::minutes(index as i64),
+                    description: None,
+                    url: None,
+                    priority: None,
+                    status: None,
+                    labels: None,
+                    updated_at: None,
+                })
+                .unwrap();
+        }
+
+        let all = tracker
+            .list_scoped_issues(AttemptScope::WithoutSecurity, 100, 0)
+            .unwrap();
+        let ids: Vec<&str> = all.iter().map(|issue| issue.issue_id.as_str()).collect();
+        assert_eq!(ids, ["1", "3", "4"]);
+        let page = tracker
+            .list_scoped_issues(AttemptScope::WithoutSecurity, 1, 1)
+            .unwrap();
+        assert_eq!(page[0].issue_id, "3");
+    }
+
     #[test]
     fn test_count_attempts_all() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker.record_attempt("linear", "1", "L-1").unwrap();
         tracker.record_attempt("sentry", "2", "S-2").unwrap();
 
-        let count = tracker.count_attempts(None, None).unwrap();
+        let count = tracker
+            .count_attempts(None, None, AttemptScope::All)
+            .unwrap();
         assert_eq!(count, 2);
     }
 
@@ -18753,8 +20132,18 @@ mod tests {
         tracker.record_attempt("linear", "2", "L-2").unwrap();
         tracker.mark_failed("linear", "2", "err").unwrap();
 
-        assert_eq!(tracker.count_attempts(Some("pending"), None).unwrap(), 1);
-        assert_eq!(tracker.count_attempts(Some("failed"), None).unwrap(), 1);
+        assert_eq!(
+            tracker
+                .count_attempts(Some("pending"), None, AttemptScope::All)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .count_attempts(Some("failed"), None, AttemptScope::All)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -18763,8 +20152,18 @@ mod tests {
         tracker.record_attempt("linear", "1", "L-1").unwrap();
         tracker.record_attempt("sentry", "2", "S-2").unwrap();
 
-        assert_eq!(tracker.count_attempts(None, Some("linear")).unwrap(), 1);
-        assert_eq!(tracker.count_attempts(None, Some("sentry")).unwrap(), 1);
+        assert_eq!(
+            tracker
+                .count_attempts(None, Some("linear"), AttemptScope::All)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .count_attempts(None, Some("sentry"), AttemptScope::All)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -18777,13 +20176,13 @@ mod tests {
 
         assert_eq!(
             tracker
-                .count_attempts(Some("pending"), Some("linear"))
+                .count_attempts(Some("pending"), Some("linear"), AttemptScope::All)
                 .unwrap(),
             1
         );
         assert_eq!(
             tracker
-                .count_attempts(Some("failed"), Some("sentry"))
+                .count_attempts(Some("failed"), Some("sentry"), AttemptScope::All)
                 .unwrap(),
             0
         );
@@ -18797,13 +20196,17 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let result = tracker.list_attempts_since(since).unwrap();
+        let result = tracker
+            .list_attempts_since(since, AttemptScope::All)
+            .unwrap();
         assert_eq!(result.len(), 1);
 
         let since_future = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let result_empty = tracker.list_attempts_since(since_future).unwrap();
+        let result_empty = tracker
+            .list_attempts_since(since_future, AttemptScope::All)
+            .unwrap();
         assert!(result_empty.is_empty());
     }
 
@@ -19226,7 +20629,7 @@ mod tests {
     #[test]
     fn test_count_issues_no_filter() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        assert_eq!(tracker.count_issues(None).unwrap(), 0);
+        assert_eq!(tracker.count_issues(None, AttemptScope::All).unwrap(), 0);
 
         let emb = IssueEmbedding {
             id: 0,
@@ -19245,7 +20648,7 @@ mod tests {
             updated_at: None,
         };
         tracker.store_embedding(&emb).unwrap();
-        assert_eq!(tracker.count_issues(None).unwrap(), 1);
+        assert_eq!(tracker.count_issues(None, AttemptScope::All).unwrap(), 1);
     }
 
     #[test]
@@ -19286,9 +20689,24 @@ mod tests {
         tracker.store_embedding(&emb1).unwrap();
         tracker.store_embedding(&emb2).unwrap();
 
-        assert_eq!(tracker.count_issues(Some("linear")).unwrap(), 1);
-        assert_eq!(tracker.count_issues(Some("sentry")).unwrap(), 1);
-        assert_eq!(tracker.count_issues(Some("other")).unwrap(), 0);
+        assert_eq!(
+            tracker
+                .count_issues(Some("linear"), AttemptScope::All)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .count_issues(Some("sentry"), AttemptScope::All)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .count_issues(Some("other"), AttemptScope::All)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -19400,7 +20818,7 @@ mod tests {
     fn test_delete_user_sessions() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker
-            .create_user("test@example.com", "hash", "Test", "user")
+            .create_user("test@example.com", "hash", "Test", Role::Viewer)
             .unwrap();
         let user = tracker
             .get_user_by_email("test@example.com")
@@ -19566,7 +20984,9 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let counts = tracker.get_activity_type_counts_since(since).unwrap();
+        let counts = tracker
+            .get_activity_type_counts_since(since, AttemptScope::All)
+            .unwrap();
 
         assert_eq!(*counts.get("fix_started").unwrap(), 2);
         assert_eq!(*counts.get("pr_merged").unwrap(), 1);
@@ -19578,7 +20998,9 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let counts = tracker.get_activity_type_counts_since(since).unwrap();
+        let counts = tracker
+            .get_activity_type_counts_since(since, AttemptScope::All)
+            .unwrap();
         assert!(counts.is_empty());
     }
 
@@ -20042,6 +21464,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(keep_count, 1);
+    }
+
+    fn hold_write_lock(path: &Path, tracker: &SqliteTracker) -> Connection {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        let writer = Connection::open(path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writer
+    }
+
+    #[test]
+    fn test_cleanup_stale_discord_message_data_without_stale_chunks_skips_the_write_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let tracker = SqliteTracker::new(&path).unwrap();
+        tracker
+            .save_discord_chunks(&[
+                sample_discord_chunk("100", "1001"),
+                sample_discord_chunk("100", "1002"),
+            ])
+            .unwrap();
+        let _writer = hold_write_lock(&path, &tracker);
+
+        tracker
+            .cleanup_stale_discord_message_data(
+                "100",
+                &["hash-1001".to_string(), "hash-1002".to_string()],
+            )
+            .expect("a cleanup with nothing stale must not wait on another writer");
+    }
+
+    #[test]
+    fn test_cleanup_stale_code_data_without_stale_files_skips_the_write_lock() {
+        use claudear_core::types::Language;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let tracker = SqliteTracker::new(&path).unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+        tracker
+            .save_code_chunks(&[claudear_core::types::CodeChunk {
+                id: None,
+                repo_id,
+                file_path: "keep.rs".to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: None,
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 5,
+                chunk_text: "fn keep() {}".to_string(),
+                context_text: "".to_string(),
+                file_hash: "h1".to_string(),
+                content_hash: None,
+            }])
+            .unwrap();
+        let _writer = hold_write_lock(&path, &tracker);
+
+        tracker
+            .cleanup_stale_code_data(repo_id, &["keep.rs".to_string()])
+            .expect("a cleanup with nothing stale must not wait on another writer");
     }
 
     #[test]
@@ -20527,8 +22012,6 @@ mod tests {
         tracker.save_code_chunk_embeddings(&[], "test").unwrap();
     }
 
-    // --- Discord message chunks (vectorlite) ---
-
     fn sample_discord_chunk(
         channel_id: &str,
         start_id: &str,
@@ -20816,7 +22299,7 @@ mod tests {
 
         // With max_plan_monthly_cost > 0 and no API costs
         let estimate = tracker
-            .get_cost_estimate("2020-01-01T00:00:00", 200.0, "30d")
+            .get_cost_estimate("2020-01-01T00:00:00", 200.0, "30d", AttemptScope::All)
             .unwrap();
         assert_eq!(estimate.cost_source, "plan_estimate");
         // total_cost should be > 0 since there's duration data
@@ -20871,29 +22354,6 @@ mod tests {
         assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
     }
 
-    // =========================================================
-    // Tests for previously uncovered code paths
-    // =========================================================
-
-    #[test]
-    fn test_validate_dimension_zero() {
-        let result = validate_dimension(0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_dimension_too_large() {
-        let result = validate_dimension(MAX_EMBEDDING_DIMENSION + 1);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_dimension_valid() {
-        assert!(validate_dimension(1).is_ok());
-        assert!(validate_dimension(128).is_ok());
-        assert!(validate_dimension(MAX_EMBEDDING_DIMENSION).is_ok());
-    }
-
     #[test]
     fn test_blob_to_embedding_none() {
         assert!(SqliteTracker::blob_to_embedding(None).is_none());
@@ -20923,32 +22383,17 @@ mod tests {
     }
 
     #[test]
-    fn test_table_exists_true() {
-        let tracker = SqliteTracker::in_memory().unwrap();
-        let conn = tracker.acquire_lock().unwrap();
-        // fix_attempts is created by migrations
-        assert!(SqliteTracker::table_exists(&conn, "fix_attempts").unwrap());
-    }
-
-    #[test]
-    fn test_table_exists_false() {
-        let tracker = SqliteTracker::in_memory().unwrap();
-        let conn = tracker.acquire_lock().unwrap();
-        assert!(!SqliteTracker::table_exists(&conn, "nonexistent_table_xyz").unwrap());
-    }
-
-    #[test]
     fn test_get_user_by_id() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("user@example.com", "hash123", "Test User", "admin")
+            .create_user("user@example.com", "hash123", "Test User", Role::Admin)
             .unwrap();
 
         let user = tracker.get_user_by_id(id).unwrap().unwrap();
         assert_eq!(user.id, id);
         assert_eq!(user.email, "user@example.com");
         assert_eq!(user.name, "Test User");
-        assert_eq!(user.role, "admin");
+        assert_eq!(user.role, Role::Admin);
     }
 
     #[test]
@@ -21037,14 +22482,30 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // --- Chat Store Tests ---
+    const OWNERLESS_CHAT_SESSIONS: claudear_core::types::ChatSessionScope =
+        claudear_core::types::ChatSessionScope::OWNERLESS;
+
+    const EVERY_CHAT_SESSION: claudear_core::types::ChatSessionScope =
+        claudear_core::types::ChatSessionScope {
+            owner_user_id: None,
+            include_ownerless: true,
+            include_other_owners: true,
+        };
+
+    fn chat_owner(tracker: &SqliteTracker, email: &str) -> i64 {
+        tracker
+            .create_user(email, "hash", "Chat Owner", Role::Viewer)
+            .unwrap()
+    }
 
     #[test]
     fn test_create_chat_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "sess-1");
         assert!(sessions[0].repo_id.is_none());
@@ -21055,10 +22516,12 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
         let repo_id = tracker.get_or_create_repo_id("my-repo").unwrap();
         tracker
-            .create_chat_session("sess-2", Some(repo_id))
+            .create_chat_session("sess-2", Some(repo_id), None)
             .unwrap();
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].repo_id, Some(repo_id));
     }
@@ -21066,24 +22529,29 @@ mod tests {
     #[test]
     fn test_save_and_get_chat_messages() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
         let id1 = tracker
-            .save_chat_message("sess-1", "user", "Hello!", None)
+            .save_chat_message("sess-1", &EVERY_CHAT_SESSION, "user", "Hello!", None)
+            .unwrap()
             .unwrap();
         assert!(id1 > 0);
 
         let id2 = tracker
             .save_chat_message(
                 "sess-1",
+                &EVERY_CHAT_SESSION,
                 "assistant",
                 "Hi there!",
                 Some(r#"{"docs":["a.rs"]}"#),
             )
+            .unwrap()
             .unwrap();
         assert!(id2 > id1);
 
-        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 10)
+            .unwrap();
         assert_eq!(history.len(), 2);
         // Should be in chronological order
         assert_eq!(history[0].content, "Hello!");
@@ -21097,15 +22565,23 @@ mod tests {
     #[test]
     fn test_get_chat_history_respects_limit() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
         for i in 0..5 {
             tracker
-                .save_chat_message("sess-1", "user", &format!("msg {}", i), None)
+                .save_chat_message(
+                    "sess-1",
+                    &EVERY_CHAT_SESSION,
+                    "user",
+                    &format!("msg {}", i),
+                    None,
+                )
                 .unwrap();
         }
 
-        let history = tracker.get_chat_history("sess-1", 3).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 3)
+            .unwrap();
         assert_eq!(history.len(), 3);
         // Should return the 3 most recent in chronological order
         assert_eq!(history[0].content, "msg 2");
@@ -21116,59 +22592,72 @@ mod tests {
     #[test]
     fn test_get_chat_history_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
-        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 10)
+            .unwrap();
         assert!(history.is_empty());
     }
 
     #[test]
     fn test_list_chat_sessions_multiple() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-a", None).unwrap();
-        tracker.create_chat_session("sess-b", None).unwrap();
-        tracker.create_chat_session("sess-c", None).unwrap();
+        tracker.create_chat_session("sess-a", None, None).unwrap();
+        tracker.create_chat_session("sess-b", None, None).unwrap();
+        tracker.create_chat_session("sess-c", None, None).unwrap();
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 3);
     }
 
     #[test]
     fn test_list_chat_sessions_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert!(sessions.is_empty());
     }
 
     #[test]
     fn test_delete_chat_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
         tracker
-            .save_chat_message("sess-1", "user", "hello", None)
+            .save_chat_message("sess-1", &EVERY_CHAT_SESSION, "user", "hello", None)
             .unwrap();
 
-        tracker.delete_chat_session("sess-1").unwrap();
+        assert!(tracker
+            .delete_chat_session("sess-1", &EVERY_CHAT_SESSION)
+            .unwrap());
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert!(sessions.is_empty());
 
         // Messages should also be gone (CASCADE delete)
-        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 10)
+            .unwrap();
         assert!(history.is_empty());
     }
 
     #[test]
     fn test_delete_chat_session_nonexistent() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        // Should not error even if session doesn't exist
-        tracker.delete_chat_session("nonexistent").unwrap();
+        assert!(!tracker
+            .delete_chat_session("nonexistent", &EVERY_CHAT_SESSION)
+            .unwrap());
     }
 
     #[test]
     fn test_cleanup_expired_chat_sessions() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-old", None).unwrap();
-        tracker.create_chat_session("sess-new", None).unwrap();
+        tracker.create_chat_session("sess-old", None, None).unwrap();
+        tracker.create_chat_session("sess-new", None, None).unwrap();
 
         // Manually age one session via direct SQL
         {
@@ -21183,7 +22672,9 @@ mod tests {
         let deleted = tracker.cleanup_expired_chat_sessions(30).unwrap();
         assert_eq!(deleted, 1);
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "sess-new");
     }
@@ -21191,16 +22682,216 @@ mod tests {
     #[test]
     fn test_cleanup_expired_chat_sessions_none_expired() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
         let deleted = tracker.cleanup_expired_chat_sessions(30).unwrap();
         assert_eq!(deleted, 0);
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
     }
 
-    // --- Code Index Meta Tests ---
+    #[test]
+    fn test_chat_session_records_its_owner() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let owner = chat_owner(&tracker, "owner@example.com");
+        tracker
+            .create_chat_session("owned", None, Some(owner))
+            .unwrap();
+        tracker.create_chat_session("legacy", None, None).unwrap();
+
+        let owned = tracker
+            .get_chat_session("owned", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(owned.id, "owned");
+        assert_eq!(owned.owner_user_id, Some(owner));
+        let legacy = tracker
+            .get_chat_session("legacy", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.owner_user_id, None);
+        assert!(tracker
+            .get_chat_session("missing", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_list_chat_sessions_is_scoped_to_the_owner() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let owner = chat_owner(&tracker, "owner@example.com");
+        let other = chat_owner(&tracker, "other@example.com");
+        tracker
+            .create_chat_session("mine", None, Some(owner))
+            .unwrap();
+        tracker
+            .create_chat_session("theirs", None, Some(other))
+            .unwrap();
+        tracker.create_chat_session("legacy", None, None).unwrap();
+
+        let ids = |include_ownerless: bool| {
+            let scope = claudear_core::types::ChatSessionScope {
+                owner_user_id: Some(owner),
+                include_ownerless,
+                include_other_owners: false,
+            };
+            let mut ids: Vec<String> = tracker
+                .list_chat_sessions(&scope)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(ids(false), ["mine"]);
+        assert_eq!(ids(true), ["legacy", "mine"]);
+    }
+
+    #[test]
+    fn test_deleting_a_user_deletes_their_chat_sessions() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let owner = chat_owner(&tracker, "owner@example.com");
+        tracker
+            .create_chat_session("owned", None, Some(owner))
+            .unwrap();
+        tracker
+            .save_chat_message("owned", &EVERY_CHAT_SESSION, "user", "hello", None)
+            .unwrap();
+
+        assert!(tracker.delete_user(owner).unwrap());
+
+        assert!(tracker
+            .get_chat_session("owned", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_none());
+        assert!(tracker
+            .get_chat_history("owned", &EVERY_CHAT_SESSION, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    fn scoped_chat_sessions(tracker: &SqliteTracker) -> (i64, i64, i64) {
+        let owner = chat_owner(tracker, "owner@example.com");
+        let other = chat_owner(tracker, "other@example.com");
+        let admin = chat_owner(tracker, "admin@example.com");
+        for (id, owner_user_id) in [
+            ("mine", Some(owner)),
+            ("theirs", Some(other)),
+            ("legacy", None),
+        ] {
+            tracker
+                .create_chat_session(id, None, owner_user_id)
+                .unwrap();
+            tracker
+                .save_chat_message(id, &EVERY_CHAT_SESSION, "user", "seed", None)
+                .unwrap()
+                .unwrap();
+        }
+        (owner, other, admin)
+    }
+
+    fn chat_scopes(owner: i64, admin: i64) -> [claudear_core::types::ChatSessionScope; 4] {
+        let viewer = claudear_core::types::ChatViewer {
+            user_id: owner,
+            is_admin: false,
+        };
+        let administrator = claudear_core::types::ChatViewer {
+            user_id: admin,
+            is_admin: true,
+        };
+        [
+            viewer.scope(),
+            administrator.scope(),
+            administrator.delete_scope(),
+            OWNERLESS_CHAT_SESSIONS,
+        ]
+    }
+
+    #[test]
+    fn test_chat_reads_and_appends_are_confined_to_the_scope() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let (owner, _, admin) = scoped_chat_sessions(&tracker);
+
+        for scope in chat_scopes(owner, admin) {
+            let mut listed: Vec<String> = tracker
+                .list_chat_sessions(&scope)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            listed.sort();
+            let mut expected = Vec::new();
+            for id in ["legacy", "mine", "theirs"] {
+                let session = tracker
+                    .get_chat_session(id, &EVERY_CHAT_SESSION)
+                    .unwrap()
+                    .unwrap();
+                let included = scope.includes(&session);
+                if included {
+                    expected.push(id.to_string());
+                }
+                assert_eq!(
+                    tracker.get_chat_session(id, &scope).unwrap().is_some(),
+                    included,
+                    "get {id} in {scope:?}"
+                );
+                assert_eq!(
+                    !tracker.get_chat_history(id, &scope, 10).unwrap().is_empty(),
+                    included,
+                    "history of {id} in {scope:?}"
+                );
+                assert_eq!(
+                    tracker
+                        .save_chat_message(id, &scope, "user", "appended", None)
+                        .unwrap()
+                        .is_some(),
+                    included,
+                    "append to {id} in {scope:?}"
+                );
+            }
+            assert_eq!(listed, expected, "list in {scope:?}");
+        }
+
+        assert!(tracker
+            .save_chat_message("missing", &EVERY_CHAT_SESSION, "user", "lost", None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_chat_session_delete_is_confined_to_the_scope() {
+        for id in ["legacy", "mine", "theirs"] {
+            for index in 0..4 {
+                let tracker = SqliteTracker::in_memory().unwrap();
+                let (owner, _, admin) = scoped_chat_sessions(&tracker);
+                let scope = chat_scopes(owner, admin)[index];
+                let session = tracker
+                    .get_chat_session(id, &EVERY_CHAT_SESSION)
+                    .unwrap()
+                    .unwrap();
+                let included = scope.includes(&session);
+
+                assert_eq!(
+                    tracker.delete_chat_session(id, &scope).unwrap(),
+                    included,
+                    "delete {id} in {scope:?}"
+                );
+                assert_eq!(
+                    tracker
+                        .get_chat_session(id, &EVERY_CHAT_SESSION)
+                        .unwrap()
+                        .is_none(),
+                    included,
+                    "{id} after a delete in {scope:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_get_set_code_index_meta() {
@@ -21296,8 +22987,6 @@ mod tests {
         assert_eq!(model.as_deref(), Some("test-model-v1"));
     }
 
-    // --- Delete All Code Data ---
-
     #[test]
     fn test_delete_all_code_data_for_repo() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21353,8 +23042,6 @@ mod tests {
         tracker.delete_all_code_data_for_repo(repo_id).unwrap();
     }
 
-    // --- Indexing Progress ---
-
     #[test]
     fn test_get_indexing_progress_default() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21365,13 +23052,11 @@ mod tests {
         assert_eq!(progress.indexed_repos, 0);
     }
 
-    // --- Update user with no fields ---
-
     #[test]
     fn test_update_user_no_fields() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("u@ex.com", "h", "Name", "admin")
+            .create_user("u@ex.com", "h", "Name", Role::Admin)
             .unwrap();
 
         // Calling update with all None should return false (no fields to update)
@@ -21385,7 +23070,7 @@ mod tests {
     fn test_update_user_partial_fields() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("u@ex.com", "oldhash", "OldName", "viewer")
+            .create_user("u@ex.com", "oldhash", "OldName", Role::Viewer)
             .unwrap();
 
         // Update only the name
@@ -21397,14 +23082,14 @@ mod tests {
         let user = tracker.get_user_by_id(id).unwrap().unwrap();
         assert_eq!(user.name, "NewName");
         assert_eq!(user.email, "u@ex.com"); // unchanged
-        assert_eq!(user.role, "viewer"); // unchanged
+        assert_eq!(user.role, Role::Viewer); // unchanged
     }
 
     #[test]
     fn test_update_user_avatar_url() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let id = tracker
-            .create_user("u@ex.com", "h", "Name", "admin")
+            .create_user("u@ex.com", "h", "Name", Role::Admin)
             .unwrap();
 
         let result = tracker
@@ -21425,8 +23110,6 @@ mod tests {
             Some("https://example.com/avatar.png")
         );
     }
-
-    // --- get_activities_for_issue (isolation) ---
 
     #[test]
     fn test_get_activities_for_issue_filters_by_source_and_id() {
@@ -21484,8 +23167,6 @@ mod tests {
         assert!(activities.is_empty());
     }
 
-    // --- find_similar_issues_vector (without vectorlite) ---
-
     #[test]
     fn test_find_similar_issues_vector_empty_embedding() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21507,8 +23188,6 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    // --- find_similar_outcomes_vector (without vectorlite) ---
-
     #[test]
     fn test_find_similar_outcomes_vector_empty_embedding() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21527,8 +23206,6 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    // --- generate_session_token ---
-
     #[test]
     fn test_generate_session_token_length_and_uniqueness() {
         let t1 = generate_session_token();
@@ -21541,8 +23218,6 @@ mod tests {
         // Should be valid hex
         assert!(t1.chars().all(|c| c.is_ascii_hexdigit()));
     }
-
-    // --- record_release_tracking (edge case: no released_at) ---
 
     #[test]
     fn test_record_release_tracking_no_released_at() {
@@ -21576,8 +23251,6 @@ mod tests {
         let id = tracker.record_release_tracking(&tracking).unwrap();
         assert!(id > 0);
     }
-
-    // --- store_embeddings_batch with actual data ---
 
     #[test]
     fn test_store_embeddings_batch_with_embeddings() {
@@ -21625,16 +23298,12 @@ mod tests {
         assert_eq!(e2.description.as_deref(), Some("Desc"));
     }
 
-    // --- list_issues (tested indirectly but let's test count_issues with source) ---
-
     #[test]
     fn test_count_issues_no_data() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let count = tracker.count_issues(None).unwrap();
+        let count = tracker.count_issues(None, AttemptScope::All).unwrap();
         assert_eq!(count, 0);
     }
-
-    // --- get_success_rate with mixed outcomes ---
 
     #[test]
     fn test_get_success_rate_with_data() {
@@ -21658,8 +23327,6 @@ mod tests {
         assert!((rate - 1.0 / 3.0).abs() < 0.01);
     }
 
-    // --- record_metrics_batch edge case ---
-
     #[test]
     fn test_record_metrics_batch_with_tags() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -21675,8 +23342,6 @@ mod tests {
         let count = tracker.record_metrics_batch(&[metric]).unwrap();
         assert_eq!(count, 1);
     }
-
-    // --- subscribe_indexing_progress ---
 
     #[test]
     fn test_subscribe_indexing_progress_returns_receiver() {
@@ -21930,5 +23595,2341 @@ mod tests {
         // Verify regression data is gone
         let watches = tracker.get_all_regression_watches().unwrap();
         assert!(watches.is_empty());
+    }
+
+    mod vector_index_rebuild {
+        use super::*;
+        use crate::vectorlite::require_vectorlite_for_tests;
+        use claudear_core::types::{CodeChunk, Language};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        const MODEL: &str = "test-model";
+        const TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+        fn sample_code_chunk(repository_id: i64, index: usize) -> CodeChunk {
+            CodeChunk {
+                id: None,
+                repo_id: repository_id,
+                file_path: format!("src/file_{index}.rs"),
+                chunk_type: "function".to_string(),
+                symbol_name: Some(format!("function_{index}")),
+                language: Language::Rust,
+                start_line: index + 1,
+                end_line: index + 2,
+                chunk_text: format!("fn function_{index}() {{}}"),
+                context_text: String::new(),
+                file_hash: format!("hash-{index}"),
+                content_hash: None,
+            }
+        }
+
+        fn sample_embedding(index: usize) -> Vec<f32> {
+            vec![1.0, index as f32, 0.5, 0.25]
+        }
+
+        fn save_code_chunk_embeddings(path: &Path, count: usize) -> bool {
+            let writer = SqliteTracker::new(path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return false;
+            }
+            let repository_id = writer.get_or_create_repo_id("org/repo").unwrap();
+            let chunks: Vec<CodeChunk> = (0..count)
+                .map(|index| sample_code_chunk(repository_id, index))
+                .collect();
+            let chunk_ids = writer.save_code_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..count).map(sample_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            writer.save_code_chunk_embeddings(&pairs, MODEL).unwrap();
+            true
+        }
+
+        fn is_indexed(connection: &Connection, rowid: i64) -> bool {
+            connection
+                .prepare_cached("SELECT rowid FROM code_chunk_vectors WHERE rowid = ?1")
+                .unwrap()
+                .query_row(params![rowid], |row| row.get::<_, i64>(0))
+                .optional()
+                .unwrap()
+                .is_some()
+        }
+
+        #[cfg(unix)]
+        fn thread_cpu_time() -> Duration {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `time` is a valid, writable timespec for the duration of the call.
+            let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+            assert_eq!(
+                result,
+                0,
+                "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            Duration::new(
+                u64::try_from(time.tv_sec).unwrap(),
+                u32::try_from(time.tv_nsec).unwrap(),
+            )
+        }
+
+        #[test]
+        fn test_rebuild_vector_indexes_restores_every_code_chunk_vector_after_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let count = 3 * REBUILD_BATCH_SIZE + 1;
+
+            if !save_code_chunk_embeddings(&path, count) {
+                return;
+            }
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            assert!(require_vectorlite_for_tests(
+                &reader.acquire_lock().unwrap()
+            ));
+            reader.rebuild_vector_indexes();
+
+            let connection = reader.acquire_lock().unwrap();
+            let embedding_ids: Vec<i64> = connection
+                .prepare("SELECT id FROM code_chunk_embeddings ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(embedding_ids.len(), count);
+            let mut lookup = connection
+                .prepare("SELECT rowid FROM code_chunk_vectors WHERE rowid = ?1")
+                .unwrap();
+            let missing: Vec<i64> = embedding_ids
+                .into_iter()
+                .filter(|embedding_id| {
+                    lookup
+                        .query_row(params![embedding_id], |row| row.get::<_, i64>(0))
+                        .optional()
+                        .unwrap()
+                        .is_none()
+                })
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "rebuild_vector_indexes left {} of {count} embeddings out of code_chunk_vectors, starting with {:?}",
+                missing.len(),
+                missing.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn test_rebuild_vector_indexes_releases_the_lock_between_batches() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let batches = 64;
+            let count = batches * REBUILD_BATCH_SIZE;
+
+            if !save_code_chunk_embeddings(&path, count) {
+                return;
+            }
+
+            let tracker = Arc::new(SqliteTracker::new(&path).unwrap());
+            let first: i64 = {
+                let connection = tracker.acquire_lock().unwrap();
+                assert!(require_vectorlite_for_tests(&connection));
+                connection
+                    .query_row("SELECT min(id) FROM code_chunk_embeddings", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            };
+            let batch_size = i64::try_from(REBUILD_BATCH_SIZE).unwrap();
+            let indexed_batches = |connection: &Connection| {
+                let (mut low, mut high) = (0, batches);
+                while low < high {
+                    let middle = (low + high) / 2;
+                    let rowid = first + i64::try_from(middle).unwrap() * batch_size;
+                    if is_indexed(connection, rowid) {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                low
+            };
+
+            let rebuilding = Arc::clone(&tracker);
+            let rebuild = std::thread::spawn(move || rebuilding.rebuild_vector_indexes());
+            let mut observed = 0;
+            let mut advances = Vec::new();
+            let mut observe = || {
+                let (connection, queued) = match tracker.connection.try_lock() {
+                    Some(connection) => (connection, false),
+                    None => (tracker.connection.lock(), true),
+                };
+                let indexed = indexed_batches(&connection);
+                if indexed > observed {
+                    if queued {
+                        advances.push(indexed - observed);
+                    }
+                    observed = indexed;
+                }
+            };
+            while !rebuild.is_finished() {
+                observe();
+            }
+            rebuild.join().unwrap();
+            observe();
+
+            assert_eq!(observed, batches, "the rebuild left batches unindexed");
+            assert!(
+                advances.len() >= batches / 2,
+                "a thread waiting on the connection lock got it only {} times across {batches} rebuild batches, so the rebuild held the lock across batches; batches indexed between its acquisitions: {advances:?}",
+                advances.len()
+            );
+            let single_batch = advances.iter().filter(|&&advance| advance == 1).count();
+            assert!(
+                single_batch > 0,
+                "a waiting thread never got the lock after a single rebuild batch in {} acquisitions, so the rebuild holds the lock across batches; batches indexed between its acquisitions: {advances:?}",
+                advances.len()
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn test_rebuild_vector_indexes_sleeps_while_another_thread_holds_the_lock() {
+            const HOLD: Duration = Duration::from_millis(500);
+            const QUEUE: Duration = Duration::from_millis(50);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let count = 4 * REBUILD_BATCH_SIZE;
+            if !save_code_chunk_embeddings(&path, count) {
+                return;
+            }
+
+            let tracker = Arc::new(SqliteTracker::new(&path).unwrap());
+            let blocking = tracker.acquire_lock().unwrap();
+            assert!(require_vectorlite_for_tests(&blocking));
+            let last: i64 = blocking
+                .query_row("SELECT max(id) FROM code_chunk_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+
+            let rebuilding = Arc::clone(&tracker);
+            let rebuild = std::thread::spawn(move || {
+                let started = thread_cpu_time();
+                rebuilding.rebuild_vector_indexes();
+                thread_cpu_time() - started
+            });
+            let held = Arc::new(AtomicBool::new(false));
+            let holds_while_pending = Arc::new(AtomicUsize::new(0));
+            let hold = {
+                let held = Arc::clone(&held);
+                let holds_while_pending = Arc::clone(&holds_while_pending);
+                move |connection: MutexGuard<'_, Connection>| {
+                    held.store(true, Ordering::SeqCst);
+                    if !is_indexed(&connection, last) {
+                        holds_while_pending.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(HOLD);
+                }
+            };
+            std::thread::sleep(QUEUE);
+            let requesting = Arc::new(AtomicBool::new(false));
+            let queued = {
+                let tracker = Arc::clone(&tracker);
+                let requesting = Arc::clone(&requesting);
+                let hold = hold.clone();
+                std::thread::spawn(move || {
+                    requesting.store(true, Ordering::SeqCst);
+                    hold(tracker.acquire_lock().unwrap());
+                })
+            };
+            while !requesting.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(QUEUE);
+            MutexGuard::unlock_fair(blocking);
+            while !tracker.connection.is_locked() {
+                std::hint::spin_loop();
+            }
+            let barging = {
+                let tracker = Arc::clone(&tracker);
+                std::thread::spawn(move || {
+                    let connection = loop {
+                        if let Some(connection) = tracker.connection.try_lock() {
+                            break connection;
+                        }
+                        if held.load(Ordering::SeqCst) {
+                            break tracker.acquire_lock().unwrap();
+                        }
+                        std::hint::spin_loop();
+                    };
+                    hold(connection);
+                })
+            };
+            queued.join().unwrap();
+            barging.join().unwrap();
+            let rebuild_cpu = rebuild.join().unwrap();
+
+            assert!(
+                is_indexed(&tracker.acquire_lock().unwrap(), last),
+                "the rebuild stopped before indexing every batch"
+            );
+            assert!(
+                holds_while_pending.load(Ordering::SeqCst) > 0,
+                "the rebuild finished before another thread held the lock, so it never had to wait"
+            );
+            assert!(
+                rebuild_cpu < HOLD / 2,
+                "the rebuild thread burned {rebuild_cpu:?} of CPU while other threads held the connection lock for {HOLD:?} each; it must sleep until the lock is handed back"
+            );
+        }
+
+        #[test]
+        fn test_rebuild_vector_indexes_terminates_when_a_vector_table_name_is_taken() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let chunk_ids = tracker
+                .save_code_chunks(&[sample_code_chunk(repository_id, 0)])
+                .unwrap();
+            {
+                let connection = tracker.acquire_lock().unwrap();
+                connection
+                    .execute_batch("CREATE TABLE code_chunk_vectors(x)")
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO code_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
+                        params![chunk_ids[0], embedding_blob(&sample_embedding(0)), MODEL],
+                    )
+                    .unwrap();
+            }
+
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                tracker.rebuild_vector_indexes();
+                let _ = sender.send(());
+            });
+
+            receiver.recv_timeout(TERMINATION_TIMEOUT).expect(
+                "rebuild_vector_indexes must terminate when an ordinary table holds a vector index name",
+            );
+        }
+    }
+
+    mod vector_index_regression {
+        use super::*;
+        use crate::vectorlite::require_vectorlite_for_tests;
+        use claudear_core::types::{CodeChunk, Language};
+
+        const CODE_CHUNK_VECTORS: &str = "code_chunk_vectors";
+        const DISCORD_MESSAGE_CHUNK_VECTORS: &str = "discord_message_chunk_vectors";
+        const MODEL: &str = "test-model";
+
+        fn vector_exists(tracker: &SqliteTracker, table: &str, rowid: i64) -> bool {
+            let connection = tracker.acquire_lock().unwrap();
+            let lookup = connection
+                .query_row(
+                    &format!("SELECT rowid FROM {table} WHERE rowid = ?1"),
+                    params![rowid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional();
+            match lookup {
+                Ok(found) => found.is_some(),
+                Err(error) if error.to_string().contains("no such table") => false,
+                Err(error) => panic!("looking up rowid {rowid} in {table} failed: {error}"),
+            }
+        }
+
+        fn axis_embedding(axis: usize) -> Vec<f32> {
+            let mut embedding = vec![0.0f32; 4];
+            embedding[axis % 4] = 1.0;
+            embedding
+        }
+
+        fn spread_embedding(index: usize) -> Vec<f32> {
+            vec![1.0, index as f32, 0.5, 0.25]
+        }
+
+        fn database_path(directory: &tempfile::TempDir) -> PathBuf {
+            directory.path().join("claudear.db")
+        }
+
+        fn legacy_vector_table(table: &str) -> String {
+            format!(
+                "CREATE VIRTUAL TABLE {table} USING vectorlite(embedding float32[4] cosine, hnsw(max_elements=4, ef_construction=200, M=16))"
+            )
+        }
+
+        fn sample_code_chunk(repository_id: i64, file_path: &str, start_line: usize) -> CodeChunk {
+            CodeChunk {
+                id: None,
+                repo_id: repository_id,
+                file_path: file_path.to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: Some(format!("function_{start_line}")),
+                language: Language::Rust,
+                start_line,
+                end_line: start_line + 1,
+                chunk_text: format!("fn function_{start_line}() {{}}"),
+                context_text: String::new(),
+                file_hash: format!("hash-{file_path}"),
+                content_hash: None,
+            }
+        }
+
+        fn embedding_ids(tracker: &SqliteTracker, table: &str, chunk_ids: &[i64]) -> Vec<i64> {
+            let connection = tracker.acquire_lock().unwrap();
+            chunk_ids
+                .iter()
+                .map(|chunk_id| {
+                    connection
+                        .query_row(
+                            &format!("SELECT id FROM {table} WHERE chunk_id = ?1"),
+                            params![chunk_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        fn assert_indexed(tracker: &SqliteTracker, table: &str, embedding_ids: &[i64]) {
+            for &embedding_id in embedding_ids {
+                assert!(
+                    vector_exists(tracker, table, embedding_id),
+                    "embedding {embedding_id} must be in {table} before the operation under test"
+                );
+            }
+        }
+
+        fn assert_removed(tracker: &SqliteTracker, table: &str, embedding_ids: &[i64]) {
+            for &embedding_id in embedding_ids {
+                assert!(
+                    !vector_exists(tracker, table, embedding_id),
+                    "the vector for deleted embedding {embedding_id} is still in {table}"
+                );
+            }
+        }
+
+        fn index_code_chunks(
+            tracker: &SqliteTracker,
+            repository_id: i64,
+            file_paths: &[&str],
+        ) -> (Vec<i64>, Vec<i64>) {
+            let chunks: Vec<CodeChunk> = file_paths
+                .iter()
+                .enumerate()
+                .map(|(index, file_path)| sample_code_chunk(repository_id, file_path, index + 1))
+                .collect();
+            let chunk_ids = tracker.save_code_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(axis_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker.save_code_chunk_embeddings(&pairs, MODEL).unwrap();
+            let embedding_ids = embedding_ids(tracker, "code_chunk_embeddings", &chunk_ids);
+            assert_indexed(tracker, CODE_CHUNK_VECTORS, &embedding_ids);
+            (chunk_ids, embedding_ids)
+        }
+
+        fn index_discord_chunks(
+            tracker: &SqliteTracker,
+            chunks: &[(&str, &str)],
+        ) -> (Vec<i64>, Vec<i64>) {
+            let chunks: Vec<claudear_core::types::DiscordMessageChunk> = chunks
+                .iter()
+                .map(|(channel_id, start_id)| sample_discord_chunk(channel_id, start_id))
+                .collect();
+            let chunk_ids = tracker.save_discord_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(axis_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker
+                .save_discord_chunk_embeddings(&pairs, MODEL)
+                .unwrap();
+            let embedding_ids =
+                embedding_ids(tracker, "discord_message_chunk_embeddings", &chunk_ids);
+            assert_indexed(tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids);
+            (chunk_ids, embedding_ids)
+        }
+
+        #[test]
+        fn test_code_chunk_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = writer.get_or_create_repo_id("org/repo").unwrap();
+            let (chunk_ids, _) =
+                index_code_chunks(&writer, repository_id, &["src/a.rs", "src/b.rs"]);
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let results = reader
+                .search_code_chunks(&[0.9, 0.1, 0.0, 0.0], None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_ids[0]),
+                "a reopened tracker must search vectors written before it opened; got {} results",
+                results.len()
+            );
+        }
+
+        #[test]
+        fn test_discord_message_chunk_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let (chunk_ids, _) = index_discord_chunks(&writer, &[("100", "1001"), ("200", "2001")]);
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let results = reader
+                .search_discord_message_chunks(&[0.9, 0.1, 0.0, 0.0], None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_ids[0]),
+                "a reopened tracker must search vectors written before it opened; got {} results",
+                results.len()
+            );
+        }
+
+        #[test]
+        fn test_qa_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let mut entry = make_qa_entry(
+                "linear",
+                Some("org/repo"),
+                "issue-1",
+                "How do I reset my password?",
+                "Use the reset link on the sign-in page.",
+                "correlation-1",
+            );
+            entry.question_embedding = Some(axis_embedding(0));
+            let qa_id = writer.store_qa_knowledge(&entry).unwrap();
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let matches = reader
+                .find_similar_qa_global(
+                    "a question sharing no normalized text with any entry",
+                    Some(&axis_embedding(0)),
+                    0.5,
+                    5,
+                )
+                .unwrap();
+            assert_eq!(
+                matches.first().map(|found| found.entry.id),
+                Some(qa_id),
+                "a reopened tracker must search Q&A vectors written before it opened; got {} matches",
+                matches.len()
+            );
+        }
+
+        #[test]
+        fn test_issue_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            let issue = IssueEmbedding {
+                id: 0,
+                source: "linear".to_string(),
+                issue_id: "issue-1".to_string(),
+                short_id: Some("LIN-1".to_string()),
+                title: Some("Login fails after password reset".to_string()),
+                description: None,
+                url: None,
+                priority: None,
+                status: None,
+                labels: None,
+                embedding: Some(axis_embedding(0)),
+                embedding_model: Some(MODEL.to_string()),
+                created_at: Utc::now(),
+                updated_at: None,
+            };
+            let issue_row_id = writer.store_embedding(&issue).unwrap();
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let similar = reader
+                .find_similar_issues_vector(&axis_embedding(0), "linear", None, 0.5, 5)
+                .unwrap()
+                .expect("vectorlite is loaded, so the vector search must run");
+            assert_eq!(
+                similar.first().map(|(found, _)| found.id),
+                Some(issue_row_id),
+                "a reopened tracker must search issue vectors written before it opened; got {} results",
+                similar.len()
+            );
+        }
+
+        #[test]
+        fn test_outcome_vectors_survive_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            let writer = SqliteTracker::new(&path).unwrap();
+            if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
+                return;
+            }
+            writer.record_attempt("linear", "issue-1", "LIN-1").unwrap();
+            let attempt = writer.get_attempt("linear", "issue-1").unwrap().unwrap();
+            let outcome = FixOutcome {
+                id: 0,
+                attempt_id: attempt.id,
+                source: "linear".to_string(),
+                issue_id: "issue-1".to_string(),
+                issue_text: "Null pointer in handler".to_string(),
+                prompt_used: "Fix the null pointer".to_string(),
+                outcome: Outcome::CannotFix,
+                error_type: Some("null_reference".to_string()),
+                learnings: None,
+                keywords: vec!["null".to_string()],
+                embedding: Some(axis_embedding(0)),
+                created_at: Utc::now(),
+            };
+            let outcome_id = writer.store_feedback_outcome(&outcome).unwrap();
+            drop(writer);
+
+            let reader = SqliteTracker::new(&path).unwrap();
+            let similar = reader
+                .find_similar_outcomes_vector(&axis_embedding(0), 0.5, 5)
+                .unwrap()
+                .expect("vectorlite is loaded, so the vector search must run");
+            assert_eq!(
+                similar.first().map(|(found, _)| found.id),
+                Some(outcome_id),
+                "a reopened tracker must search outcome vectors written before it opened; got {} results",
+                similar.len()
+            );
+        }
+
+        #[test]
+        fn test_code_chunk_embeddings_retry_after_rolled_back_batch() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let chunk = sample_code_chunk(repository_id, "src/a.rs", 1);
+            let chunk_id = tracker
+                .save_code_chunks(std::slice::from_ref(&chunk))
+                .unwrap()[0];
+            let embedding = axis_embedding(0);
+            let missing_chunk_id = chunk_id + 1_000;
+
+            assert!(
+                tracker
+                    .save_code_chunk_embeddings(
+                        &[
+                            (chunk_id, embedding.as_slice()),
+                            (missing_chunk_id, embedding.as_slice()),
+                        ],
+                        MODEL,
+                    )
+                    .is_err(),
+                "an embedding for a missing chunk must fail and roll back the whole batch"
+            );
+            tracker
+                .save_code_chunk_embeddings(&[(chunk_id, embedding.as_slice())], MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("retrying the rolled-back embedding must succeed: {error}")
+                });
+
+            let results = tracker.search_code_chunks(&embedding, None, 5).unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_id),
+                "the retried embedding must be searchable"
+            );
+            assert!(
+                tracker
+                    .code_chunk_hash_matches(repository_id, &chunk.file_path, &chunk.file_hash)
+                    .unwrap(),
+                "the retried chunk must count as fully embedded"
+            );
+        }
+
+        #[test]
+        fn test_discord_message_chunk_embeddings_retry_after_rolled_back_batch() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let chunk = sample_discord_chunk("100", "1001");
+            let chunk_id = tracker
+                .save_discord_chunks(std::slice::from_ref(&chunk))
+                .unwrap()[0];
+            let embedding = axis_embedding(0);
+            let missing_chunk_id = chunk_id + 1_000;
+
+            assert!(
+                tracker
+                    .save_discord_chunk_embeddings(
+                        &[
+                            (chunk_id, embedding.as_slice()),
+                            (missing_chunk_id, embedding.as_slice()),
+                        ],
+                        MODEL,
+                    )
+                    .is_err(),
+                "an embedding for a missing chunk must fail and roll back the whole batch"
+            );
+            tracker
+                .save_discord_chunk_embeddings(&[(chunk_id, embedding.as_slice())], MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("retrying the rolled-back embedding must succeed: {error}")
+                });
+
+            let results = tracker
+                .search_discord_message_chunks(&embedding, None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_id),
+                "the retried embedding must be searchable"
+            );
+            let content_hash = chunk.content_hash.as_deref().unwrap();
+            assert!(
+                tracker
+                    .discord_chunk_hash_matches(&chunk.channel_id, content_hash)
+                    .unwrap(),
+                "the retried chunk must count as fully embedded"
+            );
+        }
+
+        #[test]
+        fn test_code_chunk_vectors_outgrow_legacy_capacity() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            drop(SqliteTracker::new(&path).unwrap());
+            {
+                let connection = Connection::open(&path).unwrap();
+                if !require_vectorlite_for_tests(&connection) {
+                    return;
+                }
+                connection
+                    .execute_batch(&legacy_vector_table(CODE_CHUNK_VECTORS))
+                    .unwrap();
+            }
+
+            let tracker = SqliteTracker::new(&path).unwrap();
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let chunks: Vec<CodeChunk> = (1..=10)
+                .map(|line| sample_code_chunk(repository_id, "src/a.rs", line))
+                .collect();
+            let chunk_ids = tracker.save_code_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(spread_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker
+                .save_code_chunk_embeddings(&pairs, MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("ten embeddings must fit despite a legacy max_elements=4 table: {error}")
+                });
+
+            let results = tracker
+                .search_code_chunks(&embeddings[0], None, 10)
+                .unwrap();
+            assert_eq!(results.len(), 10, "every embedding must be searchable");
+            assert!(
+                tracker
+                    .code_chunk_hash_matches(repository_id, "src/a.rs", &chunks[0].file_hash)
+                    .unwrap(),
+                "every chunk must count as fully embedded"
+            );
+        }
+
+        #[test]
+        fn test_discord_message_chunk_vectors_outgrow_legacy_capacity() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = database_path(&directory);
+            drop(SqliteTracker::new(&path).unwrap());
+            {
+                let connection = Connection::open(&path).unwrap();
+                if !require_vectorlite_for_tests(&connection) {
+                    return;
+                }
+                connection
+                    .execute_batch(&legacy_vector_table(DISCORD_MESSAGE_CHUNK_VECTORS))
+                    .unwrap();
+            }
+
+            let tracker = SqliteTracker::new(&path).unwrap();
+            let chunks: Vec<claudear_core::types::DiscordMessageChunk> = (1..=10)
+                .map(|index| sample_discord_chunk("100", &format!("{}", 1000 + index)))
+                .collect();
+            let chunk_ids = tracker.save_discord_chunks(&chunks).unwrap();
+            let embeddings: Vec<Vec<f32>> = (0..chunk_ids.len()).map(spread_embedding).collect();
+            let pairs: Vec<(i64, &[f32])> = chunk_ids
+                .iter()
+                .copied()
+                .zip(embeddings.iter().map(Vec::as_slice))
+                .collect();
+            tracker
+                .save_discord_chunk_embeddings(&pairs, MODEL)
+                .unwrap_or_else(|error| {
+                    panic!("ten embeddings must fit despite a legacy max_elements=4 table: {error}")
+                });
+
+            let results = tracker
+                .search_discord_message_chunks(&embeddings[0], None, 10)
+                .unwrap();
+            assert_eq!(results.len(), 10, "every embedding must be searchable");
+            for chunk in &chunks {
+                let content_hash = chunk.content_hash.as_deref().unwrap();
+                assert!(
+                    tracker
+                        .discord_chunk_hash_matches("100", content_hash)
+                        .unwrap(),
+                    "chunk {content_hash} must count as fully embedded"
+                );
+            }
+        }
+
+        #[test]
+        fn test_delete_code_chunks_by_ids_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (chunk_ids, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker.delete_code_chunks_by_ids(&chunk_ids[..1]).unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_delete_code_data_for_file_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker
+                .delete_code_data_for_file(repository_id, "src/a.rs")
+                .unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_code_data_removes_vectors_for_stale_paths() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/stale.rs", "src/kept.rs"]);
+
+            tracker
+                .cleanup_stale_code_data(repository_id, &["src/kept.rs".to_string()])
+                .unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_code_data_removes_all_vectors_when_no_paths_remain() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker.cleanup_stale_code_data(repository_id, &[]).unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids);
+        }
+
+        #[test]
+        fn test_delete_all_code_data_for_repo_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let deleted_repository_id = tracker.get_or_create_repo_id("org/deleted").unwrap();
+            let kept_repository_id = tracker.get_or_create_repo_id("org/kept").unwrap();
+            let (_, deleted_embedding_ids) =
+                index_code_chunks(&tracker, deleted_repository_id, &["src/a.rs", "src/b.rs"]);
+            let (_, kept_embedding_ids) =
+                index_code_chunks(&tracker, kept_repository_id, &["src/a.rs"]);
+
+            tracker
+                .delete_all_code_data_for_repo(deleted_repository_id)
+                .unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &deleted_embedding_ids);
+            assert_indexed(&tracker, CODE_CHUNK_VECTORS, &kept_embedding_ids);
+        }
+
+        #[test]
+        fn test_clear_repositories_removes_code_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+            let (_, embedding_ids) =
+                index_code_chunks(&tracker, repository_id, &["src/a.rs", "src/b.rs"]);
+
+            tracker.clear_repositories().unwrap();
+
+            assert_removed(&tracker, CODE_CHUNK_VECTORS, &embedding_ids);
+        }
+
+        #[test]
+        fn test_clear_repositories_without_extension_keeps_code_vector_table() {
+            let directory = tempfile::tempdir().unwrap();
+            {
+                let tracker = SqliteTracker::new(database_path(&directory)).unwrap();
+                if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                    return;
+                }
+                let repository_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+                index_code_chunks(&tracker, repository_id, &["src/a.rs"]);
+            }
+
+            let tracker = SqliteTracker::new(database_path(&directory)).unwrap();
+            tracker
+                .clear_repositories()
+                .expect("clearing repositories must not need the vectorlite extension");
+
+            let connection = tracker.acquire_lock().unwrap();
+            let vector_tables: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    params![CODE_CHUNK_VECTORS],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                vector_tables, 1,
+                "a tracker that never loaded vectorlite must leave {CODE_CHUNK_VECTORS} in place"
+            );
+            let embeddings: i64 = connection
+                .query_row("SELECT COUNT(*) FROM code_chunk_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                embeddings, 0,
+                "clearing repositories must cascade to embeddings"
+            );
+        }
+
+        #[test]
+        fn test_delete_discord_message_chunks_by_ids_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (chunk_ids, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("100", "1002")]);
+
+            tracker
+                .delete_discord_message_chunks_by_ids(&chunk_ids[..1])
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_delete_discord_message_data_for_channel_removes_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (_, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("200", "2001")]);
+
+            tracker
+                .delete_discord_message_data_for_channel("100")
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_discord_message_data_removes_stale_vectors() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (_, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("100", "1002")]);
+
+            tracker
+                .cleanup_stale_discord_message_data("100", &["hash-1002".to_string()])
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[..1]);
+            assert_indexed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids[1..]);
+        }
+
+        #[test]
+        fn test_cleanup_stale_discord_message_data_removes_all_vectors_when_no_hashes_remain() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            let (_, embedding_ids) =
+                index_discord_chunks(&tracker, &[("100", "1001"), ("100", "1002")]);
+
+            tracker
+                .cleanup_stale_discord_message_data("100", &[])
+                .unwrap();
+
+            assert_removed(&tracker, DISCORD_MESSAGE_CHUNK_VECTORS, &embedding_ids);
+        }
+
+        #[test]
+        fn test_discord_message_chunk_vectors_work_after_delete_all_discord_message_data() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            if !require_vectorlite_for_tests(&tracker.acquire_lock().unwrap()) {
+                return;
+            }
+            index_discord_chunks(&tracker, &[("100", "1001")]);
+
+            tracker.delete_all_discord_message_data().unwrap();
+
+            let (chunk_ids, _) = index_discord_chunks(&tracker, &[("200", "2001")]);
+            let results = tracker
+                .search_discord_message_chunks(&axis_embedding(0), None, 5)
+                .unwrap();
+            assert_eq!(
+                results.first().and_then(|result| result.chunk.id),
+                Some(chunk_ids[0]),
+                "embeddings saved after a full delete must be searchable"
+            );
+        }
+    }
+
+    mod user_directory {
+        use super::*;
+        use crate::types::InviteWrite;
+        use std::sync::{Arc, Barrier};
+
+        const FUTURE: &str = "2099-12-31 23:59:59";
+        const PAST: &str = "2000-01-01 00:00:00";
+        const UNUSABLE_HASH: &str = "$2b$12$unusable";
+        const PASSWORD_HASH: &str = "$2b$12$chosen";
+
+        fn complete_identities() -> Identities {
+            Identities {
+                linear_names: vec!["Jake Barnby".to_string()],
+                github_usernames: vec!["jakebarnby".to_string(), "jake-alt".to_string()],
+                sentry_usernames: vec!["jake.sentry".to_string()],
+                jira_usernames: vec!["jake.jira".to_string()],
+                gitlab_usernames: vec!["jake.gitlab".to_string()],
+                discord_id: Some("452316113016193024".to_string()),
+                slack_id: Some("U0123456789".to_string()),
+                email: Some("alerts@example.com".to_string()),
+                push_user_key: Some("uQiRzpo4DXghDmr9QzzfQu27cmVRsG".to_string()),
+                sms_number: Some("+14155550123".to_string()),
+                whatsapp_number: Some("+14155550199".to_string()),
+                telegram_chat_id: Some("-1001234567890".to_string()),
+            }
+        }
+
+        fn github(login: &str) -> Identities {
+            Identities {
+                github_usernames: vec![login.to_string()],
+                ..Identities::default()
+            }
+        }
+
+        fn create_admin(tracker: &SqliteTracker) -> i64 {
+            tracker
+                .create_user("admin@example.com", "$2b$12$admin", "Admin", Role::Admin)
+                .unwrap()
+        }
+
+        fn invite(token_hash: &str, expires_at: &str, created_by: i64) -> InviteWrite {
+            InviteWrite {
+                token_hash: token_hash.to_string(),
+                expires_at: expires_at.to_string(),
+                created_by,
+            }
+        }
+
+        fn new_user(email: &str, status: UserStatus) -> DirectoryUser {
+            DirectoryUser::New {
+                email: email.to_string(),
+                name: "Person".to_string(),
+                role: Role::Viewer,
+                password_hash: match status {
+                    UserStatus::Active => PASSWORD_HASH,
+                    UserStatus::Invited => UNUSABLE_HASH,
+                }
+                .to_string(),
+                status,
+            }
+        }
+
+        fn identities_write(
+            user_id: i64,
+            slug: Option<&str>,
+            identities: Identities,
+        ) -> DirectoryWrite {
+            DirectoryWrite {
+                user: DirectoryUser::Existing {
+                    user_id,
+                    name: None,
+                    role: None,
+                },
+                identities: Some(IdentityWrite {
+                    slug: slug.map(str::to_string),
+                    identities,
+                }),
+                invite: None,
+            }
+        }
+
+        fn invited_with_invite(tracker: &SqliteTracker, email: &str, token_hash: &str) -> i64 {
+            let admin = tracker.get_user_by_email("admin@example.com").unwrap();
+            let created_by = match admin {
+                Some(admin) => admin.id,
+                None => create_admin(tracker),
+            };
+            tracker
+                .save_directory(&[DirectoryWrite {
+                    user: new_user(email, UserStatus::Invited),
+                    identities: None,
+                    invite: Some(invite(token_hash, FUTURE, created_by)),
+                }])
+                .unwrap()[0]
+        }
+
+        fn count(tracker: &SqliteTracker, table: &str) -> i64 {
+            tracker
+                .acquire_lock()
+                .unwrap()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        }
+
+        fn invite_by_hash(tracker: &SqliteTracker, token_hash: &str) -> InviteRow {
+            tracker
+                .acquire_lock()
+                .unwrap()
+                .query_row(
+                    &format!(
+                        "SELECT {QUALIFIED_INVITE_COLUMNS} FROM user_invites i WHERE i.token_hash = ?1"
+                    ),
+                    params![token_hash],
+                    |row| InviteRow::from_row_at(row, 0),
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn test_user_identities_round_trip_every_field() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("jake@example.com", "hash", "Jake", Role::Admin)
+                .unwrap();
+
+            let ids = tracker
+                .save_directory(&[identities_write(
+                    user_id,
+                    Some("jake"),
+                    complete_identities(),
+                )])
+                .unwrap();
+            assert_eq!(ids, vec![user_id]);
+
+            let listed = tracker.list_user_identities().unwrap();
+            assert_eq!(listed.len(), 1);
+            let entry = &listed[0];
+            assert_eq!(entry.user_id, user_id);
+            assert_eq!(entry.login_email, "jake@example.com");
+            assert_eq!(entry.name, "Jake");
+            assert_eq!(entry.slug.as_deref(), Some("jake"));
+            assert_eq!(entry.identities, complete_identities());
+            assert!(SqliteTracker::parse_datetime(&entry.updated_at).is_ok());
+        }
+
+        #[test]
+        fn test_user_identities_upsert_replaces_the_whole_row() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("jake@example.com", "hash", "Jake", Role::Admin)
+                .unwrap();
+            tracker
+                .save_directory(&[identities_write(
+                    user_id,
+                    Some("jake"),
+                    complete_identities(),
+                )])
+                .unwrap();
+
+            tracker
+                .save_directory(&[identities_write(user_id, None, github("renamed"))])
+                .unwrap();
+
+            let listed = tracker.list_user_identities().unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].slug, None);
+            assert_eq!(listed[0].identities, github("renamed"));
+        }
+
+        #[test]
+        fn test_list_user_identities_skips_users_without_a_row_and_orders_by_id() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            tracker
+                .create_user("plain@example.com", "hash", "Plain", Role::Viewer)
+                .unwrap();
+            let invited = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+            tracker
+                .save_directory(&[
+                    identities_write(invited, None, github("amy")),
+                    identities_write(admin, None, github("admin")),
+                ])
+                .unwrap();
+
+            let listed: Vec<i64> = tracker
+                .list_user_identities()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.user_id)
+                .collect();
+            assert_eq!(listed, vec![admin, invited]);
+        }
+
+        #[test]
+        fn test_delete_user_identities_reports_whether_a_row_existed() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("jake@example.com", "hash", "Jake", Role::Admin)
+                .unwrap();
+            assert!(!tracker.delete_user_identities(user_id).unwrap());
+
+            tracker
+                .save_directory(&[identities_write(user_id, Some("jake"), github("jake"))])
+                .unwrap();
+            assert!(tracker.delete_user_identities(user_id).unwrap());
+            assert!(!tracker.delete_user_identities(user_id).unwrap());
+            assert!(tracker.list_user_identities().unwrap().is_empty());
+            assert!(tracker.get_user_by_id(user_id).unwrap().is_some());
+        }
+
+        #[test]
+        fn test_deleting_a_user_cascades_to_identities_and_invites() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+            tracker
+                .save_directory(&[identities_write(user_id, Some("amy"), github("amy"))])
+                .unwrap();
+            assert_eq!(count(&tracker, "user_invites"), 1);
+
+            assert!(tracker.delete_user(user_id).unwrap());
+
+            assert!(tracker.list_user_identities().unwrap().is_empty());
+            assert_eq!(count(&tracker, "user_identities"), 0);
+            assert_eq!(count(&tracker, "user_invites"), 0);
+        }
+
+        #[test]
+        fn test_an_unknown_stored_role_reads_as_a_viewer() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            for (email, role) in [
+                ("owner@example.com", "owner"),
+                ("shout@example.com", "ADMIN"),
+            ] {
+                tracker
+                    .acquire_lock()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO users (email, password_hash, name, role) VALUES (?1, 'hash', 'Odd', ?2)",
+                        params![email, role],
+                    )
+                    .unwrap();
+            }
+
+            for user in tracker.list_users().unwrap() {
+                assert_eq!(user.role, Role::Viewer, "{}", user.email);
+            }
+            let owner = tracker
+                .get_user_by_email("owner@example.com")
+                .unwrap()
+                .unwrap();
+            assert_eq!(owner.role, Role::Viewer);
+        }
+
+        #[test]
+        fn test_users_inserted_without_a_status_read_as_active() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            tracker
+                .acquire_lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO users (email, password_hash, name, role) VALUES ('old@example.com', 'hash', 'Old', 'viewer')",
+                    [],
+                )
+                .unwrap();
+            let created = tracker
+                .create_user("new@example.com", "hash", "New", Role::Admin)
+                .unwrap();
+
+            let old = tracker
+                .get_user_by_email("old@example.com")
+                .unwrap()
+                .unwrap();
+            assert_eq!(old.status, UserStatus::Active);
+            assert_eq!(
+                tracker.get_user_by_id(created).unwrap().unwrap().status,
+                UserStatus::Active
+            );
+            assert!(tracker
+                .list_users()
+                .unwrap()
+                .iter()
+                .all(|user| user.status == UserStatus::Active));
+        }
+
+        #[test]
+        fn test_invited_user_sessions_and_tokens_resolve_only_after_activation() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+            let session = tracker
+                .create_session(user_id, "2099-12-31T23:59:59")
+                .unwrap();
+            tracker
+                .create_api_token(user_id, "mcp", "hash_token", "cldr_a", None)
+                .unwrap();
+
+            assert!(tracker.get_session_user(&session).unwrap().is_none());
+            assert!(tracker
+                .get_user_by_api_token_hash("hash_token")
+                .unwrap()
+                .is_none());
+
+            assert!(tracker.activate_user(user_id, PASSWORD_HASH).unwrap());
+
+            let user = tracker.get_session_user(&session).unwrap().unwrap();
+            assert_eq!(user.status, UserStatus::Active);
+            assert!(tracker
+                .get_user_by_api_token_hash("hash_token")
+                .unwrap()
+                .is_some());
+        }
+
+        #[test]
+        fn test_save_directory_creates_invited_user_with_identities_and_invite() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+
+            let ids = tracker
+                .save_directory(&[DirectoryWrite {
+                    user: new_user("amy@example.com", UserStatus::Invited),
+                    identities: Some(IdentityWrite {
+                        slug: Some("amy".to_string()),
+                        identities: github("amy"),
+                    }),
+                    invite: Some(invite("hash_amy", FUTURE, admin)),
+                }])
+                .unwrap();
+
+            let user = tracker.get_user_by_id(ids[0]).unwrap().unwrap();
+            assert_eq!(user.email, "amy@example.com");
+            assert_eq!(user.status, UserStatus::Invited);
+            assert_eq!(user.password_hash, UNUSABLE_HASH);
+
+            let listed = tracker.list_user_identities().unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].user_id, ids[0]);
+            assert_eq!(listed[0].slug.as_deref(), Some("amy"));
+            assert_eq!(listed[0].identities, github("amy"));
+
+            let open = tracker.get_open_invite_for_user(ids[0]).unwrap().unwrap();
+            assert_eq!(open.token_hash, "hash_amy");
+            assert_eq!(open.created_by, Some(admin));
+            assert_eq!(open.expires_at, FUTURE);
+            let (found, found_user) = tracker.find_open_invite("hash_amy").unwrap().unwrap();
+            assert_eq!(found, open);
+            assert_eq!(found_user.id, ids[0]);
+        }
+
+        #[test]
+        fn test_save_directory_creates_active_user_without_invite() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let ids = tracker
+                .save_directory(&[DirectoryWrite {
+                    user: new_user("bob@example.com", UserStatus::Active),
+                    identities: None,
+                    invite: None,
+                }])
+                .unwrap();
+
+            let user = tracker.get_user_by_id(ids[0]).unwrap().unwrap();
+            assert_eq!(user.status, UserStatus::Active);
+            assert_eq!(user.password_hash, PASSWORD_HASH);
+            assert!(tracker.get_open_invite_for_user(ids[0]).unwrap().is_none());
+            assert!(tracker.list_user_identities().unwrap().is_empty());
+        }
+
+        #[test]
+        fn test_save_directory_rejects_an_active_user_with_an_invite() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+
+            let result = tracker.save_directory(&[
+                DirectoryWrite {
+                    user: new_user("amy@example.com", UserStatus::Invited),
+                    identities: None,
+                    invite: Some(invite("hash_amy", FUTURE, admin)),
+                },
+                DirectoryWrite {
+                    user: new_user("bob@example.com", UserStatus::Active),
+                    identities: None,
+                    invite: Some(invite("hash_bob", FUTURE, admin)),
+                },
+            ]);
+
+            assert!(result.is_err());
+            assert_eq!(tracker.count_users().unwrap(), 1);
+            assert_eq!(count(&tracker, "user_invites"), 0);
+        }
+
+        #[test]
+        fn test_save_directory_rolls_back_the_batch_on_a_duplicate_email() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let existing = tracker
+                .create_user("jake@example.com", "hash", "Jake", Role::Viewer)
+                .unwrap();
+
+            let result = tracker.save_directory(&[
+                identities_write(existing, Some("jake"), github("jake")),
+                DirectoryWrite {
+                    user: new_user("amy@example.com", UserStatus::Invited),
+                    identities: Some(IdentityWrite {
+                        slug: None,
+                        identities: github("amy"),
+                    }),
+                    invite: Some(invite("hash_amy", FUTURE, admin)),
+                },
+                DirectoryWrite {
+                    user: new_user("jake@example.com", UserStatus::Invited),
+                    identities: None,
+                    invite: Some(invite("hash_duplicate", FUTURE, admin)),
+                },
+            ]);
+
+            assert!(result.is_err());
+            assert_eq!(tracker.count_users().unwrap(), 2);
+            assert!(tracker
+                .get_user_by_email("amy@example.com")
+                .unwrap()
+                .is_none());
+            assert_eq!(count(&tracker, "user_identities"), 0);
+            assert_eq!(count(&tracker, "user_invites"), 0);
+        }
+
+        #[test]
+        fn test_save_directory_rolls_back_the_batch_on_a_duplicate_slug() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let first = tracker
+                .create_user("first@example.com", "hash", "First", Role::Viewer)
+                .unwrap();
+            let second = tracker
+                .create_user("second@example.com", "hash", "Second", Role::Viewer)
+                .unwrap();
+
+            let result = tracker.save_directory(&[
+                identities_write(first, Some("jake"), github("first")),
+                identities_write(second, Some("jake"), github("second")),
+            ]);
+
+            assert!(result.is_err());
+            assert_eq!(count(&tracker, "user_identities"), 0);
+        }
+
+        fn viewer(tracker: &SqliteTracker, email: &str) -> i64 {
+            tracker
+                .create_user(email, "hash", "Person", Role::Viewer)
+                .unwrap()
+        }
+
+        fn handle_owners(tracker: &SqliteTracker) -> Vec<(i64, String, String)> {
+            let connection = tracker.acquire_lock().unwrap();
+            let mut statement = connection
+                .prepare("SELECT user_id, field, value FROM user_handles ORDER BY field, value")
+                .unwrap();
+            let owners = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            owners
+        }
+
+        fn assert_duplicate_handle(result: Result<Vec<i64>>) {
+            match result {
+                Err(claudear_core::error::Error::Database(message)) => assert!(
+                    message.contains(crate::DUPLICATE_HANDLE),
+                    "unexpected database error: {message}"
+                ),
+                other => panic!("expected a duplicate handle error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_save_directory_claims_each_exclusive_handle_in_comparison_form() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = viewer(&tracker, "jake@example.com");
+            let identities = Identities {
+                github_usernames: vec!["JakeBarnby".to_string(), "jakebarnby".to_string()],
+                gitlab_usernames: vec!["Jake.GitLab".to_string()],
+                ..complete_identities()
+            };
+
+            tracker
+                .save_directory(&[identities_write(user_id, None, identities)])
+                .unwrap();
+
+            let claimed =
+                |field: &str, value: &str| (user_id, field.to_string(), value.to_string());
+            assert_eq!(
+                handle_owners(&tracker),
+                vec![
+                    claimed("discord_id", "452316113016193024"),
+                    claimed("github_usernames", "jakebarnby"),
+                    claimed("gitlab_usernames", "jake.gitlab"),
+                    claimed("jira_usernames", "jake.jira"),
+                    claimed("linear_names", "Jake Barnby"),
+                    claimed("sentry_usernames", "jake.sentry"),
+                    claimed("slack_id", "U0123456789"),
+                ]
+            );
+        }
+
+        #[test]
+        fn test_save_directory_rejects_a_github_login_another_user_claims_in_any_case() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, None, github("JakeBarnby"))])
+                .unwrap();
+
+            assert_duplicate_handle(tracker.save_directory(&[identities_write(
+                bob,
+                None,
+                github("jakebarnby"),
+            )]));
+            assert!(tracker.get_user_identities(bob).unwrap().is_none());
+        }
+
+        #[test]
+        fn test_save_directory_rejects_an_exact_handle_another_user_claims() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            let slack = |slack_id: &str| Identities {
+                slack_id: Some(slack_id.to_string()),
+                ..Identities::default()
+            };
+            tracker
+                .save_directory(&[identities_write(amy, None, slack("U0123456789"))])
+                .unwrap();
+
+            tracker
+                .save_directory(&[identities_write(bob, None, slack("u0123456789"))])
+                .unwrap();
+            assert_duplicate_handle(tracker.save_directory(&[identities_write(
+                bob,
+                None,
+                slack("U0123456789"),
+            )]));
+        }
+
+        #[test]
+        fn test_save_directory_lets_people_share_notification_targets() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            let shared = Identities {
+                email: Some("team@example.com".to_string()),
+                push_user_key: Some("uQiRzpo4DXghDmr9QzzfQu27cmVRsG".to_string()),
+                sms_number: Some("+14155550123".to_string()),
+                whatsapp_number: Some("+14155550199".to_string()),
+                telegram_chat_id: Some("-1001234567890".to_string()),
+                ..Identities::default()
+            };
+
+            tracker
+                .save_directory(&[
+                    identities_write(amy, None, shared.clone()),
+                    identities_write(bob, None, shared.clone()),
+                ])
+                .unwrap();
+
+            assert_eq!(tracker.list_user_identities().unwrap().len(), 2);
+            assert!(handle_owners(&tracker).is_empty());
+        }
+
+        #[test]
+        fn test_save_directory_rolls_back_the_batch_on_a_duplicate_handle() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, Some("amy"), github("amy"))])
+                .unwrap();
+            let before = handle_owners(&tracker);
+
+            assert_duplicate_handle(tracker.save_directory(&[
+                identities_write(amy, Some("amy"), github("amy-renamed")),
+                DirectoryWrite {
+                    user: new_user("cleo@example.com", UserStatus::Invited),
+                    identities: Some(IdentityWrite {
+                        slug: None,
+                        identities: github("cleo"),
+                    }),
+                    invite: Some(invite("hash_cleo", FUTURE, admin)),
+                },
+                identities_write(bob, None, github("AMY-RENAMED")),
+            ]));
+
+            assert_eq!(handle_owners(&tracker), before);
+            assert_eq!(
+                tracker
+                    .get_user_identities(amy)
+                    .unwrap()
+                    .unwrap()
+                    .identities,
+                github("amy")
+            );
+            assert!(tracker.get_user_identities(bob).unwrap().is_none());
+            assert!(tracker
+                .get_user_by_email("cleo@example.com")
+                .unwrap()
+                .is_none());
+            assert_eq!(count(&tracker, "user_invites"), 0);
+        }
+
+        #[test]
+        fn test_save_directory_moves_a_handle_between_people_in_one_batch() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, None, github("shared-login"))])
+                .unwrap();
+
+            tracker
+                .save_directory(&[
+                    identities_write(bob, None, github("shared-login")),
+                    identities_write(amy, None, github("amy")),
+                ])
+                .unwrap();
+
+            assert_eq!(
+                handle_owners(&tracker),
+                vec![
+                    (amy, "github_usernames".to_string(), "amy".to_string()),
+                    (
+                        bob,
+                        "github_usernames".to_string(),
+                        "shared-login".to_string()
+                    ),
+                ]
+            );
+        }
+
+        #[test]
+        fn test_rewriting_identities_releases_the_old_handles() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, None, github("old-login"))])
+                .unwrap();
+            tracker
+                .save_directory(&[identities_write(amy, None, github("new-login"))])
+                .unwrap();
+
+            tracker
+                .save_directory(&[identities_write(bob, None, github("old-login"))])
+                .unwrap();
+            assert_duplicate_handle(tracker.save_directory(&[identities_write(
+                bob,
+                None,
+                github("new-login"),
+            )]));
+        }
+
+        #[test]
+        fn test_deleting_identities_frees_their_handles() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, None, github("amy"))])
+                .unwrap();
+
+            assert!(tracker.delete_user_identities(amy).unwrap());
+
+            assert!(handle_owners(&tracker).is_empty());
+            tracker
+                .save_directory(&[identities_write(bob, None, github("amy"))])
+                .unwrap();
+        }
+
+        #[test]
+        fn test_deleting_a_user_frees_their_handles() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, None, github("amy"))])
+                .unwrap();
+
+            tracker
+                .acquire_lock()
+                .unwrap()
+                .execute("DELETE FROM users WHERE id = ?1", params![amy])
+                .unwrap();
+
+            assert!(handle_owners(&tracker).is_empty());
+        }
+
+        #[test]
+        fn test_concurrent_trackers_claiming_one_handle_succeed_exactly_once() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let setup = SqliteTracker::new(&path).unwrap();
+            let users: Vec<i64> = (0..4)
+                .map(|index| viewer(&setup, &format!("person{index}@example.com")))
+                .collect();
+            let trackers: Vec<SqliteTracker> = users
+                .iter()
+                .map(|_| SqliteTracker::new(&path).unwrap())
+                .collect();
+            let barrier = Arc::new(Barrier::new(trackers.len()));
+
+            let results: Vec<Result<Vec<i64>>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = trackers
+                    .iter()
+                    .zip(&users)
+                    .enumerate()
+                    .map(|(index, (tracker, &user_id))| {
+                        let barrier = Arc::clone(&barrier);
+                        let login = if index % 2 == 0 {
+                            "JakeBarnby"
+                        } else {
+                            "jakebarnby"
+                        };
+                        scope.spawn(move || {
+                            barrier.wait();
+                            tracker.save_directory(&[identities_write(
+                                user_id,
+                                None,
+                                github(login),
+                            )])
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect()
+            });
+
+            let (won, lost): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+            assert_eq!(won.len(), 1);
+            for result in lost {
+                assert_duplicate_handle(result);
+            }
+            assert_eq!(setup.list_user_identities().unwrap().len(), 1);
+            assert_eq!(handle_owners(&setup).len(), 1);
+        }
+
+        #[test]
+        fn test_save_directory_updates_existing_users_sparsely() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("jake@example.com", "hash", "Jake", Role::Viewer)
+                .unwrap();
+
+            tracker
+                .save_directory(&[DirectoryWrite {
+                    user: DirectoryUser::Existing {
+                        user_id,
+                        name: Some("Jake Barnby".to_string()),
+                        role: None,
+                    },
+                    identities: None,
+                    invite: None,
+                }])
+                .unwrap();
+            let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
+            assert_eq!(user.name, "Jake Barnby");
+            assert_eq!(user.role, Role::Viewer);
+
+            tracker
+                .save_directory(&[DirectoryWrite {
+                    user: DirectoryUser::Existing {
+                        user_id,
+                        name: None,
+                        role: Some(Role::Admin),
+                    },
+                    identities: None,
+                    invite: None,
+                }])
+                .unwrap();
+            let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
+            assert_eq!(user.name, "Jake Barnby");
+            assert_eq!(user.role, Role::Admin);
+            assert!(tracker.list_user_identities().unwrap().is_empty());
+        }
+
+        #[test]
+        fn test_save_directory_rejects_a_missing_existing_user() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let result = tracker.save_directory(&[identities_write(999, None, github("ghost"))]);
+            assert!(result.is_err());
+            assert_eq!(count(&tracker, "user_identities"), 0);
+        }
+
+        #[test]
+        fn test_save_directory_returns_user_ids_in_entry_order() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let existing = tracker
+                .create_user("jake@example.com", "hash", "Jake", Role::Viewer)
+                .unwrap();
+            let ids = tracker
+                .save_directory(&[
+                    DirectoryWrite {
+                        user: new_user("amy@example.com", UserStatus::Active),
+                        identities: None,
+                        invite: None,
+                    },
+                    identities_write(existing, None, github("jake")),
+                ])
+                .unwrap();
+            let amy = tracker
+                .get_user_by_email("amy@example.com")
+                .unwrap()
+                .unwrap();
+            assert_eq!(ids, vec![amy.id, existing]);
+        }
+
+        #[test]
+        fn test_issue_invite_revokes_the_previous_invite() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_first");
+            let admin = tracker
+                .get_user_by_email("admin@example.com")
+                .unwrap()
+                .unwrap()
+                .id;
+
+            let reissued = tracker
+                .issue_invite(user_id, "hash_second", FUTURE, admin)
+                .unwrap();
+
+            assert_eq!(reissued.user_id, user_id);
+            assert_eq!(reissued.token_hash, "hash_second");
+            assert_eq!(reissued.created_by, Some(admin));
+            assert!(reissued.accepted_at.is_none() && reissued.revoked_at.is_none());
+            assert!(invite_by_hash(&tracker, "hash_first").revoked_at.is_some());
+            assert_eq!(
+                tracker.get_open_invite_for_user(user_id).unwrap(),
+                Some(reissued)
+            );
+            assert!(tracker.find_open_invite("hash_first").unwrap().is_none());
+            assert!(tracker.find_open_invite("hash_second").unwrap().is_some());
+        }
+
+        #[test]
+        fn test_open_invite_expiries_match_each_users_newest_open_invite() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let reissued = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+            let accepted = invited_with_invite(&tracker, "bob@example.com", "hash_bob");
+            let revoked = invited_with_invite(&tracker, "cy@example.com", "hash_cy");
+            let pending = invited_with_invite(&tracker, "dee@example.com", "hash_dee");
+            let admin = tracker
+                .get_user_by_email("admin@example.com")
+                .unwrap()
+                .unwrap()
+                .id;
+            tracker
+                .issue_invite(reissued, "hash_amy_again", "2099-06-01 00:00:00", admin)
+                .unwrap();
+            tracker.accept_invite("hash_bob", PASSWORD_HASH).unwrap();
+            assert!(tracker.revoke_invite(revoked).unwrap());
+
+            let expiries = tracker.open_invite_expiries().unwrap();
+
+            assert_eq!(
+                expiries,
+                HashMap::from([
+                    (reissued, "2099-06-01 00:00:00".to_string()),
+                    (pending, FUTURE.to_string()),
+                ])
+            );
+            let users = [reissued, accepted, revoked, pending];
+            let listed: Vec<Option<String>> = users
+                .iter()
+                .map(|user_id| expiries.get(user_id).cloned())
+                .collect();
+            let fetched: Vec<Option<String>> = users
+                .iter()
+                .map(|user_id| {
+                    tracker
+                        .get_open_invite_for_user(*user_id)
+                        .unwrap()
+                        .map(|invite| invite.expires_at)
+                })
+                .collect();
+            assert_eq!(
+                listed, fetched,
+                "open_invite_expiries must agree with get_open_invite_for_user"
+            );
+        }
+
+        #[test]
+        fn test_accept_invite_is_single_use_and_activates_the_user() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+
+            let accepted = tracker
+                .accept_invite("hash_amy", PASSWORD_HASH)
+                .unwrap()
+                .unwrap();
+            assert_eq!(accepted.id, user_id);
+            assert_eq!(accepted.status, UserStatus::Active);
+            assert_eq!(accepted.password_hash, PASSWORD_HASH);
+            assert!(invite_by_hash(&tracker, "hash_amy").accepted_at.is_some());
+            assert!(tracker.get_open_invite_for_user(user_id).unwrap().is_none());
+            assert!(tracker.find_open_invite("hash_amy").unwrap().is_none());
+
+            assert!(tracker
+                .accept_invite("hash_amy", "$2b$12$second")
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                tracker
+                    .get_user_by_id(user_id)
+                    .unwrap()
+                    .unwrap()
+                    .password_hash,
+                PASSWORD_HASH
+            );
+        }
+
+        #[test]
+        fn test_accept_invite_rejects_expired_and_revoked_invites() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let expired = invited_with_invite(&tracker, "expired@example.com", "hash_unused");
+            tracker
+                .issue_invite(expired, "hash_expired", PAST, admin)
+                .unwrap();
+            let revoked = invited_with_invite(&tracker, "revoked@example.com", "hash_revoked");
+            assert!(tracker.revoke_invite(revoked).unwrap());
+
+            for token_hash in [
+                "hash_expired",
+                "hash_revoked",
+                "hash_unused",
+                "hash_missing",
+            ] {
+                assert!(
+                    tracker
+                        .accept_invite(token_hash, PASSWORD_HASH)
+                        .unwrap()
+                        .is_none(),
+                    "{token_hash} must not be accepted"
+                );
+            }
+            for user_id in [expired, revoked] {
+                let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
+                assert_eq!(user.status, UserStatus::Invited);
+                assert_eq!(user.password_hash, UNUSABLE_HASH);
+            }
+            assert!(invite_by_hash(&tracker, "hash_expired")
+                .accepted_at
+                .is_none());
+        }
+
+        #[test]
+        fn test_invites_for_active_users_cannot_be_found_or_accepted() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let active = tracker
+                .create_user("jake@example.com", "hash", "Jake", Role::Viewer)
+                .unwrap();
+            tracker
+                .issue_invite(active, "hash_active", FUTURE, admin)
+                .unwrap();
+
+            assert!(tracker.find_open_invite("hash_active").unwrap().is_none());
+            assert!(tracker
+                .accept_invite("hash_active", PASSWORD_HASH)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                tracker
+                    .get_user_by_id(active)
+                    .unwrap()
+                    .unwrap()
+                    .password_hash,
+                "hash"
+            );
+        }
+
+        #[test]
+        fn test_concurrent_accepts_succeed_exactly_once() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let setup = SqliteTracker::new(&path).unwrap();
+            invited_with_invite(&setup, "amy@example.com", "hash_amy");
+            let trackers: Vec<SqliteTracker> =
+                (0..4).map(|_| SqliteTracker::new(&path).unwrap()).collect();
+            let barrier = Arc::new(Barrier::new(trackers.len()));
+
+            let accepted = std::thread::scope(|scope| {
+                let handles: Vec<_> = trackers
+                    .iter()
+                    .map(|tracker| {
+                        let barrier = Arc::clone(&barrier);
+                        scope.spawn(move || {
+                            barrier.wait();
+                            tracker.accept_invite("hash_amy", PASSWORD_HASH).unwrap()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().unwrap())
+                    .count()
+            });
+
+            assert_eq!(accepted, 1);
+        }
+
+        #[test]
+        fn test_activate_user_revokes_open_invites() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_amy");
+
+            assert!(tracker.activate_user(user_id, PASSWORD_HASH).unwrap());
+
+            let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
+            assert_eq!(user.status, UserStatus::Active);
+            assert_eq!(user.password_hash, PASSWORD_HASH);
+            assert!(invite_by_hash(&tracker, "hash_amy").revoked_at.is_some());
+            assert!(tracker.get_open_invite_for_user(user_id).unwrap().is_none());
+            assert!(!tracker.activate_user(999, PASSWORD_HASH).unwrap());
+        }
+
+        #[test]
+        fn test_open_invite_for_user_includes_expired_invites_that_find_excludes() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_first");
+            tracker
+                .issue_invite(user_id, "hash_expired", PAST, admin)
+                .unwrap();
+
+            let open = tracker.get_open_invite_for_user(user_id).unwrap().unwrap();
+            assert_eq!(open.token_hash, "hash_expired");
+            assert_eq!(open.expires_at, PAST);
+            assert!(tracker.find_open_invite("hash_expired").unwrap().is_none());
+        }
+
+        #[test]
+        fn test_revoke_invite_reports_whether_an_open_invite_existed() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let user_id = invited_with_invite(&tracker, "amy@example.com", "hash_first");
+            tracker
+                .issue_invite(user_id, "hash_expired", PAST, admin)
+                .unwrap();
+
+            assert!(tracker.revoke_invite(user_id).unwrap());
+            assert!(!tracker.revoke_invite(user_id).unwrap());
+            assert!(tracker.get_open_invite_for_user(user_id).unwrap().is_none());
+            assert!(invite_by_hash(&tracker, "hash_expired")
+                .revoked_at
+                .is_some());
+        }
+
+        #[test]
+        fn test_directory_write_debug_never_prints_hashes_or_emails() {
+            let write = DirectoryWrite {
+                user: new_user("amy@example.com", UserStatus::Invited),
+                identities: None,
+                invite: Some(invite("hash_secret_invite", FUTURE, 1)),
+            };
+            let output = format!("{write:?}");
+            for (label, value) in [
+                ("password hash", UNUSABLE_HASH),
+                ("invite token hash", "hash_secret_invite"),
+                ("login email", "amy@example.com"),
+            ] {
+                assert!(!output.contains(value), "Debug output leaked the {label}");
+            }
+            assert!(output.contains("Invited"));
+        }
+
+        fn insert_raw_user(tracker: &SqliteTracker, email: &str) -> i64 {
+            let connection = tracker.acquire_lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO users (email, password_hash, name, role) VALUES (?1, 'hash', 'Legacy', 'viewer')",
+                    params![email],
+                )
+                .unwrap();
+            connection.last_insert_rowid()
+        }
+
+        fn assert_duplicate_email(result: Result<impl std::fmt::Debug>) {
+            let error = result.expect_err("a case-insensitive duplicate login email must fail");
+            assert!(
+                error.to_string().contains(DUPLICATE_LOGIN_EMAIL),
+                "unexpected error: {error}"
+            );
+        }
+
+        #[test]
+        fn test_create_user_stores_the_normalized_login_email() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("  Amy@Example.COM ", "hash", "Amy", Role::Viewer)
+                .unwrap();
+
+            let user = tracker.get_user_by_id(user_id).unwrap().unwrap();
+            assert_eq!(user.email, "amy@example.com");
+        }
+
+        #[test]
+        fn test_get_user_by_email_is_case_insensitive() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = tracker
+                .create_user("amy@example.com", "hash", "Amy", Role::Viewer)
+                .unwrap();
+            let legacy = insert_raw_user(&tracker, "Bob@Example.com");
+
+            for lookup in ["amy@example.com", "AMY@example.com", " Amy@Example.Com "] {
+                assert_eq!(
+                    tracker
+                        .get_user_by_email(lookup)
+                        .unwrap()
+                        .map(|user| user.id),
+                    Some(user_id),
+                    "{lookup:?}"
+                );
+            }
+            assert_eq!(
+                tracker
+                    .get_user_by_email("bob@example.com")
+                    .unwrap()
+                    .map(|user| user.id),
+                Some(legacy)
+            );
+        }
+
+        #[test]
+        fn test_get_user_by_email_prefers_the_exact_row_among_legacy_case_variants() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let mixed = insert_raw_user(&tracker, "Amy@Example.com");
+            let lower = insert_raw_user(&tracker, "amy@example.com");
+
+            assert_eq!(
+                tracker
+                    .get_user_by_email("AMY@EXAMPLE.COM")
+                    .unwrap()
+                    .map(|user| user.id),
+                Some(lower)
+            );
+            assert_ne!(mixed, lower);
+        }
+
+        #[test]
+        fn test_create_user_rejects_a_case_variant_of_an_existing_email() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            tracker
+                .create_user("amy@example.com", "hash", "Amy", Role::Viewer)
+                .unwrap();
+            insert_raw_user(&tracker, "Bob@Example.com");
+
+            assert_duplicate_email(tracker.create_user(
+                "Amy@Example.com",
+                "hash",
+                "Amy",
+                Role::Admin,
+            ));
+            assert_duplicate_email(tracker.create_user(
+                "bob@example.com",
+                "hash",
+                "Bob",
+                Role::Admin,
+            ));
+            assert_eq!(count(&tracker, "users"), 2);
+        }
+
+        #[test]
+        fn test_save_directory_rejects_case_variant_emails_and_rolls_back() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            tracker
+                .create_user("amy@example.com", "hash", "Amy", Role::Viewer)
+                .unwrap();
+
+            assert_duplicate_email(tracker.save_directory(&[DirectoryWrite {
+                user: new_user("AMY@example.com", UserStatus::Active),
+                identities: None,
+                invite: None,
+            }]));
+            assert_duplicate_email(tracker.save_directory(&[
+                DirectoryWrite {
+                    user: new_user("carl@example.com", UserStatus::Active),
+                    identities: None,
+                    invite: None,
+                },
+                DirectoryWrite {
+                    user: new_user("Carl@Example.com", UserStatus::Active),
+                    identities: None,
+                    invite: None,
+                },
+            ]));
+            assert_eq!(count(&tracker, "users"), 1);
+
+            let ids = tracker
+                .save_directory(&[DirectoryWrite {
+                    user: new_user(" Dana@Example.com", UserStatus::Active),
+                    identities: None,
+                    invite: None,
+                }])
+                .unwrap();
+            assert_eq!(
+                tracker.get_user_by_id(ids[0]).unwrap().unwrap().email,
+                "dana@example.com"
+            );
+        }
+
+        #[test]
+        fn test_update_user_normalizes_and_rejects_another_users_email() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = tracker
+                .create_user("amy@example.com", "hash", "Amy", Role::Viewer)
+                .unwrap();
+            let bob = tracker
+                .create_user("bob@example.com", "hash", "Bob", Role::Viewer)
+                .unwrap();
+
+            assert_duplicate_email(tracker.update_user(
+                bob,
+                Some("Amy@Example.com"),
+                None,
+                Some("Renamed"),
+                None,
+                None,
+            ));
+            let unchanged = tracker.get_user_by_id(bob).unwrap().unwrap();
+            assert_eq!(unchanged.email, "bob@example.com");
+            assert_eq!(unchanged.name, "Bob");
+
+            assert!(tracker
+                .update_user(amy, Some(" AMY@example.com "), None, None, None, None)
+                .unwrap());
+            assert!(tracker
+                .update_user(bob, Some("Robert@Example.com"), None, None, None, None)
+                .unwrap());
+            assert_eq!(
+                tracker.get_user_by_id(amy).unwrap().unwrap().email,
+                "amy@example.com"
+            );
+            assert_eq!(
+                tracker.get_user_by_id(bob).unwrap().unwrap().email,
+                "robert@example.com"
+            );
+        }
+
+        #[test]
+        fn test_get_user_identities_returns_one_users_row() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = tracker
+                .create_user("amy@example.com", "hash", "Amy", Role::Viewer)
+                .unwrap();
+            let bob = tracker
+                .create_user("bob@example.com", "hash", "Bob", Role::Viewer)
+                .unwrap();
+            tracker
+                .save_directory(&[
+                    identities_write(amy, Some("amy"), complete_identities()),
+                    identities_write(bob, None, github("bob-gh")),
+                ])
+                .unwrap();
+
+            let found = tracker.get_user_identities(amy).unwrap().unwrap();
+            assert_eq!(found.user_id, amy);
+            assert_eq!(found.login_email, "amy@example.com");
+            assert_eq!(found.name, "Amy");
+            assert_eq!(found.slug.as_deref(), Some("amy"));
+            assert_eq!(found.identities, complete_identities());
+            assert_eq!(
+                tracker
+                    .list_user_identities()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.user_id == amy),
+                Some(found)
+            );
+
+            assert!(tracker.delete_user_identities(bob).unwrap());
+            assert_eq!(tracker.get_user_identities(bob).unwrap(), None);
+            assert_eq!(tracker.get_user_identities(9999).unwrap(), None);
+        }
     }
 }

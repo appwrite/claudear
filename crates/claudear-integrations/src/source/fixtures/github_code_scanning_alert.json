@@ -1,0 +1,49 @@
+{
+  "number": 17,
+  "created_at": "2026-10-30T02:14:09Z",
+  "updated_at": "2026-10-31T02:15:44Z",
+  "url": "https://api.github.com/repos/appwrite/appwrite/code-scanning/alerts/17",
+  "html_url": "https://github.com/appwrite/appwrite/security/code-scanning/17",
+  "state": "open",
+  "fixed_at": null,
+  "dismissed_by": null,
+  "dismissed_at": null,
+  "dismissed_reason": null,
+  "dismissed_comment": null,
+  "rule": {
+    "id": "ureview/missing-authorization-check",
+    "severity": "error",
+    "description": "Missing authorization check on team membership update",
+    "name": "missing-authorization-check",
+    "tags": ["security", "external/cwe/cwe-862"],
+    "full_description": "The membership update endpoint changes roles without confirming the caller owns the team.",
+    "help": "Check that the caller holds the owner role before changing membership roles.",
+    "help_uri": "https://cwe.mitre.org/data/definitions/862.html",
+    "security_severity_level": "high"
+  },
+  "tool": {
+    "name": "ureview security review",
+    "guid": null,
+    "version": "1.4.0"
+  },
+  "most_recent_instance": {
+    "ref": "refs/heads/main",
+    "analysis_key": ".github/workflows/security-review.yml:review",
+    "environment": "{}",
+    "category": "ureview",
+    "state": "open",
+    "commit_sha": "4f1c2b9e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c",
+    "message": {
+      "text": "PATCH /v1/teams/{teamId}/memberships/{membershipId} updates roles after only checking that the caller is a team member."
+    },
+    "location": {
+      "path": "app/controllers/api/teams.php",
+      "start_line": 812,
+      "end_line": 840,
+      "start_column": 5,
+      "end_column": 6
+    },
+    "classifications": []
+  },
+  "instances_url": "https://api.github.com/repos/appwrite/appwrite/code-scanning/alerts/17/instances"
+}

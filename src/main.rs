@@ -2,10 +2,10 @@
 
 use clap::{Parser, Subcommand};
 use claudear::{
-    api::ApiServer,
-    config::Config,
+    api::{chat_state, ApiServer},
+    config::{Config, SecurityDeploymentConfig, HELPSCOUT_SOURCE},
     deploy_qa::{DeployQaPollAction, DeployQaTracker},
-    feedback::{EmbeddingClient, IssueEmbeddingService},
+    feedback::{EmbeddingClient, EmbeddingConfig, IssueEmbeddingService},
     github::GitHubClient,
     housekeeping::HousekeepingWorker,
     ipc::{
@@ -21,7 +21,10 @@ use claudear::{
         RegressionScheduler, RegressionSchedulerConfig, SentryRegressionChecker,
         SentryRegressionConfig,
     },
-    release::{ReleaseTracker, ReleaseTrackerConfig},
+    release::{
+        DeployedApplication, DeployedPackage, DeploymentResolver, DeploymentStatus,
+        DeploymentTopology, ReleaseTracker, ReleaseTrackerConfig,
+    },
     repo::{build_repo_index, DependencyType, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
@@ -46,6 +49,7 @@ use claudear::{
         WebhookServer, WhatsAppWebhookHandler,
     },
 };
+use claudear_engine::security::{SecurityInbox, SecurityInboxDependencies};
 use futures::{Stream, StreamExt};
 use serde_json::json;
 use std::future::{pending, Future};
@@ -493,8 +497,222 @@ enum UsersCommands {
     },
 }
 
+/// What `claudear users seed` did to the admin account.
+#[derive(Debug, PartialEq, Eq)]
+enum SeededAdmin {
+    Created(i64),
+    Updated(i64),
+}
+
+/// Create the admin, or give the existing user with this login email the password, name
+/// and admin role. The password hash is written once: activating an invited user sets it
+/// (and revokes their invites); an active user gets it through the ordinary update.
+fn seed_admin(
+    store: &dyn UserStore,
+    email: &str,
+    password_hash: &str,
+    name: &str,
+) -> claudear_core::error::Result<SeededAdmin> {
+    let role = claudear_core::identity::Role::Admin;
+    match store.get_user_by_email(email)? {
+        Some(existing) if existing.status == claudear_core::identity::UserStatus::Invited => {
+            store.activate_user(existing.id, password_hash)?;
+            store.update_user(existing.id, None, None, Some(name), Some(role), None)?;
+            Ok(SeededAdmin::Updated(existing.id))
+        }
+        Some(existing) => {
+            store.update_user(
+                existing.id,
+                None,
+                Some(password_hash),
+                Some(name),
+                Some(role),
+                None,
+            )?;
+            Ok(SeededAdmin::Updated(existing.id))
+        }
+        None => Ok(SeededAdmin::Created(store.create_user(
+            email,
+            password_hash,
+            name,
+            role,
+        )?)),
+    }
+}
+
+#[cfg(test)]
+mod seed_admin_tests {
+    use super::*;
+    use claudear_core::identity::{Role, UserStatus};
+    use claudear_storage::{DirectoryUser, DirectoryWrite, InviteWrite, UserRow};
+    use std::sync::Mutex;
+
+    const HASH: &str = "$2b$12$seeded";
+
+    struct RecordingStore {
+        user: Option<UserRow>,
+        password_writes: Mutex<usize>,
+    }
+
+    impl RecordingStore {
+        fn with(status: Option<UserStatus>) -> Self {
+            Self {
+                user: status.map(|status| UserRow {
+                    id: 7,
+                    email: "admin@example.com".to_string(),
+                    password_hash: "$2b$12$old".to_string(),
+                    name: "Old".to_string(),
+                    role: Role::Viewer,
+                    avatar_url: None,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    status,
+                }),
+                password_writes: Mutex::new(0),
+            }
+        }
+
+        fn password_writes(&self) -> usize {
+            *self.password_writes.lock().unwrap()
+        }
+    }
+
+    impl UserStore for RecordingStore {
+        fn get_user_by_email(&self, _email: &str) -> claudear_core::error::Result<Option<UserRow>> {
+            Ok(self.user.clone())
+        }
+
+        fn create_user(
+            &self,
+            _email: &str,
+            _password_hash: &str,
+            _name: &str,
+            _role: Role,
+        ) -> claudear_core::error::Result<i64> {
+            *self.password_writes.lock().unwrap() += 1;
+            Ok(1)
+        }
+
+        fn update_user(
+            &self,
+            _id: i64,
+            _email: Option<&str>,
+            password_hash: Option<&str>,
+            _name: Option<&str>,
+            _role: Option<Role>,
+            _avatar_url: Option<&str>,
+        ) -> claudear_core::error::Result<bool> {
+            if password_hash.is_some() {
+                *self.password_writes.lock().unwrap() += 1;
+            }
+            Ok(true)
+        }
+
+        fn activate_user(
+            &self,
+            _user_id: i64,
+            _password_hash: &str,
+        ) -> claudear_core::error::Result<bool> {
+            *self.password_writes.lock().unwrap() += 1;
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn writes_the_password_hash_once() {
+        for (status, outcome) in [
+            (None, SeededAdmin::Created(1)),
+            (Some(UserStatus::Active), SeededAdmin::Updated(7)),
+            (Some(UserStatus::Invited), SeededAdmin::Updated(7)),
+        ] {
+            let store = RecordingStore::with(status);
+            assert_eq!(
+                seed_admin(&store, "admin@example.com", HASH, "Admin").unwrap(),
+                outcome
+            );
+            assert_eq!(store.password_writes(), 1, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn creates_then_updates_one_admin_case_insensitively() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let SeededAdmin::Created(id) =
+            seed_admin(&tracker, "Admin@Example.com", HASH, "Admin").unwrap()
+        else {
+            panic!("the first seed must create the admin");
+        };
+        assert_eq!(
+            seed_admin(&tracker, "ADMIN@example.com", "$2b$12$second", "Root").unwrap(),
+            SeededAdmin::Updated(id)
+        );
+
+        let users = tracker.list_users().unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, "admin@example.com");
+        assert_eq!(users[0].password_hash, "$2b$12$second");
+        assert_eq!(users[0].name, "Root");
+        assert_eq!(users[0].role, Role::Admin);
+    }
+
+    #[test]
+    fn activates_an_invited_user_and_revokes_their_invite() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let creator = tracker
+            .create_user("owner@example.com", HASH, "Owner", Role::Admin)
+            .unwrap();
+        let invited = tracker
+            .save_directory(&[DirectoryWrite {
+                user: DirectoryUser::New {
+                    email: "amy@example.com".to_string(),
+                    name: "Amy".to_string(),
+                    role: Role::Viewer,
+                    password_hash: "$2b$12$unusable".to_string(),
+                    status: UserStatus::Invited,
+                },
+                identities: None,
+                invite: Some(InviteWrite {
+                    token_hash: "invite-hash".to_string(),
+                    expires_at: "2099-12-31 23:59:59".to_string(),
+                    created_by: creator,
+                }),
+            }])
+            .unwrap()[0];
+
+        assert_eq!(
+            seed_admin(&tracker, "amy@example.com", HASH, "Amy").unwrap(),
+            SeededAdmin::Updated(invited)
+        );
+
+        let user = tracker.get_user_by_id(invited).unwrap().unwrap();
+        assert_eq!(user.status, UserStatus::Active);
+        assert_eq!(user.password_hash, HASH);
+        assert_eq!(user.role, Role::Admin);
+        assert!(tracker.get_open_invite_for_user(invited).unwrap().is_none());
+    }
+}
+
 /// Initialize logging with both console and file output.
 /// Returns a guard that must be kept alive for the duration of the program.
+fn sentry_layer<S>() -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    use sentry::integrations::tracing::{BreadcrumbLayer, ErrorLayer, SpanLayer};
+    use tracing_subscriber::filter::filter_fn;
+
+    SpanLayer::new()
+        .with_filter(LevelFilter::INFO)
+        .and_then(BreadcrumbLayer::new().with_filter(filter_fn(|metadata| {
+            matches!(
+                *metadata.level(),
+                tracing::Level::WARN | tracing::Level::INFO
+            )
+        })))
+        .and_then(ErrorLayer::new().with_filter(LevelFilter::ERROR))
+}
+
 fn init_logging(
     log_dir: Option<&std::path::Path>,
     verbose: bool,
@@ -533,7 +751,7 @@ fn init_logging(
             tracing_subscriber::registry()
                 .with(filter)
                 .with(console_layer)
-                .with(sentry::integrations::tracing::layer())
+                .with(sentry_layer())
                 .init();
             return None;
         }
@@ -551,7 +769,7 @@ fn init_logging(
             .with(filter)
             .with(console_layer)
             .with(file_layer)
-            .with(sentry::integrations::tracing::layer())
+            .with(sentry_layer())
             .init();
 
         tracing::info!("Logging to file: {}/claudear.log", dir.display());
@@ -561,7 +779,7 @@ fn init_logging(
         tracing_subscriber::registry()
             .with(filter)
             .with(console_layer)
-            .with(sentry::integrations::tracing::layer())
+            .with(sentry_layer())
             .init();
         None
     }
@@ -698,6 +916,20 @@ fn build_issue_embedding_service(
     })
 }
 
+/// Build an embedding client for chat code search, only when chat can run.
+fn chat_embedding_client(config: &Config) -> Option<Arc<EmbeddingClient>> {
+    if !(config.chat.enabled && config.llm.enabled) {
+        return None;
+    }
+    match EmbeddingClient::new(EmbeddingConfig::from_settings(&config.embedding)) {
+        Ok(client) => Some(Arc::new(client)),
+        Err(error) => {
+            tracing::warn!(error = %error, "Failed to initialize the chat embedding client");
+            None
+        }
+    }
+}
+
 /// Common dependencies needed to construct a [`Watcher`].
 ///
 /// Built once by [`build_watcher_deps`] and consumed by both `Commands::Start`
@@ -726,8 +958,9 @@ struct WatcherDeps {
 async fn build_watcher_deps(
     config: &Config,
     tracker: &Arc<dyn FixAttemptTracker>,
+    user_registry: &UserRegistry,
 ) -> anyhow::Result<WatcherDeps> {
-    let sources = create_sources(config, tracker);
+    let sources = create_sources(config, tracker, user_registry);
 
     // GitHub client for API-based repo discovery
     let github_client = GitHubClient::new(config.github().clone());
@@ -1054,6 +1287,7 @@ fn create_review_watcher(
 fn create_sources(
     config: &Config,
     tracker: &Arc<dyn FixAttemptTracker>,
+    user_registry: &UserRegistry,
 ) -> Vec<Arc<dyn IssueSource>> {
     let mut sources: Vec<Arc<dyn IssueSource>> = Vec::new();
 
@@ -1082,7 +1316,7 @@ fn create_sources(
         if helpscout_config.enabled {
             if !helpscout_config.app_id.expose().is_empty()
                 && !helpscout_config.app_secret.expose().is_empty()
-                && !helpscout_config.mailbox_ids.is_empty()
+                && !helpscout_config.all_mailbox_ids().is_empty()
             {
                 sources.push(Arc::new(HelpScoutSource::new(helpscout_config.clone())));
                 tracing::info!("HelpScout source initialized");
@@ -1092,6 +1326,14 @@ fn create_sources(
                 );
             }
         }
+    }
+
+    if let Some(source) = claudear::build_github_issues_source(config) {
+        sources.push(source);
+    }
+
+    if let Some(source) = claudear::build_github_code_scanning_source(config) {
+        sources.push(source);
     }
 
     let discord = config.discord_merged();
@@ -1144,11 +1386,111 @@ fn create_sources(
         }
     }
 
-    if let Some(source) = claudear::build_deploy_qa_source(config, tracker.clone()) {
+    if let Some(source) =
+        claudear::build_deploy_qa_source(config, tracker.clone(), user_registry.clone())
+    {
         sources.push(source);
     }
 
     sources.into_iter().map(InstrumentedSource::wrap).collect()
+}
+
+/// The security inbox, when `[issues.helpscout.security]` is enabled and
+/// everything it needs runs: the HelpScout source among `sources` (wrapped,
+/// so its calls are instrumented) and an `agent` that can run sandboxed
+/// security queries. Without one, security conversations are dropped.
+async fn build_security_inbox(
+    config: &Config,
+    tracker: &Arc<dyn FixAttemptTracker>,
+    notifier: &Arc<dyn Notifier>,
+    sources: &[Arc<dyn IssueSource>],
+    agent: &Arc<dyn AgentRunner>,
+    embedding_client: Option<Arc<EmbeddingClient>>,
+    inferrer: Option<claudear::inference::RepoInferrer>,
+) -> Option<Arc<SecurityInbox>> {
+    let security = config.security_inbox()?;
+    let Some(source) = sources
+        .iter()
+        .find(|source| source.name() == HELPSCOUT_SOURCE)
+    else {
+        tracing::error!(
+            "The security inbox is enabled but the HelpScout source is not running, so security reports are not processed"
+        );
+        return None;
+    };
+    let probe = Arc::clone(agent);
+    let supported = tokio::task::spawn_blocking(move || probe.supports_security_query())
+        .await
+        .unwrap_or(false);
+    if !supported {
+        tracing::error!(
+            agent = agent.name(),
+            "The security inbox is enabled but the agent cannot run sandboxed security queries, so security reports are not processed"
+        );
+        return None;
+    }
+    let deployment = match config.github().token.as_ref() {
+        Some(token) => Some(Arc::new(DeploymentResolver::new(
+            token.expose(),
+            deployment_topology(&security.deployment),
+        )) as Arc<dyn DeploymentStatus>),
+        None => {
+            tracing::warn!(
+                "No GitHub token is configured, so security fixes are not tracked to production; mark them live from the dashboard"
+            );
+            None
+        }
+    };
+    tracing::info!("Security inbox enabled");
+    Some(Arc::new(SecurityInbox::new(SecurityInboxDependencies {
+        config: security.clone(),
+        tracker: Arc::clone(tracker),
+        agent: Arc::clone(agent),
+        embedding_client,
+        notifier: Arc::clone(notifier),
+        source: Arc::clone(source),
+        deployment,
+        inferrer,
+    })))
+}
+
+/// Why a security inbox that is built without polling processes no report.
+const SECURITY_INBOX_NEEDS_POLLING: &str = "The security inbox only screens, assesses and replies to reports while polling, so reports wait until claudear runs with `start --poll`";
+
+/// Warn when `inbox` is built but never advanced, because only polling
+/// advances it. Returns whether it warned.
+fn warn_unless_security_inbox_advances(inbox: Option<&Arc<SecurityInbox>>, polling: bool) -> bool {
+    let idle = inbox.is_some() && !polling;
+    if idle {
+        tracing::warn!("{SECURITY_INBOX_NEEDS_POLLING}");
+    }
+    idle
+}
+
+/// The production deployment the security inbox tracks fixes into.
+fn deployment_topology(deployment: &SecurityDeploymentConfig) -> DeploymentTopology {
+    DeploymentTopology {
+        configuration_repository: deployment.configuration_repository.clone(),
+        configuration_reference: deployment.configuration_reference.clone(),
+        applications: deployment
+            .applications
+            .iter()
+            .map(|application| DeployedApplication {
+                repository: application.repository.clone(),
+                image: application.image.clone(),
+                directories: application.directories.clone(),
+                packages: application
+                    .packages
+                    .iter()
+                    .map(|package| DeployedPackage {
+                        repository: package.repository.clone(),
+                        package: package.package.clone(),
+                        lock_file: package.lock_file.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
 }
 
 /// Build the live backends for the MCP list tools: a HelpScout source (for
@@ -1168,7 +1510,7 @@ fn build_mcp_list_backends(
             c.enabled
                 && !c.app_id.expose().is_empty()
                 && !c.app_secret.expose().is_empty()
-                && !c.mailbox_ids.is_empty()
+                && !c.all_mailbox_ids().is_empty()
         })
         .map(|c| Arc::new(HelpScoutSource::new(c.clone())) as Arc<dyn IssueSource>);
 
@@ -1328,7 +1670,7 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
     Arc::new(composite)
 }
 
-fn create_tracker(config: &Config) -> Arc<dyn FixAttemptTracker> {
+fn create_tracker(config: &Config) -> Arc<SqliteTracker> {
     Arc::new(SqliteTracker::new(&config.db_path).expect("Failed to initialize SQLite tracker"))
 }
 
@@ -2136,20 +2478,21 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Initialize Sentry before the async runtime to ensure proper flushing on shutdown
-    let sentry_guard = sentry::init((
-        std::env::var("CLAUDEAR_SENTRY_DSN").unwrap_or_default(),
-        sentry::ClientOptions {
-            release: std::env::var("CLAUDEAR_SENTRY_RELEASE")
+    let mut sentry_options = sentry::ClientOptions::new()
+        .maybe_release(
+            std::env::var("CLAUDEAR_SENTRY_RELEASE")
                 .ok()
-                .filter(|s| !s.is_empty())
+                .filter(|release| !release.is_empty())
                 .map(Into::into)
                 .or_else(|| sentry::release_name!()),
-            environment: std::env::var("CLAUDEAR_SENTRY_ENVIRONMENT")
-                .ok()
-                .map(Into::into),
-            traces_sample_rate: 0.2,
-            ..Default::default()
-        },
+        )
+        .traces_sample_rate(0.2);
+    if let Ok(environment) = std::env::var("CLAUDEAR_SENTRY_ENVIRONMENT") {
+        sentry_options = sentry_options.environment(environment);
+    }
+    let sentry_guard = sentry::init((
+        std::env::var("CLAUDEAR_SENTRY_DSN").unwrap_or_default(),
+        sentry_options,
     ));
 
     sentry::configure_scope(|scope| {
@@ -2768,7 +3111,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
 
             ReposCommands::Reindex { repo } => {
-                use claudear::feedback::{EmbeddingClient, EmbeddingConfig};
                 use claudear::repo::build_repo_index;
                 use claudear::repo::code_index::CodeIndexer;
 
@@ -2778,45 +3120,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     );
                 }
 
-                // Build execution providers from config
-                #[allow(unused_mut)]
-                let mut execution_providers = Vec::new();
-                if config.embedding.gpu {
-                    #[cfg(feature = "cuda")]
-                    {
-                        let cuda_ep = ort::execution_providers::CUDA::default()
-                            .with_device_id(config.embedding.device_id)
-                            .build();
-                        execution_providers.push(cuda_ep);
-                        tracing::info!(
-                            device_id = config.embedding.device_id,
-                            "CUDA execution provider configured for embeddings"
-                        );
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        tracing::warn!(
-                            "embedding.gpu = true but binary was compiled without --features cuda; falling back to CPU"
-                        );
-                    }
-                }
-
-                let emb_pool_size = if config.embedding.pool_size > 0 {
-                    config.embedding.pool_size as usize
-                } else if config.embedding.gpu {
-                    1
-                } else {
-                    EmbeddingConfig::default().pool_size
-                };
-
-                let emb_config = EmbeddingConfig {
-                    pool_size: emb_pool_size,
-                    execution_providers,
-                    sub_batch_size: config.embedding.sub_batch_size as usize,
-                    ..EmbeddingConfig::default()
-                };
-
-                let emb_client = Arc::new(EmbeddingClient::new(emb_config)?);
+                let emb_client = Arc::new(EmbeddingClient::new(EmbeddingConfig::from_settings(
+                    &config.embedding,
+                ))?);
                 let tracker: Arc<dyn claudear::storage::FixAttemptTracker> =
                     Arc::new(SqliteTracker::new(&config.db_path)?);
 
@@ -3342,28 +3648,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 password,
                 name,
             } => {
+                let email = claudear_core::identity::normalize_login_email(email);
                 let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
-                    .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))?;
+                    .map_err(|error| anyhow::anyhow!("Failed to hash password: {}", error))?;
 
-                match db_tracker.get_user_by_email(email)? {
-                    Some(existing) => {
-                        db_tracker.update_user(
-                            existing.id,
-                            None,
-                            Some(&hash),
-                            Some(name.as_str()),
-                            Some("admin"),
-                            None,
-                        )?;
-                        println!(
-                            "Updated existing user '{}' (id={}) with new password and admin role",
-                            email, existing.id
-                        );
+                match seed_admin(&db_tracker, &email, &hash, name)? {
+                    SeededAdmin::Updated(_) => {
+                        println!("Updated the existing user with a new password and admin role")
                     }
-                    None => {
-                        let id = db_tracker.create_user(email, &hash, name, "admin")?;
-                        println!("Created admin user '{}' (id={})", email, id);
-                    }
+                    SeededAdmin::Created(_) => println!("Created the admin user"),
                 }
             }
         }
@@ -3489,8 +3782,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         if let Some(q) = question {
             // One-shot mode
-            let session_id = uuid::Uuid::new_v4().to_string();
-            match chat_service.chat(&session_id, q, repo_id, None).await {
+            match chat_service
+                .chat(
+                    claudear::chat::ChatActor::Operator,
+                    &mut claudear::chat::SessionTarget::fresh(),
+                    q,
+                    repo_id,
+                    None,
+                )
+                .await
+            {
                 Ok((tokens, sources)) => {
                     // Print streaming tokens
                     for token in &tokens {
@@ -3532,7 +3833,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
             println!();
 
-            let mut session_id = uuid::Uuid::new_v4().to_string();
+            let mut target = claudear::chat::SessionTarget::fresh();
             let stdin = std::io::stdin();
             let mut show_sources = true;
 
@@ -3554,7 +3855,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 match input {
                     "/quit" | "/exit" => break,
                     "/clear" => {
-                        session_id = uuid::Uuid::new_v4().to_string();
+                        target = claudear::chat::SessionTarget::fresh();
                         println!("Session cleared.");
                         continue;
                     }
@@ -3569,7 +3870,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     _ => {}
                 }
 
-                match chat_service.chat(&session_id, input, repo_id, None).await {
+                match chat_service
+                    .chat(
+                        claudear::chat::ChatActor::Operator,
+                        &mut target,
+                        input,
+                        repo_id,
+                        None,
+                    )
+                    .await
+                {
                     Ok((tokens, sources)) => {
                         println!();
                         for token in &tokens {
@@ -3608,6 +3918,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     } = cli.command
     {
         let tracker = create_tracker(&config);
+        let rebuilder = tracker.spawn_vector_index_rebuilder()?;
+        let chat = chat_state(&config, tracker.clone(), chat_embedding_client(&config));
+        let registry = UserRegistry::new(config.users.clone());
+        let directory_refresh = tokio::spawn(claudear_engine::registry::refresh_every(
+            registry.clone(),
+            tracker.clone(),
+            Duration::from_millis(config.poll_interval_ms),
+        ));
         let server = if let Some(dir) = dashboard_dir {
             ApiServer::with_dashboard(
                 config,
@@ -3623,7 +3941,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 port,
                 std::path::PathBuf::from(config_path.clone()),
             )
-        };
+        }
+        .with_registry(registry)
+        .with_chat(chat);
 
         let shutdown = async {
             tokio::signal::ctrl_c()
@@ -3632,10 +3952,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("\nReceived shutdown signal...");
         };
 
-        tokio::select! {
-            result = server.start() => result?,
-            _ = shutdown => {}
-        }
+        let served = tokio::select! {
+            result = server.start() => result,
+            _ = shutdown => Ok(()),
+        };
+        directory_refresh.abort();
+        rebuilder.stop();
+        served?;
 
         return Ok(());
     }
@@ -3645,7 +3968,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     tracing::info!("Initializing...");
     let user_registry = UserRegistry::new(config.users.clone());
     let notifier = create_notifier(&config, user_registry.clone());
-    let tracker = create_tracker(&config);
+    let database = create_tracker(&config);
+    let tracker: Arc<dyn FixAttemptTracker> = database.clone();
+    claudear_engine::registry::reload(&user_registry, tracker.as_ref());
 
     if let Commands::Start {
         port,
@@ -3683,7 +4008,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
         let mode_str = modes.join("+");
 
-        let deps = build_watcher_deps(&config, &tracker).await?;
+        let deps = build_watcher_deps(&config, &tracker, &user_registry).await?;
+        let rebuilder = database.spawn_vector_index_rebuilder()?;
         let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
         let sources = deps.sources;
         if sources.is_empty() {
@@ -3692,6 +4018,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         let github_webhook_handler =
             create_github_webhook_handler(&config, deps.review_watcher.clone());
+
+        let security_inbox = build_security_inbox(
+            &config,
+            &tracker,
+            &notifier,
+            &sources,
+            &deps.agent,
+            deps.embedding_client.clone(),
+            deps.inferrer.clone(),
+        )
+        .await;
+        warn_unless_security_inbox_advances(security_inbox.as_ref(), enable_polling);
 
         let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: config.clone(),
@@ -3716,6 +4054,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             dry_run: false,
             llm_engine: deps.llm_engine.clone(),
         }));
+        if let Some(inbox) = security_inbox {
+            watcher.set_security_inbox(inbox);
+        }
 
         let ipc_server = Arc::new(
             IpcServer::builder(tracker.clone(), sources.clone(), notifier.clone())
@@ -3790,6 +4131,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         config.webhook_port = *port;
         let http = http_mode(enable_webhooks, enable_dashboard).map(|mode| {
             let notifier = notifier.clone();
+            let user_registry = user_registry.clone();
             let tracker = tracker.clone();
             let runs = runs.clone();
             let config_path = std::path::PathBuf::from(&config_path);
@@ -3808,6 +4150,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             build_mcp_list_backends(&config);
                         let mut server = WebhookServer::new_with_github(
                             config,
+                            user_registry,
                             handlers,
                             notifier,
                             tracker.clone(),
@@ -3831,7 +4174,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         server.start().await?;
                     }
                     HttpMode::Dashboard => {
+                        let chat = chat_state(&config, tracker.clone(), deps.embedding_client);
                         ApiServer::with_port(config, tracker, *port, config_path)
+                            .with_registry(user_registry)
+                            .with_chat(chat)
                             .start()
                             .await?;
                     }
@@ -3880,6 +4226,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             "outcome": summary.outcome.label(),
         }));
         tracker.record_activity(&activity).ok();
+        rebuilder.stop();
 
         return summary.error.map_or(Ok(()), Err);
     }
@@ -3892,7 +4239,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         let github_client = GitHubClient::new(config.github().clone());
         let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
-        let sources = create_sources(&config, &tracker);
+        let sources = create_sources(&config, &tracker, &user_registry);
         let pr_monitor = if config.regression.enabled {
             PrMonitor::with_regression_tracking(
                 provider,
@@ -4144,7 +4491,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         println!("\nProcessing {} retries...", ready.len());
 
-        let sources = create_sources(&config, &tracker);
+        let sources = create_sources(&config, &tracker, &user_registry);
         if sources.is_empty() {
             anyhow::bail!("No sources were initialized");
         }
@@ -4176,6 +4523,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let agent: Arc<dyn AgentRunner> =
             claudear::build_provider_runner(&config, tracker.clone(), None);
 
+        let security_inbox = build_security_inbox(
+            &config,
+            &tracker,
+            &notifier,
+            &sources,
+            &agent,
+            embedding_client.clone(),
+            inferrer.clone(),
+        )
+        .await;
+
         let watcher = Watcher::new(WatcherOptions {
             config: config.clone(),
             sources,
@@ -4199,6 +4557,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             dry_run: false,
             llm_engine: None,
         });
+        if let Some(inbox) = security_inbox {
+            watcher.set_security_inbox(inbox);
+        }
 
         interruptible(async {
             for attempt in ready {
@@ -4370,7 +4731,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             let handlers = create_webhook_handlers(&config);
 
-            let deps = build_watcher_deps(&config, &tracker).await?;
+            let deps = build_watcher_deps(&config, &tracker, &user_registry).await?;
             let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
             let github_webhook_handler =
                 create_github_webhook_handler(&config, deps.review_watcher.clone());
@@ -4390,6 +4751,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 vector_store_embeddings,
                 &user_registry,
             );
+
+            let security_inbox = build_security_inbox(
+                &config,
+                &tracker,
+                &notifier,
+                &deps.sources,
+                &deps.agent,
+                deps.embedding_client.clone(),
+                deps.inferrer.clone(),
+            )
+            .await;
+            warn_unless_security_inbox_advances(security_inbox.as_ref(), false);
 
             let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
@@ -4414,12 +4787,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 dry_run: false,
                 llm_engine: deps.llm_engine.clone(),
             }));
+            if let Some(inbox) = security_inbox {
+                watcher.set_security_inbox(inbox);
+            }
 
             let worker = HousekeepingWorker::new(watcher.clone(), config.poll_interval_ms);
             let runs = TaskTracker::new();
 
             let mut server = WebhookServer::new_with_github(
                 config.clone(),
+                user_registry.clone(),
                 handlers,
                 notifier.clone(),
                 tracker.clone(),
@@ -4443,7 +4820,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let regression_handle = start_regression_monitoring(
                 &config,
                 tracker.clone(),
-                create_sources(&config, &tracker),
+                create_sources(&config, &tracker, &user_registry),
                 notifier.clone(),
             );
             if regression_handle.is_some() {
@@ -4493,7 +4870,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         _ => {
             tracing::info!("Initializing sources...");
-            let sources = create_sources(&config, &tracker);
+            let sources = create_sources(&config, &tracker, &user_registry);
 
             if sources.is_empty() {
                 anyhow::bail!("No sources were initialized");
@@ -4618,6 +4995,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 provider.and_then(|p| p.qa_model.clone()),
             );
 
+            let security_inbox = build_security_inbox(
+                &config,
+                &tracker,
+                &notifier,
+                &sources,
+                &agent,
+                embedding_client.clone(),
+                inferrer.clone(),
+            )
+            .await;
+
             let tracker_for_api = tracker.clone();
             let vector_store_embeddings = inferrer.as_ref().map(|i| i.embedding_count());
             let watcher = Arc::new(Watcher::new(WatcherOptions {
@@ -4626,7 +5014,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 notifier,
                 tracker,
                 inferrer,
-                embedding_client,
+                embedding_client: embedding_client.clone(),
                 review_watcher,
                 issue_embedding_service,
                 code_search_service,
@@ -4647,6 +5035,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 dry_run,
                 llm_engine,
             }));
+            if let Some(inbox) = security_inbox {
+                watcher.set_security_inbox(inbox);
+            }
 
             match cli.command {
                 Commands::Seed => {
@@ -4716,12 +5107,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             .map_err(anyhow::Error::from)
                     });
                     let http = (!no_dashboard).then(|| {
+                        let chat =
+                            chat_state(&config, tracker_for_api.clone(), embedding_client.clone());
                         let server = ApiServer::with_port(
                             config.clone(),
                             tracker_for_api.clone(),
                             port,
                             std::path::PathBuf::from(&config_path),
-                        );
+                        )
+                        .with_registry(user_registry.clone())
+                        .with_chat(chat);
                         Service::new(HTTP_SERVICE, async move {
                             server.start().await.map_err(anyhow::Error::from)
                         })
@@ -4847,6 +5242,194 @@ mod tests {
 
     const PARKED_SOURCE: &str = "parked";
     const PARKED_ISSUE: &str = "parked-1";
+
+    /// An agent that can or cannot run sandboxed security queries.
+    struct SecurityProbeAgent {
+        supports_security_query: bool,
+    }
+
+    #[async_trait]
+    impl AgentRunner for SecurityProbeAgent {
+        fn name(&self) -> &str {
+            "security-probe"
+        }
+
+        fn capabilities(&self) -> claudear::runner::ProviderCapabilities {
+            claudear::runner::ProviderCapabilities::default()
+        }
+
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            context: &str,
+            _project_dir: &std::path::Path,
+        ) -> String {
+            context.to_string()
+        }
+
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &std::path::Path,
+        ) -> claudear::Result<claudear::types::AgentResult> {
+            Err(claudear::Error::runner("unused"))
+        }
+
+        fn supports_security_query(&self) -> bool {
+            self.supports_security_query
+        }
+    }
+
+    /// A source with `name` that serves nothing.
+    struct NamedSource(&'static str);
+
+    #[async_trait]
+    impl IssueSource for NamedSource {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn display_name(&self) -> &str {
+            self.0
+        }
+
+        async fn fetch_issues(&self) -> claudear::Result<Vec<Issue>> {
+            Ok(Vec::new())
+        }
+
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::not_matched("serves nothing")
+        }
+
+        async fn build_issue_context(&self, _issue: &Issue) -> claudear::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn get_issue(&self, _issue_id: &str) -> claudear::Result<Issue> {
+            Err(claudear::Error::Other("serves nothing".to_string()))
+        }
+    }
+
+    fn security_inbox_config(enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.issues.helpscout = Some(claudear::config::HelpScoutConfig {
+            enabled: true,
+            mailbox_ids: vec!["249877".to_string()],
+            mailboxes: vec![claudear::config::HelpScoutMailboxConfig {
+                id: "249891".to_string(),
+                profile: claudear::config::MailboxProfile::Security,
+                reply_as: None,
+                trigger_tags: Some(Vec::new()),
+                trigger_status: None,
+            }],
+            security: claudear::config::SecurityInboxConfig {
+                enabled,
+                ..claudear::config::SecurityInboxConfig::default()
+            },
+            ..claudear::config::HelpScoutConfig::default()
+        });
+        config
+    }
+
+    async fn security_inbox_for(
+        config: &Config,
+        sources: &[Arc<dyn IssueSource>],
+        supports_security_query: bool,
+    ) -> Option<Arc<SecurityInbox>> {
+        let agent: Arc<dyn AgentRunner> = Arc::new(SecurityProbeAgent {
+            supports_security_query,
+        });
+        let notifier: Arc<dyn Notifier> = Arc::new(ConsoleNotifier::new());
+        build_security_inbox(
+            config,
+            &in_memory_tracker(),
+            &notifier,
+            sources,
+            &agent,
+            None,
+            None,
+        )
+        .await
+    }
+
+    fn helpscout_sources() -> Vec<Arc<dyn IssueSource>> {
+        vec![Arc::new(NamedSource(HELPSCOUT_SOURCE))]
+    }
+
+    #[tokio::test]
+    async fn the_security_inbox_is_built_when_the_agent_supports_security_queries() {
+        let inbox =
+            security_inbox_for(&security_inbox_config(true), &helpscout_sources(), true).await;
+
+        assert!(inbox.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_security_inbox_is_not_enabled_when_the_agent_cannot_run_security_queries() {
+        let inbox =
+            security_inbox_for(&security_inbox_config(true), &helpscout_sources(), false).await;
+
+        assert!(inbox.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_security_inbox_built_without_polling_warns_that_it_never_advances() {
+        let inbox =
+            security_inbox_for(&security_inbox_config(true), &helpscout_sources(), true).await;
+
+        assert!(warn_unless_security_inbox_advances(inbox.as_ref(), false));
+        assert!(!warn_unless_security_inbox_advances(inbox.as_ref(), true));
+        assert!(!warn_unless_security_inbox_advances(None, false));
+    }
+
+    #[tokio::test]
+    async fn the_security_inbox_is_not_enabled_while_it_is_disabled() {
+        let inbox =
+            security_inbox_for(&security_inbox_config(false), &helpscout_sources(), true).await;
+
+        assert!(inbox.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_security_inbox_is_not_enabled_without_the_helpscout_source() {
+        let sources: Vec<Arc<dyn IssueSource>> = vec![Arc::new(NamedSource("linear"))];
+
+        let inbox = security_inbox_for(&security_inbox_config(true), &sources, true).await;
+
+        assert!(inbox.is_none());
+    }
+
+    #[test]
+    fn the_deployment_topology_mirrors_the_configured_applications() {
+        let config = security_inbox_config(true);
+        let deployment = &config.security_inbox().unwrap().deployment;
+
+        let topology = deployment_topology(deployment);
+
+        assert_eq!(
+            topology.configuration_repository,
+            deployment.configuration_repository
+        );
+        assert_eq!(
+            topology.configuration_reference,
+            deployment.configuration_reference
+        );
+        assert_eq!(topology.applications.len(), deployment.applications.len());
+        for (application, configured) in topology.applications.iter().zip(&deployment.applications)
+        {
+            assert_eq!(application.repository, configured.repository);
+            assert_eq!(application.image, configured.image);
+            assert_eq!(application.directories, configured.directories);
+            assert_eq!(application.packages.len(), configured.packages.len());
+            for (package, configured) in application.packages.iter().zip(&configured.packages) {
+                assert_eq!(package.repository, configured.repository);
+                assert_eq!(package.package, configured.package);
+                assert_eq!(package.lock_file, configured.lock_file);
+            }
+        }
+    }
 
     /// An agent CLI that exits with [`INTERRUPTED_CLI_STATUS`] on SIGINT. Perl, because a shell
     /// cannot trap a signal it inherited as ignored, as a test runner a script backgrounds does.
