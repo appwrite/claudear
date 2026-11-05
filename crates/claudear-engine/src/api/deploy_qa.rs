@@ -58,13 +58,19 @@ const NOT_SUFFIX: TagFilterKind = TagFilterKind {
     requires_value: true,
 };
 
-pub(super) const TAG_FILTER_KINDS: &[TagFilterKind] = &[ANY, SUFFIX, NOT_SUFFIX];
+const PREFIX: TagFilterKind = TagFilterKind {
+    kind: "prefix",
+    requires_value: true,
+};
+
+pub(super) const TAG_FILTER_KINDS: &[TagFilterKind] = &[ANY, SUFFIX, NOT_SUFFIX, PREFIX];
 
 pub(super) fn kind(filter: &DeployQaTagFilter) -> &'static str {
     match filter {
         DeployQaTagFilter::Any => ANY.kind,
         DeployQaTagFilter::Suffix(_) => SUFFIX.kind,
         DeployQaTagFilter::NotSuffix(_) => NOT_SUFFIX.kind,
+        DeployQaTagFilter::Prefix(_) => PREFIX.kind,
     }
 }
 
@@ -682,12 +688,14 @@ mod tests {
             DeployQaTagFilter::Any,
             DeployQaTagFilter::Suffix("-db".to_string()),
             DeployQaTagFilter::NotSuffix("-db".to_string()),
+            DeployQaTagFilter::Prefix("apps/console/".to_string()),
         ];
         for sample in &samples {
             match sample {
                 DeployQaTagFilter::Any
                 | DeployQaTagFilter::Suffix(_)
-                | DeployQaTagFilter::NotSuffix(_) => {}
+                | DeployQaTagFilter::NotSuffix(_)
+                | DeployQaTagFilter::Prefix(_) => {}
             }
         }
         samples
