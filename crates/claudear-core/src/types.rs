@@ -2134,6 +2134,9 @@ pub struct PrAssignment {
     pub pr_number: i64,
     /// GitHub login of the responsible developer.
     pub assignee: String,
+    /// GitHub login of who held the PR before it was handed over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
     /// Strongest signal that won the assignee the PR.
     pub reason: AssignmentReason,
     /// Ownership score the assignee had for the PR.
@@ -2145,6 +2148,9 @@ pub struct PrAssignment {
     /// When the assignment was released or closed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<DateTime<Utc>>,
+    /// When a ping reached the assignee; `None` until one does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notified_at: Option<DateTime<Utc>>,
 }
 
 impl PrAssignment {
@@ -2163,11 +2169,13 @@ impl PrAssignment {
             repo: repo.into(),
             pr_number,
             assignee: assignee.into(),
+            previous: None,
             reason,
             score,
             status: AssignmentStatus::Active,
             assigned_at: Utc::now(),
             ended_at: None,
+            notified_at: None,
         }
     }
 }

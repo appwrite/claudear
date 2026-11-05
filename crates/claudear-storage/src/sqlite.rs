@@ -5029,6 +5029,10 @@ impl PrAssignmentStore for SqliteTracker {
     ) -> Result<bool> {
         SqliteTracker::end_pr_assignment(self, id, status)
     }
+
+    fn mark_pr_assignment_notified(&self, id: i64) -> Result<bool> {
+        SqliteTracker::mark_pr_assignment_notified(self, id)
+    }
 }
 
 impl ChatStore for SqliteTracker {
@@ -8669,7 +8673,8 @@ impl SqliteTracker {
 }
 
 const PR_ASSIGNMENT_COLUMNS: &str =
-    "id, pr_url, repo, pr_number, assignee, reason, score, status, assigned_at, ended_at";
+    "id, pr_url, repo, pr_number, assignee, previous, reason, score, status, assigned_at, \
+     ended_at, notified_at";
 
 impl SqliteTracker {
     fn row_to_pr_assignment(
@@ -8687,21 +8692,19 @@ impl SqliteTracker {
                 )
             })
         }
-        let ended_at = row
-            .get::<_, Option<String>>(9)?
-            .map(|value| Self::parse_datetime(&value))
-            .transpose()?;
         Ok(claudear_core::types::PrAssignment {
             id: row.get(0)?,
             pr_url: row.get(1)?,
             repo: row.get(2)?,
             pr_number: row.get(3)?,
             assignee: row.get(4)?,
-            reason: parse(row, 5)?,
-            score: row.get(6)?,
-            status: parse(row, 7)?,
-            assigned_at: Self::parse_datetime(&row.get::<_, String>(8)?)?,
-            ended_at,
+            previous: row.get(5)?,
+            reason: parse(row, 6)?,
+            score: row.get(7)?,
+            status: parse(row, 8)?,
+            assigned_at: Self::parse_datetime(&row.get::<_, String>(9)?)?,
+            ended_at: Self::parse_optional_datetime(row.get(10)?)?,
+            notified_at: Self::parse_optional_datetime(row.get(11)?)?,
         })
     }
 
@@ -8741,14 +8744,15 @@ impl SqliteTracker {
         let inserted = conn.execute(
             r#"
             INSERT OR IGNORE INTO pr_assignments
-                (pr_url, repo, pr_number, assignee, reason, score, status, assigned_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)
+                (pr_url, repo, pr_number, assignee, previous, reason, score, status, assigned_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8)
             "#,
             params![
                 assignment.pr_url,
                 assignment.repo,
                 assignment.pr_number,
                 assignment.assignee,
+                assignment.previous,
                 assignment.reason.to_string(),
                 assignment.score,
                 assignment.assigned_at.to_rfc3339(),
@@ -8780,6 +8784,18 @@ impl SqliteTracker {
             params![status.to_string(), Utc::now().to_rfc3339(), id],
         )?;
         Ok(ended > 0)
+    }
+
+    /// Record that a ping reached the assignee of the active assignment `id`,
+    /// returning whether it was still active and not yet notified.
+    pub fn mark_pr_assignment_notified(&self, id: i64) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let marked = conn.execute(
+            "UPDATE pr_assignments SET notified_at = ?1 \
+             WHERE id = ?2 AND status = 'active' AND notified_at IS NULL",
+            params![Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(marked > 0)
     }
 
     /// System 1: Update learnings text on a feedback outcome.
@@ -12318,6 +12334,50 @@ mod tests {
             .unwrap();
         assert_eq!(status, "released");
         assert!(ended.is_some());
+    }
+
+    #[test]
+    fn test_pr_assignment_keeps_its_handover_and_is_marked_notified_once() {
+        use claudear_core::types::{AssignmentReason, AssignmentStatus, PrAssignment};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let url = "https://github.com/org/repo/pull/7";
+        let mut handover =
+            PrAssignment::new(url, "org/repo", 7, "bob", AssignmentReason::Load, 0.0);
+        handover.previous = Some("alice".to_string());
+        let stored = tracker.record_pr_assignment(&handover).unwrap().unwrap();
+
+        assert_eq!(stored.previous.as_deref(), Some("alice"));
+        assert!(stored.notified_at.is_none());
+
+        assert!(tracker.mark_pr_assignment_notified(stored.id).unwrap());
+        let notified = tracker.active_pr_assignment(url).unwrap().unwrap();
+        assert!(notified.notified_at.is_some());
+        assert!(!tracker.mark_pr_assignment_notified(stored.id).unwrap());
+        assert_eq!(
+            tracker
+                .active_pr_assignment(url)
+                .unwrap()
+                .unwrap()
+                .notified_at,
+            notified.notified_at
+        );
+
+        let unnotified = tracker
+            .record_pr_assignment(&PrAssignment::new(
+                "https://github.com/org/repo/pull/8",
+                "org/repo",
+                8,
+                "alice",
+                AssignmentReason::Load,
+                0.0,
+            ))
+            .unwrap()
+            .unwrap();
+        tracker
+            .end_pr_assignment(unnotified.id, AssignmentStatus::Closed)
+            .unwrap();
+        assert!(!tracker.mark_pr_assignment_notified(unnotified.id).unwrap());
     }
 
     #[test]

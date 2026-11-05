@@ -2072,6 +2072,12 @@ pub trait PrAssignmentStore: Send + Sync {
     fn end_pr_assignment(&self, _id: i64, _status: AssignmentStatus) -> Result<bool> {
         Ok(false)
     }
+
+    /// Record that a ping reached the assignee of the active assignment `id`,
+    /// returning whether it was still active and not yet notified.
+    fn mark_pr_assignment_notified(&self, _id: i64) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Regression watches and checks (all defaulted).
