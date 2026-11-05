@@ -3,10 +3,14 @@
 //! SQL files are included at compile time from the `migrations/` directory.
 //! Each file must be named `V<N>__<description>.sql` (e.g. `V1__initial_schema.sql`).
 //! Migrations are applied in version order and tracked in a `schema_migrations` table.
+//! Every migration whose version is not recorded there is applied, so versions
+//! may have gaps and a lower version merged after a higher one still runs.
 
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 /// A single compiled-in migration.
+#[derive(Clone, Copy)]
 struct Migration {
     version: u32,
     name: &'static str,
@@ -87,6 +91,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/V14__fix_attempt_heartbeat.sql"),
     },
     Migration {
+        version: 17,
+        name: "chat_session_owner",
+        sql: include_str!("../../../migrations/V17__chat_session_owner.sql"),
+    },
+    Migration {
         version: 18,
         name: "security_inbox",
         sql: include_str!("../../../migrations/V18__security_inbox.sql"),
@@ -96,9 +105,12 @@ const MIGRATIONS: &[Migration] = &[
 /// Run all pending migrations against the given connection.
 ///
 /// Creates the `schema_migrations` tracking table if it doesn't exist,
-/// then applies any migrations whose version exceeds the current maximum.
+/// then applies, in version order, every migration not yet recorded in it.
 pub fn run(conn: &Connection) -> Result<(), String> {
-    // Create tracking table
+    apply(conn, MIGRATIONS)
+}
+
+fn apply(conn: &Connection, migrations: &[Migration]) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
@@ -108,21 +120,15 @@ pub fn run(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to create schema_migrations table: {e}"))?;
 
-    // Get current version
-    let current: u32 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Failed to query schema version: {e}"))?;
+    let applied = applied_versions(conn)?;
 
-    // Apply pending migrations in order
-    for m in MIGRATIONS {
-        if m.version <= current {
-            continue;
-        }
+    let mut pending: Vec<&Migration> = migrations
+        .iter()
+        .filter(|migration| !applied.contains(&migration.version))
+        .collect();
+    pending.sort_by_key(|migration| migration.version);
 
+    for m in pending {
         conn.execute_batch(m.sql)
             .map_err(|e| format!("Migration V{}_{} failed: {e}", m.version, m.name))?;
 
@@ -134,6 +140,18 @@ pub fn run(conn: &Connection) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn applied_versions(conn: &Connection) -> Result<HashSet<u32>, String> {
+    let mut statement = conn
+        .prepare("SELECT version FROM schema_migrations")
+        .map_err(|e| format!("Failed to query applied migrations: {e}"))?;
+    let versions = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|e| format!("Failed to query applied migrations: {e}"))?
+        .collect::<Result<HashSet<u32>, _>>()
+        .map_err(|e| format!("Failed to read applied migrations: {e}"))?;
+    Ok(versions)
 }
 
 #[cfg(test)]
@@ -249,6 +267,99 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_deploy_qa, 1);
+    }
+
+    #[test]
+    fn test_chat_sessions_record_their_owner() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let has_owner: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('chat_sessions') WHERE name = 'owner_user_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_owner, 1);
+
+        let owner_foreign_key: (String, String, String) = conn
+            .query_row(
+                "SELECT \"table\", \"to\", on_delete FROM pragma_foreign_key_list('chat_sessions') WHERE \"from\" = 'owner_user_id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            owner_foreign_key,
+            ("users".to_string(), "id".to_string(), "CASCADE".to_string())
+        );
+
+        let has_index: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_chat_sessions_owner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1);
+    }
+
+    #[test]
+    fn test_owner_migration_keeps_existing_sessions_ownerless() {
+        let conn = Connection::open_in_memory().unwrap();
+        let before_owner: Vec<Migration> = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 17)
+            .copied()
+            .collect();
+        apply(&conn, &before_owner).unwrap();
+        conn.execute("INSERT INTO chat_sessions (id) VALUES ('legacy')", [])
+            .unwrap();
+
+        run(&conn).unwrap();
+
+        let owner: Option<i64> = conn
+            .query_row(
+                "SELECT owner_user_id FROM chat_sessions WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, None);
+    }
+
+    #[test]
+    fn test_a_lower_version_added_after_a_higher_one_is_applied() {
+        let conn = Connection::open_in_memory().unwrap();
+        let first = Migration {
+            version: 1,
+            name: "first",
+            sql: "CREATE TABLE first (id INTEGER);",
+        };
+        let late = Migration {
+            version: 2,
+            name: "late",
+            sql: "CREATE TABLE late (id INTEGER);",
+        };
+        let third = Migration {
+            version: 3,
+            name: "third",
+            sql: "CREATE TABLE third (id INTEGER);",
+        };
+
+        apply(&conn, &[first, third]).unwrap();
+        apply(&conn, &[first, late, third]).unwrap();
+
+        let late_tables: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'late'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(late_tables, 1);
+        assert_eq!(applied_count(&conn), 3);
     }
 
     #[test]

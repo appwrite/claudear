@@ -7,10 +7,70 @@ use super::types::*;
 use claudear_analysis::repo::code_index::{format_code_search_context, CodeSearchService};
 use claudear_config::config::{ChatConfig, LlmModelConfig};
 use claudear_core::error::{Error, Result};
+use claudear_core::types::{ChatSessionScope, ChatViewer};
 use claudear_storage::FixAttemptTracker;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+
+/// The error a chat request gets for a session it may not continue, whether
+/// or not the session exists.
+pub const CHAT_SESSION_NOT_FOUND: &str = "Chat session not found";
+
+/// Who a chat request acts for.
+#[derive(Debug, Clone, Copy)]
+pub enum ChatActor<'a> {
+    /// A signed-in dashboard user, who owns the sessions they create.
+    Viewer(&'a ChatViewer),
+    /// The local `claudear chat` operator, whose sessions have no owner and so
+    /// are visible in the dashboard only to admins.
+    Operator,
+}
+
+impl ChatActor<'_> {
+    fn owner_user_id(self) -> Option<i64> {
+        match self {
+            Self::Viewer(viewer) => Some(viewer.user_id),
+            Self::Operator => None,
+        }
+    }
+
+    /// The sessions this actor may continue.
+    fn scope(self) -> ChatSessionScope {
+        match self {
+            Self::Viewer(viewer) => viewer.scope(),
+            Self::Operator => ChatSessionScope::OWNERLESS,
+        }
+    }
+}
+
+/// The session a chat message goes to. Only the server names new sessions:
+/// a session id from a client is always [`SessionTarget::Existing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionTarget {
+    /// A session to create under this server-generated id.
+    New(String),
+    /// A session that must already exist and be the actor's to continue.
+    Existing(String),
+}
+
+impl SessionTarget {
+    /// A new session under a fresh id.
+    pub fn fresh() -> Self {
+        Self::New(uuid::Uuid::new_v4().to_string())
+    }
+
+    /// The session a client named, or a new one when it named none.
+    pub fn requested(session_id: Option<String>) -> Self {
+        session_id.map_or_else(Self::fresh, Self::Existing)
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::New(id) | Self::Existing(id) => id,
+        }
+    }
+}
 
 /// Service that orchestrates RAG-powered code chat.
 ///
@@ -98,13 +158,14 @@ impl ChatService {
     /// Returns a list of token strings (for streaming to client) and the source references.
     pub async fn chat(
         &self,
-        session_id: &str,
+        actor: ChatActor<'_>,
+        target: &mut SessionTarget,
         message: &str,
         repo_id: Option<i64>,
         params_override: Option<&GenerationParamsOverride>,
     ) -> Result<(Vec<String>, Vec<ChatSource>)> {
         let prepared = self
-            .prepare_chat(session_id, message, repo_id, params_override)
+            .prepare_chat(actor, target, message, repo_id, params_override)
             .await?;
 
         let tokens = prepared
@@ -112,39 +173,48 @@ impl ChatService {
             .complete_streaming(&prepared.prompt, &prepared.gen_params)?;
 
         let full_response: String = tokens.join("");
-        self.save_assistant_message(&prepared.session_id, &full_response, &prepared.sources)?;
+        self.save_assistant_message(&prepared, &full_response)?;
 
         Ok((tokens, prepared.sources))
     }
 
     /// Prepare a chat request: create session, save user message, RAG search, build prompt, load LLM.
     ///
+    /// A [`SessionTarget::New`] session is created owned by `actor`, and the
+    /// target becomes [`SessionTarget::Existing`]. An existing session that is
+    /// missing or not `actor`'s fails with [`CHAT_SESSION_NOT_FOUND`] alike;
+    /// the user message is appended only if the session is the actor's in the
+    /// same statement, so nothing is created or saved for it.
+    ///
     /// Returns a `PreparedChat` that the caller can use to drive generation (either
     /// via `complete_streaming` or `complete_streaming_channel`).
     pub async fn prepare_chat(
         &self,
-        session_id: &str,
+        actor: ChatActor<'_>,
+        target: &mut SessionTarget,
         message: &str,
         repo_id: Option<i64>,
         params_override: Option<&GenerationParamsOverride>,
     ) -> Result<PreparedChat> {
-        // 1. Ensure session exists
-        if self.tracker.get_chat_history(session_id, 1).is_err()
-            || self
-                .tracker
-                .get_chat_history(session_id, 1)
-                .map(|h| h.is_empty())
-                .unwrap_or(true)
-        {
-            let sessions = self.tracker.list_chat_sessions().unwrap_or_default();
-            if !sessions.iter().any(|s| s.id == session_id) {
-                self.tracker.create_chat_session(session_id, repo_id)?;
-            }
-        }
+        let scope = actor.scope();
 
-        // 2. Save user message
-        self.tracker
-            .save_chat_message(session_id, "user", message, None)?;
+        // 1. Create a new session, owned by the actor
+        if let SessionTarget::New(id) = target {
+            self.tracker
+                .create_chat_session(id, repo_id, actor.owner_user_id())?;
+            let id = std::mem::take(id);
+            *target = SessionTarget::Existing(id);
+        }
+        let session_id = target.id().to_string();
+
+        // 2. Save the user message, only to a session in the actor's scope
+        if self
+            .tracker
+            .save_chat_message(&session_id, &scope, "user", message, None)?
+            .is_none()
+        {
+            return Err(Error::Other(CHAT_SESSION_NOT_FOUND.to_string()));
+        }
 
         // 3. Retrieve relevant code chunks
         let max_chunks = self.config.max_context_chunks;
@@ -166,9 +236,9 @@ impl ChatService {
         let code_context = format_code_search_context(&search_results);
 
         // 6. Load conversation history
-        let history_messages = self
-            .tracker
-            .get_chat_history(session_id, self.config.max_history_messages)?;
+        let history_messages =
+            self.tracker
+                .get_chat_history(&session_id, &scope, self.config.max_history_messages)?;
 
         let history: Vec<ChatMessage> = history_messages
             .into_iter()
@@ -183,7 +253,8 @@ impl ChatService {
         let gen_params = self.build_generation_params(params_override);
 
         Ok(PreparedChat {
-            session_id: session_id.to_string(),
+            session_id,
+            scope,
             prompt: full_prompt,
             sources,
             gen_params,
@@ -191,16 +262,13 @@ impl ChatService {
         })
     }
 
-    /// Save the assistant's (possibly partial) response after streaming ends.
-    pub fn save_assistant_message(
-        &self,
-        session_id: &str,
-        content: &str,
-        sources: &[ChatSource],
-    ) -> Result<()> {
-        let sources_json = serde_json::to_string(sources).ok();
+    /// Save the assistant's (possibly partial) response after streaming ends,
+    /// unless the session left the actor's scope meanwhile.
+    pub fn save_assistant_message(&self, prepared: &PreparedChat, content: &str) -> Result<()> {
+        let sources_json = serde_json::to_string(&prepared.sources).ok();
         self.tracker.save_chat_message(
-            session_id,
+            &prepared.session_id,
+            &prepared.scope,
             "assistant",
             content,
             sources_json.as_deref(),
@@ -339,6 +407,35 @@ pub fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_viewer_continues_its_own_sessions_and_owns_new_ones() {
+        let viewer = ChatViewer {
+            user_id: 1,
+            is_admin: true,
+        };
+        let actor = ChatActor::Viewer(&viewer);
+        assert_eq!(actor.owner_user_id(), Some(1));
+        assert_eq!(actor.scope(), viewer.scope());
+    }
+
+    #[test]
+    fn the_operator_continues_only_ownerless_sessions_and_owns_none() {
+        let actor = ChatActor::Operator;
+        assert_eq!(actor.owner_user_id(), None);
+        assert_eq!(actor.scope(), ChatSessionScope::OWNERLESS);
+    }
+
+    #[test]
+    fn a_client_named_session_is_never_new() {
+        assert_eq!(
+            SessionTarget::requested(Some("named-by-client".to_string())),
+            SessionTarget::Existing("named-by-client".to_string())
+        );
+        let fresh = SessionTarget::requested(None);
+        assert!(matches!(fresh, SessionTarget::New(_)));
+        assert_ne!(fresh.id(), SessionTarget::requested(None).id());
+    }
 
     #[test]
     fn test_expand_tilde() {

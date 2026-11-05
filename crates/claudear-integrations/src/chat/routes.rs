@@ -1,6 +1,26 @@
 //! API route handlers for the chat feature.
+//!
+//! Every route reads the signed-in user from a [`ChatViewer`] request
+//! extension, which the layer mounting this router must insert; without it a
+//! request fails rather than running unscoped. Chat sessions belong to the
+//! user who created them:
+//!
+//! - Only the owner lists, reads or attaches the websocket to an owned
+//!   session. Admins cannot read other users' history.
+//! - The owner, or any admin, may delete a session.
+//! - Sessions from before sessions had owners are listed, read, attached to
+//!   and deleted only by admins.
+//! - A session the caller may not read or delete answers 404, never 403,
+//!   exactly as a missing one does, so its existence does not leak; over the
+//!   websocket both get the same error chunk saying the session was not found.
+//! - Only the server names sessions: a websocket message without a session id
+//!   starts a new session under a server-generated id, owned by the caller,
+//!   and one with an id only continues an existing session; it never creates
+//!   one.
+//! - Each read, append and delete applies the caller's scope in the same SQL
+//!   statement, so no ownership check can go stale before the act.
 
-use super::service::ChatService;
+use super::service::{ChatActor, ChatService, SessionTarget};
 use super::types::*;
 use axum::{
     extract::{
@@ -10,11 +30,14 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
+use claudear_core::types::ChatViewer;
 use claudear_storage::FixAttemptTracker;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+const HISTORY_LIMIT: usize = 100;
 
 /// Shared state for chat API handlers.
 #[derive(Clone)]
@@ -40,12 +63,13 @@ pub fn create_chat_router(state: ChatState) -> Router {
 async fn chat_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<ChatState>,
+    Extension(viewer): Extension<ChatViewer>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_chat_ws(socket, state))
+    ws.on_upgrade(move |socket| handle_chat_ws(socket, state, viewer))
 }
 
 /// Handle a WebSocket connection for chat.
-async fn handle_chat_ws(mut socket: WebSocket, state: ChatState) {
+async fn handle_chat_ws(mut socket: WebSocket, state: ChatState, viewer: ChatViewer) {
     loop {
         let msg = match socket.recv().await {
             Some(Ok(m)) => m,
@@ -89,15 +113,18 @@ async fn handle_chat_ws(mut socket: WebSocket, state: ChatState) {
             }
         };
 
-        let session_id = request
-            .session_id
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mut target = SessionTarget::requested(request.session_id);
+        let created_session_id = match &target {
+            SessionTarget::New(id) => Some(id.clone()),
+            SessionTarget::Existing(_) => None,
+        };
 
         // Prepare the chat (session, user msg, RAG, prompt, LLM)
         let prepared = match state
             .chat_service
             .prepare_chat(
-                &session_id,
+                ChatActor::Viewer(&viewer),
+                &mut target,
                 &request.message,
                 request.repo_id,
                 request.params.as_ref(),
@@ -110,7 +137,7 @@ async fn handle_chat_ws(mut socket: WebSocket, state: ChatState) {
                     delta: String::new(),
                     done: true,
                     sources: None,
-                    session_id: Some(session_id),
+                    session_id: created_session_id,
                     error: Some(e.to_string()),
                     stopped: None,
                 };
@@ -122,6 +149,8 @@ async fn handle_chat_ws(mut socket: WebSocket, state: ChatState) {
                 continue;
             }
         };
+
+        let session_id = prepared.session_id.clone();
 
         // Set up streaming channel and cancel flag
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
@@ -207,11 +236,9 @@ async fn handle_chat_ws(mut socket: WebSocket, state: ChatState) {
 
         if ws_broken {
             // Still save whatever was generated
-            let _ = state.chat_service.save_assistant_message(
-                &session_id,
-                &accumulated,
-                &prepared.sources,
-            );
+            let _ = state
+                .chat_service
+                .save_assistant_message(&prepared, &accumulated);
             break;
         }
 
@@ -235,10 +262,9 @@ async fn handle_chat_ws(mut socket: WebSocket, state: ChatState) {
             .await;
 
         // Save the (possibly partial) response
-        let _ =
-            state
-                .chat_service
-                .save_assistant_message(&session_id, &accumulated, &prepared.sources);
+        let _ = state
+            .chat_service
+            .save_assistant_message(&prepared, &accumulated);
     }
 }
 
@@ -279,36 +305,34 @@ async fn list_models_handler(State(state): State<ChatState>) -> Json<ModelsRespo
     })
 }
 
-/// List chat sessions.
+/// List the caller's chat sessions, and for an admin the ownerless ones.
 async fn list_sessions_handler(
     State(state): State<ChatState>,
+    Extension(viewer): Extension<ChatViewer>,
 ) -> Result<Json<Vec<ChatSession>>, StatusCode> {
     state
         .tracker
-        .list_chat_sessions()
+        .list_chat_sessions(&viewer.scope())
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// Get a specific session with its message history.
+/// Get a session the caller may read, with its message history.
 async fn get_session_handler(
     Path(id): Path<String>,
     State(state): State<ChatState>,
+    Extension(viewer): Extension<ChatViewer>,
 ) -> Result<Json<ChatSession>, StatusCode> {
+    let scope = viewer.scope();
+    let session = state
+        .tracker
+        .get_chat_session(&id, &scope)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
     let messages = state
         .tracker
-        .get_chat_history(&id, 100)
+        .get_chat_history(&id, &scope, HISTORY_LIMIT)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let sessions = state
-        .tracker
-        .list_chat_sessions()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let session = sessions
-        .into_iter()
-        .find(|s| s.id == id)
-        .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(ChatSession {
         messages,
@@ -316,13 +340,18 @@ async fn get_session_handler(
     }))
 }
 
-/// Delete a chat session.
+/// Delete a session the caller may delete.
 async fn delete_session_handler(
     Path(id): Path<String>,
     State(state): State<ChatState>,
+    Extension(viewer): Extension<ChatViewer>,
 ) -> StatusCode {
-    match state.tracker.delete_chat_session(&id) {
-        Ok(()) => StatusCode::NO_CONTENT,
+    match state
+        .tracker
+        .delete_chat_session(&id, &viewer.delete_scope())
+    {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -560,6 +589,7 @@ mod tests {
         let session = ChatSession {
             id: "sess-abc".to_string(),
             repo_id: Some(1),
+            owner_user_id: Some(7),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             messages: vec![],
@@ -567,6 +597,7 @@ mod tests {
         let json = serde_json::to_string(&session).unwrap();
         assert!(json.contains("\"id\":\"sess-abc\""));
         assert!(json.contains("\"repo_id\":1"));
+        assert!(json.contains("\"owner_user_id\":7"));
     }
 
     #[test]

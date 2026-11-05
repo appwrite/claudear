@@ -3292,10 +3292,72 @@ pub struct ChatMessage {
 pub struct ChatSession {
     pub id: String,
     pub repo_id: Option<i64>,
+    /// The dashboard user the session belongs to; `None` for sessions created
+    /// before sessions had owners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
+}
+
+/// The signed-in dashboard user a chat request acts for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatViewer {
+    pub user_id: i64,
+    pub is_admin: bool,
+}
+
+/// The chat sessions a request may act on: those owned by `owner_user_id`,
+/// the ownerless ones when `include_ownerless` is set, and every other user's
+/// when `include_other_owners` is set. Storage applies it in the same
+/// statement as the read or write, so no check can go stale before the act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatSessionScope {
+    pub owner_user_id: Option<i64>,
+    pub include_ownerless: bool,
+    pub include_other_owners: bool,
+}
+
+impl ChatSessionScope {
+    /// Only the ownerless sessions, as the local `claudear chat` operator sees them.
+    pub const OWNERLESS: Self = Self {
+        owner_user_id: None,
+        include_ownerless: true,
+        include_other_owners: false,
+    };
+
+    /// Whether `session` falls within this scope.
+    pub fn includes(&self, session: &ChatSession) -> bool {
+        match session.owner_user_id {
+            Some(owner_user_id) => {
+                self.include_other_owners || self.owner_user_id == Some(owner_user_id)
+            }
+            None => self.include_ownerless,
+        }
+    }
+}
+
+impl ChatViewer {
+    /// The sessions this viewer may list, read and continue: its own, and for
+    /// an admin the ownerless ones. Admins never read other users' sessions.
+    pub fn scope(&self) -> ChatSessionScope {
+        ChatSessionScope {
+            owner_user_id: Some(self.user_id),
+            include_ownerless: self.is_admin,
+            include_other_owners: false,
+        }
+    }
+
+    /// The sessions this viewer may delete: its own, and for an admin any.
+    pub fn delete_scope(&self) -> ChatSessionScope {
+        ChatSessionScope {
+            owner_user_id: Some(self.user_id),
+            include_ownerless: self.is_admin,
+            include_other_owners: self.is_admin,
+        }
+    }
 }
 
 /// Alias for backward compatibility (was `PrReviewComment` in github.rs).
@@ -7147,5 +7209,66 @@ mod tests {
         let deser: AgentResult = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.confidence, 0);
         assert!(deser.confidence_reasoning.is_some());
+    }
+
+    fn chat_session(owner_user_id: Option<i64>) -> ChatSession {
+        ChatSession {
+            id: "session".to_string(),
+            repo_id: None,
+            owner_user_id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            messages: Vec::new(),
+        }
+    }
+
+    const OWNER: ChatViewer = ChatViewer {
+        user_id: 1,
+        is_admin: false,
+    };
+
+    const OTHER_VIEWER: ChatViewer = ChatViewer {
+        user_id: 2,
+        is_admin: false,
+    };
+
+    const ADMIN: ChatViewer = ChatViewer {
+        user_id: 3,
+        is_admin: true,
+    };
+
+    #[test]
+    fn only_the_owner_reads_an_owned_chat_session() {
+        let owned = chat_session(Some(OWNER.user_id));
+        assert!(OWNER.scope().includes(&owned));
+        assert!(!OTHER_VIEWER.scope().includes(&owned));
+        assert!(!ADMIN.scope().includes(&owned));
+        assert!(!ChatSessionScope::OWNERLESS.includes(&owned));
+    }
+
+    #[test]
+    fn the_owner_and_admins_delete_an_owned_chat_session() {
+        let owned = chat_session(Some(OWNER.user_id));
+        assert!(OWNER.delete_scope().includes(&owned));
+        assert!(ADMIN.delete_scope().includes(&owned));
+        assert!(!OTHER_VIEWER.delete_scope().includes(&owned));
+    }
+
+    #[test]
+    fn only_admins_and_the_operator_reach_an_ownerless_chat_session() {
+        let ownerless = chat_session(None);
+        assert!(ADMIN.scope().includes(&ownerless));
+        assert!(ADMIN.delete_scope().includes(&ownerless));
+        assert!(ChatSessionScope::OWNERLESS.includes(&ownerless));
+        assert!(!OWNER.scope().includes(&ownerless));
+        assert!(!OWNER.delete_scope().includes(&ownerless));
+    }
+
+    #[test]
+    fn an_ownerless_chat_session_omits_its_owner_when_serialized() {
+        let json = serde_json::to_value(chat_session(None)).unwrap();
+        assert!(json.get("owner_user_id").is_none());
+        let json = serde_json::to_value(chat_session(Some(7))).unwrap();
+        assert_eq!(json["owner_user_id"], 7);
     }
 }

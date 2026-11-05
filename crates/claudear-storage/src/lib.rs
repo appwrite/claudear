@@ -1963,6 +1963,12 @@ pub trait DeployQaStore: Send + Sync {
         Ok(None)
     }
 
+    /// Most recent tips first, across every track or only `track`, at most
+    /// `limit` of them.
+    fn list_deploy_qa_tips(&self, _track: Option<&str>, _limit: usize) -> Result<Vec<DeployQaTip>> {
+        Ok(Vec::new())
+    }
+
     /// Pending tips waiting to be enqueued / picked up by the `deploy_qa` source.
     fn list_pending_deploy_qa_tips(&self) -> Result<Vec<DeployQaTip>> {
         Ok(Vec::new())
@@ -2319,39 +2325,65 @@ pub trait RegressionStore: Send + Sync {
 
 /// Chat sessions and messages (all defaulted).
 pub trait ChatStore: Send + Sync {
-    /// Create a new chat session.
-    fn create_chat_session(&self, _id: &str, _repo_id: Option<i64>) -> Result<()> {
+    /// Create a new chat session belonging to `owner_user_id`.
+    fn create_chat_session(
+        &self,
+        _id: &str,
+        _repo_id: Option<i64>,
+        _owner_user_id: Option<i64>,
+    ) -> Result<()> {
         Ok(())
     }
 
-    /// Save a chat message to a session.
+    /// The chat session `id`, with its owner and without its messages, if it
+    /// is in `scope`.
+    fn get_chat_session(
+        &self,
+        _id: &str,
+        _scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Option<claudear_core::types::ChatSession>> {
+        Ok(None)
+    }
+
+    /// Append a message to the session, checked to be in `scope` by the same
+    /// statement; `None` when no such session is in scope.
     fn save_chat_message(
         &self,
         _session_id: &str,
+        _scope: &claudear_core::types::ChatSessionScope,
         _role: &str,
         _content: &str,
         _sources_json: Option<&str>,
-    ) -> Result<i64> {
-        Ok(0)
+    ) -> Result<Option<i64>> {
+        Ok(None)
     }
 
-    /// Get chat message history for a session.
+    /// The most recent `limit` messages of the session, if it is in `scope`.
     fn get_chat_history(
         &self,
         _session_id: &str,
+        _scope: &claudear_core::types::ChatSessionScope,
         _limit: usize,
     ) -> Result<Vec<claudear_core::types::ChatMessage>> {
         Ok(Vec::new())
     }
 
-    /// List all chat sessions.
-    fn list_chat_sessions(&self) -> Result<Vec<claudear_core::types::ChatSession>> {
+    /// List the chat sessions in `scope`, most recently updated first.
+    fn list_chat_sessions(
+        &self,
+        _scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Vec<claudear_core::types::ChatSession>> {
         Ok(Vec::new())
     }
 
-    /// Delete a chat session and all its messages.
-    fn delete_chat_session(&self, _session_id: &str) -> Result<()> {
-        Ok(())
+    /// Delete the session and its messages if it is in `scope`, returning
+    /// whether it was.
+    fn delete_chat_session(
+        &self,
+        _session_id: &str,
+        _scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Cleanup expired chat sessions older than the given number of days.
@@ -3547,41 +3579,49 @@ mod tests {
         #[test]
         fn test_default_create_chat_session_succeeds() {
             let t = MockChat;
-            assert!(t.create_chat_session("session-1", None).is_ok());
-            assert!(t.create_chat_session("session-2", Some(42)).is_ok());
+            assert!(t.create_chat_session("session-1", None, None).is_ok());
+            assert!(t
+                .create_chat_session("session-2", Some(42), Some(7))
+                .is_ok());
+        }
+
+        const SCOPE: claudear_core::types::ChatSessionScope =
+            claudear_core::types::ChatSessionScope::OWNERLESS;
+
+        #[test]
+        fn test_default_get_chat_session_returns_none() {
+            let t = MockChat;
+            assert!(t.get_chat_session("session-1", &SCOPE).unwrap().is_none());
         }
 
         #[test]
-        fn test_default_save_chat_message_returns_zero() {
+        fn test_default_save_chat_message_saves_nothing() {
             let t = MockChat;
-            assert_eq!(
-                t.save_chat_message("session-1", "user", "hello", None)
-                    .unwrap(),
-                0
-            );
-            assert_eq!(
-                t.save_chat_message("session-1", "assistant", "hi", Some("[]"))
-                    .unwrap(),
-                0
-            );
+            assert!(t
+                .save_chat_message("session-1", &SCOPE, "user", "hello", None)
+                .unwrap()
+                .is_none());
         }
 
         #[test]
         fn test_default_get_chat_history_returns_empty() {
             let t = MockChat;
-            assert!(t.get_chat_history("session-1", 50).unwrap().is_empty());
+            assert!(t
+                .get_chat_history("session-1", &SCOPE, 50)
+                .unwrap()
+                .is_empty());
         }
 
         #[test]
         fn test_default_list_chat_sessions_returns_empty() {
             let t = MockChat;
-            assert!(t.list_chat_sessions().unwrap().is_empty());
+            assert!(t.list_chat_sessions(&SCOPE).unwrap().is_empty());
         }
 
         #[test]
-        fn test_default_delete_chat_session_succeeds() {
+        fn test_default_delete_chat_session_deletes_nothing() {
             let t = MockChat;
-            assert!(t.delete_chat_session("session-1").is_ok());
+            assert!(!t.delete_chat_session("session-1", &SCOPE).unwrap());
         }
 
         #[test]

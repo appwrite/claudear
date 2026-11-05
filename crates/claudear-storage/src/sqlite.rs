@@ -56,6 +56,12 @@ const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
+/// `chat_sessions` rows within a `ChatSessionScope` bound as
+/// `:owner_user_id`, `:include_ownerless` and `:include_other_owners`.
+const CHAT_SESSION_IN_SCOPE: &str = "(owner_user_id = :owner_user_id \
+     OR (:include_ownerless AND owner_user_id IS NULL) \
+     OR (:include_other_owners AND owner_user_id IS NOT NULL))";
+
 impl UserRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -4486,6 +4492,14 @@ impl DeployQaStore for SqliteTracker {
         SqliteTracker::get_last_seen_deploy_qa_tip(self, track)
     }
 
+    fn list_deploy_qa_tips(
+        &self,
+        track: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::list_deploy_qa_tips(self, track, limit)
+    }
+
     fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
         SqliteTracker::list_pending_deploy_qa_tips(self)
     }
@@ -4746,34 +4760,56 @@ impl SecurityReportStore for SqliteTracker {
 }
 
 impl ChatStore for SqliteTracker {
-    fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
-        SqliteTracker::create_chat_session(self, id, repo_id)
+    fn create_chat_session(
+        &self,
+        id: &str,
+        repo_id: Option<i64>,
+        owner_user_id: Option<i64>,
+    ) -> Result<()> {
+        SqliteTracker::create_chat_session(self, id, repo_id, owner_user_id)
+    }
+
+    fn get_chat_session(
+        &self,
+        id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Option<claudear_core::types::ChatSession>> {
+        SqliteTracker::get_chat_session(self, id, scope)
     }
 
     fn save_chat_message(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         role: &str,
         content: &str,
         sources_json: Option<&str>,
-    ) -> Result<i64> {
-        SqliteTracker::save_chat_message(self, session_id, role, content, sources_json)
+    ) -> Result<Option<i64>> {
+        SqliteTracker::save_chat_message(self, session_id, scope, role, content, sources_json)
     }
 
     fn get_chat_history(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         limit: usize,
     ) -> Result<Vec<claudear_core::types::ChatMessage>> {
-        SqliteTracker::get_chat_history(self, session_id, limit)
+        SqliteTracker::get_chat_history(self, session_id, scope, limit)
     }
 
-    fn list_chat_sessions(&self) -> Result<Vec<claudear_core::types::ChatSession>> {
-        SqliteTracker::list_chat_sessions(self)
+    fn list_chat_sessions(
+        &self,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Vec<claudear_core::types::ChatSession>> {
+        SqliteTracker::list_chat_sessions(self, scope)
     }
 
-    fn delete_chat_session(&self, session_id: &str) -> Result<()> {
-        SqliteTracker::delete_chat_session(self, session_id)
+    fn delete_chat_session(
+        &self,
+        session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<bool> {
+        SqliteTracker::delete_chat_session(self, session_id, scope)
     }
 
     fn cleanup_expired_chat_sessions(&self, max_age_days: u32) -> Result<usize> {
@@ -8229,6 +8265,33 @@ impl SqliteTracker {
             .optional()?)
     }
 
+    /// Most recent tips first, across every track or only `track`, at most
+    /// `limit` of them.
+    pub fn list_deploy_qa_tips(
+        &self,
+        track: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE (?1 IS NULL OR track = ?1)
+            ORDER BY CAST(COALESCE(strftime('%s', published_at), strftime('%s', created_at)) AS INTEGER) DESC,
+                     id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let tips = stmt
+            .query_map(params![track, limit], Self::row_to_deploy_qa_tip)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tips)
+    }
+
     /// Tips waiting to be picked up by the `deploy_qa` source.
     pub fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
         use claudear_core::types::DeployQaTipStatus;
@@ -10347,116 +10410,196 @@ impl SqliteTracker {
         Ok(())
     }
 
-    /// Create a new chat session.
-    pub fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
+    /// Create a new chat session belonging to `owner_user_id`.
+    pub fn create_chat_session(
+        &self,
+        id: &str,
+        repo_id: Option<i64>,
+        owner_user_id: Option<i64>,
+    ) -> Result<()> {
         let conn = self.acquire_lock()?;
         conn.execute(
-            "INSERT INTO chat_sessions (id, repo_id) VALUES (?1, ?2)",
-            params![id, repo_id],
+            "INSERT INTO chat_sessions (id, repo_id, owner_user_id) VALUES (?1, ?2, ?3)",
+            params![id, repo_id, owner_user_id],
         )?;
         Ok(())
     }
 
-    /// Save a chat message to a session.
+    /// The chat session `id`, with its owner and without its messages, if it
+    /// is in `scope`.
+    pub fn get_chat_session(
+        &self,
+        id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Option<claudear_core::types::ChatSession>> {
+        let conn = self.acquire_lock()?;
+        let session = conn
+            .query_row(
+                &format!(
+                    "SELECT id, repo_id, owner_user_id, created_at, updated_at
+                     FROM chat_sessions
+                     WHERE id = :id AND {CHAT_SESSION_IN_SCOPE}"
+                ),
+                rusqlite::named_params! {
+                    ":id": id,
+                    ":owner_user_id": scope.owner_user_id,
+                    ":include_ownerless": scope.include_ownerless,
+                    ":include_other_owners": scope.include_other_owners,
+                },
+                Self::row_to_chat_session,
+            )
+            .optional()?;
+        Ok(session)
+    }
+
+    /// Append a message to the session, checked to be in `scope` by the same
+    /// statement; `None` when no such session is in scope.
     pub fn save_chat_message(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         role: &str,
         content: &str,
         sources_json: Option<&str>,
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
         let conn = self.acquire_lock()?;
-        conn.execute(
-            "INSERT INTO chat_messages (session_id, role, content, sources_json) VALUES (?1, ?2, ?3, ?4)",
-            params![session_id, role, content, sources_json],
+        let inserted = conn.execute(
+            &format!(
+                "INSERT INTO chat_messages (session_id, role, content, sources_json)
+                 SELECT id, :role, :content, :sources_json
+                 FROM chat_sessions
+                 WHERE id = :id AND {CHAT_SESSION_IN_SCOPE}"
+            ),
+            rusqlite::named_params! {
+                ":role": role,
+                ":content": content,
+                ":sources_json": sources_json,
+                ":id": session_id,
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+            },
         )?;
+        if inserted == 0 {
+            return Ok(None);
+        }
         let id = conn.last_insert_rowid();
-        // Update session's updated_at
         conn.execute(
             "UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?1",
             params![session_id],
         )?;
-        Ok(id)
+        Ok(Some(id))
     }
 
-    /// Get chat message history for a session (most recent N messages).
+    /// The most recent `limit` messages of the session, oldest first, if it is
+    /// in `scope`.
     pub fn get_chat_history(
         &self,
         session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
         limit: usize,
     ) -> Result<Vec<claudear_core::types::ChatMessage>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, role, content, sources_json, created_at
+        let mut stmt = conn.prepare(&format!(
+            "SELECT chat_messages.id, role, content, sources_json, chat_messages.created_at
              FROM chat_messages
-             WHERE session_id = ?1
-             ORDER BY created_at DESC
-             LIMIT ?2",
+             JOIN chat_sessions ON chat_sessions.id = chat_messages.session_id
+             WHERE chat_messages.session_id = :id AND {CHAT_SESSION_IN_SCOPE}
+             ORDER BY chat_messages.created_at DESC, chat_messages.id DESC
+             LIMIT :limit"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::named_params! {
+                ":id": session_id,
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+                ":limit": i64::try_from(limit).unwrap_or(i64::MAX),
+            },
+            |row| {
+                let role_str: String = row.get(1)?;
+                let created_str: String = row.get(4)?;
+                Ok(claudear_core::types::ChatMessage {
+                    id: Some(row.get(0)?),
+                    role: claudear_core::types::ChatRole::parse(&role_str)
+                        .unwrap_or(claudear_core::types::ChatRole::User),
+                    content: row.get(2)?,
+                    sources_json: row.get(3)?,
+                    created_at: chrono::NaiveDateTime::parse_from_str(
+                        &created_str,
+                        "%Y-%m-%d %H:%M:%S",
+                    )
+                    .map(|dt| dt.and_utc())
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                })
+            },
         )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-            let role_str: String = row.get(1)?;
-            let created_str: String = row.get(4)?;
-            Ok(claudear_core::types::ChatMessage {
-                id: Some(row.get(0)?),
-                role: claudear_core::types::ChatRole::parse(&role_str)
-                    .unwrap_or(claudear_core::types::ChatRole::User),
-                content: row.get(2)?,
-                sources_json: row.get(3)?,
-                created_at: chrono::NaiveDateTime::parse_from_str(
-                    &created_str,
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .map(|dt| dt.and_utc())
-                .unwrap_or_else(|_| chrono::Utc::now()),
-            })
-        })?;
 
         let mut messages: Vec<_> = rows.filter_map(|r| r.ok()).collect();
-        messages.reverse(); // Return in chronological order
+        messages.reverse();
         Ok(messages)
     }
 
-    /// List all chat sessions.
-    pub fn list_chat_sessions(&self) -> Result<Vec<claudear_core::types::ChatSession>> {
+    /// List the chat sessions in `scope`, most recently updated first.
+    pub fn list_chat_sessions(
+        &self,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<Vec<claudear_core::types::ChatSession>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, repo_id, created_at, updated_at
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, repo_id, owner_user_id, created_at, updated_at
              FROM chat_sessions
-             ORDER BY updated_at DESC",
+             WHERE {CHAT_SESSION_IN_SCOPE}
+             ORDER BY updated_at DESC"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::named_params! {
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+            },
+            Self::row_to_chat_session,
         )?;
-        let rows = stmt.query_map([], |row| {
-            let created_str: String = row.get(2)?;
-            let updated_str: String = row.get(3)?;
-            Ok(claudear_core::types::ChatSession {
-                id: row.get(0)?,
-                repo_id: row.get(1)?,
-                created_at: chrono::NaiveDateTime::parse_from_str(
-                    &created_str,
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .map(|dt| dt.and_utc())
-                .unwrap_or_else(|_| chrono::Utc::now()),
-                updated_at: chrono::NaiveDateTime::parse_from_str(
-                    &updated_str,
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .map(|dt| dt.and_utc())
-                .unwrap_or_else(|_| chrono::Utc::now()),
-                messages: Vec::new(),
-            })
-        })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Delete a chat session and all its messages.
-    pub fn delete_chat_session(&self, session_id: &str) -> Result<()> {
+    fn row_to_chat_session(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<claudear_core::types::ChatSession> {
+        let created_str: String = row.get(3)?;
+        let updated_str: String = row.get(4)?;
+        Ok(claudear_core::types::ChatSession {
+            id: row.get(0)?,
+            repo_id: row.get(1)?,
+            owner_user_id: row.get(2)?,
+            created_at: chrono::NaiveDateTime::parse_from_str(&created_str, "%Y-%m-%d %H:%M:%S")
+                .map(|dt| dt.and_utc())
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: chrono::NaiveDateTime::parse_from_str(&updated_str, "%Y-%m-%d %H:%M:%S")
+                .map(|dt| dt.and_utc())
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            messages: Vec::new(),
+        })
+    }
+
+    /// Delete the session and its messages (by cascade) if it is in `scope`,
+    /// returning whether it was.
+    pub fn delete_chat_session(
+        &self,
+        session_id: &str,
+        scope: &claudear_core::types::ChatSessionScope,
+    ) -> Result<bool> {
         let conn = self.acquire_lock()?;
-        // Messages are CASCADE-deleted via FK.
-        conn.execute(
-            "DELETE FROM chat_sessions WHERE id = ?1",
-            params![session_id],
+        let deleted = conn.execute(
+            &format!("DELETE FROM chat_sessions WHERE id = :id AND {CHAT_SESSION_IN_SCOPE}"),
+            rusqlite::named_params! {
+                ":id": session_id,
+                ":owner_user_id": scope.owner_user_id,
+                ":include_ownerless": scope.include_ownerless,
+                ":include_other_owners": scope.include_other_owners,
+            },
         )?;
-        Ok(())
+        Ok(deleted > 0)
     }
 
     /// Cleanup expired chat sessions older than max_age_days. Returns count deleted.
@@ -11745,6 +11888,86 @@ mod tests {
         assert_eq!(stored.attempt_id, Some(9));
         assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
         assert_eq!(tracker.list_pending_deploy_qa_tips().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_list_deploy_qa_tips_newest_first_with_track_filter_and_limit() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for (track, tag, published_at) in [
+            ("cloud", "1.0.0", "2026-01-01T00:00:00Z"),
+            ("edge", "2.0.0", "2026-02-01T00:00:00Z"),
+            ("cloud", "1.1.0", "2026-03-01T00:00:00Z"),
+        ] {
+            let mut tip = DeployQaTip::new(track, format!("acme/{track}"), tag);
+            tip.published_at = Some(published_at.into());
+            tracker.upsert_deploy_qa_tip(&tip).unwrap();
+        }
+
+        let tags = |tips: Vec<DeployQaTip>| -> Vec<String> {
+            tips.into_iter().map(|tip| tip.tag).collect()
+        };
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(None, 10).unwrap()),
+            ["1.1.0", "2.0.0", "1.0.0"]
+        );
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(Some("cloud"), 10).unwrap()),
+            ["1.1.0", "1.0.0"]
+        );
+        assert_eq!(
+            tags(tracker.list_deploy_qa_tips(None, 2).unwrap()),
+            ["1.1.0", "2.0.0"]
+        );
+        assert_eq!(
+            tags(
+                tracker
+                    .list_deploy_qa_tips(Some("edge"), usize::MAX)
+                    .unwrap()
+            ),
+            ["2.0.0"]
+        );
+        assert!(tracker
+            .list_deploy_qa_tips(Some("missing"), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_list_deploy_qa_tips_orders_unpublished_tips_by_created_at_epoch() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut published = DeployQaTip::new("cloud", "acme/cloud", "1.0.0");
+        published.published_at = Some("2026-03-01T08:00:00Z".into());
+        tracker.upsert_deploy_qa_tip(&published).unwrap();
+
+        let unpublished = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "acme/cloud", "1.1.0"))
+            .unwrap();
+        assert_eq!(unpublished.published_at, None);
+
+        let mut offset = DeployQaTip::new("cloud", "acme/cloud", "0.9.0");
+        offset.published_at = Some("2026-03-01T10:30:00+05:00".into());
+        tracker.upsert_deploy_qa_tip(&offset).unwrap();
+
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE deploy_qa_tips SET created_at = '2026-03-01 09:00:00' WHERE id = ?1",
+                params![unpublished.id],
+            )
+            .unwrap();
+
+        let tags: Vec<String> = tracker
+            .list_deploy_qa_tips(Some("cloud"), 10)
+            .unwrap()
+            .into_iter()
+            .map(|tip| tip.tag)
+            .collect();
+        assert_eq!(tags, ["1.1.0", "1.0.0", "0.9.0"]);
     }
 
     #[test]
@@ -21423,12 +21646,30 @@ mod tests {
         assert!(result.is_none());
     }
 
+    const OWNERLESS_CHAT_SESSIONS: claudear_core::types::ChatSessionScope =
+        claudear_core::types::ChatSessionScope::OWNERLESS;
+
+    const EVERY_CHAT_SESSION: claudear_core::types::ChatSessionScope =
+        claudear_core::types::ChatSessionScope {
+            owner_user_id: None,
+            include_ownerless: true,
+            include_other_owners: true,
+        };
+
+    fn chat_owner(tracker: &SqliteTracker, email: &str) -> i64 {
+        tracker
+            .create_user(email, "hash", "Chat Owner", "viewer")
+            .unwrap()
+    }
+
     #[test]
     fn test_create_chat_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "sess-1");
         assert!(sessions[0].repo_id.is_none());
@@ -21439,10 +21680,12 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
         let repo_id = tracker.get_or_create_repo_id("my-repo").unwrap();
         tracker
-            .create_chat_session("sess-2", Some(repo_id))
+            .create_chat_session("sess-2", Some(repo_id), None)
             .unwrap();
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].repo_id, Some(repo_id));
     }
@@ -21450,24 +21693,29 @@ mod tests {
     #[test]
     fn test_save_and_get_chat_messages() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
         let id1 = tracker
-            .save_chat_message("sess-1", "user", "Hello!", None)
+            .save_chat_message("sess-1", &EVERY_CHAT_SESSION, "user", "Hello!", None)
+            .unwrap()
             .unwrap();
         assert!(id1 > 0);
 
         let id2 = tracker
             .save_chat_message(
                 "sess-1",
+                &EVERY_CHAT_SESSION,
                 "assistant",
                 "Hi there!",
                 Some(r#"{"docs":["a.rs"]}"#),
             )
+            .unwrap()
             .unwrap();
         assert!(id2 > id1);
 
-        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 10)
+            .unwrap();
         assert_eq!(history.len(), 2);
         // Should be in chronological order
         assert_eq!(history[0].content, "Hello!");
@@ -21481,15 +21729,23 @@ mod tests {
     #[test]
     fn test_get_chat_history_respects_limit() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
         for i in 0..5 {
             tracker
-                .save_chat_message("sess-1", "user", &format!("msg {}", i), None)
+                .save_chat_message(
+                    "sess-1",
+                    &EVERY_CHAT_SESSION,
+                    "user",
+                    &format!("msg {}", i),
+                    None,
+                )
                 .unwrap();
         }
 
-        let history = tracker.get_chat_history("sess-1", 3).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 3)
+            .unwrap();
         assert_eq!(history.len(), 3);
         // Should return the 3 most recent in chronological order
         assert_eq!(history[0].content, "msg 2");
@@ -21500,59 +21756,72 @@ mod tests {
     #[test]
     fn test_get_chat_history_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
-        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 10)
+            .unwrap();
         assert!(history.is_empty());
     }
 
     #[test]
     fn test_list_chat_sessions_multiple() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-a", None).unwrap();
-        tracker.create_chat_session("sess-b", None).unwrap();
-        tracker.create_chat_session("sess-c", None).unwrap();
+        tracker.create_chat_session("sess-a", None, None).unwrap();
+        tracker.create_chat_session("sess-b", None, None).unwrap();
+        tracker.create_chat_session("sess-c", None, None).unwrap();
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 3);
     }
 
     #[test]
     fn test_list_chat_sessions_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert!(sessions.is_empty());
     }
 
     #[test]
     fn test_delete_chat_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
         tracker
-            .save_chat_message("sess-1", "user", "hello", None)
+            .save_chat_message("sess-1", &EVERY_CHAT_SESSION, "user", "hello", None)
             .unwrap();
 
-        tracker.delete_chat_session("sess-1").unwrap();
+        assert!(tracker
+            .delete_chat_session("sess-1", &EVERY_CHAT_SESSION)
+            .unwrap());
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert!(sessions.is_empty());
 
         // Messages should also be gone (CASCADE delete)
-        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        let history = tracker
+            .get_chat_history("sess-1", &EVERY_CHAT_SESSION, 10)
+            .unwrap();
         assert!(history.is_empty());
     }
 
     #[test]
     fn test_delete_chat_session_nonexistent() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        // Should not error even if session doesn't exist
-        tracker.delete_chat_session("nonexistent").unwrap();
+        assert!(!tracker
+            .delete_chat_session("nonexistent", &EVERY_CHAT_SESSION)
+            .unwrap());
     }
 
     #[test]
     fn test_cleanup_expired_chat_sessions() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-old", None).unwrap();
-        tracker.create_chat_session("sess-new", None).unwrap();
+        tracker.create_chat_session("sess-old", None, None).unwrap();
+        tracker.create_chat_session("sess-new", None, None).unwrap();
 
         // Manually age one session via direct SQL
         {
@@ -21567,7 +21836,9 @@ mod tests {
         let deleted = tracker.cleanup_expired_chat_sessions(30).unwrap();
         assert_eq!(deleted, 1);
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "sess-new");
     }
@@ -21575,13 +21846,215 @@ mod tests {
     #[test]
     fn test_cleanup_expired_chat_sessions_none_expired() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker.create_chat_session("sess-1", None, None).unwrap();
 
         let deleted = tracker.cleanup_expired_chat_sessions(30).unwrap();
         assert_eq!(deleted, 0);
 
-        let sessions = tracker.list_chat_sessions().unwrap();
+        let sessions = tracker
+            .list_chat_sessions(&OWNERLESS_CHAT_SESSIONS)
+            .unwrap();
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_chat_session_records_its_owner() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let owner = chat_owner(&tracker, "owner@example.com");
+        tracker
+            .create_chat_session("owned", None, Some(owner))
+            .unwrap();
+        tracker.create_chat_session("legacy", None, None).unwrap();
+
+        let owned = tracker
+            .get_chat_session("owned", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(owned.id, "owned");
+        assert_eq!(owned.owner_user_id, Some(owner));
+        let legacy = tracker
+            .get_chat_session("legacy", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.owner_user_id, None);
+        assert!(tracker
+            .get_chat_session("missing", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_list_chat_sessions_is_scoped_to_the_owner() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let owner = chat_owner(&tracker, "owner@example.com");
+        let other = chat_owner(&tracker, "other@example.com");
+        tracker
+            .create_chat_session("mine", None, Some(owner))
+            .unwrap();
+        tracker
+            .create_chat_session("theirs", None, Some(other))
+            .unwrap();
+        tracker.create_chat_session("legacy", None, None).unwrap();
+
+        let ids = |include_ownerless: bool| {
+            let scope = claudear_core::types::ChatSessionScope {
+                owner_user_id: Some(owner),
+                include_ownerless,
+                include_other_owners: false,
+            };
+            let mut ids: Vec<String> = tracker
+                .list_chat_sessions(&scope)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(ids(false), ["mine"]);
+        assert_eq!(ids(true), ["legacy", "mine"]);
+    }
+
+    #[test]
+    fn test_deleting_a_user_deletes_their_chat_sessions() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let owner = chat_owner(&tracker, "owner@example.com");
+        tracker
+            .create_chat_session("owned", None, Some(owner))
+            .unwrap();
+        tracker
+            .save_chat_message("owned", &EVERY_CHAT_SESSION, "user", "hello", None)
+            .unwrap();
+
+        assert!(tracker.delete_user(owner).unwrap());
+
+        assert!(tracker
+            .get_chat_session("owned", &EVERY_CHAT_SESSION)
+            .unwrap()
+            .is_none());
+        assert!(tracker
+            .get_chat_history("owned", &EVERY_CHAT_SESSION, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    fn scoped_chat_sessions(tracker: &SqliteTracker) -> (i64, i64, i64) {
+        let owner = chat_owner(tracker, "owner@example.com");
+        let other = chat_owner(tracker, "other@example.com");
+        let admin = chat_owner(tracker, "admin@example.com");
+        for (id, owner_user_id) in [
+            ("mine", Some(owner)),
+            ("theirs", Some(other)),
+            ("legacy", None),
+        ] {
+            tracker
+                .create_chat_session(id, None, owner_user_id)
+                .unwrap();
+            tracker
+                .save_chat_message(id, &EVERY_CHAT_SESSION, "user", "seed", None)
+                .unwrap()
+                .unwrap();
+        }
+        (owner, other, admin)
+    }
+
+    fn chat_scopes(owner: i64, admin: i64) -> [claudear_core::types::ChatSessionScope; 4] {
+        let viewer = claudear_core::types::ChatViewer {
+            user_id: owner,
+            is_admin: false,
+        };
+        let administrator = claudear_core::types::ChatViewer {
+            user_id: admin,
+            is_admin: true,
+        };
+        [
+            viewer.scope(),
+            administrator.scope(),
+            administrator.delete_scope(),
+            OWNERLESS_CHAT_SESSIONS,
+        ]
+    }
+
+    #[test]
+    fn test_chat_reads_and_appends_are_confined_to_the_scope() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let (owner, _, admin) = scoped_chat_sessions(&tracker);
+
+        for scope in chat_scopes(owner, admin) {
+            let mut listed: Vec<String> = tracker
+                .list_chat_sessions(&scope)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            listed.sort();
+            let mut expected = Vec::new();
+            for id in ["legacy", "mine", "theirs"] {
+                let session = tracker
+                    .get_chat_session(id, &EVERY_CHAT_SESSION)
+                    .unwrap()
+                    .unwrap();
+                let included = scope.includes(&session);
+                if included {
+                    expected.push(id.to_string());
+                }
+                assert_eq!(
+                    tracker.get_chat_session(id, &scope).unwrap().is_some(),
+                    included,
+                    "get {id} in {scope:?}"
+                );
+                assert_eq!(
+                    !tracker.get_chat_history(id, &scope, 10).unwrap().is_empty(),
+                    included,
+                    "history of {id} in {scope:?}"
+                );
+                assert_eq!(
+                    tracker
+                        .save_chat_message(id, &scope, "user", "appended", None)
+                        .unwrap()
+                        .is_some(),
+                    included,
+                    "append to {id} in {scope:?}"
+                );
+            }
+            assert_eq!(listed, expected, "list in {scope:?}");
+        }
+
+        assert!(tracker
+            .save_chat_message("missing", &EVERY_CHAT_SESSION, "user", "lost", None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_chat_session_delete_is_confined_to_the_scope() {
+        for id in ["legacy", "mine", "theirs"] {
+            for index in 0..4 {
+                let tracker = SqliteTracker::in_memory().unwrap();
+                let (owner, _, admin) = scoped_chat_sessions(&tracker);
+                let scope = chat_scopes(owner, admin)[index];
+                let session = tracker
+                    .get_chat_session(id, &EVERY_CHAT_SESSION)
+                    .unwrap()
+                    .unwrap();
+                let included = scope.includes(&session);
+
+                assert_eq!(
+                    tracker.delete_chat_session(id, &scope).unwrap(),
+                    included,
+                    "delete {id} in {scope:?}"
+                );
+                assert_eq!(
+                    tracker
+                        .get_chat_session(id, &EVERY_CHAT_SESSION)
+                        .unwrap()
+                        .is_none(),
+                    included,
+                    "{id} after a delete in {scope:?}"
+                );
+            }
+        }
     }
 
     #[test]

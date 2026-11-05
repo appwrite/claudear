@@ -4,7 +4,8 @@
 //! - Redacted `Debug` and `Display` — prints `[REDACTED]` instead of the actual value
 //! - Zeroize-on-drop — securely clears memory when dropped
 //! - Explicit access via `.expose()` — forces conscious decision to reveal the secret
-//! - Serde support — deserializes/serializes as a plain string for TOML round-tripping
+//! - Serde support — deserializes/serializes as a plain string for TOML round-tripping,
+//!   or as [`REDACTED`] inside [`with_redaction`]
 //! - Constant-time equality — uses `subtle::ConstantTimeEq` to prevent timing attacks
 //! - Encryption at rest — AES-256-GCM encryption with `ENC[v1:...]` format
 //! - Redaction — [`Redactor`] masks credentials in untrusted text before it
@@ -16,11 +17,39 @@ mod redactor;
 pub use redactor::Redactor;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cell::Cell;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 /// What every redacted secret is replaced with.
 pub const REDACTED: &str = "[REDACTED]";
+
+thread_local! {
+    static REDACTION_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct RedactionGuard {
+    previous: bool,
+}
+
+impl Drop for RedactionGuard {
+    fn drop(&mut self) {
+        REDACTION_ACTIVE.set(self.previous);
+    }
+}
+
+/// Run `operation` with every [`SecretValue`], empty ones included,
+/// serializing as [`REDACTED`].
+///
+/// The scope is thread-local, so `operation` must be synchronous: never let it
+/// span an `.await`, or the task may resume on a thread without the scope.
+/// Scopes nest, and the previous state is restored even if `operation` panics.
+pub fn with_redaction<T>(operation: impl FnOnce() -> T) -> T {
+    let _guard = RedactionGuard {
+        previous: REDACTION_ACTIVE.replace(true),
+    };
+    operation()
+}
 
 /// A wrapper around a secret string that provides secure handling.
 ///
@@ -106,7 +135,11 @@ impl Serialize for SecretValue {
     where
         S: Serializer,
     {
-        self.inner.serialize(serializer)
+        if REDACTION_ACTIVE.get() {
+            serializer.serialize_str(REDACTED)
+        } else {
+            self.inner.serialize(serializer)
+        }
     }
 }
 
@@ -221,6 +254,80 @@ mod tests {
 
         let serialized = toml::to_string(&config).unwrap();
         assert!(serialized.contains("my-token"));
+    }
+
+    #[derive(Serialize)]
+    struct Credentials {
+        token: SecretValue,
+        optional: Option<SecretValue>,
+        empty: SecretValue,
+        name: String,
+    }
+
+    fn credentials() -> Credentials {
+        Credentials {
+            token: SecretValue::new("fake-token-value"),
+            optional: Some(SecretValue::new("fake-optional-value")),
+            empty: SecretValue::new(""),
+            name: "visible".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_with_redaction_masks_json_and_toml() {
+        let credentials = credentials();
+
+        let json = with_redaction(|| serde_json::to_value(&credentials).unwrap());
+        assert_eq!(json["token"], REDACTED);
+        assert_eq!(json["optional"], REDACTED);
+        assert_eq!(json["empty"], REDACTED);
+        assert_eq!(json["name"], "visible");
+
+        let toml_text = with_redaction(|| toml::to_string(&credentials).unwrap());
+        assert!(!toml_text.contains("fake-token-value"), "{toml_text}");
+        assert!(!toml_text.contains("fake-optional-value"), "{toml_text}");
+        assert!(toml_text.contains("name = \"visible\""), "{toml_text}");
+        assert_eq!(toml_text.matches(REDACTED).count(), 3, "{toml_text}");
+    }
+
+    #[test]
+    fn test_serialization_outside_redaction_is_plain() {
+        let credentials = credentials();
+        with_redaction(|| ());
+
+        let json = serde_json::to_value(&credentials).unwrap();
+        assert_eq!(json["token"], "fake-token-value");
+        assert_eq!(json["optional"], "fake-optional-value");
+        assert_eq!(json["empty"], "");
+
+        let toml_text = toml::to_string(&credentials).unwrap();
+        assert!(toml_text.contains("fake-token-value"), "{toml_text}");
+    }
+
+    #[test]
+    fn test_redaction_resets_after_panic() {
+        let outcome = std::panic::catch_unwind(|| {
+            with_redaction(|| panic!("serialization failed"));
+        });
+        assert!(outcome.is_err());
+
+        let json = serde_json::to_value(credentials()).unwrap();
+        assert_eq!(json["token"], "fake-token-value");
+    }
+
+    #[test]
+    fn test_redaction_scopes_nest() {
+        let credentials = credentials();
+        let (inner, after_inner) = with_redaction(|| {
+            let inner = with_redaction(|| serde_json::to_value(&credentials).unwrap());
+            (inner, serde_json::to_value(&credentials).unwrap())
+        });
+        assert_eq!(inner["token"], REDACTED);
+        assert_eq!(after_inner["token"], REDACTED);
+        assert_eq!(after_inner["empty"], REDACTED);
+
+        let outside = serde_json::to_value(&credentials).unwrap();
+        assert_eq!(outside["token"], "fake-token-value");
     }
 
     #[test]

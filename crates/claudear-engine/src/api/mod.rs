@@ -3,7 +3,11 @@
 //! Provides REST API for the analytics dashboard.
 
 pub mod auth;
+mod chat;
+mod config_file;
+mod deploy_qa;
 pub(crate) mod embedded;
+mod features;
 mod routes;
 mod security;
 mod security_reports;
@@ -12,11 +16,13 @@ mod test_support;
 mod tokens;
 mod visibility;
 
+pub use chat::chat_state;
 pub use routes::{create_api_router, create_api_router_full, create_api_router_with_dashboard};
 
 use axum::http;
 use claudear_config::config::Config;
 use claudear_core::error::Result;
+use claudear_integrations::chat::ChatState;
 use claudear_storage::FixAttemptTracker;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use std::path::PathBuf;
@@ -80,6 +86,7 @@ pub struct ApiServer {
     port: u16,
     dashboard_dir: Option<PathBuf>,
     config_path: PathBuf,
+    chat: Option<ChatState>,
 }
 
 impl ApiServer {
@@ -92,6 +99,7 @@ impl ApiServer {
             port,
             dashboard_dir: None,
             config_path,
+            chat: None,
         }
     }
 
@@ -108,6 +116,7 @@ impl ApiServer {
             port,
             dashboard_dir: None,
             config_path,
+            chat: None,
         }
     }
 
@@ -125,7 +134,14 @@ impl ApiServer {
             port,
             dashboard_dir: Some(dashboard_dir),
             config_path,
+            chat: None,
         }
+    }
+
+    /// Serve the chat routes from `chat`; without it they are not mounted.
+    pub fn with_chat(mut self, chat: Option<ChatState>) -> Self {
+        self.chat = chat;
+        self
     }
 
     /// Start the API server.
@@ -135,12 +151,13 @@ impl ApiServer {
 
         let tls_enabled = self.config.tls.enabled;
         let app = apply_dashboard_middleware(
-            create_api_router_with_dashboard(
+            create_api_router_full(
                 self.config.clone(),
                 self.tracker.clone(),
                 self.config_path,
                 indexing_rx,
                 self.dashboard_dir.clone(),
+                self.chat,
             ),
             tls_enabled,
         )

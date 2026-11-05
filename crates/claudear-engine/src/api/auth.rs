@@ -14,6 +14,7 @@ use tower_cookies::{Cookie, Cookies};
 use super::routes::ApiState;
 
 const SESSION_COOKIE: &str = "claudear_session";
+const ADMIN_ROLE: &str = "admin";
 const SESSION_MAX_AGE_DAYS: i64 = 7;
 
 /// Maximum number of login attempts per email within the rate limit window.
@@ -209,8 +210,6 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
     "unknown".to_string()
 }
 
-pub const ADMIN_ROLE: &str = "admin";
-
 /// Authenticated user extracted from session cookie.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthUser {
@@ -275,7 +274,7 @@ impl FromRequestParts<ApiState> for AuthUser {
     }
 }
 
-/// Admin user extractor — wraps AuthUser and checks the admin role.
+/// Admin user extractor — wraps AuthUser and checks it is an admin.
 #[derive(Debug, Clone)]
 pub struct AdminUser(pub AuthUser);
 

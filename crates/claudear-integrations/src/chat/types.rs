@@ -98,6 +98,7 @@ impl Default for GenerationParams {
 /// Result of preparing a chat request (before LLM generation).
 pub struct PreparedChat {
     pub session_id: String,
+    pub scope: claudear_core::types::ChatSessionScope,
     pub prompt: String,
     pub sources: Vec<ChatSource>,
     pub gen_params: super::llm::GenerationParams,
