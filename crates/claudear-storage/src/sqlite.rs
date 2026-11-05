@@ -17,7 +17,7 @@ use crate::vector_index::{embedding_blob, embedding_from_blob, REBUILD_BATCH_SIZ
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::identity::{
-    normalize_login_email, ConsoleIdentity, Identities, Role, UserStatus,
+    normalize_login_email, ConsoleIdentity, Identities, IdentityField, Role, UserStatus,
 };
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
@@ -29,7 +29,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rand::RngExt;
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -284,6 +284,34 @@ fn write_identities(connection: &Connection, user_id: i64, write: &IdentityWrite
             identities.telegram_chat_id,
         ],
     )?;
+    Ok(())
+}
+
+/// Drop every handle the user claims, so a rewrite can claim its new set.
+fn release_handles(connection: &Connection, user_id: i64) -> rusqlite::Result<usize> {
+    connection.execute(
+        "DELETE FROM user_handles WHERE user_id = ?1",
+        params![user_id],
+    )
+}
+
+/// Claim the user's exclusive handles in comparison form. A handle another user holds
+/// fails with [`crate::DUPLICATE_HANDLE`].
+fn claim_handles(connection: &Connection, user_id: i64, identities: &Identities) -> Result<()> {
+    let handles: HashSet<(IdentityField, String)> = IdentityField::EXCLUSIVE
+        .into_iter()
+        .flat_map(|field| {
+            identities
+                .values(field)
+                .into_iter()
+                .map(move |value| (field, field.comparison_key(value)))
+        })
+        .collect();
+    let mut statement = connection
+        .prepare_cached("INSERT INTO user_handles (user_id, field, value) VALUES (?1, ?2, ?3)")?;
+    for (field, value) in &handles {
+        statement.execute(params![user_id, field.as_str(), value])?;
+    }
     Ok(())
 }
 
@@ -4669,11 +4697,14 @@ impl UserStore for SqliteTracker {
     }
 
     fn delete_user_identities(&self, user_id: i64) -> Result<bool> {
-        let connection = self.acquire_lock()?;
-        let deleted = connection.execute(
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        release_handles(&transaction, user_id)?;
+        let deleted = transaction.execute(
             "DELETE FROM user_identities WHERE user_id = ?1",
             params![user_id],
         )?;
+        transaction.commit()?;
         Ok(deleted > 0)
     }
 
@@ -4697,10 +4728,13 @@ impl UserStore for SqliteTracker {
         let mut connection = self.acquire_lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut user_ids = Vec::with_capacity(writes.len());
+        let mut claims: BTreeMap<i64, &Identities> = BTreeMap::new();
         for write in writes {
             let user_id = write_directory_user(&transaction, &write.user)?;
             if let Some(identities) = &write.identities {
                 write_identities(&transaction, user_id, identities)?;
+                release_handles(&transaction, user_id)?;
+                claims.insert(user_id, &identities.identities);
             }
             if let Some(invite) = &write.invite {
                 replace_invite(
@@ -4712,6 +4746,11 @@ impl UserStore for SqliteTracker {
                 )?;
             }
             user_ids.push(user_id);
+        }
+        // Claimed only after every user released theirs, so one batch can move a handle
+        // between people whatever order their entries come in.
+        for (user_id, identities) in claims {
+            claim_handles(&transaction, user_id, identities)?;
         }
         transaction.commit()?;
         Ok(user_ids)
@@ -24271,6 +24310,307 @@ mod tests {
 
             assert!(result.is_err());
             assert_eq!(count(&tracker, "user_identities"), 0);
+        }
+
+        fn viewer(tracker: &SqliteTracker, email: &str) -> i64 {
+            tracker
+                .create_user(email, "hash", "Person", Role::Viewer)
+                .unwrap()
+        }
+
+        fn handle_owners(tracker: &SqliteTracker) -> Vec<(i64, String, String)> {
+            let connection = tracker.acquire_lock().unwrap();
+            let mut statement = connection
+                .prepare("SELECT user_id, field, value FROM user_handles ORDER BY field, value")
+                .unwrap();
+            let owners = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            owners
+        }
+
+        fn assert_duplicate_handle(result: Result<Vec<i64>>) {
+            match result {
+                Err(claudear_core::error::Error::Database(message)) => assert!(
+                    message.contains(crate::DUPLICATE_HANDLE),
+                    "unexpected database error: {message}"
+                ),
+                other => panic!("expected a duplicate handle error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_save_directory_claims_each_exclusive_handle_in_comparison_form() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let user_id = viewer(&tracker, "jake@example.com");
+            let identities = Identities {
+                github_usernames: vec!["JakeBarnby".to_string(), "jakebarnby".to_string()],
+                gitlab_usernames: vec!["Jake.GitLab".to_string()],
+                ..complete_identities()
+            };
+
+            tracker
+                .save_directory(&[identities_write(user_id, None, identities)])
+                .unwrap();
+
+            let claimed =
+                |field: &str, value: &str| (user_id, field.to_string(), value.to_string());
+            assert_eq!(
+                handle_owners(&tracker),
+                vec![
+                    claimed("discord_id", "452316113016193024"),
+                    claimed("github_usernames", "jakebarnby"),
+                    claimed("gitlab_usernames", "jake.gitlab"),
+                    claimed("jira_usernames", "jake.jira"),
+                    claimed("linear_names", "Jake Barnby"),
+                    claimed("sentry_usernames", "jake.sentry"),
+                    claimed("slack_id", "U0123456789"),
+                ]
+            );
+        }
+
+        #[test]
+        fn test_save_directory_rejects_a_github_login_another_user_claims_in_any_case() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, None, github("JakeBarnby"))])
+                .unwrap();
+
+            assert_duplicate_handle(tracker.save_directory(&[identities_write(
+                bob,
+                None,
+                github("jakebarnby"),
+            )]));
+            assert!(tracker.get_user_identities(bob).unwrap().is_none());
+        }
+
+        #[test]
+        fn test_save_directory_rejects_an_exact_handle_another_user_claims() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            let slack = |slack_id: &str| Identities {
+                slack_id: Some(slack_id.to_string()),
+                ..Identities::default()
+            };
+            tracker
+                .save_directory(&[identities_write(amy, None, slack("U0123456789"))])
+                .unwrap();
+
+            tracker
+                .save_directory(&[identities_write(bob, None, slack("u0123456789"))])
+                .unwrap();
+            assert_duplicate_handle(tracker.save_directory(&[identities_write(
+                bob,
+                None,
+                slack("U0123456789"),
+            )]));
+        }
+
+        #[test]
+        fn test_save_directory_lets_people_share_notification_targets() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            let shared = Identities {
+                email: Some("team@example.com".to_string()),
+                push_user_key: Some("uQiRzpo4DXghDmr9QzzfQu27cmVRsG".to_string()),
+                sms_number: Some("+14155550123".to_string()),
+                whatsapp_number: Some("+14155550199".to_string()),
+                telegram_chat_id: Some("-1001234567890".to_string()),
+                ..Identities::default()
+            };
+
+            tracker
+                .save_directory(&[
+                    identities_write(amy, None, shared.clone()),
+                    identities_write(bob, None, shared.clone()),
+                ])
+                .unwrap();
+
+            assert_eq!(tracker.list_user_identities().unwrap().len(), 2);
+            assert!(handle_owners(&tracker).is_empty());
+        }
+
+        #[test]
+        fn test_save_directory_rolls_back_the_batch_on_a_duplicate_handle() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let admin = create_admin(&tracker);
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, Some("amy"), github("amy"))])
+                .unwrap();
+            let before = handle_owners(&tracker);
+
+            assert_duplicate_handle(tracker.save_directory(&[
+                identities_write(amy, Some("amy"), github("amy-renamed")),
+                DirectoryWrite {
+                    user: new_user("cleo@example.com", UserStatus::Invited),
+                    identities: Some(IdentityWrite {
+                        slug: None,
+                        identities: github("cleo"),
+                    }),
+                    invite: Some(invite("hash_cleo", FUTURE, admin)),
+                },
+                identities_write(bob, None, github("AMY-RENAMED")),
+            ]));
+
+            assert_eq!(handle_owners(&tracker), before);
+            assert_eq!(
+                tracker
+                    .get_user_identities(amy)
+                    .unwrap()
+                    .unwrap()
+                    .identities,
+                github("amy")
+            );
+            assert!(tracker.get_user_identities(bob).unwrap().is_none());
+            assert!(tracker
+                .get_user_by_email("cleo@example.com")
+                .unwrap()
+                .is_none());
+            assert_eq!(count(&tracker, "user_invites"), 0);
+        }
+
+        #[test]
+        fn test_save_directory_moves_a_handle_between_people_in_one_batch() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, None, github("shared-login"))])
+                .unwrap();
+
+            tracker
+                .save_directory(&[
+                    identities_write(bob, None, github("shared-login")),
+                    identities_write(amy, None, github("amy")),
+                ])
+                .unwrap();
+
+            assert_eq!(
+                handle_owners(&tracker),
+                vec![
+                    (amy, "github_usernames".to_string(), "amy".to_string()),
+                    (
+                        bob,
+                        "github_usernames".to_string(),
+                        "shared-login".to_string()
+                    ),
+                ]
+            );
+        }
+
+        #[test]
+        fn test_rewriting_identities_releases_the_old_handles() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, None, github("old-login"))])
+                .unwrap();
+            tracker
+                .save_directory(&[identities_write(amy, None, github("new-login"))])
+                .unwrap();
+
+            tracker
+                .save_directory(&[identities_write(bob, None, github("old-login"))])
+                .unwrap();
+            assert_duplicate_handle(tracker.save_directory(&[identities_write(
+                bob,
+                None,
+                github("new-login"),
+            )]));
+        }
+
+        #[test]
+        fn test_deleting_identities_frees_their_handles() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            let bob = viewer(&tracker, "bob@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, None, github("amy"))])
+                .unwrap();
+
+            assert!(tracker.delete_user_identities(amy).unwrap());
+
+            assert!(handle_owners(&tracker).is_empty());
+            tracker
+                .save_directory(&[identities_write(bob, None, github("amy"))])
+                .unwrap();
+        }
+
+        #[test]
+        fn test_deleting_a_user_frees_their_handles() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let amy = viewer(&tracker, "amy@example.com");
+            tracker
+                .save_directory(&[identities_write(amy, None, github("amy"))])
+                .unwrap();
+
+            tracker
+                .acquire_lock()
+                .unwrap()
+                .execute("DELETE FROM users WHERE id = ?1", params![amy])
+                .unwrap();
+
+            assert!(handle_owners(&tracker).is_empty());
+        }
+
+        #[test]
+        fn test_concurrent_trackers_claiming_one_handle_succeed_exactly_once() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let setup = SqliteTracker::new(&path).unwrap();
+            let users: Vec<i64> = (0..4)
+                .map(|index| viewer(&setup, &format!("person{index}@example.com")))
+                .collect();
+            let trackers: Vec<SqliteTracker> = users
+                .iter()
+                .map(|_| SqliteTracker::new(&path).unwrap())
+                .collect();
+            let barrier = Arc::new(Barrier::new(trackers.len()));
+
+            let results: Vec<Result<Vec<i64>>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = trackers
+                    .iter()
+                    .zip(&users)
+                    .enumerate()
+                    .map(|(index, (tracker, &user_id))| {
+                        let barrier = Arc::clone(&barrier);
+                        let login = if index % 2 == 0 {
+                            "JakeBarnby"
+                        } else {
+                            "jakebarnby"
+                        };
+                        scope.spawn(move || {
+                            barrier.wait();
+                            tracker.save_directory(&[identities_write(
+                                user_id,
+                                None,
+                                github(login),
+                            )])
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect()
+            });
+
+            let (won, lost): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+            assert_eq!(won.len(), 1);
+            for result in lost {
+                assert_duplicate_handle(result);
+            }
+            assert_eq!(setup.list_user_identities().unwrap().len(), 1);
+            assert_eq!(handle_owners(&setup).len(), 1);
         }
 
         #[test]
