@@ -10,12 +10,12 @@ mod channel;
 pub use channel::NotificationChannel;
 
 use crate::config::UserConfig;
-use claudear_core::identity::{ConsoleIdentity, Identities, IdentityField, IdentityOrigin};
+use claudear_core::identity::{
+    ConsoleIdentity, Identities, IdentityField, IdentityOrigin, CONSOLE_KEY_PREFIX,
+};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-
-const CONSOLE_KEY_PREFIX: &str = "console-";
 
 const SOURCES: [(&str, IdentityField); 5] = [
     ("linear", IdentityField::LinearNames),
@@ -23,18 +23,6 @@ const SOURCES: [(&str, IdentityField); 5] = [
     ("sentry", IdentityField::SentryUsernames),
     ("jira", IdentityField::JiraUsernames),
     ("gitlab", IdentityField::GitlabUsernames),
-];
-
-/// Handles that identify exactly one person. Notification targets (email, phone numbers,
-/// push keys, chat ids) may be shared, for example by a team inbox, so they are not indexed.
-const EXCLUSIVE_FIELDS: [IdentityField; 7] = [
-    IdentityField::LinearNames,
-    IdentityField::GithubUsernames,
-    IdentityField::SentryUsernames,
-    IdentityField::JiraUsernames,
-    IdentityField::GitlabUsernames,
-    IdentityField::DiscordId,
-    IdentityField::SlackId,
 ];
 
 /// Resolved user with notification channel IDs.
@@ -281,7 +269,10 @@ struct Seed {
 }
 
 impl Seed {
-    fn new(users: HashMap<String, UserConfig>) -> Self {
+    /// Config keys with the reserved [`CONSOLE_KEY_PREFIX`] are dropped, so they can never
+    /// shadow a console alias or be linked to a console user by email.
+    fn new(mut users: HashMap<String, UserConfig>) -> Self {
+        users.retain(|key, _| !key.starts_with(CONSOLE_KEY_PREFIX));
         let mut emails: HashMap<String, Vec<String>> = HashMap::new();
         for (key, user) in &users {
             if let Some(email) = user.email.as_deref().and_then(email_key) {
@@ -329,12 +320,10 @@ struct Handle {
 
 impl Handle {
     fn new(field: IdentityField, value: &str) -> Self {
-        let value = if field.is_case_insensitive() {
-            value.to_lowercase()
-        } else {
-            value.to_string()
-        };
-        Self { field, value }
+        Self {
+            field,
+            value: field.comparison_key(value),
+        }
     }
 }
 
@@ -382,7 +371,7 @@ impl Directory {
         let mut handles: HashMap<Handle, usize> = HashMap::new();
         for (index, person) in persons.iter().enumerate() {
             keys.entry(person.key.clone()).or_insert(index);
-            for field in EXCLUSIVE_FIELDS {
+            for field in IdentityField::EXCLUSIVE {
                 for value in exclusive_values(&person.user, field) {
                     handles.entry(Handle::new(field, value)).or_insert(index);
                 }
@@ -390,7 +379,7 @@ impl Directory {
         }
         let mut consoles: HashMap<i64, usize> = HashMap::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
-            keys.entry(console_key(entry.user_id)).or_insert(index);
+            keys.insert(console_key(entry.user_id), index);
             consoles.insert(entry.user_id, index);
         }
 
@@ -697,6 +686,52 @@ mod tests {
             email: email.map(str::to_string),
             ..UserConfig::default()
         }
+    }
+
+    #[test]
+    fn config_key_with_console_prefix_never_shadows_a_console_alias() {
+        let mut users = test_users();
+        users.insert(
+            "console-3".to_string(),
+            config_user(&["impostor"], None, Some("impostor@example.com")),
+        );
+        let registry = UserRegistry::new(users);
+        assert!(registry.get_by_slug("console-3").is_none());
+        assert!(registry.resolve("github", "impostor").is_none());
+
+        let identities = handles(&["real-console"], None);
+        let entry = console(3, "impostor@example.com", None, identities.clone());
+        registry.replace_console(vec![entry.clone()]);
+
+        assert_eq!(
+            registry.get_by_slug("console-3"),
+            Some(UserConfig::from(identities))
+        );
+        assert_eq!(registry.origin("console-3"), Some(IdentityOrigin::Console));
+        assert_eq!(registry.person_key(&entry), "console-3");
+    }
+
+    #[test]
+    fn console_alias_wins_over_a_console_slug_naming_another_user() {
+        let registry = UserRegistry::new(test_users());
+        registry.replace_console(vec![
+            console(
+                3,
+                "three@example.com",
+                Some("console-5"),
+                handles(&["three"], None),
+            ),
+            console(5, "five@example.com", None, handles(&["five"], None)),
+        ]);
+
+        assert_eq!(
+            registry.get_by_slug("console-5").unwrap().github_usernames,
+            vec!["five"]
+        );
+        assert_eq!(
+            registry.get_by_slug("console-3").unwrap().github_usernames,
+            vec!["three"]
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! Environment variables can override any TOML values.
 
 use claudear_core::error::{Error, Result};
+use claudear_core::identity::CONSOLE_KEY_PREFIX;
 use claudear_core::secret::SecretValue;
 use claudear_core::types::DeployQaTip;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -2791,8 +2792,8 @@ impl Config {
 
     /// Validate minimal configuration needed for loading.
     ///
-    /// Only validates `workspace` is set. Repository validation is done
-    /// in `validate()` for commands that actually need repositories.
+    /// Only validates `workspace` is set and the `[users]` keys. Repository
+    /// validation is done in `validate()` for commands that actually need repositories.
     fn validate_project_config(&self) -> Result<()> {
         if self.workspace.as_os_str().is_empty() {
             return Err(Error::config(
@@ -2800,7 +2801,26 @@ impl Config {
             ));
         }
 
-        Ok(())
+        self.validate_user_keys()
+    }
+
+    /// Reject `[users.<key>]` entries whose key starts with the prefix reserved for the
+    /// `console-<user_id>` alias of every console user.
+    fn validate_user_keys(&self) -> Result<()> {
+        let mut reserved: Vec<&str> = self
+            .users
+            .keys()
+            .map(String::as_str)
+            .filter(|key| key.starts_with(CONSOLE_KEY_PREFIX))
+            .collect();
+        reserved.sort_unstable();
+        match reserved.first() {
+            Some(key) => Err(Error::config(format!(
+                "[users.{key}]: user keys must not start with '{CONSOLE_KEY_PREFIX}', which is \
+                 reserved for console users; rename the entry"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Load configuration from the default config file path.
@@ -4812,6 +4832,45 @@ known_orgs = ["appwrite"]
             let result = Config::load(file.path());
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains("workspace"));
+        });
+    }
+
+    #[test]
+    fn test_load_rejects_a_user_key_with_the_reserved_console_prefix() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[users.jake]
+github_usernames = ["jakebarnby"]
+
+[users.console-7]
+github_usernames = ["impostor"]
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[], || {
+            let message = Config::load(file.path()).unwrap_err().to_string();
+            assert!(message.contains("[users.console-7]"), "{message}");
+            assert!(message.contains("reserved"), "{message}");
+        });
+    }
+
+    #[test]
+    fn test_load_accepts_user_keys_that_only_resemble_the_console_prefix() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[users.console]
+github_usernames = ["console-bot"]
+
+[users.consoles-team]
+github_usernames = ["consoles"]
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[], || {
+            let config = Config::load(file.path()).unwrap();
+            assert_eq!(config.users.len(), 2);
         });
     }
 
