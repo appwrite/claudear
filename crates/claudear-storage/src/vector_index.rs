@@ -24,7 +24,7 @@ use statements::Statements;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-pub(crate) const REBUILD_BATCH_SIZE: usize = 256;
+pub(crate) const REBUILD_BATCH_SIZE: usize = 64;
 
 /// Catches schema changes no write or search on this connection noticed, such as another
 /// process dropping a vector table.

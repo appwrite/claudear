@@ -4,6 +4,7 @@ use super::signal::Signal;
 use super::VectorIndex;
 use rusqlite::Connection;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub(crate) struct Catalog {
     session: Arc<Session>,
@@ -40,6 +41,10 @@ impl Catalog {
 
     pub(crate) fn is_stopped(&self) -> bool {
         self.session.signal().is_stopped()
+    }
+
+    pub(crate) fn rest(&self, duration: Duration) {
+        self.session.signal().rest(duration);
     }
 
     pub(crate) fn all(&self) -> [&VectorIndex; 5] {
