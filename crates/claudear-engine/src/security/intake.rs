@@ -70,7 +70,8 @@ fn reply_outcome(verdict: &Verdict) -> Option<SecurityOutcome> {
         Verdict::Valid
         | Verdict::FixedAfterReport(_)
         | Verdict::NeedsHuman(_)
-        | Verdict::UnindexedRepository(_) => None,
+        | Verdict::UnindexedRepository(_)
+        | Verdict::ConflictingRepository(_) => None,
     }
 }
 

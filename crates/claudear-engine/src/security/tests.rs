@@ -879,6 +879,19 @@ async fn an_assessment_naming_an_unindexed_repository_goes_to_needs_human() {
     for (named, recorded) in [
         (OTHER_REPOSITORY, OTHER_REPOSITORY),
         ("appwrite-labs/billing", "[redacted]"),
+        ("git@github.com:appwrite/console.git", OTHER_REPOSITORY),
+        (
+            "https://github.com/appwrite/console/tree/main/src",
+            OTHER_REPOSITORY,
+        ),
+        ("www.github.com/appwrite/console", OTHER_REPOSITORY),
+        ("not a repository", "not a repository"),
+        ("console", "console"),
+        ("appwrite/appwrite/src", "appwrite/appwrite/src"),
+        (
+            "https://gitlab.com/appwrite/console",
+            "https://gitlab.com/appwrite/console",
+        ),
     ] {
         let harness = Harness::new();
         harness
@@ -888,9 +901,12 @@ async fn an_assessment_naming_an_unindexed_repository_goes_to_needs_human() {
             .route(&report_issue("1", REPORT_BODY, reported(0)))
             .await;
 
-        assert!(matches!(route, SecurityRoute::Done { .. }), "{route:?}");
+        assert!(
+            matches!(route, SecurityRoute::Done { .. }),
+            "{named:?}: {route:?}"
+        );
         let report = harness.report("1");
-        assert_eq!(report.state, SecurityReportState::NeedsHuman);
+        assert_eq!(report.state, SecurityReportState::NeedsHuman, "{named:?}");
         assert_eq!(report.outcome, None);
         assert_eq!(report.vulnerability_id, None);
         assert_eq!(report.affected_repository, None);
@@ -922,7 +938,10 @@ async fn an_assessment_naming_the_checked_repository_keeps_its_verdict() {
         REPOSITORY,
         "Appwrite/Appwrite",
         " https://github.com/appwrite/appwrite.git ",
-        "not a repository",
+        "git@github.com:appwrite/appwrite.git",
+        "ssh://git@github.com/appwrite/appwrite",
+        "www.github.com/appwrite/appwrite",
+        "https://github.com/appwrite/appwrite/tree/main/src",
     ] {
         let harness = Harness::new();
         harness
@@ -970,6 +989,95 @@ async fn an_assessment_naming_an_indexed_repository_is_rerun_there() {
     let vulnerability = harness.vulnerability(report.vulnerability_id.unwrap());
     assert_eq!(vulnerability.repository.as_deref(), Some(OTHER_REPOSITORY));
     assert_eq!(harness.pings_containing("unindexed_repository"), 0);
+}
+
+#[tokio::test]
+async fn a_rerun_naming_the_redirected_repository_keeps_its_verdict() {
+    for rerun in [
+        "",
+        OTHER_REPOSITORY,
+        "https://github.com/appwrite/console/tree/main/src",
+    ] {
+        let other = Repository::new();
+        let mut harness = Harness::new();
+        harness.index(OTHER_REPOSITORY, &other);
+        harness
+            .agent
+            .queue(Query::Assessment, Ok(assessment_naming(OTHER_REPOSITORY)));
+        harness
+            .agent
+            .queue(Query::Assessment, Ok(assessment_naming(rerun)));
+        let route = harness
+            .route(&report_issue("1", REPORT_BODY, reported(0)))
+            .await;
+
+        assert!(
+            matches!(route, SecurityRoute::RunFix(_)),
+            "{rerun:?}: {route:?}"
+        );
+        assert_eq!(harness.agent.calls_of(Query::Assessment).len(), 2);
+        assert_eq!(
+            harness.report("1").affected_repository.as_deref(),
+            Some(OTHER_REPOSITORY)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rerun_naming_another_repository_goes_to_needs_human() {
+    let third = "appwrite/sdk-generator";
+    for (rerun, recorded) in [
+        (REPOSITORY, REPOSITORY),
+        ("git@github.com:appwrite/appwrite.git", REPOSITORY),
+        (third, third),
+        ("appwrite-labs/billing", "[redacted]"),
+        ("not a repository", "not a repository"),
+    ] {
+        let other = Repository::new();
+        let mut harness = Harness::new();
+        harness.index(OTHER_REPOSITORY, &other);
+        harness
+            .agent
+            .queue(Query::Assessment, Ok(assessment_naming(OTHER_REPOSITORY)));
+        harness
+            .agent
+            .queue(Query::Assessment, Ok(assessment_naming(rerun)));
+        let route = harness
+            .route(&report_issue("1", REPORT_BODY, reported(0)))
+            .await;
+
+        assert!(
+            matches!(route, SecurityRoute::Done { .. }),
+            "{rerun:?}: {route:?}"
+        );
+        let assessments = harness.agent.calls_of(Query::Assessment);
+        assert_eq!(assessments.len(), 2);
+        assert_eq!(assessments[1].project_dir, other.clone);
+        let report = harness.report("1");
+        assert_eq!(report.state, SecurityReportState::NeedsHuman, "{rerun:?}");
+        assert_eq!(report.outcome, None);
+        assert_eq!(report.vulnerability_id, None);
+        assert_eq!(report.affected_repository, None);
+        assert!(harness.source.replies().is_empty());
+        assert!(reply_kinds(&harness.tracker, report.id).is_empty());
+        assert!(harness.agent.calls_of(Query::History).is_empty());
+        assert!(harness.agent.calls_of(Query::Duplicate).is_empty());
+        assert!(harness
+            .tracker
+            .get_attempt(SECURITY_FIX_SOURCE, "SEC-1")
+            .unwrap()
+            .is_none());
+        assert_eq!(harness.pings().len(), 1, "{:?}", harness.pings());
+        assert_eq!(harness.pings_containing("assessment_inconclusive"), 1);
+        let needs_human = harness.timeline(report.id).pop().unwrap();
+        assert_eq!(needs_human.kind, SecurityEventKind::NeedsHuman);
+        assert_eq!(
+            needs_human.detail["reason"],
+            json!("assessment_inconclusive")
+        );
+        assert_eq!(needs_human.detail["named_repository"], json!(recorded));
+        assert_eq!(needs_human.detail["repository"], Value::Null);
+    }
 }
 
 #[tokio::test]
