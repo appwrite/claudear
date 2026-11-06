@@ -20,4 +20,5 @@ pub mod repo_index;
 pub mod retry;
 pub mod security;
 pub mod shutdown;
+pub mod support_digest;
 pub mod watcher;
