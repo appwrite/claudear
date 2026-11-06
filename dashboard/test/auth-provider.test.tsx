@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import useSWR, { SWRConfig } from "swr";
+import { getMe } from "../src/lib/api";
 import { AuthProvider, useAuth } from "../src/lib/auth";
 
 function jsonResponse(data: unknown, status = 200) {
@@ -209,5 +210,36 @@ describe("AuthProvider", () => {
     await waitFor(() => {
       expect(screen.getByTestId("user").textContent).toBe("none");
     });
+  });
+
+  test("stops handling 401s once unmounted", async () => {
+    globalThis.fetch = mock((input: RequestInfo | URL) =>
+      Promise.resolve(
+        String(input).endsWith("/api/auth/me") && meServed
+          ? jsonResponse({ error: "unauthorized" }, 401)
+          : jsonResponse({ id: 1, email: "user@test.com", name: "User", role: "admin" })
+      )
+    ) as unknown as typeof fetch;
+    let meServed = false;
+    const cache = new Map();
+
+    const { unmount } = render(
+      <SWRConfig value={{ provider: () => cache }}>
+        <AuthProvider>
+          <TestHarness />
+        </AuthProvider>
+      </SWRConfig>
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("user").textContent).toBe("user@test.com|User");
+    });
+    unmount();
+
+    meServed = true;
+    cache.set("/api/overview", { data: { kept: true } });
+    await expect(getMe()).rejects.toThrow();
+    await Promise.resolve();
+
+    expect(cache.get("/api/overview")).toEqual({ data: { kept: true } });
   });
 });

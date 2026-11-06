@@ -42,6 +42,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     setOnUnauthorized(handleUnauthorized)
+    return () => setOnUnauthorized(null)
   }, [handleUnauthorized])
 
   useEffect(() => {

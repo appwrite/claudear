@@ -764,7 +764,7 @@ export interface TelemetryLatency {
 
 let onUnauthorized: (() => void) | null = null
 
-export function setOnUnauthorized(cb: () => void) {
+export function setOnUnauthorized(cb: (() => void) | null) {
   onUnauthorized = cb
 }
 
