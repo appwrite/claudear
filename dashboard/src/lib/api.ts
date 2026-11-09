@@ -768,6 +768,10 @@ export function setOnUnauthorized(cb: () => void) {
   onUnauthorized = cb
 }
 
+export function clearOnUnauthorized(cb: () => void) {
+  if (onUnauthorized === cb) onUnauthorized = null
+}
+
 /**
  * Read the CSRF token from the readable `claudear_csrf` cookie. The backend
  * sets this cookie on every request and requires mutating requests (POST/PUT/
