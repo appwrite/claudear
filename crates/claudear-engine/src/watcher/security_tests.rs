@@ -741,6 +741,39 @@ async fn poll_holds_a_waiting_fix_until_it_is_approved() {
 }
 
 #[tokio::test]
+async fn a_manual_trigger_cannot_start_an_unapproved_fix() {
+    let mut config = config();
+    if let Some(helpscout) = config.issues.helpscout.as_mut() {
+        helpscout.security.require_fix_approval = true;
+    }
+    let fixture = Fixture::with_config(config);
+    let (vulnerability_id, _) = fixture.awaiting_fix();
+    let watcher = fixture.watcher();
+    let short_id = security_fix_short_id(vulnerability_id);
+
+    let refused = watcher.trigger_issue(SECURITY_FIX_SOURCE, &short_id).await;
+
+    let error = refused.expect_err("an unapproved fix must not start");
+    assert!(
+        error.to_string().contains("awaiting fix approval"),
+        "{error}"
+    );
+    assert!(fixture.fix_attempt(vulnerability_id).is_none());
+
+    fixture
+        .tracker
+        .record_security_event(
+            None,
+            Some(vulnerability_id),
+            &NewSecurityEvent::new(SecurityEventKind::FixApproved),
+        )
+        .unwrap();
+    let _ = watcher.trigger_issue(SECURITY_FIX_SOURCE, &short_id).await;
+
+    assert!(fixture.fix_attempt(vulnerability_id).is_some());
+}
+
+#[tokio::test]
 async fn poll_advances_the_inbox_and_starts_waiting_fixes() {
     let fixture = Fixture::new();
     let (vulnerability_id, _) = fixture.awaiting_fix();

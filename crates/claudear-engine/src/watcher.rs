@@ -5534,12 +5534,19 @@ Create a PR with your changes.{custom_instructions}"#,
                 format!("{issue_id} is not a security fix"),
             )
         })?;
-        inbox.fix_request(vulnerability_id)?.ok_or_else(|| {
+        let request = inbox.fix_request(vulnerability_id)?.ok_or_else(|| {
             claudear_core::error::Error::source(
                 SECURITY_FIX_SOURCE,
                 format!("vulnerability {vulnerability_id} does not exist"),
             )
-        })
+        })?;
+        if !inbox.fix_approved(vulnerability_id)? {
+            return Err(claudear_core::error::Error::source(
+                SECURITY_FIX_SOURCE,
+                format!("vulnerability {vulnerability_id} is awaiting fix approval"),
+            ));
+        }
+        Ok(request)
     }
 
     /// Whether the failed security fix `short_id` will not be retried: the
