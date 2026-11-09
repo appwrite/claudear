@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
-// Use bun's module mocking to intercept @sentry/react
 const sentryStubs = {
   init: mock(() => {}),
   setTag: mock(() => {}),
@@ -15,7 +14,9 @@ const sentryStubs = {
   reportingObserverIntegration: mock(() => ({})),
 };
 
-mock.module("@sentry/react", () => sentryStubs);
+const actualSentry = await import("@sentry/react");
+
+mock.module("@sentry/react", () => ({ ...actualSentry, ...sentryStubs }));
 
 // Import after mock is set up
 const { initSentry, setSentryColorScheme, hideSentryFeedbackWidget } = await import(
@@ -23,6 +24,12 @@ const { initSentry, setSentryColorScheme, hideSentryFeedbackWidget } = await imp
 );
 
 describe("sentry", () => {
+  test("keeps the rest of @sentry/react for test files that run after this one", async () => {
+    const sentry = await import("@sentry/react");
+    expect(typeof sentry.addBreadcrumb).toBe("function");
+    expect(typeof sentry.captureException).toBe("function");
+  });
+
   beforeEach(() => {
     for (const fn of Object.values(sentryStubs)) {
       if (typeof fn === "function" && "mockClear" in fn) {
