@@ -29,15 +29,7 @@ macro_rules! statements {
                 $embedding,
                 ") = ?2 ORDER BY id LIMIT ?3"
             ),
-            count: concat!(
-                "SELECT count(*) FROM ",
-                $source,
-                " WHERE ",
-                $embedding,
-                " IS NOT NULL AND length(",
-                $embedding,
-                ") = ?1"
-            ),
+            count: concat!("SELECT count(*) FROM ", $source),
             newest: concat!(
                 "SELECT length(",
                 $embedding,

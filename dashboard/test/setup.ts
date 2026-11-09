@@ -1,6 +1,22 @@
+import { afterEach } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 
 GlobalRegistrator.register({ url: "http://localhost/" });
+
+const { cleanup } = await import("@testing-library/react");
+
+const EXPIRED = "expires=Thu, 01 Jan 1970 00:00:00 GMT";
+
+afterEach(() => {
+  cleanup();
+  for (const cookie of document.cookie.split(";")) {
+    const name = cookie.split("=")[0].trim();
+    if (name) {
+      document.cookie = `${name}=; ${EXPIRED}`;
+      document.cookie = `${name}=; ${EXPIRED}; path=/`;
+    }
+  }
+});
 
 // Happy DOM does not compute layout sizes, so chart containers end up at 0x0.
 // Recharts treats that as an error/warning and can fail stricter test runs.
