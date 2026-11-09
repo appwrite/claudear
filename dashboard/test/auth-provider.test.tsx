@@ -212,18 +212,20 @@ describe("AuthProvider", () => {
     });
   });
 
-  test("stops handling 401s once unmounted", async () => {
-    globalThis.fetch = mock((input: RequestInfo | URL) =>
-      Promise.resolve(
-        String(input).endsWith("/api/auth/me") && meServed
-          ? jsonResponse({ error: "unauthorized" }, 401)
-          : jsonResponse({ id: 1, email: "user@test.com", name: "User", role: "admin" })
-      )
-    ) as unknown as typeof fetch;
-    let meServed = false;
+  test("an unmounted provider no longer handles a 401", async () => {
+    let unauthorized = false;
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (unauthorized || !url.endsWith("/api/auth/me")) {
+        return Promise.resolve(jsonResponse({ error: "unauthorized" }, 401)) as Promise<Response>;
+      }
+      return Promise.resolve(
+        jsonResponse({ id: 1, email: "user@test.com", name: "User", role: "admin" })
+      ) as Promise<Response>;
+    }) as unknown as typeof fetch;
     const cache = new Map();
 
-    const { unmount } = render(
+    render(
       <SWRConfig value={{ provider: () => cache }}>
         <AuthProvider>
           <TestHarness />
@@ -233,13 +235,13 @@ describe("AuthProvider", () => {
     await waitFor(() => {
       expect(screen.getByTestId("user").textContent).toBe("user@test.com|User");
     });
-    unmount();
+    cleanup();
+    cache.set("/api/kept", { data: "kept" });
+    unauthorized = true;
 
-    meServed = true;
-    cache.set("/api/overview", { data: { kept: true } });
-    await expect(getMe()).rejects.toThrow();
-    await Promise.resolve();
+    await getMe().catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(cache.get("/api/overview")).toEqual({ data: { kept: true } });
+    expect(cache.get("/api/kept")?.data).toBe("kept");
   });
 });

@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { useSWRConfig } from 'swr'
-import { getMe, login as apiLogin, logout as apiLogout, updateProfile as apiUpdateProfile, setOnUnauthorized, type AuthUser } from './api'
+import { clearOnUnauthorized, getMe, login as apiLogin, logout as apiLogout, updateProfile as apiUpdateProfile, setOnUnauthorized, type AuthUser } from './api'
 import { Sentry } from './sentry'
 
 interface AuthState {
@@ -42,7 +42,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     setOnUnauthorized(handleUnauthorized)
-    return () => setOnUnauthorized(null)
+    return () => clearOnUnauthorized(handleUnauthorized)
   }, [handleUnauthorized])
 
   useEffect(() => {
