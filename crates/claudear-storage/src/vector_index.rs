@@ -24,7 +24,7 @@ use statements::Statements;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-pub(crate) const REBUILD_BATCH_SIZE: usize = 256;
+pub(crate) const REBUILD_BATCH_SIZE: usize = 64;
 
 /// Catches schema changes no write or search on this connection noticed, such as another
 /// process dropping a vector table.
@@ -85,7 +85,7 @@ impl VectorIndex {
         self.statements().table
     }
 
-    fn statements(&self) -> &'static Statements {
+    pub(crate) fn statements(&self) -> &'static Statements {
         self.definition.statements()
     }
 
@@ -285,7 +285,7 @@ impl VectorIndex {
         let required = self
             .statements()
             .minimum_capacity
-            .max(self.count(connection, dimension)?.saturating_mul(2));
+            .max(self.count(connection)?.saturating_mul(2));
 
         let stale = matches!(*state, State::Stale { .. });
         let capacity = match lookup {
@@ -446,12 +446,10 @@ impl VectorIndex {
         Ok(())
     }
 
-    fn count(&self, connection: &Connection, dimension: usize) -> Result<usize> {
-        let count: i64 = connection.query_row(
-            self.statements().count,
-            params![Self::byte_length(dimension)],
-            |row| row.get(0),
-        )?;
+    /// Sizes the index from every source row, an upper bound on the rows it will hold, so the
+    /// count reads an index instead of every embedding while the connection lock is held.
+    fn count(&self, connection: &Connection) -> Result<usize> {
+        let count: i64 = connection.query_row(self.statements().count, [], |row| row.get(0))?;
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
@@ -1018,7 +1016,7 @@ mod tests {
             declared(&connection, TABLE),
             Declaration {
                 dimension: 4,
-                capacity: 6,
+                capacity: 12,
             }
         );
         assert!((1..=3).all(|rowid| !vector_exists(&connection, TABLE, rowid)));
