@@ -96,6 +96,7 @@ impl SecurityInbox {
                 .tracker
                 .get_attempt(SECURITY_FIX_SOURCE, &short_id)?
                 .is_some()
+                || !self.fix_approved(vulnerability.id)?
             {
                 continue;
             }
@@ -104,6 +105,16 @@ impl SecurityInbox {
             }
         }
         Ok(requests)
+    }
+
+    /// Whether a first fix run may start for `vulnerability_id`: always when
+    /// approval is not required, otherwise once an admin approved it.
+    pub fn fix_approved(&self, vulnerability_id: i64) -> Result<bool> {
+        Ok(!self.config.require_fix_approval
+            || self
+                .tracker
+                .last_security_event(vulnerability_id, SecurityEventKind::FixApproved)?
+                .is_some())
     }
 
     /// The assessment recorded when the current first reporter was linked,

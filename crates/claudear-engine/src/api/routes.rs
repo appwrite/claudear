@@ -236,6 +236,10 @@ pub fn create_api_router_full(
             "/api/security/vulnerabilities/{id}/live",
             axum::routing::post(super::security_reports::live_handler),
         )
+        .route(
+            "/api/security/vulnerabilities/{id}/approve-fix",
+            axum::routing::post(super::security_reports::approve_fix_handler),
+        )
         // Auth routes
         .route("/api/auth/login", axum::routing::post(login_handler))
         .route("/api/auth/logout", axum::routing::post(logout_handler))

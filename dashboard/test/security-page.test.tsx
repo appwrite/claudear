@@ -133,6 +133,7 @@ const details: Record<number, SecurityReportDetail> = {
     replies: [],
     award: null,
     related_reports: [],
+    awaiting_fix_approval: false,
   },
   2: {
     report: report(trackedRow),
@@ -203,6 +204,7 @@ const details: Record<number, SecurityReportDetail> = {
       updated_at: "2026-11-02T09:00:00Z",
     },
     related_reports: [trackedRow, duplicateRow],
+    awaiting_fix_approval: true,
   },
   3: {
     report: report(duplicateRow),
@@ -211,6 +213,7 @@ const details: Record<number, SecurityReportDetail> = {
     replies: [],
     award: null,
     related_reports: [],
+    awaiting_fix_approval: false,
   },
 };
 
@@ -512,6 +515,26 @@ describe("SecurityPage", () => {
       method: "POST",
       body: { pull_request_url: "https://github.com/appwrite/appwrite/pull/400" },
     });
+  });
+
+  test("Approve fix posts the approval for the vulnerability", async () => {
+    const calls = harness(admin);
+    render(<SecurityPage />, { wrapper: Wrapper });
+    await openReport("HS-1002");
+    fireEvent.click(screen.getByRole("button", { name: "Approve fix" }));
+    await waitFor(() => expect(posts(calls)).toHaveLength(1));
+    expect(posts(calls)[0]).toEqual({
+      url: "/api/security/vulnerabilities/7/approve-fix",
+      method: "POST",
+      body: {},
+    });
+  });
+
+  test("a report not awaiting fix approval offers no Approve fix", async () => {
+    harness(admin);
+    render(<SecurityPage />, { wrapper: Wrapper });
+    await openReport("HS-1001");
+    expect(screen.queryByRole("button", { name: "Approve fix" })).toBeNull();
   });
 
   test("Mark live posts the deployed version", async () => {

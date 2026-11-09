@@ -1509,6 +1509,7 @@ export const SECURITY_EVENT_KINDS = [
   'delivery_confirmed',
   'conversation_closed',
   'reporter_follow_up',
+  'fix_approved',
   'fix_started',
   'pull_request_opened',
   'pull_request_linked',
@@ -1660,6 +1661,7 @@ export interface SecurityReportDetail {
   replies: SecurityReply[]
   award: SecurityAward | null
   related_reports: SecurityReportRow[]
+  awaiting_fix_approval: boolean
 }
 
 export type SecurityOverride =
@@ -1722,6 +1724,10 @@ export async function linkSecurityPullRequest(
   return postJson(`${API_BASE}/security/vulnerabilities/${vulnerabilityId}/pull-request`, {
     pull_request_url: pullRequestUrl,
   })
+}
+
+export async function approveSecurityFix(vulnerabilityId: number): Promise<SecurityVulnerability> {
+  return postJson(`${API_BASE}/security/vulnerabilities/${vulnerabilityId}/approve-fix`, {})
 }
 
 export async function markSecurityLive(

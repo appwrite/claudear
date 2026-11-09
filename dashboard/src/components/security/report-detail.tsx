@@ -20,6 +20,7 @@ import {
 } from './badges'
 import {
   ActionSection,
+  ApproveFixAction,
   AwardPanel,
   DeliveryConfirmation,
   LinkPullRequestForm,
@@ -291,6 +292,9 @@ export function ReportDetail({
       {report.state === 'needs_human' && <NeedsHumanPanel key={report.id} report={report} onChanged={onChanged} />}
       <DeliveryConfirmation report={report} replies={detail.replies} onChanged={onChanged} />
       {vulnerability && <VulnerabilitySection vulnerability={vulnerability} />}
+      {vulnerability && detail.awaiting_fix_approval && (
+        <ApproveFixAction key={`approve-${vulnerability.id}`} vulnerability={vulnerability} onChanged={onChanged} />
+      )}
       {vulnerability && canLinkPullRequest && (
         <LinkPullRequestForm key={`pull-request-${vulnerability.id}`} vulnerability={vulnerability} onChanged={onChanged} />
       )}
