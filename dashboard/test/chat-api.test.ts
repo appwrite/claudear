@@ -25,6 +25,7 @@ describe("chat REST API helpers", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
     setOnUnauthorized(() => {});
+    document.cookie = "claudear_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
   });
 
   describe("fetchChatSessions", () => {
