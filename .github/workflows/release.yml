@@ -18,7 +18,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned to 24.04 (glibc 2.39), not ubuntu-latest: the binary must run
+          # on the Ubuntu 24.04 droplet. ubuntu-latest moved to 26.04 (glibc 2.43).
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset_name: claudear-linux-amd64
             binary_name: claudear
@@ -236,7 +238,9 @@ jobs:
 
   build-deb:
     name: Build Debian Package
-    runs-on: ubuntu-latest
+    # Pinned to 24.04 (glibc 2.39): the .deb must install and run on the Ubuntu
+    # 24.04 droplet. ubuntu-latest moved to 26.04 (glibc 2.43), which 0.57.1 hit.
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
