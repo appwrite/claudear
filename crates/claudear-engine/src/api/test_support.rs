@@ -26,14 +26,20 @@ pub struct Harness {
 
 impl Harness {
     pub fn start() -> Self {
-        Self::build(|router| router.layer(CookieManagerLayer::new()))
+        Self::with_config(Config::default())
+    }
+
+    pub fn with_config(config: Config) -> Self {
+        Self::build(config, |router| router.layer(CookieManagerLayer::new()))
     }
 
     pub fn with_dashboard_middleware() -> Self {
-        Self::build(|router| super::apply_dashboard_middleware(router, false))
+        Self::build(Config::default(), |router| {
+            super::apply_dashboard_middleware(router, false)
+        })
     }
 
-    fn build(wrap: impl FnOnce(Router) -> Router) -> Self {
+    fn build(config: Config, wrap: impl FnOnce(Router) -> Router) -> Self {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"));
         let password_hash = bcrypt::hash(super::fixture::password(), 4).expect("hash");
@@ -51,7 +57,7 @@ impl Harness {
             .expect("viewer session");
         let config = Config {
             storage_dir: std::env::temp_dir().join("claudear-api-test-storage"),
-            ..Config::default()
+            ..config
         };
         let indexing = tracker.subscribe_indexing_progress();
         let router = wrap(create_api_router(

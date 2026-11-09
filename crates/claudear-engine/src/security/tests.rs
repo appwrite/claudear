@@ -422,6 +422,7 @@ fn reported(minute: u32) -> DateTime<Utc> {
 fn test_config() -> SecurityInboxConfig {
     SecurityInboxConfig {
         enabled: true,
+        require_fix_approval: false,
         ..SecurityInboxConfig::default()
     }
 }
@@ -835,6 +836,44 @@ async fn each_non_valid_outcome_sends_its_template_and_closes() {
         assert!(events.contains(&SecurityEventKind::ConversationClosed));
         assert!(harness.pings().is_empty(), "{outcome}");
     }
+}
+
+#[tokio::test]
+async fn a_valid_report_waits_for_fix_approval_when_it_is_required() {
+    let harness = Harness::build(
+        SecurityInboxConfig {
+            require_fix_approval: true,
+            ..test_config()
+        },
+        |inbox| inbox,
+    );
+    let route = harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+
+    assert!(matches!(route, SecurityRoute::Done { .. }), "{route:?}");
+    let report = harness.report("1");
+    assert_eq!(report.state, SecurityReportState::Tracking);
+    let vulnerability_id = report.vulnerability_id.unwrap();
+    assert_eq!(
+        harness.vulnerability(vulnerability_id).state,
+        VulnerabilityState::AwaitingFix
+    );
+    assert!(harness.inbox.pending_fix_requests().unwrap().is_empty());
+    assert_eq!(harness.pings_containing("fix awaiting approval"), 1);
+
+    harness
+        .tracker
+        .record_security_event(
+            None,
+            Some(vulnerability_id),
+            &NewSecurityEvent::new(SecurityEventKind::FixApproved).with_actor("admin@example.com"),
+        )
+        .unwrap();
+
+    let pending = harness.inbox.pending_fix_requests().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].vulnerability_id, vulnerability_id);
 }
 
 #[tokio::test]

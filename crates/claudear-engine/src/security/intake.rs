@@ -219,7 +219,8 @@ impl SecurityInbox {
                     SECURITY_FIX_SOURCE,
                     &security_fix_short_id(vulnerability_id),
                 )?
-                .is_none();
+                .is_none()
+            && self.fix_approved(vulnerability_id)?;
         if waiting {
             self.fix_request(vulnerability_id)
         } else {
@@ -414,8 +415,13 @@ impl SecurityInbox {
         registration: &Registration,
     ) -> Result<()> {
         if registration.kind == RegistrationKind::Created {
+            let action = if self.config.require_fix_approval {
+                OwnerAction::FixAwaitingApproval
+            } else {
+                OwnerAction::NewValidReport
+            };
             self.ping(
-                OwnerAction::NewValidReport,
+                action,
                 PingSubject::vulnerability(&registration.vulnerability),
             )
             .await;

@@ -387,6 +387,7 @@ fn security_inbox(config: &Config) -> FeatureStatus {
         .setting("spam_action", security.spam_action.as_str())
         .setting("spam_confidence", security.spam_confidence)
         .setting("acknowledge_valid", security.acknowledge_valid)
+        .setting("require_fix_approval", security.require_fix_approval)
         .setting("close_after_reply", security.close_after_reply)
         .setting("assessment_timeout_secs", security.assessment_timeout_secs)
         .setting("max_assessment_attempts", security.max_assessment_attempts)

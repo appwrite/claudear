@@ -291,6 +291,7 @@ fn config() -> Config {
         }],
         security: SecurityInboxConfig {
             enabled: true,
+            require_fix_approval: false,
             ..SecurityInboxConfig::default()
         },
         ..HelpScoutConfig::default()
@@ -709,6 +710,34 @@ async fn racing_starts_of_one_fix_run_it_once() {
         "{runs:?}"
     );
     assert_eq!(fixture.fix_failures(report_id), 1);
+}
+
+#[tokio::test]
+async fn poll_holds_a_waiting_fix_until_it_is_approved() {
+    let mut config = config();
+    if let Some(helpscout) = config.issues.helpscout.as_mut() {
+        helpscout.security.require_fix_approval = true;
+    }
+    let fixture = Fixture::with_config(config);
+    let (vulnerability_id, _) = fixture.awaiting_fix();
+    let watcher = fixture.watcher();
+
+    watcher.poll().await.unwrap();
+    watcher.drain_spawned_tasks().await;
+    assert!(fixture.fix_attempt(vulnerability_id).is_none());
+
+    fixture
+        .tracker
+        .record_security_event(
+            None,
+            Some(vulnerability_id),
+            &NewSecurityEvent::new(SecurityEventKind::FixApproved),
+        )
+        .unwrap();
+    watcher.poll().await.unwrap();
+    watcher.drain_spawned_tasks().await;
+
+    assert!(fixture.fix_attempt(vulnerability_id).is_some());
 }
 
 #[tokio::test]

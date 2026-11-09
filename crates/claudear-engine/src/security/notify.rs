@@ -55,6 +55,7 @@ impl fmt::Display for ReviewReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnerAction {
     NewValidReport,
+    FixAwaitingApproval,
     NeedsReview(ReviewReason),
     CloudBumpRequired,
     AwardReady,
@@ -65,6 +66,9 @@ impl fmt::Display for OwnerAction {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NewValidReport => formatter.write_str("new valid report"),
+            Self::FixAwaitingApproval => {
+                formatter.write_str("new valid report, fix awaiting approval")
+            }
             Self::NeedsReview(reason) => write!(formatter, "needs review ({reason})"),
             Self::CloudBumpRequired => formatter.write_str("cloud server-ce bump required"),
             Self::AwardReady => formatter.write_str("award ready"),

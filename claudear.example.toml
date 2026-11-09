@@ -677,6 +677,7 @@ poll_interval_ms = 300000
 # dashboard_url = "https://<dashboard host>"
 # spam_confidence = 0.9                     # 0..=1, minimum screening confidence for spam
 # acknowledge_valid = true                  # send "confirmed" when a report is valid
+# require_fix_approval = true               # hold fix runs until an admin approves them
 # close_after_reply = true                  # close the conversation with terminal replies
 # assessment_timeout_secs = 1800
 # max_assessment_attempts = 3

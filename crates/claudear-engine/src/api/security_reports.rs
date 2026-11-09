@@ -77,6 +77,7 @@ pub struct SecurityReportDetail {
     pub replies: Vec<SecurityReply>,
     pub award: Option<SecurityAward>,
     pub related_reports: Vec<SecurityReportRow>,
+    pub awaiting_fix_approval: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +302,12 @@ pub async fn report_handler(
     };
     let events = tracker.list_security_timeline(id).map_err(internal_error)?;
     let replies = tracker.list_security_replies(id).map_err(internal_error)?;
+    let awaiting_fix_approval = match &vulnerability {
+        Some(vulnerability) => {
+            awaits_fix_approval(&state, vulnerability).map_err(internal_error)?
+        }
+        None => false,
+    };
 
     Ok(Json(SecurityReportDetail {
         report,
@@ -309,7 +316,24 @@ pub async fn report_handler(
         replies,
         award,
         related_reports,
+        awaiting_fix_approval,
     }))
+}
+
+fn awaits_fix_approval(
+    state: &ApiState,
+    vulnerability: &SecurityVulnerability,
+) -> claudear_core::error::Result<bool> {
+    let required = state
+        .config
+        .helpscout()
+        .is_some_and(|helpscout| helpscout.security.require_fix_approval);
+    Ok(required
+        && vulnerability.state == VulnerabilityState::AwaitingFix
+        && state
+            .tracker
+            .last_security_event(vulnerability.id, SecurityEventKind::FixApproved)?
+            .is_none())
 }
 
 fn clean_public_reason(raw: Option<&str>) -> Option<String> {
@@ -533,6 +557,37 @@ pub async fn pull_request_handler(
     )
 }
 
+/// `POST /api/security/vulnerabilities/{id}/approve-fix`: let the first fix
+/// run start for a vulnerability awaiting one. Approving twice records once.
+pub async fn approve_fix_handler(
+    AdminUser(admin): AdminUser,
+    State(state): State<ApiState>,
+    Path(vulnerability_id): Path<i64>,
+) -> ApiResult<SecurityVulnerability> {
+    let tracker = state.tracker.as_ref();
+    let vulnerability = tracker
+        .get_security_vulnerability(vulnerability_id)
+        .map_err(internal_error)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if vulnerability.state != VulnerabilityState::AwaitingFix {
+        return Err(StatusCode::CONFLICT);
+    }
+    let approved = tracker
+        .last_security_event(vulnerability_id, SecurityEventKind::FixApproved)
+        .map_err(internal_error)?
+        .is_some();
+    if !approved {
+        tracker
+            .record_security_event(
+                None,
+                Some(vulnerability_id),
+                &NewSecurityEvent::new(SecurityEventKind::FixApproved).with_actor(admin.email),
+            )
+            .map_err(internal_error)?;
+    }
+    Ok(Json(vulnerability))
+}
+
 /// `POST /api/security/vulnerabilities/{id}/live`
 pub async fn live_handler(
     AdminUser(admin): AdminUser,
@@ -567,6 +622,7 @@ mod tests {
     use super::super::test_support::{Harness, ADMIN_EMAIL};
     use super::*;
     use chrono::TimeDelta;
+    use claudear_config::config::{Config, HelpScoutConfig, SecurityInboxConfig};
     use claudear_core::security::{
         DeliveryStatus, NewSecurityAward, NewSecurityReport, NewSecurityVulnerability,
         SecurityReplyKind,
@@ -788,6 +844,10 @@ mod tests {
             ),
             (
                 format!("/api/security/vulnerabilities/{}/award", merged.id),
+                "{}".to_string(),
+            ),
+            (
+                format!("/api/security/vulnerabilities/{}/approve-fix", awaiting.id),
                 "{}".to_string(),
             ),
             (
@@ -1524,6 +1584,120 @@ mod tests {
             body["pull_request_url"],
             "https://github.com/appwrite/console/pull/9"
         );
+    }
+
+    fn approval_required() -> Config {
+        let mut config = Config::default();
+        config.issues.helpscout = Some(HelpScoutConfig {
+            security: SecurityInboxConfig {
+                enabled: true,
+                require_fix_approval: true,
+                ..SecurityInboxConfig::default()
+            },
+            ..HelpScoutConfig::default()
+        });
+        config
+    }
+
+    fn approvals(harness: &Harness, vulnerability_id: i64) -> usize {
+        harness
+            .tracker
+            .list_security_timeline(
+                harness
+                    .tracker
+                    .get_security_vulnerability(vulnerability_id)
+                    .expect("vulnerability")
+                    .expect("vulnerability exists")
+                    .first_report_id,
+            )
+            .expect("timeline")
+            .iter()
+            .filter(|event| event.kind == SecurityEventKind::FixApproved)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn approving_a_fix_records_it_once_and_clears_the_detail_flag() {
+        let harness = Harness::with_config(approval_required());
+        let seed = Seed {
+            tracker: harness.tracker.as_ref(),
+        };
+        let first = seed.report("1400", 2);
+        let awaiting = seed.vulnerability(&first, VulnerabilityState::AwaitingFix);
+        let detail = format!("/api/security/reports/{}", first.id);
+        let approve = format!("/api/security/vulnerabilities/{}/approve-fix", awaiting.id);
+
+        let (status, body) = harness.get(&detail, Some(&harness.admin)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["awaiting_fix_approval"], Value::Bool(true));
+
+        for _ in 0..2 {
+            assert_eq!(
+                harness.post(&approve, Some(&harness.admin), "{}").await.0,
+                StatusCode::OK
+            );
+        }
+
+        assert_eq!(approvals(&harness, awaiting.id), 1);
+        let event = harness
+            .tracker
+            .last_security_event(awaiting.id, SecurityEventKind::FixApproved)
+            .expect("event")
+            .expect("approval recorded");
+        assert_eq!(event.actor.as_deref(), Some(ADMIN_EMAIL));
+        let (_, body) = harness.get(&detail, Some(&harness.admin)).await;
+        assert_eq!(body["awaiting_fix_approval"], Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn approving_a_fix_needs_a_vulnerability_awaiting_one() {
+        let harness = Harness::with_config(approval_required());
+        let seed = Seed {
+            tracker: harness.tracker.as_ref(),
+        };
+        let merged = seed.vulnerability(&seed.report("1401", 2), VulnerabilityState::Merged);
+
+        assert_eq!(
+            harness
+                .post(
+                    "/api/security/vulnerabilities/999/approve-fix",
+                    Some(&harness.admin),
+                    "{}"
+                )
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            harness
+                .post(
+                    &format!("/api/security/vulnerabilities/{}/approve-fix", merged.id),
+                    Some(&harness.admin),
+                    "{}"
+                )
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(approvals(&harness, merged.id), 0);
+    }
+
+    #[tokio::test]
+    async fn the_detail_flag_stays_off_when_approval_is_not_required() {
+        let harness = Harness::start();
+        let seed = Seed {
+            tracker: harness.tracker.as_ref(),
+        };
+        let first = seed.report("1402", 2);
+        seed.vulnerability(&first, VulnerabilityState::AwaitingFix);
+
+        let (_, body) = harness
+            .get(
+                &format!("/api/security/reports/{}", first.id),
+                Some(&harness.admin),
+            )
+            .await;
+        assert_eq!(body["awaiting_fix_approval"], Value::Bool(false));
     }
 
     #[tokio::test]

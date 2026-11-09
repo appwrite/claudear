@@ -297,6 +297,7 @@ string_enum! {
         DeliveryConfirmed => "delivery_confirmed",
         ConversationClosed => "conversation_closed",
         ReporterFollowUp => "reporter_follow_up",
+        FixApproved => "fix_approved",
         FixStarted => "fix_started",
         PullRequestOpened => "pull_request_opened",
         PullRequestLinked => "pull_request_linked",
