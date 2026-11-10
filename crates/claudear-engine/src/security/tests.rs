@@ -201,7 +201,9 @@ struct MockSource {
     resolved: Mutex<Vec<String>>,
     spammed: Mutex<Vec<String>>,
     notes: Mutex<Vec<(String, String)>>,
+    moved: Mutex<Vec<(String, String)>>,
     mark_spam_fails: AtomicBool,
+    move_fails: AtomicBool,
 }
 
 impl MockSource {
@@ -296,6 +298,17 @@ impl IssueSource for MockSource {
             return Err(Error::Other("spam status refused".to_string()));
         }
         self.spammed.lock().unwrap().push(issue_id.to_string());
+        Ok(())
+    }
+
+    async fn move_conversation(&self, issue_id: &str, mailbox_id: &str) -> Result<()> {
+        if self.move_fails.load(Ordering::SeqCst) {
+            return Err(Error::Other("move refused".to_string()));
+        }
+        self.moved
+            .lock()
+            .unwrap()
+            .push((issue_id.to_string(), mailbox_id.to_string()));
         Ok(())
     }
 }
@@ -750,6 +763,97 @@ async fn spam_action_marks_spam_and_falls_back_to_closing() {
         vec!["2".to_string()]
     );
     assert_eq!(harness.report("2").state, SecurityReportState::Spam);
+}
+
+const SUPPORT_MAILBOX: &str = "249877";
+
+fn support_config() -> SecurityInboxConfig {
+    SecurityInboxConfig {
+        support_mailbox_id: Some(SUPPORT_MAILBOX.to_string()),
+        ..test_config()
+    }
+}
+
+fn support_verdict(harness: &Harness, confidence: f64) {
+    harness.agent.respond(
+        Query::Screening,
+        json!({"verdict": "support", "confidence": confidence, "reason": "paused project"}),
+    );
+}
+
+#[tokio::test]
+async fn support_requests_move_to_the_support_mailbox_without_a_reply() {
+    let harness = Harness::build(support_config(), |inbox| inbox);
+    support_verdict(&harness, 0.95);
+    let issue = report_issue("1", REPORT_BODY, reported(0));
+
+    let route = harness.route(&issue).await;
+    assert!(matches!(route, SecurityRoute::Done { .. }), "{route:?}");
+    let report = harness.report("1");
+    assert_eq!(report.state, SecurityReportState::Forwarded);
+    assert_eq!(report.outcome, Some(SecurityOutcome::Support));
+    assert_eq!(
+        *harness.source.moved.lock().unwrap(),
+        vec![("1".to_string(), SUPPORT_MAILBOX.to_string())]
+    );
+    assert!(harness.source.replies().is_empty());
+    assert!(harness.source.resolved.lock().unwrap().is_empty());
+    assert!(harness.source.spammed.lock().unwrap().is_empty());
+    assert_eq!(harness.source.notes.lock().unwrap().len(), 1);
+    assert!(harness.agent.calls_of(Query::Assessment).is_empty());
+    assert!(harness
+        .events(report.id)
+        .contains(&SecurityEventKind::ForwardedToSupport));
+
+    harness.inbox.advance().await;
+    assert_eq!(harness.source.moved.lock().unwrap().len(), 1);
+    assert!(harness.source.replies().is_empty());
+    assert_eq!(
+        harness.inbox.poll_decision(&issue).unwrap(),
+        SecurityPollDecision::Skip
+    );
+}
+
+#[tokio::test]
+async fn a_refused_move_releases_the_report_for_the_next_poll() {
+    let harness = Harness::build(support_config(), |inbox| inbox);
+    support_verdict(&harness, 0.95);
+    harness.source.move_fails.store(true, Ordering::SeqCst);
+    let issue = report_issue("1", REPORT_BODY, reported(0));
+    harness.route(&issue).await;
+
+    let report = harness.report("1");
+    assert_eq!(report.state, SecurityReportState::Received);
+    assert!(harness.source.notes.lock().unwrap().is_empty());
+    assert_eq!(
+        harness.inbox.poll_decision(&issue).unwrap(),
+        SecurityPollDecision::Route
+    );
+}
+
+#[tokio::test]
+async fn support_verdicts_are_assessed_without_a_mailbox_or_confidence() {
+    let harness = Harness::new();
+    support_verdict(&harness, 0.95);
+    harness
+        .agent
+        .respond(Query::Assessment, assessment_response("not_reproducible"));
+    harness
+        .route(&report_issue("1", REPORT_BODY, reported(0)))
+        .await;
+    assert_eq!(harness.report("1").state, SecurityReportState::Closed);
+    assert!(harness.source.moved.lock().unwrap().is_empty());
+
+    let harness = Harness::build(support_config(), |inbox| inbox);
+    support_verdict(&harness, 0.5);
+    harness
+        .agent
+        .respond(Query::Assessment, assessment_response("not_reproducible"));
+    harness
+        .route(&report_issue("2", REPORT_BODY, reported(1)))
+        .await;
+    assert_eq!(harness.report("2").state, SecurityReportState::Closed);
+    assert!(harness.source.moved.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

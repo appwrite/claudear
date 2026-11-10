@@ -675,7 +675,8 @@ poll_interval_ms = 300000
 # default_repository = "appwrite-labs/cloud"
 # owner_mention = "<@DISCORD_USER_ID>"      # prefixed to owner pings
 # dashboard_url = "https://<dashboard host>"
-# spam_confidence = 0.9                     # 0..=1, minimum screening confidence for spam
+# spam_confidence = 0.9                     # 0..=1, minimum screening confidence for spam or support
+# support_mailbox_id = "249877"             # move support requests here; unset assesses them as reports
 # acknowledge_valid = true                  # send "confirmed" when a report is valid
 # require_fix_approval = true               # hold fix runs until an admin approves them
 # close_after_reply = true                  # close the conversation with terminal replies

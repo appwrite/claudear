@@ -25,6 +25,7 @@ const reportStateTones: Record<SecurityReportState, Tone> = {
   needs_human: 'warning',
   registering: 'progress',
   spam: 'neutral',
+  forwarded: 'neutral',
   replying: 'progress',
   closed: 'neutral',
   tracking: 'merged',
@@ -33,6 +34,7 @@ const reportStateTones: Record<SecurityReportState, Tone> = {
 
 const outcomeTones: Record<SecurityOutcome, Tone> = {
   spam: 'neutral',
+  support: 'info',
   valid: 'danger',
   not_reproducible: 'neutral',
   already_fixed: 'info',

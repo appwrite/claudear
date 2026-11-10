@@ -1446,6 +1446,7 @@ export const SECURITY_REPORT_STATES = [
   'needs_human',
   'registering',
   'spam',
+  'forwarded',
   'replying',
   'closed',
   'tracking',
@@ -1455,6 +1456,7 @@ export type SecurityReportState = (typeof SECURITY_REPORT_STATES)[number]
 
 export const SECURITY_OUTCOMES = [
   'spam',
+  'support',
   'valid',
   'not_reproducible',
   'already_fixed',
@@ -1463,7 +1465,7 @@ export const SECURITY_OUTCOMES = [
   'duplicate',
 ] as const
 export type SecurityOutcome = (typeof SECURITY_OUTCOMES)[number]
-export type SecurityOverrideOutcome = Exclude<SecurityOutcome, 'valid'>
+export type SecurityOverrideOutcome = Exclude<SecurityOutcome, 'valid' | 'support'>
 
 export const VULNERABILITY_STATES = ['awaiting_fix', 'fixing', 'merged', 'live', 'needs_human'] as const
 export type VulnerabilityState = (typeof VULNERABILITY_STATES)[number]
@@ -1498,6 +1500,7 @@ export const SECURITY_EVENT_KINDS = [
   'overridden',
   'admin_confirmed',
   'screened_spam',
+  'forwarded_to_support',
   'assessed',
   'vulnerability_created',
   'duplicate_linked',
