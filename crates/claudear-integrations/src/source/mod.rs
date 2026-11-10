@@ -181,6 +181,13 @@ pub trait IssueSource: Send + Sync {
             "mark_spam not supported by this source".into(),
         ))
     }
+
+    /// Move a conversation to another mailbox on the remote source.
+    async fn move_conversation(&self, _issue_id: &str, _mailbox_id: &str) -> Result<()> {
+        Err(claudear_core::error::Error::Other(
+            "move_conversation not supported by this source".into(),
+        ))
+    }
 }
 
 /// Registry for available sources.
@@ -347,6 +354,10 @@ mod tests {
             self.record(format!("mark_spam:{issue_id}"));
             Ok(())
         }
+        async fn move_conversation(&self, issue_id: &str, mailbox_id: &str) -> Result<()> {
+            self.record(format!("move_conversation:{issue_id}:{mailbox_id}"));
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -364,6 +375,7 @@ mod tests {
             ReporterReply::Unconfirmed("timed out".into())
         );
         wrapped.mark_spam("42").await.unwrap();
+        wrapped.move_conversation("42", "249877").await.unwrap();
 
         assert_eq!(
             *inner.calls.lock().unwrap(),
@@ -371,6 +383,7 @@ mod tests {
                 "list_conversations:closed".to_string(),
                 "reply_to_reporter:42:hello:closed".to_string(),
                 "mark_spam:42".to_string(),
+                "move_conversation:42:249877".to_string(),
             ]
         );
     }

@@ -386,6 +386,7 @@ fn security_inbox(config: &Config) -> FeatureStatus {
         )
         .setting("spam_action", security.spam_action.as_str())
         .setting("spam_confidence", security.spam_confidence)
+        .setting("support_mailbox_id", security.support_mailbox_id.clone())
         .setting("acknowledge_valid", security.acknowledge_valid)
         .setting("require_fix_approval", security.require_fix_approval)
         .setting("close_after_reply", security.close_after_reply)

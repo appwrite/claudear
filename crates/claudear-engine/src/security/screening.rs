@@ -16,6 +16,7 @@ static HTML_TAG: LazyLock<Regex> =
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Screening {
     Spam { confidence: f64 },
+    Support { mailbox_id: String, confidence: f64 },
     Report { confidence: Option<f64> },
 }
 
@@ -23,6 +24,7 @@ pub(crate) enum Screening {
 #[serde(rename_all = "snake_case")]
 enum ScreeningVerdict {
     Spam,
+    Support,
     Report,
 }
 
@@ -60,11 +62,14 @@ impl SecurityInbox {
         let response: ScreeningResponse = serde_json::from_value(value)
             .map_err(|error| Error::Other(format!("malformed screening verdict: {error}")))?;
         let confidence = response.confidence.clamp(0.0, 1.0);
-        Ok(match response.verdict {
-            ScreeningVerdict::Spam if confidence >= self.config.spam_confidence => {
-                Screening::Spam { confidence }
-            }
-            ScreeningVerdict::Spam | ScreeningVerdict::Report => Screening::Report {
+        let confident = confidence >= self.config.spam_confidence;
+        Ok(match (response.verdict, &self.config.support_mailbox_id) {
+            (ScreeningVerdict::Spam, _) if confident => Screening::Spam { confidence },
+            (ScreeningVerdict::Support, Some(mailbox_id)) if confident => Screening::Support {
+                mailbox_id: mailbox_id.clone(),
+                confidence,
+            },
+            _ => Screening::Report {
                 confidence: Some(confidence),
             },
         })

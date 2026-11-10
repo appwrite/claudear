@@ -28,7 +28,7 @@ const NOTE_LIMIT = 1000
 const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 
 const overrideOutcomes = SECURITY_OUTCOMES.filter(
-  (outcome): outcome is SecurityOverrideOutcome => outcome !== 'valid',
+  (outcome): outcome is SecurityOverrideOutcome => outcome !== 'valid' && outcome !== 'support',
 )
 const outcomesNeedingReason: SecurityOverrideOutcome[] = ['not_vulnerability', 'out_of_scope']
 

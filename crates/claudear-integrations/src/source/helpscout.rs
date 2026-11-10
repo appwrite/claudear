@@ -370,9 +370,25 @@ impl<H: HttpClient> HelpScoutSource<H> {
     }
 
     async fn update_status(&self, issue_id: &str, status: &str, action: &str) -> Result<()> {
-        // HelpScout uses JSON-PATCH to update conversation status.
+        let patch = serde_json::json!({ "op": "replace", "path": "/status", "value": status });
+        self.patch_conversation(issue_id, &patch, action).await
+    }
+
+    /// HelpScout's update endpoint takes one JSON Patch operation as an
+    /// object; an array is rejected with "Error parsing request body into JSON".
+    async fn patch_conversation(
+        &self,
+        issue_id: &str,
+        patch: &serde_json::Value,
+        action: &str,
+    ) -> Result<()> {
+        if !is_conversation_id(issue_id) {
+            return Err(Error::source(
+                HELPSCOUT_SOURCE,
+                format!("invalid conversation id '{issue_id}'"),
+            ));
+        }
         let token = self.access_token().await?;
-        let body = format!(r#"[{{"op":"replace","path":"/status","value":"{status}"}}]"#);
         let response = self
             .http
             .patch(
@@ -381,7 +397,7 @@ impl<H: HttpClient> HelpScoutSource<H> {
                     ("Authorization", format!("Bearer {token}")),
                     ("Content-Type", "application/json".to_string()),
                 ],
-                &body,
+                &patch.to_string(),
             )
             .await?;
         if response.is_success() {
@@ -986,13 +1002,19 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
     }
 
     async fn mark_spam(&self, issue_id: &str) -> Result<()> {
-        if !is_conversation_id(issue_id) {
-            return Err(Error::source(
-                HELPSCOUT_SOURCE,
-                format!("invalid conversation id '{issue_id}'"),
-            ));
-        }
         self.update_status(issue_id, "spam", "mark conversation as spam")
+            .await
+    }
+
+    async fn move_conversation(&self, issue_id: &str, mailbox_id: &str) -> Result<()> {
+        let mailbox: u64 = mailbox_id.parse().map_err(|_| {
+            Error::source(
+                HELPSCOUT_SOURCE,
+                format!("invalid mailbox id '{mailbox_id}'"),
+            )
+        })?;
+        let patch = serde_json::json!({ "op": "move", "path": "/mailboxId", "value": mailbox });
+        self.patch_conversation(issue_id, &patch, "move conversation")
             .await
     }
 }
@@ -1772,10 +1794,7 @@ mod tests {
         source.mark_spam("42").await.unwrap();
         let patches = source.http.requests_to("PATCH", "/v2/conversations/42");
         assert_eq!(patches.len(), 1);
-        assert_eq!(
-            patches[0].body,
-            r#"[{"op":"replace","path":"/status","value":"spam"}]"#
-        );
+        assert_status_patch(&patches[0].body, "spam");
 
         let mock = MockHttpClient::new(vec![("/v2/oauth2/token", 200, TOKEN_BODY)]).on(
             "PATCH",
@@ -1788,17 +1807,71 @@ mod tests {
         assert!(source.mark_spam("4 2").await.is_err());
     }
 
+    /// HelpScout documents the update body as a single JSON Patch object and
+    /// rejects an array, so the patch must parse as exactly that object.
+    fn assert_status_patch(body: &str, status: &str) {
+        let patch: serde_json::Value = serde_json::from_str(body).expect("patch body is JSON");
+        assert_eq!(
+            patch,
+            serde_json::json!({ "op": "replace", "path": "/status", "value": status }),
+            "the status patch must be one JSON object, not an array: {body}"
+        );
+    }
+
     #[tokio::test]
-    async fn test_resolve_issue_body_is_unchanged() {
+    async fn test_move_conversation_patches_mailbox_as_a_number() {
+        let mock = MockHttpClient::new(vec![
+            ("/v2/oauth2/token", 200, TOKEN_BODY),
+            ("/v2/conversations/42", 204, ""),
+        ]);
+        let source = HelpScoutSource::with_http_client(security_config(), mock);
+        source.move_conversation("42", "249877").await.unwrap();
+        let patches = source.http.requests_to("PATCH", "/v2/conversations/42");
+        assert_eq!(patches.len(), 1);
+        let patch: serde_json::Value =
+            serde_json::from_str(&patches[0].body).expect("patch body is JSON");
+        assert_eq!(
+            patch,
+            serde_json::json!({ "op": "move", "path": "/mailboxId", "value": 249877 })
+        );
+
+        assert!(source.move_conversation("42", "support").await.is_err());
+        assert!(source.move_conversation("4 2", "249877").await.is_err());
+        assert_eq!(
+            source.http.requests_to("PATCH", "/v2/conversations/").len(),
+            1,
+            "invalid ids must not reach HelpScout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_move_conversation_surfaces_a_refusal() {
+        let mock = MockHttpClient::new(vec![("/v2/oauth2/token", 200, TOKEN_BODY)]).on(
+            "PATCH",
+            "/v2/conversations/42",
+            403,
+            "no access to mailbox",
+        );
+        let source = HelpScoutSource::with_http_client(security_config(), mock);
+        let error = source
+            .move_conversation("42", "249877")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("move conversation failed (403)"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_issue_patches_status_as_one_object() {
         let mock = MockHttpClient::new(vec![
             ("/v2/oauth2/token", 200, TOKEN_BODY),
             ("/v2/conversations/42", 204, ""),
         ]);
         let source = HelpScoutSource::with_http_client(test_config(), mock);
         source.resolve_issue("42").await.unwrap();
-        assert_eq!(
-            source.http.requests_to("PATCH", "/v2/conversations/42")[0].body,
-            r#"[{"op":"replace","path":"/status","value":"closed"}]"#
+        assert_status_patch(
+            &source.http.requests_to("PATCH", "/v2/conversations/42")[0].body,
+            "closed",
         );
     }
 

@@ -104,6 +104,19 @@ impl IssueSource for InstrumentedSource {
         }
     }
 
+    async fn move_conversation(&self, issue_id: &str, mailbox_id: &str) -> Result<()> {
+        match self.inner.move_conversation(issue_id, mailbox_id).await {
+            Ok(()) => {
+                tracing::info!(component = self.inner.name(), issue_id = %issue_id, mailbox_id = %mailbox_id, "Moved conversation");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(component = self.inner.name(), issue_id = %issue_id, mailbox_id = %mailbox_id, error = %e, "Failed to move conversation");
+                Err(e)
+            }
+        }
+    }
+
     async fn fetch_issues(&self) -> Result<Vec<Issue>> {
         match self.inner.fetch_issues().await {
             Ok(issues) => {

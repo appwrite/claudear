@@ -16,7 +16,7 @@ pub(crate) const SCREENING_SCHEMA: &str = r#"{
     "required": ["verdict", "confidence", "reason"],
     "additionalProperties": false,
     "properties": {
-        "verdict": {"type": "string", "enum": ["spam", "report"]},
+        "verdict": {"type": "string", "enum": ["spam", "support", "report"]},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "reason": {"type": "string"}
     }
@@ -87,10 +87,11 @@ impl ReportPrompt<'_> {
 pub(crate) fn screening_prompt(report: &ReportPrompt<'_>) -> String {
     format!(
         "You screen messages sent to a software company's security mailbox.\n\n{RULES}\n\n\
-Decide whether the message is spam (marketing, phishing, extortion, gibberish, automated bounces, \
-unrelated support requests) or a report that claims a security problem. Unpolished or short reports \
-from real researchers are reports, not spam. Set `verdict`, a `confidence` between 0 and 1 for that \
-verdict, and a short `reason`.\n\n{}",
+Decide whether the message is `spam` (marketing, phishing, extortion, gibberish, automated bounces), \
+a `support` request (a customer asking for help with their account, project, billing or product usage \
+without claiming a security problem) or a `report` that claims a security problem. Unpolished or \
+short reports from real researchers are reports, not spam or support. Set `verdict`, a `confidence` \
+between 0 and 1 for that verdict, and a short `reason`.\n\n{}",
         report.render()
     )
 }

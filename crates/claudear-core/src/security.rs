@@ -95,6 +95,7 @@ string_enum! {
         NeedsHuman => "needs_human",
         Registering => "registering",
         Spam => "spam",
+        Forwarded => "forwarded",
         Replying => "replying",
         Closed => "closed",
         Tracking => "tracking",
@@ -104,7 +105,10 @@ string_enum! {
 
 impl SecurityReportState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Spam | Self::Closed | Self::Resolved)
+        matches!(
+            self,
+            Self::Spam | Self::Forwarded | Self::Closed | Self::Resolved
+        )
     }
 
     pub fn can_transition_to(self, next: Self) -> bool {
@@ -112,7 +116,12 @@ impl SecurityReportState {
             Self::Received => matches!(next, Self::Assessing | Self::NeedsHuman),
             Self::Assessing => matches!(
                 next,
-                Self::Received | Self::NeedsHuman | Self::Spam | Self::Replying | Self::Tracking
+                Self::Received
+                    | Self::NeedsHuman
+                    | Self::Spam
+                    | Self::Forwarded
+                    | Self::Replying
+                    | Self::Tracking
             ),
             Self::NeedsHuman => matches!(
                 next,
@@ -121,7 +130,7 @@ impl SecurityReportState {
             Self::Registering => matches!(next, Self::Tracking | Self::Replying | Self::NeedsHuman),
             Self::Replying => matches!(next, Self::Closed | Self::NeedsHuman),
             Self::Tracking => matches!(next, Self::Resolved | Self::NeedsHuman),
-            Self::Spam | Self::Closed | Self::Resolved => false,
+            Self::Spam | Self::Forwarded | Self::Closed | Self::Resolved => false,
         }
     }
 }
@@ -173,6 +182,7 @@ impl VulnerabilityState {
 string_enum! {
     SecurityOutcome {
         Spam => "spam",
+        Support => "support",
         Valid => "valid",
         NotReproducible => "not_reproducible",
         AlreadyFixed => "already_fixed",
@@ -198,7 +208,7 @@ string_enum! {
 impl SecurityReplyKind {
     pub fn for_outcome(outcome: SecurityOutcome) -> Option<Self> {
         match outcome {
-            SecurityOutcome::Spam => None,
+            SecurityOutcome::Spam | SecurityOutcome::Support => None,
             SecurityOutcome::Valid => Some(Self::Confirmed),
             SecurityOutcome::NotReproducible => Some(Self::NotReproducible),
             SecurityOutcome::AlreadyFixed => Some(Self::AlreadyFixed),
@@ -286,6 +296,7 @@ string_enum! {
         Overridden => "overridden",
         AdminConfirmed => "admin_confirmed",
         ScreenedSpam => "screened_spam",
+        ForwardedToSupport => "forwarded_to_support",
         Assessed => "assessed",
         VulnerabilityCreated => "vulnerability_created",
         DuplicateLinked => "duplicate_linked",
@@ -458,6 +469,9 @@ fn validate_outcome(
 ) -> Result<(), String> {
     if outcome == SecurityOutcome::Valid {
         return Err("use confirm_valid to accept a report as valid".to_string());
+    }
+    if outcome == SecurityOutcome::Support {
+        return Err("support requests are forwarded only by screening".to_string());
     }
     if let Some(reason) = public_reason {
         if reason.chars().count() > MAX_PUBLIC_REASON_CHARS {
@@ -766,6 +780,7 @@ mod tests {
             (Assessing, Received),
             (Assessing, NeedsHuman),
             (Assessing, Spam),
+            (Assessing, Forwarded),
             (Assessing, Replying),
             (Assessing, Tracking),
             (NeedsHuman, Received),
@@ -797,7 +812,7 @@ mod tests {
         for &state in SecurityReportState::ALL {
             assert_eq!(
                 state.is_terminal(),
-                matches!(state, Spam | Closed | Resolved),
+                matches!(state, Spam | Forwarded | Closed | Resolved),
                 "{state}"
             );
             if state.is_terminal() {
@@ -898,6 +913,7 @@ mod tests {
         use SecurityReplyKind as Kind;
         let expected = [
             (Outcome::Spam, None),
+            (Outcome::Support, None),
             (Outcome::Valid, Some(Kind::Confirmed)),
             (Outcome::NotReproducible, Some(Kind::NotReproducible)),
             (Outcome::AlreadyFixed, Some(Kind::AlreadyFixed)),
@@ -1196,6 +1212,9 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 1, 2);
 
         assert!(outcome(SecurityOutcome::Valid, None, None)
+            .validate()
+            .is_err());
+        assert!(outcome(SecurityOutcome::Support, None, None)
             .validate()
             .is_err());
         assert!(outcome(SecurityOutcome::AlreadyFixed, None, None)
