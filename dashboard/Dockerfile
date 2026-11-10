@@ -1,5 +1,5 @@
 # Build stage
-FROM oven/bun:1 AS builder
+FROM oven/bun:1@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS builder
 
 WORKDIR /app
 
@@ -16,7 +16,7 @@ COPY . .
 RUN bun run build
 
 # Production stage - serve with nginx
-FROM nginx:alpine
+FROM nginx:alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
 
 # Copy built files
 COPY --from=builder /app/dist /usr/share/nginx/html
