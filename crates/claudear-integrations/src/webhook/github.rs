@@ -687,6 +687,8 @@ mod tests {
     use super::*;
     use claudear_core::secret::SecretValue;
 
+    const SECRET: &str = "test_secret";
+
     fn create_test_config(webhook_secret: Option<&str>) -> GitHubConfig {
         GitHubConfig {
             token: Some("test_token".into()),
@@ -701,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_github_webhook_signature_verification_valid() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
@@ -709,7 +711,7 @@ mod tests {
         // Compute expected signature
         use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"test_secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
         mac.update(payload);
         let expected = mac.finalize().into_bytes();
         let signature = format!("sha256={}", hex::encode(expected));
@@ -722,7 +724,7 @@ mod tests {
 
     #[test]
     fn test_github_webhook_signature_verification_invalid() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
@@ -738,7 +740,7 @@ mod tests {
 
     #[test]
     fn test_github_webhook_signature_missing_header() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
@@ -1004,7 +1006,7 @@ mod tests {
         let watcher = Arc::new(ReviewWatcher::new(provider));
         let state = PrReviewState::new(pr_url, "owner/repo", 1, "ISSUE-1", "linear");
         watcher.watch_pr(state);
-        GitHubWebhookHandler::new(create_test_config(Some("test_secret")), Some(watcher))
+        GitHubWebhookHandler::new(create_test_config(Some(SECRET)), Some(watcher))
     }
 
     /// Helper: minimal valid review-submitted payload.
@@ -1054,7 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_invalid_signature() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = b"{}";
         let headers = make_headers("pull_request_review", "sha256=badbadbadbad");
 
@@ -1066,9 +1068,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_missing_event_header() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = b"{}";
-        let sig = make_valid_signature("test_secret", payload);
+        let sig = make_valid_signature(SECRET, payload);
         // Only include signature header, no x-github-event
         let mut headers = HashMap::new();
         headers.insert("x-hub-signature-256".to_string(), sig);
@@ -1084,9 +1086,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_unknown_event() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = b"{}";
-        let sig = make_valid_signature("test_secret", payload);
+        let sig = make_valid_signature(SECRET, payload);
         let headers = make_headers("push", &sig);
 
         let result = handler
@@ -1119,7 +1121,7 @@ mod tests {
 
         let payload_value = review_submitted_payload(pr_url);
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request_review", &sig);
 
         let result = handler
@@ -1134,11 +1136,11 @@ mod tests {
     #[tokio::test]
     async fn test_process_webhook_review_no_watcher() {
         // Handler created with review_watcher=None
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let pr_url = "https://github.com/owner/repo/pull/1";
         let payload_value = review_submitted_payload(pr_url);
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request_review", &sig);
 
         let result = handler
@@ -1164,13 +1166,12 @@ mod tests {
             "linear",
         );
         watcher.watch_pr(other_state);
-        let handler =
-            GitHubWebhookHandler::new(create_test_config(Some("test_secret")), Some(watcher));
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), Some(watcher));
 
         let pr_url = "https://github.com/owner/repo/pull/1";
         let payload_value = review_submitted_payload(pr_url);
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request_review", &sig);
 
         let result = handler
@@ -1208,7 +1209,7 @@ mod tests {
 
         let payload_value = comment_created_payload(pr_url);
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request_review_comment", &sig);
 
         let result = handler
@@ -1233,13 +1234,12 @@ mod tests {
             "linear",
         );
         watcher.watch_pr(other_state);
-        let handler =
-            GitHubWebhookHandler::new(create_test_config(Some("test_secret")), Some(watcher));
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), Some(watcher));
 
         let pr_url = "https://github.com/owner/repo/pull/1";
         let payload_value = comment_created_payload(pr_url);
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request_review_comment", &sig);
 
         let result = handler
@@ -1282,7 +1282,7 @@ mod tests {
         let payload_value =
             issue_comment_payload(pr_url, "@claudear please fix the shutdown race", true);
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("issue_comment", &sig);
 
         let result = handler
@@ -1301,7 +1301,7 @@ mod tests {
 
         let payload_value = issue_comment_payload(pr_url, "LGTM, nice", true);
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("issue_comment", &sig);
 
         let result = handler
@@ -1321,7 +1321,7 @@ mod tests {
         // No `pull_request` field => a regular issue, not a PR.
         let payload_value = issue_comment_payload(pr_url, "@claudear fix this", false);
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("issue_comment", &sig);
 
         let result = handler
@@ -1337,7 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_review_non_submitted_action() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({ "action": "edited" });
 
         let result = handler.handle_review_submitted(&payload).await;
@@ -1349,7 +1349,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_review_missing_review_field() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({
             "action": "submitted",
             "pull_request": { "html_url": "https://github.com/owner/repo/pull/1" }
@@ -1364,7 +1364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_review_missing_pull_request() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({
             "action": "submitted",
             "review": {
@@ -1441,7 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_comment_non_created_action() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({ "action": "edited" });
 
         let result = handler.handle_review_comment(&payload).await;
@@ -1453,7 +1453,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_comment_missing_comment_field() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({
             "action": "created",
             "pull_request": { "html_url": "https://github.com/owner/repo/pull/1" }
@@ -1595,11 +1595,11 @@ mod tests {
 
     #[test]
     fn test_signature_empty_payload() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"";
-        let sig = make_valid_signature("test_secret", payload);
+        let sig = make_valid_signature(SECRET, payload);
         let mut headers = HashMap::new();
         headers.insert("x-hub-signature-256".to_string(), sig);
 
@@ -1642,12 +1642,12 @@ mod tests {
 
     #[test]
     fn test_signature_missing_sha256_prefix() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
         // Compute correct hex but omit the sha256= prefix
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"test_secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
         mac.update(payload);
         let hex_only = hex::encode(mac.finalize().into_bytes());
 
@@ -1662,11 +1662,11 @@ mod tests {
 
     #[test]
     fn test_signature_wrong_prefix_sha1() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"test_secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
         mac.update(payload);
         let hex = hex::encode(mac.finalize().into_bytes());
 
@@ -1682,7 +1682,7 @@ mod tests {
 
     #[test]
     fn test_signature_empty_signature_header() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
@@ -1697,7 +1697,7 @@ mod tests {
 
     #[test]
     fn test_signature_sha256_prefix_only() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
@@ -1712,11 +1712,11 @@ mod tests {
 
     #[test]
     fn test_signature_tampered_payload() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let original_payload = b"original payload";
-        let sig = make_valid_signature("test_secret", original_payload);
+        let sig = make_valid_signature(SECRET, original_payload);
         let mut headers = HashMap::new();
         headers.insert("x-hub-signature-256".to_string(), sig);
 
@@ -1729,12 +1729,12 @@ mod tests {
 
     #[test]
     fn test_signature_large_payload() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         // Large payload (100KB)
         let payload = vec![b'x'; 100_000];
-        let sig = make_valid_signature("test_secret", &payload);
+        let sig = make_valid_signature(SECRET, &payload);
         let mut headers = HashMap::new();
         headers.insert("x-hub-signature-256".to_string(), sig);
 
@@ -1746,11 +1746,11 @@ mod tests {
 
     #[test]
     fn test_signature_unicode_payload() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = "{ \"body\": \"LGTM! \u{1f44d}\" }".as_bytes();
-        let sig = make_valid_signature("test_secret", payload);
+        let sig = make_valid_signature(SECRET, payload);
         let mut headers = HashMap::new();
         headers.insert("x-hub-signature-256".to_string(), sig);
 
@@ -1762,11 +1762,11 @@ mod tests {
 
     #[test]
     fn test_signature_case_sensitive_hex() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"test_secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
         mac.update(payload);
         let hex = hex::encode(mac.finalize().into_bytes()).to_uppercase();
 
@@ -1782,11 +1782,11 @@ mod tests {
 
     #[test]
     fn test_signature_with_extra_headers() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
-        let sig = make_valid_signature("test_secret", payload);
+        let sig = make_valid_signature(SECRET, payload);
         let mut headers = HashMap::new();
         headers.insert("x-hub-signature-256".to_string(), sig);
         headers.insert("x-github-event".to_string(), "push".to_string());
@@ -2339,9 +2339,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_ping_event_ignored() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = b"{}";
-        let sig = make_valid_signature("test_secret", payload);
+        let sig = make_valid_signature(SECRET, payload);
         let headers = make_headers("ping", &sig);
 
         let result = handler
@@ -2355,9 +2355,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_issues_event_ignored() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = b"{}";
-        let sig = make_valid_signature("test_secret", payload);
+        let sig = make_valid_signature(SECRET, payload);
         let headers = make_headers("issues", &sig);
 
         let result = handler
@@ -2371,9 +2371,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_check_suite_event_ignored() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = b"{}";
-        let sig = make_valid_signature("test_secret", payload);
+        let sig = make_valid_signature(SECRET, payload);
         let headers = make_headers("check_suite", &sig);
 
         let result = handler
@@ -2387,7 +2387,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_pull_request_closed_merged() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload_value = serde_json::json!({
             "action": "closed",
             "pull_request": {
@@ -2396,7 +2396,7 @@ mod tests {
             }
         });
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request", &sig);
 
         let result = handler
@@ -2414,7 +2414,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_pull_request_closed_not_merged() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload_value = serde_json::json!({
             "action": "closed",
             "pull_request": {
@@ -2423,7 +2423,7 @@ mod tests {
             }
         });
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request", &sig);
 
         let result = handler
@@ -2441,7 +2441,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_pull_request_opened_ignored() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload_value = serde_json::json!({
             "action": "opened",
             "pull_request": {
@@ -2450,7 +2450,7 @@ mod tests {
             }
         });
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request", &sig);
 
         let result = handler
@@ -2462,7 +2462,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_pull_request_missing_pr_url_ignored() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload_value = serde_json::json!({
             "action": "closed",
             "pull_request": {
@@ -2470,7 +2470,7 @@ mod tests {
             }
         });
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request", &sig);
 
         let result = handler
@@ -2482,12 +2482,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_pull_request_missing_payload_ignored() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload_value = serde_json::json!({
             "action": "closed"
         });
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request", &sig);
 
         let result = handler
@@ -2499,9 +2499,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_empty_event_type_ignored() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = b"{}";
-        let sig = make_valid_signature("test_secret", payload);
+        let sig = make_valid_signature(SECRET, payload);
         let headers = make_headers("", &sig);
 
         let result = handler
@@ -2542,7 +2542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_review_missing_action() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         // No "action" field at all
         let payload = serde_json::json!({
             "review": { "id": 1 },
@@ -2558,7 +2558,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_review_dismissed_action() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({ "action": "dismissed" });
 
         let result = handler.handle_review_submitted(&payload).await;
@@ -2677,7 +2677,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_review_pr_url_missing_html_url() {
         // Pull request has no html_url field — defaults to empty string
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({
             "action": "submitted",
             "review": {
@@ -2700,7 +2700,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_comment_edited_action() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({ "action": "edited" });
 
         let result = handler.handle_review_comment(&payload).await;
@@ -2712,7 +2712,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_comment_deleted_action() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({ "action": "deleted" });
 
         let result = handler.handle_review_comment(&payload).await;
@@ -2724,7 +2724,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_comment_missing_action() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({
             "comment": {
                 "id": 1,
@@ -2747,7 +2747,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_comment_missing_pull_request() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = serde_json::json!({
             "action": "created",
             "comment": {
@@ -2770,7 +2770,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_comment_no_watcher() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let pr_url = "https://github.com/owner/repo/pull/1";
         let payload = comment_created_payload(pr_url);
 
@@ -2849,7 +2849,7 @@ mod tests {
         });
 
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request_review", &sig);
 
         let result = handler
@@ -2906,7 +2906,7 @@ mod tests {
         });
 
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request_review_comment", &sig);
 
         let result = handler
@@ -2945,9 +2945,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_with_json_array_payload() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload = b"[]";
-        let sig = make_valid_signature("test_secret", payload);
+        let sig = make_valid_signature(SECRET, payload);
         let headers = make_headers("pull_request_review", &sig);
 
         // JSON array is valid JSON but not an object — the handler should
@@ -2961,7 +2961,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_webhook_with_deeply_nested_payload() {
-        let handler = GitHubWebhookHandler::new(create_test_config(Some("test_secret")), None);
+        let handler = GitHubWebhookHandler::new(create_test_config(Some(SECRET)), None);
         let payload_value = serde_json::json!({
             "action": "submitted",
             "review": {
@@ -2983,7 +2983,7 @@ mod tests {
             }
         });
         let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
-        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let sig = make_valid_signature(SECRET, &payload_bytes);
         let headers = make_headers("pull_request_review", &sig);
 
         // No watcher, so returns Ok(false), but should not crash
@@ -2997,7 +2997,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_with_only_unrelated_headers() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test";
@@ -3014,11 +3014,11 @@ mod tests {
 
     #[test]
     fn test_verify_signature_truncated_hex() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
-        let full_sig = make_valid_signature("test_secret", payload);
+        let full_sig = make_valid_signature(SECRET, payload);
         // Truncate the hex to half length
         let truncated = &full_sig[..full_sig.len() / 2];
 
@@ -3033,11 +3033,11 @@ mod tests {
 
     #[test]
     fn test_verify_signature_with_newlines_in_hex() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"test_secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
         mac.update(payload);
         let hex = hex::encode(mac.finalize().into_bytes());
         // Insert a newline in the hex
@@ -3054,11 +3054,11 @@ mod tests {
 
     #[test]
     fn test_verify_signature_with_spaces_in_hex() {
-        let config = create_test_config(Some("test_secret"));
+        let config = create_test_config(Some(SECRET));
         let handler = GitHubWebhookHandler::new(config, None);
 
         let payload = b"test payload";
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"test_secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
         mac.update(payload);
         let hex = hex::encode(mac.finalize().into_bytes());
         let bad_hex = format!("sha256= {hex}");
