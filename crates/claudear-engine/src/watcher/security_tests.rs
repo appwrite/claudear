@@ -1387,11 +1387,10 @@ async fn a_source_blocking_its_thread_never_stalls_security_intake() {
         fixture.options(config, vec![blocking.clone(), fixture.helpscout.clone()]),
     ));
     watcher.set_security_inbox(fixture.inbox.clone());
-    assert!(watcher.mark_running());
 
     let loops = {
         let watcher = Arc::clone(&watcher);
-        tokio::spawn(async move { watcher.run_loops(1000).await })
+        tokio::spawn(async move { watcher.start(Some(1000)).await })
     };
     let started = std::time::Instant::now();
     let mut reached = None;
@@ -1403,7 +1402,7 @@ async fn a_source_blocking_its_thread_never_stalls_security_intake() {
     }
     watcher.stop();
     blocking.release();
-    loops.await.unwrap();
+    loops.await.unwrap().unwrap();
 
     assert!(
         reached.is_some_and(|elapsed| elapsed < BLOCKING_LIMIT / 2),

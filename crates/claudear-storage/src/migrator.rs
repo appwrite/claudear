@@ -110,6 +110,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "security_inbox",
         sql: include_str!("../../../migrations/V18__security_inbox.sql"),
     },
+    Migration {
+        version: 19,
+        name: "scheduled_runs",
+        sql: include_str!("../../../migrations/V19__scheduled_runs.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
