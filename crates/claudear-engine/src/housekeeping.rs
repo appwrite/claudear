@@ -283,13 +283,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_runs_outside_the_slot() {
+    async fn nothing_runs_before_the_slot() {
         let mut schedule = ReportSchedule::daily("pr-distribution", 9);
 
         let run = run_when_due(
             &mut schedule,
-            nine_am() + chrono::Duration::hours(1),
-            || async { panic!("ran outside its hour") },
+            nine_am() - chrono::Duration::minutes(1),
+            || async { panic!("ran before its hour") },
         )
         .await;
 

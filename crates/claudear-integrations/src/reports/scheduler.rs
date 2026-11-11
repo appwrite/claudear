@@ -102,9 +102,9 @@ impl ReportSchedule {
     }
 
     /// Whether this schedule should run at `now`: its slot falls today, `now`
-    /// is at or past the slot hour, and it has not run since the slot. A slot
-    /// missed at its exact hour, by a restart or a long tick, still runs later
-    /// the same day.
+    /// is at or past the slot hour, and it has not run since the slot (for a
+    /// weekly schedule, within the six days before it). A slot missed at its
+    /// exact hour, by a restart or a long tick, still runs later the same day.
     pub fn is_due(&self, now: DateTime<Utc>) -> bool {
         if !self.enabled {
             return false;
@@ -112,7 +112,11 @@ impl ReportSchedule {
         let Some(slot) = self.slot_on(now) else {
             return false;
         };
-        now >= slot && self.last_sent_at.is_none_or(|last| last < slot)
+        let earliest = match self.frequency {
+            ReportFrequency::Weekly(_) => slot - Duration::days(6),
+            ReportFrequency::Daily | ReportFrequency::Monthly => slot,
+        };
+        now >= slot && self.last_sent_at.is_none_or(|last| last < earliest)
     }
 
     /// The slot falling on the UTC day of `now`, if the frequency has one.
