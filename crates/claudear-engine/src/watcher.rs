@@ -43,6 +43,7 @@ use claudear_integrations::scm::{
 use claudear_integrations::source::IssueSource;
 use claudear_storage::FixAttemptTracker;
 use futures::future::join_all;
+use security_intake::SecurityIntake;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -1353,9 +1354,85 @@ impl Watcher {
         }
 
         self.poll().await?;
+        self.run_loops(poll_interval).await;
+        Ok(())
+    }
 
-        let worker = crate::housekeeping::HousekeepingWorker::new(Arc::clone(self), poll_interval);
-        tokio::join!(self.run_source_poll_loop(poll_interval), worker.run_loop());
+    /// Run source polling, security intake and housekeeping as separate tasks
+    /// until the watcher stops, so a run that blocks the thread of one loop
+    /// leaves the others polling.
+    async fn run_loops(self: &Arc<Self>, poll_interval: u64) {
+        let housekeeping = {
+            let worker =
+                crate::housekeeping::HousekeepingWorker::new(Arc::clone(self), poll_interval);
+            tokio::spawn(async move { worker.run_loop().await })
+        };
+        let security = self.security_intake_source().map(|source| {
+            let watcher = Arc::clone(self);
+            tokio::spawn(async move { watcher.run_security_intake_loop(source).await })
+        });
+        let intake = if security.is_some() {
+            SecurityIntake::Separate
+        } else {
+            SecurityIntake::Inline
+        };
+        let sources = {
+            let watcher = Arc::clone(self);
+            tokio::spawn(async move { watcher.run_source_poll_loop(poll_interval, intake).await })
+        };
+        for (name, handle) in [
+            ("source polling", Some(sources)),
+            ("housekeeping", Some(housekeeping)),
+            ("security intake", security),
+        ] {
+            let Some(handle) = handle else {
+                continue;
+            };
+            if let Err(error) = handle.await {
+                tracing::error!(component = "watcher", task = name, error = %error, "Watcher loop ended abnormally");
+            }
+        }
+    }
+
+    /// The HelpScout source when a security inbox is set, whose security
+    /// conversations then get a loop of their own.
+    fn security_intake_source(&self) -> Option<Arc<dyn IssueSource>> {
+        self.security_inbox()?;
+        self.sources
+            .iter()
+            .find(|source| source.name() == HELPSCOUT_SOURCE)
+            .cloned()
+    }
+
+    /// Route the security conversations of `source` and advance the security
+    /// inbox at that source's poll interval until the watcher stops.
+    async fn run_security_intake_loop(self: &Arc<Self>, source: Arc<dyn IssueSource>) {
+        let period = Duration::from_millis(self.config.poll_interval_ms_for(source.name()).max(1))
+            .max(MIN_SOURCE_POLL_PERIOD);
+        let mut timer = interval_at(tokio::time::Instant::now() + period, period);
+        while self.is_running.load(Ordering::SeqCst) {
+            timer.tick().await;
+            if !self.is_running.load(Ordering::SeqCst) {
+                break;
+            }
+            if self.is_rate_limit_paused().await {
+                continue;
+            }
+            if let Err(error) = self.poll_security_source(&source).await {
+                tracing::error!(component = "security", error = %error, "Error polling the security inbox");
+            }
+        }
+    }
+
+    async fn poll_security_source(self: &Arc<Self>, source: &Arc<dyn IssueSource>) -> Result<()> {
+        let security = source
+            .fetch_issues()
+            .await?
+            .into_iter()
+            .filter(|issue| is_security_issue(&self.config, issue))
+            .collect();
+        self.intake_security_issues(source, security).await;
+        self.advance_security_inbox().await;
         Ok(())
     }
 
@@ -1364,7 +1441,7 @@ impl Watcher {
     /// Polls each source at its configured interval, logging failed polls.
     /// Housekeeping is handled separately by
     /// [`HousekeepingWorker`](crate::housekeeping::HousekeepingWorker).
-    async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64) {
+    async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64, intake: SecurityIntake) {
         let now = std::time::Instant::now();
         let mut schedule: Vec<_> = self
             .sources
@@ -1401,7 +1478,7 @@ impl Watcher {
 
             for (source, interval, last_poll) in &mut schedule {
                 if last_poll.elapsed() >= *interval {
-                    if let Err(error) = self.poll_source(source).await {
+                    if let Err(error) = self.poll_source_with(source, intake).await {
                         tracing::error!(
                             component = "watcher",
                             source = source.name(),
@@ -3861,15 +3938,34 @@ Create a PR with your changes.{custom_instructions}"#,
     /// The `deploy_qa` source is skipped: its tips are dispatched only by
     /// [`Self::dispatch_pending_deploy_qa_tips`], so a tip never runs twice.
     async fn poll_source(self: &Arc<Self>, source: &Arc<dyn IssueSource>) -> Result<()> {
+        self.poll_source_with(source, SecurityIntake::Inline).await
+    }
+
+    async fn poll_source_with(
+        self: &Arc<Self>,
+        source: &Arc<dyn IssueSource>,
+        intake: SecurityIntake,
+    ) -> Result<()> {
         if source.name() == DEPLOY_QA_SOURCE || self.is_rate_limit_paused().await {
             return Ok(());
         }
 
         let issues = source.fetch_issues().await?;
-        let issues = self.intake_security_issues(source, issues).await;
-        if source.name() == HELPSCOUT_SOURCE {
-            self.advance_security_inbox().await;
-        }
+        let issues = match intake {
+            SecurityIntake::Inline => {
+                let issues = self.intake_security_issues(source, issues).await;
+                if source.name() == HELPSCOUT_SOURCE {
+                    self.advance_security_inbox().await;
+                }
+                issues
+            }
+            SecurityIntake::Separate => self.without_held_security_conversations(
+                issues
+                    .into_iter()
+                    .filter(|issue| !is_security_issue(&self.config, issue))
+                    .collect(),
+            ),
+        };
         tracing::info!(source = source.name(), count = issues.len(), "Found issues");
         let fetched_metric = ProcessingMetric::new("issues_fetched", issues.len() as f64)
             .with_source(source.name().to_string());
@@ -6541,6 +6637,7 @@ pub struct SeedResult {
     pub by_source: std::collections::HashMap<String, usize>,
 }
 
+mod security_intake;
 #[cfg(test)]
 mod security_tests;
 
