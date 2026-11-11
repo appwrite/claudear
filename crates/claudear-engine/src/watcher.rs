@@ -1473,8 +1473,11 @@ impl Watcher {
                 continue;
             }
 
+            let cycle_started_at = std::time::Instant::now();
+            let mut polled = false;
             for (source, interval, last_poll) in &mut schedule {
                 if last_poll.is_none_or(|at: std::time::Instant| at.elapsed() >= *interval) {
+                    polled = true;
                     if let Err(error) = self.poll_source_with(source, intake).await {
                         tracing::error!(
                             component = "watcher",
@@ -1486,6 +1489,19 @@ impl Watcher {
                     *last_poll = Some(std::time::Instant::now());
                 }
             }
+            if polled && !self.dry_run {
+                self.record_poll_cycle(cycle_started_at);
+            }
+        }
+    }
+
+    fn record_poll_cycle(&self, started_at: std::time::Instant) {
+        let metric = ProcessingMetric::new(
+            "poll_cycle_duration_secs",
+            started_at.elapsed().as_secs_f64(),
+        );
+        if let Err(e) = self.tracker.record_metric(&metric) {
+            tracing::debug!(error = %e, "Failed to record poll_cycle_duration_secs metric");
         }
     }
 
@@ -2923,13 +2939,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // Record lightweight operational telemetry for dashboard analytics.
         if !self.dry_run {
-            let poll_duration_metric = ProcessingMetric::new(
-                "poll_cycle_duration_secs",
-                poll_started_at.elapsed().as_secs_f64(),
-            );
-            if let Err(e) = self.tracker.record_metric(&poll_duration_metric) {
-                tracing::debug!(error = %e, "Failed to record poll_cycle_duration_secs metric");
-            }
+            self.record_poll_cycle(poll_started_at);
 
             let source_count_metric =
                 ProcessingMetric::new("poll_sources", self.sources.len() as f64);
@@ -7749,6 +7759,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_live_poll_loop_records_its_cycle_duration() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![Arc::new(MockSource::new("empty"))];
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            tracker.clone(),
+            sources,
+            false,
+        );
+        let start = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.start(Some(1000)).await }
+        });
+
+        let mut recorded = false;
+        for _ in 0..100 {
+            recorded = !tracker
+                .get_metrics("poll_cycle_duration_secs", None, 1)
+                .unwrap()
+                .is_empty();
+            if recorded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        watcher.stop();
+        start.await.unwrap().unwrap();
+
+        assert!(
+            recorded,
+            "the running poll loop must record poll_cycle_duration_secs for pipeline telemetry"
+        );
+    }
+
+    #[tokio::test]
     async fn test_watcher_poll_records_cycle_metrics() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -8584,8 +8629,8 @@ mod tests {
             async move { watcher.start(Some(50)).await }
         });
 
-        // The initial poll runs ready retries inline, so seed the retry only
-        // once that poll has finished; the housekeeping loop must run it.
+        // Seed the retry once the first source poll has finished; the
+        // housekeeping loop must run it.
         while tracker
             .get_metrics("poll_cycle_duration_secs", None, 1)
             .unwrap()
