@@ -2116,6 +2116,19 @@ pub trait DeployQaStore: Send + Sync {
     }
 }
 
+/// When each scheduled job last ran (all defaulted).
+pub trait ScheduleStore: Send + Sync {
+    /// When the job `name` last ran, if it ever has.
+    fn last_scheduled_run(&self, _name: &str) -> Result<Option<DateTime<Utc>>> {
+        Ok(None)
+    }
+
+    /// Record that the job `name` ran at `at`.
+    fn record_scheduled_run(&self, _name: &str, _at: DateTime<Utc>) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// The developer responsible for each open Claudear PR (all defaulted).
 pub trait PrAssignmentStore: Send + Sync {
     /// Every active assignment, oldest first.
@@ -2531,6 +2544,7 @@ pub trait FixAttemptTracker:
     + RegressionStore
     + DeployQaStore
     + PrAssignmentStore
+    + ScheduleStore
     + SecurityReportStore
     + ChatStore
     + DiscordStore
@@ -2551,6 +2565,7 @@ impl<T> FixAttemptTracker for T where
         + RegressionStore
         + DeployQaStore
         + PrAssignmentStore
+        + ScheduleStore
         + SecurityReportStore
         + ChatStore
         + DiscordStore
@@ -2644,6 +2659,7 @@ impl UserStore for NoopTracker {}
 impl RegressionStore for NoopTracker {}
 impl DeployQaStore for NoopTracker {}
 impl PrAssignmentStore for NoopTracker {}
+impl ScheduleStore for NoopTracker {}
 impl SecurityReportStore for NoopTracker {}
 impl ChatStore for NoopTracker {}
 impl DiscordStore for NoopTracker {}
@@ -2831,6 +2847,7 @@ mod tests {
         impl RegressionStore for FullTracker {}
         impl DeployQaStore for FullTracker {}
         impl PrAssignmentStore for FullTracker {}
+        impl ScheduleStore for FullTracker {}
         impl SecurityReportStore for FullTracker {}
         impl ChatStore for FullTracker {}
         impl DiscordStore for FullTracker {}

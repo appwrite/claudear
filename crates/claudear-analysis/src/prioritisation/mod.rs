@@ -163,7 +163,7 @@ mod tests {
     use claudear_storage::{
         ActivityStore, AttemptTracker, ChatStore, DeployQaStore, DiscordStore, EmbeddingStore,
         EvaluationStore, ExperimentStore, KnowledgeStore, PrAssignmentStore, RegressionStore,
-        RepoStore, SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
+        RepoStore, ScheduleStore, SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
     };
 
     /// Minimal no-op tracker for tests.
@@ -265,6 +265,7 @@ mod tests {
     impl DiscordStore for NoOpTracker {}
     impl DeployQaStore for NoOpTracker {}
     impl PrAssignmentStore for NoOpTracker {}
+    impl ScheduleStore for NoOpTracker {}
     impl SecurityReportStore for NoOpTracker {}
 
     fn make_candidate(
@@ -853,6 +854,7 @@ mod tests {
         impl DiscordStore for ClusterTrackingTracker {}
         impl DeployQaStore for ClusterTrackingTracker {}
         impl PrAssignmentStore for ClusterTrackingTracker {}
+        impl ScheduleStore for ClusterTrackingTracker {}
         impl SecurityReportStore for ClusterTrackingTracker {}
 
         let config = PrioritisationConfig {
@@ -2722,6 +2724,7 @@ mod tests {
         impl DiscordStore for CountingTracker {}
         impl DeployQaStore for CountingTracker {}
         impl PrAssignmentStore for CountingTracker {}
+        impl ScheduleStore for CountingTracker {}
         impl SecurityReportStore for CountingTracker {}
 
         let count = Arc::new(AtomicU32::new(0));
@@ -2885,6 +2888,7 @@ mod tests {
         impl DiscordStore for FailingTracker {}
         impl DeployQaStore for FailingTracker {}
         impl PrAssignmentStore for FailingTracker {}
+        impl ScheduleStore for FailingTracker {}
         impl SecurityReportStore for FailingTracker {}
 
         let tracker = FailingTracker;
