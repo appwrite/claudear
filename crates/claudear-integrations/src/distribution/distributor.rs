@@ -291,13 +291,7 @@ impl Distributor {
             let attention = pull_request.attention(None);
             if attention.is_finished() {
                 if let Some(assignment) = assignment {
-                    if self
-                        .store
-                        .end_pr_assignment(assignment.id, AssignmentStatus::Closed)?
-                    {
-                        outcome.closed += 1;
-                        finished.push((pull_request, assignment));
-                    }
+                    finished.push((pull_request, assignment));
                 }
                 continue;
             }
@@ -374,6 +368,15 @@ impl Distributor {
                     .map(|(item, assignment)| (&item.pull_request, assignment)),
             );
 
+        let (finished, unrounded): (Vec<_>, Vec<_>) =
+            finished.into_iter().partition(|(_, assignment)| {
+                self.digest && self.roster.find(&assignment.assignee).is_some()
+            });
+        self.close(
+            unrounded.iter().map(|(_, assignment)| assignment),
+            &mut outcome,
+        )?;
+
         if self.digest {
             let digest = self.digest(current.clone(), &finished, now);
             outcome.listed = digest.count();
@@ -390,6 +393,13 @@ impl Distributor {
                     self.store.mark_pr_assignment_notified(assignment.id)?;
                 }
             }
+            self.close(
+                finished
+                    .iter()
+                    .map(|(_, assignment)| assignment)
+                    .filter(|assignment| delivery.reached(&assignment.assignee)),
+                &mut outcome,
+            )?;
             return Ok(outcome);
         }
 
@@ -511,6 +521,25 @@ impl Distributor {
             self.store.mark_pr_assignment_notified(assignment.id)?;
         }
         Ok(delivery)
+    }
+
+    /// End the assignments of PRs that merged or closed. A PR in a roundup is
+    /// only closed once its assignee's digest was sent, so a roundup that
+    /// failed to reach them is retried on the next run.
+    fn close<'a>(
+        &self,
+        assignments: impl Iterator<Item = &'a PrAssignment>,
+        outcome: &mut Outcome,
+    ) -> Result<()> {
+        for assignment in assignments {
+            if self
+                .store
+                .end_pr_assignment(assignment.id, AssignmentStatus::Closed)?
+            {
+                outcome.closed += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Report, once per run, that `count` PRs reached no remote channel and
@@ -1659,6 +1688,57 @@ mod tests {
                 .all(|group| group.wrapped_up.is_empty()),
             "a wrapped-up PR is rounded up once"
         );
+    }
+
+    #[tokio::test]
+    async fn a_roundup_that_missed_its_assignee_is_sent_on_the_next_run() {
+        let harness = Harness::new(FakeHost::with([open(1), open(2)]));
+        harness.opened(1);
+        harness.opened(2);
+        let distributor = harness.distributor(&["amy", "bob"], config());
+        distributor.distribute(Utc::now()).await.unwrap();
+        let assignees: HashMap<i64, String> = harness.assignees().into_iter().collect();
+        let unreachable = assignees[&1].clone();
+        harness.host.update(1, |pull_request| {
+            pull_request.state = PullRequestState::Merged
+        });
+        harness
+            .recorder
+            .unreachable
+            .lock()
+            .unwrap()
+            .insert(unreachable.clone());
+
+        let missed = distributor.distribute(Utc::now()).await;
+        let rounded_up = |harness: &Harness| -> bool {
+            harness
+                .recorder
+                .digests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|digest| {
+                    digest.groups.iter().any(|group| {
+                        group.developer.login == unreachable
+                            && group
+                                .wrapped_up
+                                .iter()
+                                .any(|wrapped| wrapped.pull_request.number == 1)
+                    })
+                })
+        };
+        assert!(!rounded_up(&harness));
+        assert!(
+            harness.assignees().iter().any(|(number, _)| *number == 1),
+            "a merged PR whose roundup missed its assignee keeps its assignment: {missed:?}"
+        );
+
+        harness.recorder.unreachable.lock().unwrap().clear();
+        let outcome = distributor.distribute(Utc::now()).await.unwrap();
+
+        assert!(rounded_up(&harness));
+        assert_eq!(outcome.closed, 1);
+        assert!(harness.assignees().iter().all(|(number, _)| *number != 1));
     }
 
     #[tokio::test]

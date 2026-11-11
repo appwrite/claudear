@@ -68,6 +68,11 @@ impl DigestDelivery {
         self.pull_requests.contains(url)
     }
 
+    /// Whether the digest message of the assignee `login` was sent.
+    pub fn reached(&self, login: &str) -> bool {
+        self.developers.contains(login)
+    }
+
     /// Whether nobody was sent anything.
     pub fn is_empty(&self) -> bool {
         self.developers.is_empty()
