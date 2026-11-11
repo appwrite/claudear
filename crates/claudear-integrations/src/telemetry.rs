@@ -781,6 +781,7 @@ mod tests {
                 groups: vec![DigestGroup {
                     developer: Developer::new("amy"),
                     pull_requests: vec![summary],
+                    wrapped_up: Vec::new(),
                 }],
                 generated_at: Utc::now(),
             })

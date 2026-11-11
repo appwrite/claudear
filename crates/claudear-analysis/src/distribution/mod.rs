@@ -13,6 +13,7 @@ mod notice;
 mod ownership;
 mod pull_request;
 mod roster;
+mod wrapped_up;
 
 pub use balancer::Balancer;
 pub use balancer::Decision;
@@ -34,3 +35,4 @@ pub use pull_request::PullRequestState;
 pub use pull_request::Review;
 pub use pull_request::Verdict;
 pub use roster::Roster;
+pub use wrapped_up::WrappedUp;

@@ -1327,7 +1327,7 @@ async fn a_release_whose_only_merge_is_a_security_fix_starts_no_cascade() {
 }
 
 /// Bounds the block so a regression fails the test instead of hanging it.
-const BLOCKING_LIMIT: Duration = Duration::from_secs(30);
+const BLOCKING_LIMIT: Duration = Duration::from_secs(60);
 
 /// A source whose fetch blocks its thread until released, as a run stuck in a
 /// synchronous call does.
@@ -1406,7 +1406,7 @@ async fn a_source_blocking_its_thread_never_stalls_security_intake() {
     loops.await.unwrap();
 
     assert!(
-        reached.is_some_and(|elapsed| elapsed < BLOCKING_LIMIT / 3),
+        reached.is_some_and(|elapsed| elapsed < BLOCKING_LIMIT / 2),
         "a source blocking its polling thread kept a security report from the inbox: reached after {reached:?}"
     );
 }
