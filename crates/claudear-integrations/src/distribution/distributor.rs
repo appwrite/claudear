@@ -397,7 +397,11 @@ impl Distributor {
                 finished
                     .iter()
                     .map(|(_, assignment)| assignment)
-                    .filter(|assignment| delivery.reached(&assignment.assignee)),
+                    .filter(|assignment| {
+                        self.roster
+                            .find(&assignment.assignee)
+                            .is_some_and(|developer| delivery.reached(&developer.login))
+                    }),
                 &mut outcome,
             )?;
             return Ok(outcome);
@@ -1739,6 +1743,29 @@ mod tests {
         assert!(rounded_up(&harness));
         assert_eq!(outcome.closed, 1);
         assert!(harness.assignees().iter().all(|(number, _)| *number != 1));
+    }
+
+    #[tokio::test]
+    async fn a_delivered_roundup_closes_an_assignment_stored_under_another_login_casing() {
+        let harness = Harness::new(FakeHost::with([open(1)]));
+        harness.opened(1);
+        harness
+            .distributor(&["Amy"], config())
+            .distribute(Utc::now())
+            .await
+            .unwrap();
+        harness.host.update(1, |pull_request| {
+            pull_request.state = PullRequestState::Merged
+        });
+
+        let outcome = harness
+            .distributor(&["amy"], config())
+            .distribute(Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.closed, 1);
+        assert!(harness.assignees().is_empty());
     }
 
     #[tokio::test]
