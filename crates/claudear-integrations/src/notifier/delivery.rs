@@ -31,6 +31,7 @@ impl Delivery {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DigestDelivery {
     pull_requests: HashSet<String>,
+    developers: HashSet<String>,
 }
 
 impl DigestDelivery {
@@ -47,6 +48,7 @@ impl DigestDelivery {
 
     /// Record that `group`'s assignee was sent their digest message.
     pub fn add(&mut self, group: &DigestGroup) {
+        self.developers.insert(group.developer.login.clone());
         self.pull_requests.extend(
             group
                 .pull_requests
@@ -58,6 +60,7 @@ impl DigestDelivery {
     /// Record everything `other` delivered as delivered here too.
     pub fn merge(&mut self, other: Self) {
         self.pull_requests.extend(other.pull_requests);
+        self.developers.extend(other.developers);
     }
 
     /// Whether the assignee of the PR at `url` was sent it.
@@ -67,6 +70,6 @@ impl DigestDelivery {
 
     /// Whether nobody was sent anything.
     pub fn is_empty(&self) -> bool {
-        self.pull_requests.is_empty()
+        self.developers.is_empty()
     }
 }

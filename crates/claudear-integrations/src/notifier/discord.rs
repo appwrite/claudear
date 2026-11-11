@@ -4297,10 +4297,12 @@ mod tests {
                 claudear_analysis::distribution::DigestGroup {
                     developer: pr_developer("amy", Some("1")),
                     pull_requests: vec![pr_summary(1), pr_summary(2)],
+                    wrapped_up: Vec::new(),
                 },
                 claudear_analysis::distribution::DigestGroup {
                     developer: pr_developer("bob", Some("2")),
                     pull_requests: vec![pr_summary(3)],
+                    wrapped_up: Vec::new(),
                 },
             ],
             generated_at: Utc::now(),
@@ -4333,6 +4335,7 @@ mod tests {
             groups: vec![claudear_analysis::distribution::DigestGroup {
                 developer: pr_developer("amy", Some("1")),
                 pull_requests: (1..=100).map(pr_summary).collect(),
+                wrapped_up: Vec::new(),
             }],
             generated_at: Utc::now(),
         };
@@ -4376,10 +4379,12 @@ mod tests {
                 claudear_analysis::distribution::DigestGroup {
                     developer: pr_developer("amy", Some("1")),
                     pull_requests: vec![pr_summary(1)],
+                    wrapped_up: Vec::new(),
                 },
                 claudear_analysis::distribution::DigestGroup {
                     developer: pr_developer("bob", Some("2")),
                     pull_requests: vec![pr_summary(2)],
+                    wrapped_up: Vec::new(),
                 },
             ],
             generated_at: Utc::now(),
@@ -4448,6 +4453,7 @@ mod tests {
             groups: vec![claudear_analysis::distribution::DigestGroup {
                 developer: pr_developer("amy", Some("1")),
                 pull_requests: vec![pr_summary(1)],
+                wrapped_up: Vec::new(),
             }],
             generated_at: Utc::now(),
         };

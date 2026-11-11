@@ -1046,7 +1046,8 @@ enabled = false
 # Assign and ping as soon as Claudear opens a PR (default: true). When false,
 # new PRs are assigned on the next scheduled run.
 notify_on_open = true
-# Send each assignee the PRs still waiting on them on every scheduled run
+# Send each assignee the PRs still waiting on them, and a roundup of the ones
+# that merged or closed since the previous run, on every scheduled run
 # (default: true). When false, the scheduled run pings each new assignee.
 digest = true
 # How often the scheduled run fires: "daily", "weekly-monday" .. "weekly-sunday",

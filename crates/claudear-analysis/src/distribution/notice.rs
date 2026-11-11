@@ -2,6 +2,7 @@
 
 use crate::distribution::Developer;
 use crate::distribution::PullRequest;
+use crate::distribution::WrappedUp;
 use chrono::DateTime;
 use chrono::Utc;
 use claudear_core::types::AssignmentReason;
@@ -131,32 +132,53 @@ impl AssignmentNotice {
     }
 }
 
-/// The PRs one developer is responsible for that still need them.
+/// The PRs one developer is responsible for that still need them, and those
+/// they saw through since the previous digest.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DigestGroup {
     /// The assignee.
     pub developer: Developer,
     /// Their PRs, oldest first.
     pub pull_requests: Vec<PullRequestSummary>,
+    /// Their PRs that merged or closed since the previous digest.
+    pub wrapped_up: Vec<WrappedUp>,
 }
 
 impl DigestGroup {
     /// The line that mentions the assignee.
     pub fn heading(&self, markup: &dyn Markup) -> String {
+        let mention = markup.mention(&self.developer);
+        if self.pull_requests.is_empty() {
+            return format!("{mention} you {}", Self::roundup(self.wrapped_up.len()));
+        }
         let count = self.pull_requests.len();
         format!(
-            "{} {count} Claudear PR{} waiting on you:",
-            markup.mention(&self.developer),
-            if count == 1 { "" } else { "s" }
+            "{mention} {count} Claudear PR{} waiting on you:",
+            plural(count)
         )
     }
 
-    /// One line per PR.
+    /// One line per waiting PR, then the roundup of wrapped-up PRs.
     pub fn lines(&self, markup: &dyn Markup, now: DateTime<Utc>) -> Vec<String> {
-        self.pull_requests
+        let mut lines: Vec<String> = self
+            .pull_requests
             .iter()
             .map(|pull_request| pull_request.line(markup, now))
-            .collect()
+            .collect();
+        if !self.wrapped_up.is_empty() {
+            if !self.pull_requests.is_empty() {
+                lines.push(format!("You {}", Self::roundup(self.wrapped_up.len())));
+            }
+            lines.extend(self.wrapped_up.iter().map(|wrapped| wrapped.line(markup)));
+        }
+        lines
+    }
+
+    fn roundup(count: usize) -> String {
+        format!(
+            "wrapped up {count} Claudear PR{} since the last digest, nice work:",
+            plural(count)
+        )
     }
 
     /// The group as `markup` text.
@@ -235,6 +257,14 @@ impl Digest {
     /// The digest as plain text.
     pub fn format_text(&self) -> String {
         self.render(&PlainText)
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 
@@ -342,6 +372,7 @@ mod tests {
         let group = DigestGroup {
             developer: developer("amy", "42"),
             pull_requests: vec![pull_request],
+            wrapped_up: Vec::new(),
         };
 
         for text in [
@@ -366,10 +397,12 @@ mod tests {
                 DigestGroup {
                     developer: developer("amy", "1"),
                     pull_requests: vec![summary(1, Some(3)), summary(2, None)],
+                    wrapped_up: Vec::new(),
                 },
                 DigestGroup {
                     developer: developer("bob", "2"),
                     pull_requests: vec![summary(3, Some(0))],
+                    wrapped_up: Vec::new(),
                 },
             ],
             generated_at: now(),
@@ -398,6 +431,7 @@ mod tests {
         let group = DigestGroup {
             developer: developer("amy", "1"),
             pull_requests: (1..=3).map(|number| summary(number, None)).collect(),
+            wrapped_up: Vec::new(),
         };
         let heading = group.heading(&PlainText);
         let lines = group.lines(&PlainText, now());
@@ -422,6 +456,7 @@ mod tests {
         let group = DigestGroup {
             developer: developer("amy", "1"),
             pull_requests: vec![summary(1, None)],
+            wrapped_up: Vec::new(),
         };
 
         let pages = group.pages(&PlainText, now(), 10);
@@ -438,5 +473,45 @@ mod tests {
         };
         assert!(digest.is_empty());
         assert_eq!(digest.count(), 0);
+    }
+
+    fn wrapped(number: i64, merged: bool) -> WrappedUp {
+        WrappedUp {
+            pull_request: summary(number, None),
+            merged,
+        }
+    }
+
+    #[test]
+    fn a_group_rounds_up_what_its_assignee_wrapped_up_after_what_waits_on_them() {
+        let group = DigestGroup {
+            developer: developer("amy", "42"),
+            pull_requests: vec![summary(1, Some(3))],
+            wrapped_up: vec![wrapped(2, true), wrapped(3, false)],
+        };
+
+        assert_eq!(
+            group.render(&Chat, now()),
+            "<@42> 1 Claudear PR waiting on you:\n\
+             • [org/repo#1](https://github.com/org/repo/pull/1) Fix 1 (open 3d)\n\
+             You wrapped up 2 Claudear PRs since the last digest, nice work:\n\
+             • [org/repo#2](https://github.com/org/repo/pull/2) Fix 2 (merged)\n\
+             • [org/repo#3](https://github.com/org/repo/pull/3) Fix 3 (closed)"
+        );
+    }
+
+    #[test]
+    fn a_group_with_nothing_waiting_opens_with_its_roundup() {
+        let group = DigestGroup {
+            developer: developer("amy", "42"),
+            pull_requests: Vec::new(),
+            wrapped_up: vec![wrapped(2, true)],
+        };
+
+        assert_eq!(
+            group.render(&Chat, now()),
+            "<@42> you wrapped up 1 Claudear PR since the last digest, nice work:\n\
+             • [org/repo#2](https://github.com/org/repo/pull/2) Fix 2 (merged)"
+        );
     }
 }
