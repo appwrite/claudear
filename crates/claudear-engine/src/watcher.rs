@@ -3046,7 +3046,7 @@ Create a PR with your changes.{custom_instructions}"#,
         if self.config.reports.support_digest.drafts {
             self.write_support_drafts(orchestrator.store(), &digest, &threads)
                 .await;
-            match orchestrator.store().count_pending_drafts().await {
+            match orchestrator.store().count_drafts_to_review().await {
                 Ok(count) => digest.drafts_to_review = count,
                 Err(e) => {
                     tracing::warn!(component = "digest", error = %e, "Failed to count support drafts")

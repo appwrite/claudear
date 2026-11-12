@@ -318,15 +318,14 @@ impl ThreadsStore {
         }
     }
 
-    /// How many drafts wait for a reviewer.
-    pub async fn count_pending_drafts(&self) -> Result<usize> {
+    /// How many drafts wait for a reviewer: pending ones, and failed posts to retry.
+    pub async fn count_drafts_to_review(&self) -> Result<usize> {
         #[derive(Deserialize)]
         struct Total {
             total: usize,
         }
 
-        let query =
-            json!({"method": "equal", "attribute": "status", "values": [DraftStatus::Pending]});
+        let query = json!({"method": "equal", "attribute": "status", "values": [DraftStatus::Pending, DraftStatus::Failed]});
         let limit = json!({"method": "limit", "values": [1]});
         let body = self
             .request_with(
