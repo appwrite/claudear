@@ -9,7 +9,8 @@ use super::types::{
 use super::{
     ActivityStore, AttemptScope, AttemptTracker, ChatStore, DeployQaStore, DiscordStore,
     EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore, PrAssignmentStore,
-    RegressionStore, RepoStore, SecurityReportStore, SimilarityStore, UserStore, WebhookStore,
+    RegressionStore, RepoStore, ScheduleStore, SecurityReportStore, SimilarityStore, UserStore,
+    WebhookStore,
 };
 use crate::vector_index::catalog::Catalog;
 use crate::vector_index::progress::Progress;
@@ -497,8 +498,8 @@ impl SqliteTracker {
     }
 
     /// Rebuild every vector index on this connection from its embedding table, handing the
-    /// connection lock to any waiting thread between bounded batches so other database work
-    /// interleaves instead of stalling behind the whole rebuild.
+    /// connection lock to any waiting thread between bounded batches and resting as long as each
+    /// batch held it, so other database work keeps at least half of the connection's time.
     pub fn rebuild_vector_indexes(&self) {
         for index in self.vector_indexes.all() {
             let started = Instant::now();
@@ -515,12 +516,15 @@ impl SqliteTracker {
                         return;
                     }
                 };
+                let locked = Instant::now();
                 let step = index.rebuild_step(&connection, REBUILD_BATCH_SIZE);
                 MutexGuard::unlock_fair(connection);
+                let held = locked.elapsed();
                 batches += 1;
                 match step {
                     Ok(Progress::Pending { rows: batch }) => {
                         rows += batch;
+                        self.vector_indexes.rest(held);
                     }
                     Ok(Progress::Complete { rows: batch }) => {
                         rows += batch;
@@ -5045,6 +5049,16 @@ impl DeployQaStore for SqliteTracker {
     }
 }
 
+impl ScheduleStore for SqliteTracker {
+    fn last_scheduled_run(&self, name: &str) -> Result<Option<DateTime<Utc>>> {
+        SqliteTracker::last_scheduled_run(self, name)
+    }
+
+    fn record_scheduled_run(&self, name: &str, at: DateTime<Utc>) -> Result<()> {
+        SqliteTracker::record_scheduled_run(self, name, at)
+    }
+}
+
 impl PrAssignmentStore for SqliteTracker {
     fn active_pr_assignments(&self) -> Result<Vec<claudear_core::types::PrAssignment>> {
         SqliteTracker::active_pr_assignments(self)
@@ -9086,6 +9100,32 @@ impl SqliteTracker {
         Ok(marked > 0)
     }
 
+    /// When the job `name` last ran, if it ever has.
+    pub fn last_scheduled_run(&self, name: &str) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.acquire_lock()?;
+        let ran_at: Option<String> = conn
+            .query_row(
+                "SELECT ran_at FROM scheduled_runs WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(ran_at
+            .map(|ran_at| Self::parse_datetime(&ran_at))
+            .transpose()?)
+    }
+
+    /// Record that the job `name` ran at `at`.
+    pub fn record_scheduled_run(&self, name: &str, at: DateTime<Utc>) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO scheduled_runs (name, ran_at) VALUES (?1, ?2) \
+             ON CONFLICT(name) DO UPDATE SET ran_at = excluded.ran_at",
+            params![name, at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     /// System 1: Update learnings text on a feedback outcome.
     pub fn update_feedback_learnings(&self, outcome_id: i64, learnings: &str) -> Result<()> {
         let conn = self.acquire_lock()?;
@@ -11334,7 +11374,7 @@ fn complexity_to_hours(score: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Datelike, Timelike, Utc};
+    use chrono::{Datelike, TimeZone, Timelike, Utc};
 
     #[test]
     fn test_agent_instructions_scope_and_resolve() {
@@ -12517,6 +12557,31 @@ mod tests {
 
         let watch_id = tracker.create_regression_watch(&watch).unwrap();
         assert!(watch_id > 0);
+    }
+
+    #[test]
+    fn a_scheduled_run_keeps_only_its_latest_time() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let first = Utc.with_ymd_and_hms(2026, 11, 4, 7, 0, 0).unwrap();
+        let second = Utc.with_ymd_and_hms(2026, 11, 11, 9, 30, 0).unwrap();
+
+        assert_eq!(tracker.last_scheduled_run("pr-distribution").unwrap(), None);
+
+        tracker
+            .record_scheduled_run("pr-distribution", first)
+            .unwrap();
+        tracker
+            .record_scheduled_run("pr-distribution", second)
+            .unwrap();
+
+        assert_eq!(
+            tracker.last_scheduled_run("pr-distribution").unwrap(),
+            Some(second)
+        );
+        assert_eq!(
+            tracker.last_scheduled_run("repetitive-digest").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -23608,6 +23673,27 @@ mod tests {
         const MODEL: &str = "test-model";
         const TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+        #[test]
+        fn test_vector_index_sizing_reads_no_embeddings() {
+            let tracker = SqliteTracker::in_memory().unwrap();
+            let connection = tracker.acquire_lock().unwrap();
+            for index in tracker.vector_indexes.all() {
+                let count = index.statements().count;
+                let plan: Vec<String> = connection
+                    .prepare(&format!("EXPLAIN QUERY PLAN {count}"))
+                    .unwrap()
+                    .query_map([], |row| row.get(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert!(
+                    plan.iter().all(|step| step.contains("COVERING INDEX")),
+                    "{} sizing scans its embedding rows under the connection lock: {plan:?}",
+                    index.table()
+                );
+            }
+        }
+
         fn sample_code_chunk(repository_id: i64, index: usize) -> CodeChunk {
             CodeChunk {
                 id: None,
@@ -23629,7 +23715,21 @@ mod tests {
             vec![1.0, index as f32, 0.5, 0.25]
         }
 
+        fn wide_embedding(index: usize, dimension: usize) -> Vec<f32> {
+            (0..dimension)
+                .map(|component| ((index * 31 + component * 17) % 97) as f32 / 97.0)
+                .collect()
+        }
+
         fn save_code_chunk_embeddings(path: &Path, count: usize) -> bool {
+            save_code_chunk_embeddings_with(path, count, sample_embedding)
+        }
+
+        fn save_code_chunk_embeddings_with(
+            path: &Path,
+            count: usize,
+            embedding: impl Fn(usize) -> Vec<f32>,
+        ) -> bool {
             let writer = SqliteTracker::new(path).unwrap();
             if !require_vectorlite_for_tests(&writer.acquire_lock().unwrap()) {
                 return false;
@@ -23639,7 +23739,7 @@ mod tests {
                 .map(|index| sample_code_chunk(repository_id, index))
                 .collect();
             let chunk_ids = writer.save_code_chunks(&chunks).unwrap();
-            let embeddings: Vec<Vec<f32>> = (0..count).map(sample_embedding).collect();
+            let embeddings: Vec<Vec<f32>> = (0..count).map(embedding).collect();
             let pairs: Vec<(i64, &[f32])> = chunk_ids
                 .iter()
                 .copied()
@@ -23795,6 +23895,47 @@ mod tests {
                 single_batch > 0,
                 "a waiting thread never got the lock after a single rebuild batch in {} acquisitions, so the rebuild holds the lock across batches; batches indexed between its acquisitions: {advances:?}",
                 advances.len()
+            );
+        }
+
+        #[test]
+        fn test_rebuild_vector_indexes_leaves_most_of_the_lock_to_a_busy_thread() {
+            const DIMENSION: usize = 384;
+            const MAXIMUM_WAITING_SHARE: f64 = 0.75;
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("claudear.db");
+            let count = 32 * REBUILD_BATCH_SIZE;
+            if !save_code_chunk_embeddings_with(&path, count, |index| {
+                wide_embedding(index, DIMENSION)
+            }) {
+                return;
+            }
+
+            let tracker = Arc::new(SqliteTracker::new(&path).unwrap());
+            assert!(require_vectorlite_for_tests(
+                &tracker.acquire_lock().unwrap()
+            ));
+
+            let rebuilding = Arc::clone(&tracker);
+            let rebuild = std::thread::spawn(move || rebuilding.rebuild_vector_indexes());
+            let started = Instant::now();
+            let mut waited = Duration::ZERO;
+            while !rebuild.is_finished() {
+                let requested = Instant::now();
+                let connection = tracker.acquire_lock().unwrap();
+                waited += requested.elapsed();
+                connection
+                    .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                    .unwrap();
+            }
+            let elapsed = started.elapsed();
+            rebuild.join().unwrap();
+
+            let share = waited.as_secs_f64() / elapsed.as_secs_f64();
+            assert!(
+                share < MAXIMUM_WAITING_SHARE,
+                "a thread querying back to back spent {:.0}% of a {elapsed:?} rebuild waiting for the connection lock; the rebuild must leave other database work most of the connection's time",
+                share * 100.0
             );
         }
 

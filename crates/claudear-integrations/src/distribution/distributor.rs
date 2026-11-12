@@ -15,8 +15,10 @@ use claudear_analysis::distribution::DigestGroup;
 use claudear_analysis::distribution::Evidence;
 use claudear_analysis::distribution::Pending;
 use claudear_analysis::distribution::PullRequest;
+use claudear_analysis::distribution::PullRequestState;
 use claudear_analysis::distribution::PullRequestSummary;
 use claudear_analysis::distribution::Roster;
+use claudear_analysis::distribution::WrappedUp;
 use claudear_config::config::Config;
 use claudear_config::config::PrDistributionConfig;
 use claudear_config::users::UserRegistry;
@@ -268,6 +270,7 @@ impl Distributor {
         }
 
         let mut held: Vec<String> = Vec::new();
+        let mut finished: Vec<(PullRequest, PrAssignment)> = Vec::new();
         let mut kept: Vec<(PullRequest, PrAssignment)> = Vec::new();
         let mut unassigned: Vec<Unassigned> = Vec::new();
         for (url, (repo, number)) in &open {
@@ -288,12 +291,7 @@ impl Distributor {
             let attention = pull_request.attention(None);
             if attention.is_finished() {
                 if let Some(assignment) = assignment {
-                    if self
-                        .store
-                        .end_pr_assignment(assignment.id, AssignmentStatus::Closed)?
-                    {
-                        outcome.closed += 1;
-                    }
+                    finished.push((pull_request, assignment));
                 }
                 continue;
             }
@@ -370,8 +368,17 @@ impl Distributor {
                     .map(|(item, assignment)| (&item.pull_request, assignment)),
             );
 
+        let (finished, unrounded): (Vec<_>, Vec<_>) =
+            finished.into_iter().partition(|(_, assignment)| {
+                self.digest && self.roster.find(&assignment.assignee).is_some()
+            });
+        self.close(
+            unrounded.iter().map(|(_, assignment)| assignment),
+            &mut outcome,
+        )?;
+
         if self.digest {
-            let digest = self.digest(current.clone(), now);
+            let digest = self.digest(current.clone(), &finished, now);
             outcome.listed = digest.count();
             if digest.is_empty() {
                 return Ok(outcome);
@@ -386,6 +393,17 @@ impl Distributor {
                     self.store.mark_pr_assignment_notified(assignment.id)?;
                 }
             }
+            self.close(
+                finished
+                    .iter()
+                    .map(|(_, assignment)| assignment)
+                    .filter(|assignment| {
+                        self.roster
+                            .find(&assignment.assignee)
+                            .is_some_and(|developer| delivery.reached(&developer.login))
+                    }),
+                &mut outcome,
+            )?;
             return Ok(outcome);
         }
 
@@ -509,6 +527,25 @@ impl Distributor {
         Ok(delivery)
     }
 
+    /// End the assignments of PRs that merged or closed. A PR in a roundup is
+    /// only closed once its assignee's digest was sent, so a roundup that
+    /// failed to reach them is retried on the next run.
+    fn close<'a>(
+        &self,
+        assignments: impl Iterator<Item = &'a PrAssignment>,
+        outcome: &mut Outcome,
+    ) -> Result<()> {
+        for assignment in assignments {
+            if self
+                .store
+                .end_pr_assignment(assignment.id, AssignmentStatus::Closed)?
+            {
+                outcome.closed += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Report, once per run, that `count` PRs reached no remote channel and
     /// so stay unnotified until one is configured.
     fn unreached(count: usize) {
@@ -520,12 +557,29 @@ impl Distributor {
     }
 
     /// The digest of assigned PRs still waiting on their assignee, one group
-    /// per assignee in roster order with their PRs oldest first.
+    /// per assignee in roster order with their PRs oldest first, each with
+    /// the roundup of their PRs `finished` in this run.
     fn digest<'a>(
         &self,
         assigned: impl Iterator<Item = (&'a PullRequest, &'a PrAssignment)>,
+        finished: &[(PullRequest, PrAssignment)],
         now: DateTime<Utc>,
     ) -> Digest {
+        let mut wrapped_up: HashMap<String, Vec<WrappedUp>> = HashMap::new();
+        for (pull_request, assignment) in finished {
+            let Some(developer) = self.roster.find(&assignment.assignee) else {
+                continue;
+            };
+            let mut summary = PullRequestSummary::from(pull_request);
+            summary.url = assignment.pr_url.clone();
+            wrapped_up
+                .entry(developer.login.clone())
+                .or_default()
+                .push(WrappedUp {
+                    pull_request: summary,
+                    merged: pull_request.state == PullRequestState::Merged,
+                });
+        }
         let mut waiting: HashMap<String, Vec<PullRequestSummary>> = HashMap::new();
         for (pull_request, assignment) in assigned {
             let Some(developer) = self.roster.find(&assignment.assignee) else {
@@ -546,15 +600,22 @@ impl Distributor {
             .developers()
             .iter()
             .filter_map(|developer| {
-                let mut pull_requests = waiting.remove(&developer.login)?;
+                let mut pull_requests = waiting.remove(&developer.login).unwrap_or_default();
+                let mut wrapped_up = wrapped_up.remove(&developer.login).unwrap_or_default();
+                if pull_requests.is_empty() && wrapped_up.is_empty() {
+                    return None;
+                }
                 pull_requests.sort_by(|left, right| {
                     left.opened_at
                         .cmp(&right.opened_at)
                         .then_with(|| left.url.cmp(&right.url))
                 });
+                wrapped_up
+                    .sort_by(|left, right| left.pull_request.url.cmp(&right.pull_request.url));
                 Some(DigestGroup {
                     developer: developer.clone(),
                     pull_requests,
+                    wrapped_up,
                 })
             })
             .collect();
@@ -1555,6 +1616,155 @@ mod tests {
         let outcome = distributor.distribute(Utc::now()).await.unwrap();
 
         assert_eq!(outcome.closed, 2);
+        assert!(harness.assignees().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_digest_rounds_up_the_prs_each_assignee_wrapped_up_since_the_last_run() {
+        let harness = Harness::new(FakeHost::with([open(1), open(2), open(3)]));
+        harness.opened(1);
+        harness.opened(2);
+        harness.opened(3);
+        let distributor = harness.distributor(&["amy", "bob"], config());
+        distributor.distribute(Utc::now()).await.unwrap();
+        let assignees: HashMap<i64, String> = harness.assignees().into_iter().collect();
+        let holder_of_two = if assignees.values().filter(|login| *login == "amy").count() == 2 {
+            "amy"
+        } else {
+            "bob"
+        };
+        let (finished_by_holder, others): (Vec<i64>, Vec<i64>) =
+            (1..=3).partition(|number| assignees[number] == holder_of_two);
+
+        harness.host.update(finished_by_holder[0], |pull_request| {
+            pull_request.state = PullRequestState::Merged
+        });
+        harness.host.update(others[0], |pull_request| {
+            pull_request.state = PullRequestState::Closed
+        });
+        distributor.distribute(Utc::now()).await.unwrap();
+
+        let latest = harness
+            .recorder
+            .digests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let roundup = |login: &str| -> Vec<(i64, bool)> {
+            latest
+                .groups
+                .iter()
+                .find(|group| group.developer.login == login)
+                .map(|group| {
+                    group
+                        .wrapped_up
+                        .iter()
+                        .map(|wrapped| (wrapped.pull_request.number, wrapped.merged))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let other = if holder_of_two == "amy" { "bob" } else { "amy" };
+        assert_eq!(roundup(holder_of_two), vec![(finished_by_holder[0], true)]);
+        assert_eq!(roundup(other), vec![(others[0], false)]);
+        let other_group = latest
+            .groups
+            .iter()
+            .find(|group| group.developer.login == other)
+            .expect("an assignee with nothing left open still gets their roundup");
+        assert!(other_group.pull_requests.is_empty());
+
+        distributor.distribute(Utc::now()).await.unwrap();
+        let latest = harness
+            .recorder
+            .digests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert!(
+            latest
+                .groups
+                .iter()
+                .all(|group| group.wrapped_up.is_empty()),
+            "a wrapped-up PR is rounded up once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_roundup_that_missed_its_assignee_is_sent_on_the_next_run() {
+        let harness = Harness::new(FakeHost::with([open(1), open(2)]));
+        harness.opened(1);
+        harness.opened(2);
+        let distributor = harness.distributor(&["amy", "bob"], config());
+        distributor.distribute(Utc::now()).await.unwrap();
+        let assignees: HashMap<i64, String> = harness.assignees().into_iter().collect();
+        let unreachable = assignees[&1].clone();
+        harness.host.update(1, |pull_request| {
+            pull_request.state = PullRequestState::Merged
+        });
+        harness
+            .recorder
+            .unreachable
+            .lock()
+            .unwrap()
+            .insert(unreachable.clone());
+
+        let missed = distributor.distribute(Utc::now()).await;
+        let rounded_up = |harness: &Harness| -> bool {
+            harness
+                .recorder
+                .digests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|digest| {
+                    digest.groups.iter().any(|group| {
+                        group.developer.login == unreachable
+                            && group
+                                .wrapped_up
+                                .iter()
+                                .any(|wrapped| wrapped.pull_request.number == 1)
+                    })
+                })
+        };
+        assert!(!rounded_up(&harness));
+        assert!(
+            harness.assignees().iter().any(|(number, _)| *number == 1),
+            "a merged PR whose roundup missed its assignee keeps its assignment: {missed:?}"
+        );
+
+        harness.recorder.unreachable.lock().unwrap().clear();
+        let outcome = distributor.distribute(Utc::now()).await.unwrap();
+
+        assert!(rounded_up(&harness));
+        assert_eq!(outcome.closed, 1);
+        assert!(harness.assignees().iter().all(|(number, _)| *number != 1));
+    }
+
+    #[tokio::test]
+    async fn a_delivered_roundup_closes_an_assignment_stored_under_another_login_casing() {
+        let harness = Harness::new(FakeHost::with([open(1)]));
+        harness.opened(1);
+        harness
+            .distributor(&["Amy"], config())
+            .distribute(Utc::now())
+            .await
+            .unwrap();
+        harness.host.update(1, |pull_request| {
+            pull_request.state = PullRequestState::Merged
+        });
+
+        let outcome = harness
+            .distributor(&["amy"], config())
+            .distribute(Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.closed, 1);
         assert!(harness.assignees().is_empty());
     }
 

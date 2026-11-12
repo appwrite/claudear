@@ -789,6 +789,10 @@ export function setOnUnauthorized(cb: () => void) {
   onUnauthorized = cb
 }
 
+export function clearOnUnauthorized(cb: () => void) {
+  if (onUnauthorized === cb) onUnauthorized = null
+}
+
 /**
  * Read the CSRF token from the readable `claudear_csrf` cookie. The backend
  * sets this cookie on every request and requires mutating requests (POST/PUT/
@@ -1477,6 +1481,7 @@ export const SECURITY_REPORT_STATES = [
   'needs_human',
   'registering',
   'spam',
+  'forwarded',
   'replying',
   'closed',
   'tracking',
@@ -1486,6 +1491,7 @@ export type SecurityReportState = (typeof SECURITY_REPORT_STATES)[number]
 
 export const SECURITY_OUTCOMES = [
   'spam',
+  'support',
   'valid',
   'not_reproducible',
   'already_fixed',
@@ -1494,7 +1500,7 @@ export const SECURITY_OUTCOMES = [
   'duplicate',
 ] as const
 export type SecurityOutcome = (typeof SECURITY_OUTCOMES)[number]
-export type SecurityOverrideOutcome = Exclude<SecurityOutcome, 'valid'>
+export type SecurityOverrideOutcome = Exclude<SecurityOutcome, 'valid' | 'support'>
 
 export const VULNERABILITY_STATES = ['awaiting_fix', 'fixing', 'merged', 'live', 'needs_human'] as const
 export type VulnerabilityState = (typeof VULNERABILITY_STATES)[number]
@@ -1529,6 +1535,7 @@ export const SECURITY_EVENT_KINDS = [
   'overridden',
   'admin_confirmed',
   'screened_spam',
+  'forwarded_to_support',
   'assessed',
   'vulnerability_created',
   'duplicate_linked',
@@ -1540,6 +1547,7 @@ export const SECURITY_EVENT_KINDS = [
   'delivery_confirmed',
   'conversation_closed',
   'reporter_follow_up',
+  'fix_approved',
   'fix_started',
   'pull_request_opened',
   'pull_request_linked',
@@ -1691,6 +1699,7 @@ export interface SecurityReportDetail {
   replies: SecurityReply[]
   award: SecurityAward | null
   related_reports: SecurityReportRow[]
+  awaiting_fix_approval: boolean
 }
 
 export type SecurityOverride =
@@ -1753,6 +1762,10 @@ export async function linkSecurityPullRequest(
   return postJson(`${API_BASE}/security/vulnerabilities/${vulnerabilityId}/pull-request`, {
     pull_request_url: pullRequestUrl,
   })
+}
+
+export async function approveSecurityFix(vulnerabilityId: number): Promise<SecurityVulnerability> {
+  return postJson(`${API_BASE}/security/vulnerabilities/${vulnerabilityId}/approve-fix`, {})
 }
 
 export async function markSecurityLive(

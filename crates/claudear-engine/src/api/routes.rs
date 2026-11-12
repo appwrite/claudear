@@ -241,6 +241,10 @@ pub fn create_api_router_full(
             "/api/security/vulnerabilities/{id}/live",
             axum::routing::post(super::security_reports::live_handler),
         )
+        .route(
+            "/api/security/vulnerabilities/{id}/approve-fix",
+            axum::routing::post(super::security_reports::approve_fix_handler),
+        )
         // Auth routes
         .route("/api/auth/login", axum::routing::post(login_handler))
         .route("/api/auth/logout", axum::routing::post(logout_handler))
@@ -3112,6 +3116,21 @@ async fn model_info_handler(
     State(_state): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<claudear_integrations::chat::models::types::ModelInfoResponse>, StatusCode> {
+    // A repository id is `name` or `owner/name`; anything else could address another HuggingFace endpoint.
+    let parts: Vec<&str> = name.split('/').collect();
+    let valid = parts.len() <= 2
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && *part != "."
+                && *part != ".."
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        });
+    if !valid {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     // Fetch model info from HuggingFace API
     let url = format!("https://huggingface.co/api/models/{}", name);
     let response = claudear_integrations::chat::models::HTTP_CLIENT

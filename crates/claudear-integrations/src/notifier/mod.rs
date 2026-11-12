@@ -1974,6 +1974,7 @@ mod tests {
             groups: vec![claudear_analysis::distribution::DigestGroup {
                 developer: notice.developer,
                 pull_requests: vec![notice.pull_request],
+                wrapped_up: Vec::new(),
             }],
             generated_at: Utc::now(),
         }

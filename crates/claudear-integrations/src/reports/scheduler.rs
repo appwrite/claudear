@@ -101,50 +101,37 @@ impl ReportSchedule {
         }
     }
 
-    /// Check if this schedule is due to run.
+    /// Whether this schedule should run at `now`: its slot falls today, `now`
+    /// is at or past the slot hour, and it has not run since the slot (for a
+    /// weekly schedule, within the six days before it). A slot missed at its
+    /// exact hour, by a restart or a long tick, still runs later the same day.
     pub fn is_due(&self, now: DateTime<Utc>) -> bool {
         if !self.enabled {
             return false;
         }
-
-        // Check if we're at the right hour
-        if now.hour() != self.hour {
+        let Some(slot) = self.slot_on(now) else {
             return false;
-        }
+        };
+        let earliest = match self.frequency {
+            ReportFrequency::Weekly(_) => slot - Duration::days(6),
+            ReportFrequency::Daily | ReportFrequency::Monthly => slot,
+        };
+        now >= slot && self.last_sent_at.is_none_or(|last| last < earliest)
+    }
 
-        // Check frequency-specific conditions
-        match self.frequency {
-            ReportFrequency::Daily => {
-                // Daily: due if we haven't sent today
-                match self.last_sent_at {
-                    None => true,
-                    Some(last) => last.date_naive() < now.date_naive(),
-                }
-            }
-            ReportFrequency::Weekly(day) => {
-                // Weekly: due if it's the right day and we haven't sent this week
-                if now.weekday() != day {
-                    return false;
-                }
-                match self.last_sent_at {
-                    None => true,
-                    Some(last) => {
-                        // Check if last send was more than 6 days ago
-                        (now - last).num_days() >= 6
-                    }
-                }
-            }
-            ReportFrequency::Monthly => {
-                // Monthly: due on the 1st if we haven't sent this month
-                if now.day() != 1 {
-                    return false;
-                }
-                match self.last_sent_at {
-                    None => true,
-                    Some(last) => last.month() != now.month() || last.year() != now.year(),
-                }
-            }
+    /// The slot falling on the UTC day of `now`, if the frequency has one.
+    fn slot_on(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let scheduled = match self.frequency {
+            ReportFrequency::Daily => true,
+            ReportFrequency::Weekly(day) => now.weekday() == day,
+            ReportFrequency::Monthly => now.day() == 1,
+        };
+        if !scheduled {
+            return None;
         }
+        now.date_naive()
+            .and_hms_opt(self.hour, 0, 0)
+            .map(|slot| slot.and_utc())
     }
 
     /// Get the next scheduled run time.
@@ -313,9 +300,28 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 1, 15, 9, 0, 0).unwrap();
         assert!(schedule.is_due(now));
 
-        // At 10am, should not be due
+        // At 10am, the unsent 9am slot is still due
         let now = Utc.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).unwrap();
-        assert!(!schedule.is_due(now));
+        assert!(schedule.is_due(now));
+    }
+
+    #[test]
+    fn a_slot_missed_at_its_hour_runs_later_that_day_only() {
+        let mut schedule = ReportSchedule::weekly("pr-distribution", Weekday::Wed, 7);
+        schedule.last_sent_at = Some(Utc.with_ymd_and_hms(2026, 11, 4, 7, 5, 0).unwrap());
+
+        let before = Utc.with_ymd_and_hms(2026, 11, 11, 6, 59, 0).unwrap();
+        let afternoon = Utc.with_ymd_and_hms(2026, 11, 11, 13, 0, 0).unwrap();
+        let late = Utc.with_ymd_and_hms(2026, 11, 11, 23, 59, 0).unwrap();
+        let thursday = Utc.with_ymd_and_hms(2026, 11, 12, 7, 0, 0).unwrap();
+
+        assert!(!schedule.is_due(before));
+        assert!(schedule.is_due(afternoon));
+        assert!(schedule.is_due(late));
+        assert!(!schedule.is_due(thursday));
+
+        schedule.last_sent_at = Some(afternoon);
+        assert!(!schedule.is_due(late));
     }
 
     #[test]

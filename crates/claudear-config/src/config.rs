@@ -1014,7 +1014,8 @@ pub struct PrDistributionConfig {
     /// Assign and ping a developer as soon as Claudear opens a PR
     /// (default: true).
     pub notify_on_open: bool,
-    /// Send the scheduled per-assignee digest (default: true). When false the
+    /// Send the scheduled per-assignee digest, with a roundup of the PRs that
+    /// merged or closed since the previous run (default: true). When false the
     /// scheduled run still assigns unowned PRs, pinging each new assignee.
     pub digest: bool,
     /// How often the scheduled run fires: "daily", "weekly-monday" …

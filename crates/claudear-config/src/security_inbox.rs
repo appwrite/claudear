@@ -110,7 +110,9 @@ pub struct SecurityInboxConfig {
     pub dashboard_url: Option<String>,
     pub spam_action: SpamAction,
     pub spam_confidence: f64,
+    pub support_mailbox_id: Option<String>,
     pub acknowledge_valid: bool,
+    pub require_fix_approval: bool,
     pub close_after_reply: bool,
     pub assessment_timeout_secs: u64,
     pub max_assessment_attempts: u32,
@@ -132,7 +134,9 @@ impl Default for SecurityInboxConfig {
             dashboard_url: None,
             spam_action: SpamAction::Close,
             spam_confidence: 0.9,
+            support_mailbox_id: None,
             acknowledge_valid: true,
+            require_fix_approval: true,
             close_after_reply: true,
             assessment_timeout_secs: 1800,
             max_assessment_attempts: 3,
@@ -158,6 +162,13 @@ impl SecurityInboxConfig {
                 "issues.helpscout.security.spam_confidence must be between 0 and 1, got {}",
                 self.spam_confidence
             ));
+        }
+        if let Some(mailbox) = &self.support_mailbox_id {
+            if mailbox.is_empty() || !mailbox.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!(
+                    "issues.helpscout.security.support_mailbox_id must be a numeric mailbox id, got '{mailbox}'"
+                ));
+            }
         }
         if !(0.0..=1.0).contains(&self.duplicate_similarity) {
             return Err(format!(
@@ -551,6 +562,25 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("assessment_timeout_secs"));
+    }
+
+    #[test]
+    fn validate_requires_a_numeric_support_mailbox() {
+        let mut config = SecurityInboxConfig {
+            support_mailbox_id: Some("support".to_string()),
+            ..Default::default()
+        };
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("support_mailbox_id"));
+        config.support_mailbox_id = Some(String::new());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("support_mailbox_id"));
+        config.support_mailbox_id = Some("249877".to_string());
+        assert!(config.validate().is_ok());
     }
 
     #[test]

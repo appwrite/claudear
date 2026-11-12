@@ -26,6 +26,8 @@ use serde_json::json;
 const CUSTOMER_EMAIL_METADATA_KEY: &str = "customer_email";
 const CUSTOMER_ID_METADATA_KEY: &str = "customer_id";
 const SPAM_NOTE: &str = "Closed automatically as spam.";
+const SUPPORT_NOTE: &str =
+    "Moved automatically from the security inbox: a support request, not a security report.";
 
 fn thread_count(issue: &Issue) -> u32 {
     issue
@@ -219,7 +221,8 @@ impl SecurityInbox {
                     SECURITY_FIX_SOURCE,
                     &security_fix_short_id(vulnerability_id),
                 )?
-                .is_none();
+                .is_none()
+            && self.fix_approved(vulnerability_id)?;
         if waiting {
             self.fix_request(vulnerability_id)
         } else {
@@ -248,12 +251,54 @@ impl SecurityInbox {
         text: &ReportText,
         resolution: &RepoResolution,
     ) -> Result<SecurityRoute> {
-        if let Screening::Spam { confidence } = self.screen(text).await? {
-            self.close_spam(report, confidence).await?;
-            return Ok(SecurityRoute::done("screened as spam"));
+        match self.screen(text).await? {
+            Screening::Spam { confidence } => {
+                self.close_spam(report, confidence).await?;
+                Ok(SecurityRoute::done("screened as spam"))
+            }
+            Screening::Support {
+                mailbox_id,
+                confidence,
+            } => {
+                self.forward_to_support(report, &mailbox_id, confidence)
+                    .await?;
+                Ok(SecurityRoute::done("forwarded to support"))
+            }
+            Screening::Report { .. } => {
+                let result = self.assess(text, resolution).await?;
+                self.apply_assessment(report, result).await
+            }
         }
-        let result = self.assess(text, resolution).await?;
-        self.apply_assessment(report, result).await
+    }
+
+    async fn forward_to_support(
+        &self,
+        report: &SecurityReport,
+        mailbox_id: &str,
+        confidence: f64,
+    ) -> Result<()> {
+        self.source
+            .move_conversation(&report.conversation_id, mailbox_id)
+            .await?;
+        if let Err(error) = self
+            .source
+            .add_comment(&report.conversation_id, SUPPORT_NOTE)
+            .await
+        {
+            tracing::warn!(error = %error, report_id = report.id, "failed to note a support forward");
+        }
+        self.tracker.transition_security_report(
+            report.id,
+            SecurityReportState::Assessing,
+            SecurityReportState::Forwarded,
+            &SecurityReportChanges {
+                outcome: Some(SecurityOutcome::Support),
+                ..SecurityReportChanges::default()
+            },
+            &NewSecurityEvent::new(SecurityEventKind::ForwardedToSupport)
+                .with_detail(json!({ "mailbox_id": mailbox_id, "confidence": confidence })),
+        )?;
+        Ok(())
     }
 
     async fn close_spam(&self, report: &SecurityReport, confidence: f64) -> Result<()> {
@@ -414,8 +459,13 @@ impl SecurityInbox {
         registration: &Registration,
     ) -> Result<()> {
         if registration.kind == RegistrationKind::Created {
+            let action = if self.config.require_fix_approval {
+                OwnerAction::FixAwaitingApproval
+            } else {
+                OwnerAction::NewValidReport
+            };
             self.ping(
-                OwnerAction::NewValidReport,
+                action,
                 PingSubject::vulnerability(&registration.vulnerability),
             )
             .await;

@@ -54,7 +54,6 @@ impl HousekeepingWorker {
     /// Used by [`Watcher::start`] which handles warm-start itself.
     pub async fn run_loop(&self) {
         let mut timer = interval(Duration::from_millis(self.interval_ms));
-        timer.tick().await; // skip immediate first tick
 
         let mut cycle_count: u32 = 0;
         const REFRESH_INTERVAL: u32 = 5;
@@ -66,11 +65,6 @@ impl HousekeepingWorker {
         let discord_reindex_interval = self.watcher.discord_reindex_interval();
         let mut last_discord_reindex = Instant::now();
 
-        // Weekly digest of repetitive, non-actionable Sentry issues. State is
-        // held locally in this owned loop (no interior mutability needed). On a
-        // process restart `last_sent_at` resets; `is_due` gates on weekday +
-        // exact hour + a 6-day window, so a duplicate is only possible if the
-        // daemon restarts during the target hour on the target weekday.
         let mut digest_schedule = self.watcher.repetitive_digest_schedule();
         let mut distribution_schedule = self.watcher.pr_distribution_schedule();
 
@@ -88,6 +82,8 @@ impl HousekeepingWorker {
                 break;
             }
             if self.watcher.is_rate_limit_paused().await {
+                self.run_schedules(&mut digest_schedule, &mut distribution_schedule)
+                    .await;
                 continue;
             }
 
@@ -153,19 +149,8 @@ impl HousekeepingWorker {
                 }
             };
 
-            let digest_fut = async {
-                if !self.watcher.is_dry_run() {
-                    if let Some(schedule) = digest_schedule.as_mut() {
-                        let now = Utc::now();
-                        if schedule.is_due(now) {
-                            if let Err(e) = self.watcher.send_repetitive_digest().await {
-                                tracing::error!(component = "digest", error = %e, "Error sending repetitive-issues digest");
-                            }
-                            schedule.last_sent_at = Some(now);
-                        }
-                    }
-                }
-            };
+            let schedules_fut =
+                self.run_schedules(&mut digest_schedule, &mut distribution_schedule);
 
             // Discord support forum digest (report-only).
             if !self.watcher.is_dry_run() {
@@ -185,26 +170,12 @@ impl HousekeepingWorker {
                 }
             }
 
-            let distribution_fut = async {
-                if !self.watcher.is_dry_run() {
-                    if let Some(schedule) = distribution_schedule.as_mut() {
-                        let run = run_when_due(schedule, Utc::now(), || {
-                            self.watcher.distribute_pull_requests()
-                        });
-                        if let Some(Err(e)) = run.await {
-                            tracing::error!(component = "pr_distribution", error = %e, "Error distributing open PRs; retrying next tick");
-                        }
-                    }
-                }
-            };
-
-            let (_, _, housekeeping_ok, _, _, _) = tokio::join!(
+            let (_, _, housekeeping_ok, _, _) = tokio::join!(
                 auto_close_fut,
                 reviews_fut,
                 housekeeping_fut,
                 learning_fut,
-                digest_fut,
-                distribution_fut
+                schedules_fut
             );
 
             let duration_secs = cron_start.elapsed().as_secs_f64();
@@ -216,6 +187,45 @@ impl HousekeepingWorker {
                 self.interval_ms,
             );
         }
+    }
+
+    /// Send whichever digests are due. They need no Claude run, so they go out
+    /// while runs are paused for a rate limit too.
+    async fn run_schedules(
+        &self,
+        digest: &mut Option<ReportSchedule>,
+        distribution: &mut Option<ReportSchedule>,
+    ) {
+        if self.watcher.is_dry_run() {
+            return;
+        }
+        let digest_fut = async {
+            if let Some(schedule) = digest.as_mut() {
+                let now = Utc::now();
+                if schedule.is_due(now) {
+                    if let Err(e) = self.watcher.send_repetitive_digest().await {
+                        tracing::error!(component = "digest", error = %e, "Error sending repetitive-issues digest");
+                    }
+                    schedule.last_sent_at = Some(now);
+                    self.watcher.record_scheduled_run(schedule);
+                }
+            }
+        };
+        let distribution_fut = async {
+            if let Some(schedule) = distribution.as_mut() {
+                let run = run_when_due(schedule, Utc::now(), || {
+                    self.watcher.distribute_pull_requests()
+                });
+                match run.await {
+                    Some(Ok(())) => self.watcher.record_scheduled_run(schedule),
+                    Some(Err(e)) => {
+                        tracing::error!(component = "pr_distribution", error = %e, "Error distributing open PRs; retrying next tick");
+                    }
+                    None => {}
+                }
+            }
+        };
+        tokio::join!(digest_fut, distribution_fut);
     }
 }
 
@@ -299,13 +309,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_runs_outside_the_slot() {
+    async fn nothing_runs_before_the_slot() {
         let mut schedule = ReportSchedule::daily("pr-distribution", 9);
 
         let run = run_when_due(
             &mut schedule,
-            nine_am() + chrono::Duration::hours(1),
-            || async { panic!("ran outside its hour") },
+            nine_am() - chrono::Duration::minutes(1),
+            || async { panic!("ran before its hour") },
         )
         .await;
 

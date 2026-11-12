@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SWRConfig } from "swr";
 import type { ReactNode } from "react";
+import { prefetchRouteData, resetPrefetchedRoutes } from "../src/lib/route-prefetch";
 
 const originalFetch = globalThis.fetch;
 
@@ -143,5 +144,21 @@ describe("AttemptsPage deep link", () => {
     await waitFor(() => {
       expect(urls.some((url) => url.includes("source=github_code_scanning"))).toBe(true);
     });
+  });
+
+  test("loads normally after a failed route prefetch", async () => {
+    window.history.replaceState(null, "", "/attempts");
+    resetPrefetchedRoutes();
+    globalThis.fetch = mock(() => Promise.reject(new Error("network error"))) as unknown as typeof fetch;
+    prefetchRouteData("/attempts");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const urls = installFetch();
+
+    await renderAttempts();
+
+    await waitFor(() => {
+      expect(screen.getByText("GH-3")).toBeTruthy();
+    });
+    expect(urls.some((url) => url.startsWith("/api/attempts?"))).toBe(true);
   });
 });

@@ -45,7 +45,7 @@ use claudear_integrations::scm::{
 };
 use claudear_integrations::source::IssueSource;
 use claudear_storage::FixAttemptTracker;
-use futures::future::join_all;
+use security_intake::SecurityIntake;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, RwLock};
-use tokio::time::{interval_at, Duration};
+use tokio::time::{interval, Duration};
 
 /// A candidate issue ready for dispatch: the issue, its match result, and the
 /// decided routing `Intent` (`None` for non-QA-eligible / QA-disabled sources).
@@ -1360,10 +1360,85 @@ impl Watcher {
             return Ok(());
         }
 
-        self.poll().await?;
+        self.run_loops(poll_interval).await;
+        Ok(())
+    }
 
-        let worker = crate::housekeeping::HousekeepingWorker::new(Arc::clone(self), poll_interval);
-        tokio::join!(self.run_source_poll_loop(poll_interval), worker.run_loop());
+    /// Run source polling, security intake and housekeeping as separate tasks
+    /// until the watcher stops, so a run that blocks the thread of one loop
+    /// leaves the others polling. Each loop runs its first cycle immediately.
+    async fn run_loops(self: &Arc<Self>, poll_interval: u64) {
+        let housekeeping = {
+            let worker =
+                crate::housekeeping::HousekeepingWorker::new(Arc::clone(self), poll_interval);
+            tokio::spawn(async move { worker.run_loop().await })
+        };
+        let security = self.security_intake_source().map(|source| {
+            let watcher = Arc::clone(self);
+            tokio::spawn(async move { watcher.run_security_intake_loop(source).await })
+        });
+        let intake = if security.is_some() {
+            SecurityIntake::Separate
+        } else {
+            SecurityIntake::Inline
+        };
+        let sources = {
+            let watcher = Arc::clone(self);
+            tokio::spawn(async move { watcher.run_source_poll_loop(poll_interval, intake).await })
+        };
+        for (name, handle) in [
+            ("source polling", Some(sources)),
+            ("housekeeping", Some(housekeeping)),
+            ("security intake", security),
+        ] {
+            let Some(handle) = handle else {
+                continue;
+            };
+            if let Err(error) = handle.await {
+                tracing::error!(component = "watcher", task = name, error = %error, "Watcher loop ended abnormally");
+            }
+        }
+    }
+
+    /// The HelpScout source when a security inbox is set, whose security
+    /// conversations then get a loop of their own.
+    fn security_intake_source(&self) -> Option<Arc<dyn IssueSource>> {
+        self.security_inbox()?;
+        self.sources
+            .iter()
+            .find(|source| source.name() == HELPSCOUT_SOURCE)
+            .cloned()
+    }
+
+    /// Route the security conversations of `source` and advance the security
+    /// inbox at that source's poll interval until the watcher stops.
+    async fn run_security_intake_loop(self: &Arc<Self>, source: Arc<dyn IssueSource>) {
+        let period = Duration::from_millis(self.config.poll_interval_ms_for(source.name()).max(1))
+            .max(MIN_SOURCE_POLL_PERIOD);
+        let mut timer = interval(period);
+        while self.is_running.load(Ordering::SeqCst) {
+            timer.tick().await;
+            if !self.is_running.load(Ordering::SeqCst) {
+                break;
+            }
+            if self.is_rate_limit_paused().await {
+                continue;
+            }
+            if let Err(error) = self.poll_security_source(&source).await {
+                tracing::error!(component = "security", error = %error, "Error polling the security inbox");
+            }
+        }
+    }
+
+    async fn poll_security_source(self: &Arc<Self>, source: &Arc<dyn IssueSource>) -> Result<()> {
+        let security = source
+            .fetch_issues()
+            .await?
+            .into_iter()
+            .filter(|issue| is_security_issue(&self.config, issue))
+            .collect();
+        self.intake_security_issues(source, security).await;
+        self.advance_security_inbox().await;
         Ok(())
     }
 
@@ -1372,8 +1447,7 @@ impl Watcher {
     /// Polls each source at its configured interval, logging failed polls.
     /// Housekeeping is handled separately by
     /// [`HousekeepingWorker`](crate::housekeeping::HousekeepingWorker).
-    async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64) {
-        let now = std::time::Instant::now();
+    async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64, intake: SecurityIntake) {
         let mut schedule: Vec<_> = self
             .sources
             .iter()
@@ -1384,7 +1458,7 @@ impl Watcher {
                     interval_ms,
                     "Per-source poll interval"
                 );
-                (source, Duration::from_millis(interval_ms), now)
+                (source, Duration::from_millis(interval_ms), None)
             })
             .collect();
 
@@ -1396,7 +1470,7 @@ impl Watcher {
             .unwrap_or(poll_interval)
             .min(poll_interval)
             .max(MIN_SOURCE_POLL_PERIOD);
-        let mut timer = interval_at(tokio::time::Instant::now() + period, period);
+        let mut timer = interval(period);
 
         while self.is_running.load(Ordering::SeqCst) {
             timer.tick().await;
@@ -1407,9 +1481,12 @@ impl Watcher {
                 continue;
             }
 
+            let cycle_started_at = std::time::Instant::now();
+            let mut polled = false;
             for (source, interval, last_poll) in &mut schedule {
-                if last_poll.elapsed() >= *interval {
-                    if let Err(error) = self.poll_source(source).await {
+                if last_poll.is_none_or(|at: std::time::Instant| at.elapsed() >= *interval) {
+                    polled = true;
+                    if let Err(error) = self.poll_source_with(source, intake).await {
                         tracing::error!(
                             component = "watcher",
                             source = source.name(),
@@ -1417,9 +1494,22 @@ impl Watcher {
                             "Error polling source"
                         );
                     }
-                    *last_poll = std::time::Instant::now();
+                    *last_poll = Some(std::time::Instant::now());
                 }
             }
+            if polled && !self.dry_run {
+                self.record_poll_cycle(cycle_started_at);
+            }
+        }
+    }
+
+    fn record_poll_cycle(&self, started_at: std::time::Instant) {
+        let metric = ProcessingMetric::new(
+            "poll_cycle_duration_secs",
+            started_at.elapsed().as_secs_f64(),
+        );
+        if let Err(e) = self.tracker.record_metric(&metric) {
+            tracing::debug!(error = %e, "Failed to record poll_cycle_duration_secs metric");
         }
     }
 
@@ -2809,6 +2899,7 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Run a single poll cycle.
+    #[cfg(test)]
     async fn poll(self: &Arc<Self>) -> Result<()> {
         if self.is_rate_limit_paused().await {
             return Ok(());
@@ -2831,7 +2922,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 }
             })
             .collect();
-        join_all(poll_futures).await;
+        futures::future::join_all(poll_futures).await;
 
         // Process any ready retries
         if !self.dry_run {
@@ -2856,13 +2947,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // Record lightweight operational telemetry for dashboard analytics.
         if !self.dry_run {
-            let poll_duration_metric = ProcessingMetric::new(
-                "poll_cycle_duration_secs",
-                poll_started_at.elapsed().as_secs_f64(),
-            );
-            if let Err(e) = self.tracker.record_metric(&poll_duration_metric) {
-                tracing::debug!(error = %e, "Failed to record poll_cycle_duration_secs metric");
-            }
+            self.record_poll_cycle(poll_started_at);
 
             let source_count_metric =
                 ProcessingMetric::new("poll_sources", self.sources.len() as f64);
@@ -2910,7 +2995,29 @@ Create a PR with your changes.{custom_instructions}"#,
             Some(ReportFrequency::Weekly(d)) => d,
             _ => chrono::Weekday::Mon,
         };
-        Some(ReportSchedule::weekly("repetitive-digest", day, cfg.hour))
+        Some(self.resumed(ReportSchedule::weekly("repetitive-digest", day, cfg.hour)))
+    }
+
+    /// `schedule` carrying the time it last ran, so a restart neither repeats
+    /// a slot it already ran nor skips one it missed.
+    fn resumed(&self, mut schedule: ReportSchedule) -> ReportSchedule {
+        match self.tracker.last_scheduled_run(&schedule.name) {
+            Ok(last) => schedule.last_sent_at = last,
+            Err(error) => {
+                tracing::warn!(schedule = %schedule.name, error = %error, "Failed to load when a schedule last ran");
+            }
+        }
+        schedule
+    }
+
+    /// Persist when `schedule` last ran.
+    pub fn record_scheduled_run(&self, schedule: &ReportSchedule) {
+        let Some(at) = schedule.last_sent_at else {
+            return;
+        };
+        if let Err(error) = self.tracker.record_scheduled_run(&schedule.name, at) {
+            tracing::warn!(schedule = %schedule.name, error = %error, "Failed to record a scheduled run");
+        }
     }
 
     /// Scan interval for the support digest, or `None` when it is off.
@@ -3105,7 +3212,7 @@ Create a PR with your changes.{custom_instructions}"#,
         if !distribution.enabled {
             return None;
         }
-        Some(ReportSchedule {
+        Some(self.resumed(ReportSchedule {
             name: "pr-distribution".to_string(),
             frequency: match distribution.digest_frequency {
                 DigestFrequency::Daily => ReportFrequency::Daily,
@@ -3115,7 +3222,7 @@ Create a PR with your changes.{custom_instructions}"#,
             hour: distribution.digest_hour,
             enabled: true,
             last_sent_at: None,
-        })
+        }))
     }
 
     /// Reconcile every open Claudear PR with its assignee and send the PR
@@ -4023,16 +4130,36 @@ Create a PR with your changes.{custom_instructions}"#,
     ///
     /// The `deploy_qa` source is skipped: its tips are dispatched only by
     /// [`Self::dispatch_pending_deploy_qa_tips`], so a tip never runs twice.
+    #[cfg(test)]
     async fn poll_source(self: &Arc<Self>, source: &Arc<dyn IssueSource>) -> Result<()> {
+        self.poll_source_with(source, SecurityIntake::Inline).await
+    }
+
+    async fn poll_source_with(
+        self: &Arc<Self>,
+        source: &Arc<dyn IssueSource>,
+        intake: SecurityIntake,
+    ) -> Result<()> {
         if source.name() == DEPLOY_QA_SOURCE || self.is_rate_limit_paused().await {
             return Ok(());
         }
 
         let issues = source.fetch_issues().await?;
-        let issues = self.intake_security_issues(source, issues).await;
-        if source.name() == HELPSCOUT_SOURCE {
-            self.advance_security_inbox().await;
-        }
+        let issues = match intake {
+            SecurityIntake::Inline => {
+                let issues = self.intake_security_issues(source, issues).await;
+                if source.name() == HELPSCOUT_SOURCE {
+                    self.advance_security_inbox().await;
+                }
+                issues
+            }
+            SecurityIntake::Separate => self.without_held_security_conversations(
+                issues
+                    .into_iter()
+                    .filter(|issue| !is_security_issue(&self.config, issue))
+                    .collect(),
+            ),
+        };
         tracing::info!(source = source.name(), count = issues.len(), "Found issues");
         let fetched_metric = ProcessingMetric::new("issues_fetched", issues.len() as f64)
             .with_source(source.name().to_string());
@@ -5697,12 +5824,19 @@ Create a PR with your changes.{custom_instructions}"#,
                 format!("{issue_id} is not a security fix"),
             )
         })?;
-        inbox.fix_request(vulnerability_id)?.ok_or_else(|| {
+        let request = inbox.fix_request(vulnerability_id)?.ok_or_else(|| {
             claudear_core::error::Error::source(
                 SECURITY_FIX_SOURCE,
                 format!("vulnerability {vulnerability_id} does not exist"),
             )
-        })
+        })?;
+        if !inbox.fix_approved(vulnerability_id)? {
+            return Err(claudear_core::error::Error::source(
+                SECURITY_FIX_SOURCE,
+                format!("vulnerability {vulnerability_id} is awaiting fix approval"),
+            ));
+        }
+        Ok(request)
     }
 
     /// Whether the failed security fix `short_id` will not be retried: the
@@ -6697,6 +6831,7 @@ pub struct SeedResult {
     pub by_source: std::collections::HashMap<String, usize>,
 }
 
+mod security_intake;
 #[cfg(test)]
 mod security_tests;
 
@@ -7110,6 +7245,63 @@ mod tests {
         .pr_distribution_schedule()
         .unwrap();
         assert_eq!(monthly.frequency, ReportFrequency::Monthly);
+    }
+
+    #[test]
+    fn a_restarted_watcher_resumes_the_pr_digest_from_its_last_recorded_run() {
+        let ran_at = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 11, 11, 7, 3, 0).unwrap();
+        let watcher = watcher_with_pr_distribution(|distribution| {
+            distribution.enabled = true;
+            distribution.digest_frequency = DigestFrequency::Weekly(chrono::Weekday::Wed);
+            distribution.digest_hour = 7;
+        });
+        let mut schedule = watcher.pr_distribution_schedule().unwrap();
+        schedule.last_sent_at = Some(ran_at);
+        watcher.record_scheduled_run(&schedule);
+
+        let resumed = watcher.pr_distribution_schedule().unwrap();
+
+        assert_eq!(resumed.last_sent_at, Some(ran_at));
+        assert!(!resumed.is_due(ran_at + chrono::Duration::hours(3)));
+    }
+
+    #[tokio::test]
+    async fn the_pr_digest_goes_out_while_runs_are_paused_for_a_rate_limit() {
+        use chrono::Timelike;
+
+        let hour = Utc::now().hour();
+        let watcher = Arc::new(watcher_with_pr_distribution(|distribution| {
+            distribution.enabled = true;
+            distribution.digest_frequency = DigestFrequency::Daily;
+            distribution.digest_hour = hour;
+        }));
+        watcher.rate_limit_pause_until.write().await.insert(
+            watcher.config.agent.default_provider.clone(),
+            Utc::now() + chrono::Duration::hours(1),
+        );
+        assert!(watcher.is_rate_limit_paused().await);
+        assert!(watcher.mark_running());
+
+        let worker = crate::housekeeping::HousekeepingWorker::new(Arc::clone(&watcher), 1000);
+        let housekeeping = tokio::spawn(async move { worker.run_loop().await });
+        let mut recorded = None;
+        for _ in 0..100 {
+            recorded = watcher
+                .tracker
+                .last_scheduled_run("pr-distribution")
+                .unwrap();
+            if recorded.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        watcher.stop();
+        housekeeping.await.unwrap();
+
+        assert!(
+            recorded.is_some(),
+            "a rate-limit pause held back the PR digest, which needs no Claude run"
+        );
     }
 
     #[tokio::test]
@@ -7727,6 +7919,41 @@ mod tests {
         // Poll should succeed even with no sources
         let result = watcher.poll().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_live_poll_loop_records_its_cycle_duration() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![Arc::new(MockSource::new("empty"))];
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            tracker.clone(),
+            sources,
+            false,
+        );
+        let start = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.start(Some(1000)).await }
+        });
+
+        let mut recorded = false;
+        for _ in 0..100 {
+            recorded = !tracker
+                .get_metrics("poll_cycle_duration_secs", None, 1)
+                .unwrap()
+                .is_empty();
+            if recorded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        watcher.stop();
+        start.await.unwrap().unwrap();
+
+        assert!(
+            recorded,
+            "the running poll loop must record poll_cycle_duration_secs for pipeline telemetry"
+        );
     }
 
     #[tokio::test]
@@ -8565,8 +8792,8 @@ mod tests {
             async move { watcher.start(Some(50)).await }
         });
 
-        // The initial poll runs ready retries inline, so seed the retry only
-        // once that poll has finished; the housekeeping loop must run it.
+        // Seed the retry once the first source poll has finished; the
+        // housekeeping loop must run it.
         while tracker
             .get_metrics("poll_cycle_duration_secs", None, 1)
             .unwrap()
@@ -13878,13 +14105,13 @@ mod tests {
     }
 
     async fn finish_deploy_qa_runs(runs: Vec<tokio::task::JoinHandle<()>>) {
-        for run in join_all(runs).await {
+        for run in futures::future::join_all(runs).await {
             run.expect("a dispatched deploy_qa run should not panic");
         }
     }
 
     async fn finish_panicking_deploy_qa_runs(runs: Vec<tokio::task::JoinHandle<()>>) {
-        for run in join_all(runs).await {
+        for run in futures::future::join_all(runs).await {
             assert!(
                 run.is_err_and(|error| error.is_panic()),
                 "a dispatched deploy_qa run should panic with its QA agent"

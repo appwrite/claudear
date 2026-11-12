@@ -291,6 +291,7 @@ fn config() -> Config {
         }],
         security: SecurityInboxConfig {
             enabled: true,
+            require_fix_approval: false,
             ..SecurityInboxConfig::default()
         },
         ..HelpScoutConfig::default()
@@ -709,6 +710,67 @@ async fn racing_starts_of_one_fix_run_it_once() {
         "{runs:?}"
     );
     assert_eq!(fixture.fix_failures(report_id), 1);
+}
+
+#[tokio::test]
+async fn poll_holds_a_waiting_fix_until_it_is_approved() {
+    let mut config = config();
+    if let Some(helpscout) = config.issues.helpscout.as_mut() {
+        helpscout.security.require_fix_approval = true;
+    }
+    let fixture = Fixture::with_config(config);
+    let (vulnerability_id, _) = fixture.awaiting_fix();
+    let watcher = fixture.watcher();
+
+    watcher.poll().await.unwrap();
+    watcher.drain_spawned_tasks().await;
+    assert!(fixture.fix_attempt(vulnerability_id).is_none());
+
+    fixture
+        .tracker
+        .record_security_event(
+            None,
+            Some(vulnerability_id),
+            &NewSecurityEvent::new(SecurityEventKind::FixApproved),
+        )
+        .unwrap();
+    watcher.poll().await.unwrap();
+    watcher.drain_spawned_tasks().await;
+
+    assert!(fixture.fix_attempt(vulnerability_id).is_some());
+}
+
+#[tokio::test]
+async fn a_manual_trigger_cannot_start_an_unapproved_fix() {
+    let mut config = config();
+    if let Some(helpscout) = config.issues.helpscout.as_mut() {
+        helpscout.security.require_fix_approval = true;
+    }
+    let fixture = Fixture::with_config(config);
+    let (vulnerability_id, _) = fixture.awaiting_fix();
+    let watcher = fixture.watcher();
+    let short_id = security_fix_short_id(vulnerability_id);
+
+    let refused = watcher.trigger_issue(SECURITY_FIX_SOURCE, &short_id).await;
+
+    let error = refused.expect_err("an unapproved fix must not start");
+    assert!(
+        error.to_string().contains("awaiting fix approval"),
+        "{error}"
+    );
+    assert!(fixture.fix_attempt(vulnerability_id).is_none());
+
+    fixture
+        .tracker
+        .record_security_event(
+            None,
+            Some(vulnerability_id),
+            &NewSecurityEvent::new(SecurityEventKind::FixApproved),
+        )
+        .unwrap();
+    let _ = watcher.trigger_issue(SECURITY_FIX_SOURCE, &short_id).await;
+
+    assert!(fixture.fix_attempt(vulnerability_id).is_some());
 }
 
 #[tokio::test]
@@ -1262,4 +1324,114 @@ async fn a_release_whose_only_merge_is_a_security_fix_starts_no_cascade() {
     );
 
     assert!(watcher.release_cascade_attempt(SDK_REPOSITORY).is_none());
+}
+
+/// Bounds the block so a regression fails the test instead of hanging it.
+const BLOCKING_LIMIT: Duration = Duration::from_secs(60);
+
+/// A source whose fetch blocks its thread until released, as a run stuck in a
+/// synchronous call does.
+#[derive(Default)]
+struct Blocking {
+    released: AtomicBool,
+}
+
+impl Blocking {
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl IssueSource for Blocking {
+    fn name(&self) -> &str {
+        "sentry"
+    }
+
+    fn display_name(&self) -> &str {
+        "Sentry"
+    }
+
+    async fn fetch_issues(&self) -> Result<Vec<Issue>> {
+        let started = std::time::Instant::now();
+        while !self.released.load(Ordering::SeqCst) && started.elapsed() < BLOCKING_LIMIT {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(Vec::new())
+    }
+
+    fn matches_criteria(&self, _: &Issue) -> MatchResult {
+        MatchResult::not_matched("never processed")
+    }
+
+    async fn build_issue_context(&self, _: &Issue) -> Result<String> {
+        Ok(String::new())
+    }
+
+    async fn get_issue(&self, _: &str) -> Result<Issue> {
+        Err(claudear_core::error::Error::source(
+            "sentry",
+            "Issue not found",
+        ))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_blocking_its_thread_never_stalls_security_intake() {
+    let fixture = Fixture::new();
+    fixture.helpscout.serve(vec![report("5001")]);
+    let blocking = Arc::new(Blocking::default());
+    let mut config = config();
+    config.poll_interval_ms = 1000;
+    let watcher = Arc::new(Watcher::new(
+        fixture.options(config, vec![blocking.clone(), fixture.helpscout.clone()]),
+    ));
+    watcher.set_security_inbox(fixture.inbox.clone());
+
+    let loops = {
+        let watcher = Arc::clone(&watcher);
+        tokio::spawn(async move { watcher.start(Some(1000)).await })
+    };
+    let started = std::time::Instant::now();
+    let mut reached = None;
+    while reached.is_none() && started.elapsed() < BLOCKING_LIMIT {
+        if fixture.stored_report("5001").is_some() {
+            reached = Some(started.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    watcher.stop();
+    blocking.release();
+    loops.await.unwrap().unwrap();
+
+    assert!(
+        reached.is_some_and(|elapsed| elapsed < BLOCKING_LIMIT / 2),
+        "a source blocking its polling thread kept a security report from the inbox: reached after {reached:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_separate_intake_leaves_security_conversations_out_of_the_source_poll() {
+    let fixture = Fixture::new();
+    fixture.helpscout.serve(vec![report("5001")]);
+    let watcher = fixture.watcher();
+    let source: Arc<dyn IssueSource> = fixture.helpscout.clone();
+
+    watcher
+        .poll_source_with(&source, SecurityIntake::Separate)
+        .await
+        .unwrap();
+    watcher.drain_spawned_tasks().await;
+
+    assert!(fixture.stored_report("5001").is_none());
+    assert_eq!(fixture.agent.queries(), 0);
+    assert!(fixture
+        .tracker
+        .get_attempt(HELPSCOUT_SOURCE, "5001")
+        .unwrap()
+        .is_none());
+
+    watcher.poll_security_source(&source).await.unwrap();
+    watcher.drain_spawned_tasks().await;
+    assert!(fixture.stored_report("5001").is_some());
 }

@@ -1,9 +1,10 @@
 import { useId, useState, type FormEvent, type ReactNode } from 'react'
-import { CheckCircle2, GitPullRequest, Rocket, RotateCcw, XCircle } from 'lucide-react'
+import { CheckCircle2, GitPullRequest, Rocket, RotateCcw, ShieldCheck, XCircle } from 'lucide-react'
 import {
   ApiError,
   SECURITY_OUTCOMES,
   SECURITY_SEVERITIES,
+  approveSecurityFix,
   linkSecurityPullRequest,
   markSecurityAwardGranted,
   markSecurityLive,
@@ -27,7 +28,7 @@ const NOTE_LIMIT = 1000
 const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 
 const overrideOutcomes = SECURITY_OUTCOMES.filter(
-  (outcome): outcome is SecurityOverrideOutcome => outcome !== 'valid',
+  (outcome): outcome is SecurityOverrideOutcome => outcome !== 'valid' && outcome !== 'support',
 )
 const outcomesNeedingReason: SecurityOverrideOutcome[] = ['not_vulnerability', 'out_of_scope']
 
@@ -404,6 +405,38 @@ export function DeliveryConfirmation({
           </li>
         ))}
       </ul>
+    </ActionSection>
+  )
+}
+
+export function ApproveFixAction({
+  vulnerability,
+  onChanged,
+}: {
+  vulnerability: SecurityVulnerability
+  onChanged: () => Promise<unknown>
+}) {
+  const { pending, error, run } = useSecurityAction(onChanged)
+
+  return (
+    <ActionSection
+      title="Approve fix"
+      description="The fix run opens a pull request, which stays public on open-source repositories until Cloud deploys it."
+    >
+      <div className="space-y-3">
+        <ActionError message={error} />
+        <div className="flex justify-end">
+          <button
+            type="button"
+            disabled={pending}
+            onClick={() => void run(() => approveSecurityFix(vulnerability.id))}
+            className={primaryButtonClass}
+          >
+            <ShieldCheck className="h-4 w-4" />
+            {pending ? 'Approving...' : 'Approve fix'}
+          </button>
+        </div>
+      </div>
     </ActionSection>
   )
 }
