@@ -13,11 +13,20 @@ use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
 use reqwest::header::AUTHORIZATION;
 use reqwest::header::CONTENT_TYPE;
+use std::future::Future;
+use std::time::Duration;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
 /// Default HTTP request timeout for Discord API calls (30 seconds).
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Attempts a request gets while Discord keeps answering 429, so a request
+/// under a lasting rate limit still fails instead of retrying forever.
+const RATE_LIMIT_ATTEMPTS: u32 = 5;
+
+/// The wait Discord asks for when its 429 body has no `retry_after`.
+const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// Trait for HTTP client operations to enable testing.
 #[async_trait]
@@ -113,6 +122,31 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         Ok(Self { http, bot_token })
     }
 
+    /// Send a request, waiting out each 429 for as long as Discord asks
+    /// before sending it again.
+    async fn request<F, Fut>(&self, send: F) -> Result<HttpResponse>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<HttpResponse>>,
+    {
+        let mut attempt = 1;
+        loop {
+            let response = send().await?;
+            if response.status != 429 || attempt == RATE_LIMIT_ATTEMPTS {
+                return Ok(response);
+            }
+            let wait = retry_after(&response);
+            tracing::debug!(
+                component = "discord",
+                attempt,
+                wait_ms = wait.as_millis() as u64,
+                "Rate limited by Discord; retrying"
+            );
+            tokio::time::sleep(wait).await;
+            attempt += 1;
+        }
+    }
+
     /// Get the bot token (for verification purposes).
     pub fn bot_token(&self) -> &str {
         &self.bot_token
@@ -121,7 +155,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
     /// Get a channel by ID.
     pub async fn get_channel(&self, channel_id: &str) -> Result<DiscordChannel> {
         let url = format!("{}/channels/{}", DISCORD_API_BASE, channel_id);
-        let response = self.http.get(&url).await?;
+        let response = self.request(|| self.http.get(&url)).await?;
 
         if !response.is_success() {
             return Err(Error::notifier(
@@ -146,7 +180,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         let body = serde_json::to_value(&params).map_err(|e| {
             Error::notifier("discord", format!("Failed to serialize params: {}", e))
         })?;
-        let response = self.http.post(&url, body).await?;
+        let response = self.request(|| self.http.post(&url, body.clone())).await?;
 
         if !response.is_success() {
             return Err(Error::notifier(
@@ -175,7 +209,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         let body = serde_json::to_value(&params).map_err(|e| {
             Error::notifier("discord", format!("Failed to serialize params: {}", e))
         })?;
-        let response = self.http.post(&url, body).await?;
+        let response = self.request(|| self.http.post(&url, body.clone())).await?;
 
         if !response.is_success() {
             return Err(Error::notifier(
@@ -193,7 +227,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
     /// Get a thread by ID.
     pub async fn get_thread(&self, thread_id: &str) -> Result<DiscordThread> {
         let url = format!("{}/channels/{}", DISCORD_API_BASE, thread_id);
-        let response = self.http.get(&url).await?;
+        let response = self.request(|| self.http.get(&url)).await?;
 
         if !response.is_success() {
             return Err(Error::notifier(
@@ -218,7 +252,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         let body = serde_json::to_value(&params).map_err(|e| {
             Error::notifier("discord", format!("Failed to serialize params: {}", e))
         })?;
-        let response = self.http.post(&url, body).await?;
+        let response = self.request(|| self.http.post(&url, body.clone())).await?;
 
         if !response.is_success() {
             return Err(Error::notifier(
@@ -239,7 +273,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             "{}/channels/{}/messages/{}",
             DISCORD_API_BASE, channel_id, message_id
         );
-        let response = self.http.get(&url).await?;
+        let response = self.request(|| self.http.get(&url)).await?;
 
         if !response.is_success() {
             return Err(Error::notifier(
@@ -265,7 +299,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             "{}/channels/{}/messages?limit={}",
             DISCORD_API_BASE, channel_id, clamped_limit
         );
-        let response = self.http.get(&url).await?;
+        let response = self.request(|| self.http.get(&url)).await?;
 
         if !response.is_success() {
             return Err(list_channel_messages_failure(&response));
@@ -287,7 +321,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             "{}/channels/{}/messages?after={}&limit={}",
             DISCORD_API_BASE, channel_id, after, clamped_limit
         );
-        let response = self.http.get(&url).await?;
+        let response = self.request(|| self.http.get(&url)).await?;
 
         if !response.is_success() {
             return Err(list_channel_messages_failure(&response));
@@ -312,7 +346,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             "{}/channels/{}/messages?before={}&limit={}",
             DISCORD_API_BASE, channel_id, before, clamped_limit
         );
-        let response = self.http.get(&url).await?;
+        let response = self.request(|| self.http.get(&url)).await?;
 
         if !response.is_success() {
             return Err(list_channel_messages_failure(&response));
@@ -336,7 +370,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             "{}/channels/{}/messages/{}/reactions/{}/@me",
             DISCORD_API_BASE, channel_id, message_id, encoded_emoji
         );
-        let response = self.http.put_empty(&url).await?;
+        let response = self.request(|| self.http.put_empty(&url)).await?;
         if !response.is_success() {
             tracing::warn!(
                 channel_id,
@@ -415,7 +449,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             url.push_str(&query.join("&"));
         }
 
-        let response = self.http.get(&url).await?;
+        let response = self.request(|| self.http.get(&url)).await?;
 
         if !response.is_success() {
             return Err(Error::notifier(
@@ -438,7 +472,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
 
     pub async fn list_guild_channels(&self, guild_id: &str) -> Result<Vec<DiscordChannel>> {
         let url = format!("{}/guilds/{}/channels", DISCORD_API_BASE, guild_id);
-        let response = self.http.get(&url).await?;
+        let response = self.request(|| self.http.get(&url)).await?;
 
         if !response.is_success() {
             return Err(Error::notifier(
@@ -496,7 +530,7 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
                 url.push_str(&query.join("&"));
             }
 
-            let response = self.http.get(&url).await?;
+            let response = self.request(|| self.http.get(&url)).await?;
             if !response.is_success() {
                 return Err(Error::notifier(
                     "discord",
@@ -544,18 +578,33 @@ fn list_channel_messages_failure(response: &HttpResponse) -> Error {
     }
 }
 
+/// How long a 429 `response` asks the client to wait.
+fn retry_after(response: &HttpResponse) -> Duration {
+    serde_json::from_str::<serde_json::Value>(&response.body)
+        .ok()
+        .and_then(|body| body.get("retry_after")?.as_f64())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(Duration::from_secs_f64)
+        .unwrap_or(DEFAULT_RETRY_AFTER)
+}
+
 /// Mock HTTP client for testing (only available in tests).
 #[cfg(test)]
 pub mod mock {
     use super::*;
     use std::collections::HashMap;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
     /// Mock HTTP client for testing.
     pub struct MockDiscordClient {
         get_responses: Mutex<HashMap<String, HttpResponse>>,
         post_responses: Mutex<HashMap<String, HttpResponse>>,
+        queued_posts: Mutex<HashMap<String, VecDeque<HttpResponse>>>,
         patch_responses: Mutex<HashMap<String, HttpResponse>>,
+        posts: AtomicUsize,
     }
 
     impl MockDiscordClient {
@@ -563,8 +612,25 @@ pub mod mock {
             Self {
                 get_responses: Mutex::new(HashMap::new()),
                 post_responses: Mutex::new(HashMap::new()),
+                queued_posts: Mutex::new(HashMap::new()),
                 patch_responses: Mutex::new(HashMap::new()),
+                posts: AtomicUsize::new(0),
             }
+        }
+
+        /// Answer the next post to `url` with this response, ahead of any set
+        /// with [`Self::mock_post`].
+        pub fn queue_post(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
+            self.queued_posts
+                .lock()
+                .unwrap()
+                .entry(url.into())
+                .or_default()
+                .push_back(HttpResponse::new(status, body));
+        }
+
+        pub fn post_count(&self) -> usize {
+            self.posts.load(Ordering::SeqCst)
         }
 
         pub fn mock_get(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
@@ -601,6 +667,16 @@ pub mod mock {
         }
 
         async fn post(&self, url: &str, _body: serde_json::Value) -> Result<HttpResponse> {
+            self.posts.fetch_add(1, Ordering::SeqCst);
+            let queued = self
+                .queued_posts
+                .lock()
+                .unwrap()
+                .get_mut(url)
+                .and_then(VecDeque::pop_front);
+            if let Some(response) = queued {
+                return Ok(response);
+            }
             let responses = self.post_responses.lock().unwrap();
             if let Some(response) = responses.get(url) {
                 Ok(response.clone())
@@ -661,6 +737,53 @@ mod tests {
         let response = HttpResponse::new(200, "invalid");
         let result: Result<serde_json::Value> = response.json().map_err(Error::from);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_message_is_sent_once_discord_allows_it() {
+        let url = "https://discord.com/api/v10/channels/123/messages";
+        let mock = MockDiscordClient::new();
+        mock.queue_post(
+            url,
+            429,
+            r#"{"message": "You are being rate limited.", "retry_after": 0.01, "global": false}"#,
+        );
+        mock.mock_post(url, 200, mock_message_json());
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+
+        let sent = client
+            .send_message("123", CreateMessageParams::text("Hello"))
+            .await;
+
+        assert_eq!(sent.unwrap().id, "999");
+        assert_eq!(client.http.post_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_lasting_rate_limit_still_fails_the_message() {
+        let url = "https://discord.com/api/v10/channels/123/messages";
+        let mock = MockDiscordClient::new();
+        mock.mock_post(url, 429, r#"{"retry_after": 0}"#);
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+
+        let sent = client
+            .send_message("123", CreateMessageParams::text("Hello"))
+            .await;
+
+        assert!(sent.is_err());
+        assert_eq!(client.http.post_count(), RATE_LIMIT_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn a_429_without_retry_after_waits_the_default() {
+        assert_eq!(
+            retry_after(&HttpResponse::new(429, "rate limited")),
+            DEFAULT_RETRY_AFTER
+        );
+        assert_eq!(
+            retry_after(&HttpResponse::new(429, r#"{"retry_after": 1.5}"#)),
+            Duration::from_millis(1500)
+        );
     }
 
     #[test]
