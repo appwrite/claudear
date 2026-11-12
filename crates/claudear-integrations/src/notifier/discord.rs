@@ -17,7 +17,6 @@ use chrono::Utc;
 use claudear_analysis::distribution::AssignmentNotice;
 use claudear_analysis::distribution::Developer;
 use claudear_analysis::distribution::Digest;
-use claudear_analysis::distribution::DigestGroup;
 use claudear_analysis::distribution::Markup;
 use claudear_analysis::distribution::PlainText;
 use claudear_config::config::DiscordConfig;
@@ -30,6 +29,8 @@ use claudear_core::types::AskReply;
 use claudear_core::types::AskRequest;
 use claudear_core::types::Issue;
 use serde::Serialize;
+
+mod pr_digest;
 
 /// Trait for HTTP client used by Discord notifier.
 #[async_trait]
@@ -95,7 +96,7 @@ pub(crate) struct DiscordMessage {
     pub(crate) embeds: Option<Vec<DiscordEmbed>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub(crate) struct DiscordEmbed {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) title: Option<String>,
@@ -1282,40 +1283,6 @@ pub(crate) fn build_pr_assignment_message(
     )
 }
 
-/// Build the Discord messages for the PR digest, each with the mentions it
-/// may ping: the title, then each assignee's PRs, split to fit Discord's
-/// content limit with the mention on the first page. Empty when no PR needs
-/// anyone.
-fn build_pr_digest_title() -> (DiscordMessage, AllowedMentions) {
-    (
-        DiscordMessage {
-            content: Some(Digest::TITLE.to_string()),
-            embeds: None,
-        },
-        pr_allowed_mentions(None),
-    )
-}
-
-/// The messages that tell one assignee of a PR digest what waits on them.
-fn build_pr_digest_group_messages(
-    group: &DigestGroup,
-    generated_at: DateTime<Utc>,
-) -> Vec<(DiscordMessage, AllowedMentions)> {
-    group
-        .pages(&DiscordMarkup, generated_at, MESSAGE_CHARACTER_LIMIT)
-        .into_iter()
-        .map(|page| {
-            (
-                DiscordMessage {
-                    content: Some(page),
-                    embeds: None,
-                },
-                pr_allowed_mentions(Some(&group.developer)),
-            )
-        })
-        .collect()
-}
-
 /// Build the Discord message for a human-in-the-loop question.
 pub(crate) fn build_ask_question_message(
     issue: &Issue,
@@ -1523,17 +1490,12 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         if digest.is_empty() {
             return Ok(DigestDelivery::default());
         }
-        let (title, allowed_mentions) = build_pr_digest_title();
-        self.send_allowing(title, Some(allowed_mentions)).await?;
+        let (header, allowed_mentions) = pr_digest::header(digest);
+        self.send_allowing(header, Some(allowed_mentions)).await?;
         let groups = digest
             .groups
             .iter()
-            .map(|group| {
-                (
-                    group,
-                    build_pr_digest_group_messages(group, digest.generated_at),
-                )
-            })
+            .map(|group| (group, pr_digest::group(group, digest.generated_at)))
             .collect();
         super::send_each(
             self.name(),
@@ -4279,19 +4241,8 @@ mod tests {
         assert_eq!(allowed_mentions, AllowedMentions::users([]));
     }
 
-    fn digest_messages(digest: &Digest) -> Vec<(DiscordMessage, AllowedMentions)> {
-        std::iter::once(build_pr_digest_title())
-            .chain(
-                digest
-                    .groups
-                    .iter()
-                    .flat_map(|group| build_pr_digest_group_messages(group, digest.generated_at)),
-            )
-            .collect()
-    }
-
     #[test]
-    fn test_pr_digest_messages_mention_each_assignee() {
+    fn test_pr_digest_messages_ping_each_assignee_only_on_their_card() {
         let digest = Digest {
             groups: vec![
                 claudear_analysis::distribution::DigestGroup {
@@ -4308,54 +4259,32 @@ mod tests {
             generated_at: Utc::now(),
         };
 
-        let messages = digest_messages(&digest);
-        let contents: Vec<String> = messages
+        let messages: Vec<(DiscordMessage, AllowedMentions)> =
+            std::iter::once(pr_digest::header(&digest))
+                .chain(
+                    digest
+                        .groups
+                        .iter()
+                        .flat_map(|group| pr_digest::group(group, digest.generated_at)),
+                )
+                .collect();
+
+        let contents: Vec<Option<String>> = messages
             .iter()
-            .map(|(message, _)| message.content.clone().unwrap())
+            .map(|(message, _)| message.content.clone())
             .collect();
         let pinged: Vec<Vec<String>> = messages
             .iter()
             .map(|(_, allowed_mentions)| allowed_mentions.users.clone())
             .collect();
         assert_eq!(
+            contents,
+            vec![None, Some("<@1>".to_string()), Some("<@2>".to_string())]
+        );
+        assert_eq!(
             pinged,
             vec![Vec::new(), vec!["1".to_string()], vec!["2".to_string()]]
         );
-
-        assert_eq!(contents.len(), 3);
-        assert_eq!(contents[0], Digest::TITLE);
-        assert!(contents[1].starts_with("<@1> 2 Claudear PRs waiting on you:\n"));
-        assert!(contents[1].contains("[org/repo#2](<https://github.com/org/repo/pull/2>) Fix 2"));
-        assert!(contents[2].starts_with("<@2> 1 Claudear PR waiting on you:\n"));
-    }
-
-    #[test]
-    fn test_pr_digest_messages_fit_discords_limit() {
-        let digest = Digest {
-            groups: vec![claudear_analysis::distribution::DigestGroup {
-                developer: pr_developer("amy", Some("1")),
-                pull_requests: (1..=100).map(pr_summary).collect(),
-                wrapped_up: Vec::new(),
-            }],
-            generated_at: Utc::now(),
-        };
-
-        let messages = digest_messages(&digest);
-
-        assert!(messages.len() > 2);
-        assert!(messages.iter().all(|(message, _)| message
-            .content
-            .as_ref()
-            .unwrap()
-            .chars()
-            .count()
-            <= MESSAGE_CHARACTER_LIMIT));
-        assert!(messages[1]
-            .0
-            .content
-            .as_ref()
-            .unwrap()
-            .starts_with("<@1> 100 Claudear PRs"));
     }
 
     #[tokio::test]
@@ -4414,7 +4343,7 @@ mod tests {
 
         assert_eq!(notifier.http.get_call_count(), 3);
         let (_, body) = notifier.http.get_last_call().unwrap();
-        assert!(body["content"].as_str().unwrap().starts_with("<@2> "));
+        assert_eq!(body["content"], "<@2>");
     }
 
     #[tokio::test]
@@ -4462,10 +4391,8 @@ mod tests {
 
         assert_eq!(notifier.http.get_call_count(), 2);
         let (_, body) = notifier.http.get_last_call().unwrap();
-        assert!(body["content"]
-            .as_str()
-            .unwrap()
-            .starts_with("<@1> 1 Claudear PR"));
+        assert_eq!(body["content"], "<@1>");
+        assert_eq!(body["embeds"][0]["title"], "1 PR waiting on you");
         assert_eq!(
             body["allowed_mentions"],
             serde_json::json!({ "parse": [], "users": ["1"] })
