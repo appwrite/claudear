@@ -765,14 +765,8 @@ impl WebhookConfigurator {
             .unwrap_or_else(|_| claudear_core::tls::client());
         let auth_header = Self::jira_auth_header(config);
 
-        if self
-            .ensure_jira_webhook(&client, &auth_header, &config.base_url, &callback_url)
-            .await?
-        {
-            return Ok(true);
-        }
-
-        Ok(false)
+        self.ensure_jira_webhook(&client, &auth_header, &config.base_url, &callback_url)
+            .await
     }
 
     async fn configure_telegram(
