@@ -3023,13 +3023,12 @@ async fn browse_models_handler(
         })
 }
 
-/// Get info about a specific HuggingFace model.
-async fn model_info_handler(
-    _user: AuthUser,
-    State(_state): State<ApiState>,
-    Path(name): Path<String>,
-) -> Result<Json<claudear_integrations::chat::models::types::ModelInfoResponse>, StatusCode> {
-    // A repository id is `name` or `owner/name`; anything else could address another HuggingFace endpoint.
+/// The HuggingFace model-info URL for a repository id, or `None` when `name` is
+/// not one. A repository id is `name` or `owner/name` made of ASCII letters,
+/// digits, `.`, `_` and `-`; anything else (`..`, encoded separators, extra
+/// segments) could address another endpoint on the host. The host and the
+/// `/api/models/` prefix are fixed, and the id is appended as path segments.
+fn huggingface_model_info_url(name: &str) -> Option<reqwest::Url> {
     let parts: Vec<&str> = name.split('/').collect();
     let valid = parts.len() <= 2
         && parts.iter().all(|part| {
@@ -3041,13 +3040,24 @@ async fn model_info_handler(
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         });
     if !valid {
-        return Err(StatusCode::BAD_REQUEST);
+        return None;
     }
+    let mut url = reqwest::Url::parse("https://huggingface.co/api/models").ok()?;
+    url.path_segments_mut().ok()?.extend(parts);
+    Some(url)
+}
+
+/// Get info about a specific HuggingFace model.
+async fn model_info_handler(
+    _user: AuthUser,
+    State(_state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<claudear_integrations::chat::models::types::ModelInfoResponse>, StatusCode> {
+    let url = huggingface_model_info_url(&name).ok_or(StatusCode::BAD_REQUEST)?;
 
     // Fetch model info from HuggingFace API
-    let url = format!("https://huggingface.co/api/models/{}", name);
     let response = claudear_integrations::chat::models::HTTP_CLIENT
-        .get(&url)
+        .get(url)
         .send()
         .await
         .map_err(|e| {
@@ -3159,6 +3169,44 @@ async fn download_model_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huggingface_model_info_url_accepts_repository_ids() {
+        assert_eq!(
+            huggingface_model_info_url("Qwen/Qwen2.5-Coder-7B-Instruct-GGUF")
+                .unwrap()
+                .as_str(),
+            "https://huggingface.co/api/models/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+        );
+        assert_eq!(
+            huggingface_model_info_url("gpt2").unwrap().as_str(),
+            "https://huggingface.co/api/models/gpt2"
+        );
+    }
+
+    #[test]
+    fn huggingface_model_info_url_rejects_other_targets() {
+        for name in [
+            "",
+            "/",
+            "a/b/c",
+            "..",
+            "owner/..",
+            "../../api/whoami-v2",
+            "owner/name?x=1",
+            "owner/name#frag",
+            "owner%2F..%2Fx",
+            "@evil.com",
+            "owner\\name",
+            "http://169.254.169.254",
+            "owner/ name",
+        ] {
+            assert!(
+                huggingface_model_info_url(name).is_none(),
+                "{name:?} should be rejected"
+            );
+        }
+    }
     use axum::body::Body;
     use axum::http::Request;
     use claudear_config::config::{
