@@ -63,7 +63,7 @@ pub use ask_orchestrator::send_to_all_and_wait_first_reply;
 pub use console::ConsoleNotifier;
 pub use delivery::Delivery;
 pub use delivery::DigestDelivery;
-pub use discord::DiscordNotifier;
+pub use discord::{DiscordNotifier, SUPPORT_DIGEST_MAX_ENTRIES};
 pub use email::EmailNotifier;
 pub use push::PushNotifier;
 pub use slack::SlackNotifier;
@@ -71,7 +71,7 @@ pub use sms::SmsNotifier;
 pub use telegram::TelegramNotifier;
 pub use whatsapp::WhatsAppNotifier;
 
-use crate::reports::{RepetitiveDigest, Report};
+use crate::reports::{RepetitiveDigest, Report, SupportDigest};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_analysis::distribution::AssignmentNotice;
@@ -210,6 +210,15 @@ pub trait Notifier: Send + Sync {
     /// configured on-call user.
     async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
         self.notify_status(&digest.format_text()).await
+    }
+
+    /// Send the digest of Discord support threads that need a reply, returning
+    /// whether it was posted.
+    ///
+    /// Does nothing by default: the digest can post hourly, which is only
+    /// reasonable for chat channels that override this.
+    async fn notify_support_digest(&self, _digest: &SupportDigest) -> Result<bool> {
+        Ok(false)
     }
 
     /// Tell a developer they are now responsible for an open Claudear PR.
@@ -513,6 +522,24 @@ impl Notifier for CompositeNotifier {
         })
         .await;
         Ok(())
+    }
+
+    /// Posted when any channel posted it; failures are logged like `broadcast`.
+    async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<bool> {
+        let results = futures::future::join_all(
+            self.notifiers
+                .iter()
+                .map(|n| n.notify_support_digest(digest)),
+        )
+        .await;
+        let mut posted = false;
+        for result in results {
+            match result {
+                Ok(sent) => posted |= sent,
+                Err(e) => tracing::error!("Notification error: {}", e),
+            }
+        }
+        Ok(posted)
     }
 
     async fn notify_pr_assignment(&self, notice: &AssignmentNotice) -> Result<Delivery> {
