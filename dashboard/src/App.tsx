@@ -13,6 +13,7 @@ import SecurityPage from './pages/security'
 import AnalyticsPage from './pages/analytics'
 import ErrorsPage from './pages/errors'
 import FeedbackPage from './pages/feedback'
+import SupportPage from './pages/support'
 import RegressionsPage from './pages/regressions'
 import DeployQaPage from './pages/deploy-qa'
 import ExperimentsPage from './pages/experiments'
@@ -54,6 +55,7 @@ const routes: Record<string, () => JSX.Element | null> = {
   '/issues': IssuesPage,
   '/attempts': AttemptsPage,
   '/prs': PrsPage,
+  '/support': SupportPage,
   '/security': SecurityPage,
   '/analytics': AnalyticsPage,
   '/errors': ErrorsPage,

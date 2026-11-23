@@ -96,6 +96,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
+      # The image's Homebrew OpenSSL is 4.x, which the cpp-httplib vendored in
+      # llama.cpp does not compile against; point its CMake at OpenSSL 3.
+      - name: Use OpenSSL 3
+        if: runner.os == 'macOS'
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
         env:
