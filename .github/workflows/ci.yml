@@ -38,7 +38,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@6f50b7222954f289ae0e147ebdbf8104d873b51d # main
+        uses: cargo-bins/cargo-binstall@becf047f3683b65fbe97634eef13918e6abd8855 # main
 
       - name: Install cargo-tarpaulin
         run: cargo binstall --no-confirm cargo-tarpaulin
