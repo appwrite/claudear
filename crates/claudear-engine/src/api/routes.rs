@@ -9420,6 +9420,34 @@ mod tests {
             let other = find_person(&people, harness.other.id);
             assert_eq!(other["login_email"], OTHER_EMAIL);
             assert_eq!(other["identities"]["sms_number"], SMS_NUMBER);
+
+            // A viewer's API token reads the same redacted view, which keeps the handles
+            // a service mentions people by.
+            let secret = "cldr_identities-reader-token";
+            harness
+                .tracker
+                .create_api_token(
+                    harness.viewer.id,
+                    "identities read",
+                    &crate::api::tokens::hash_secret(secret),
+                    &secret[.."cldr_".len() + 8],
+                    None,
+                )
+                .expect("create api token");
+            let (status, people) = harness
+                .send(
+                    Request::builder()
+                        .uri("/api/identities")
+                        .header("authorization", format!("Bearer {secret}"))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            let other = find_person(&people, harness.other.id);
+            assert_redacted(other);
+            assert_eq!(other["identities"]["github_usernames"], json!(["other-gh"]));
+            assert_eq!(other["identities"]["discord_id"], OTHER_DISCORD_ID);
         }
 
         #[tokio::test]

@@ -5,7 +5,7 @@
 //! the sensitive notification targets redacted. A handle that already belongs to a
 //! different person is rejected, and every write reloads the shared registry.
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, Caller};
 use super::error::ApiError;
 use super::routes::ApiState;
 use crate::registry;
@@ -372,9 +372,10 @@ fn configured_person(registry: &UserRegistry, login_email: &str) -> Option<(Stri
         .filter(|(key, _)| registry.origin(key) == Some(IdentityOrigin::Config))
 }
 
-/// GET /api/identities
+/// GET /api/identities. Also takes a Bearer API token, so a service can read the handles
+/// it mentions people by; a non-admin token sees the same redacted view as a non-admin session.
 pub(crate) async fn list_identities_handler(
-    actor: AuthUser,
+    Caller(actor): Caller,
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<UserIdentities>>, ApiError> {
     let users = state.tracker.list_users().map_err(ApiError::storage)?;
