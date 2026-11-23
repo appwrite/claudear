@@ -1034,7 +1034,7 @@ public_url = "https://claudear.example.com"
 
 #### Identity API
 
-Unless noted, these endpoints need a dashboard session cookie and return 401 without one. Every `POST`, `PUT` and `DELETE` also needs an `x-csrf-token` header matching the `claudear_csrf` cookie, which the dashboard sets on every response. The one exception is `PUT /api/directory` sent with an `Authorization: Bearer` API token: it is the only dashboard endpoint that accepts Bearer, and with Bearer it needs no CSRF header. Writes are rate-limited per user and return 429 over the limit.
+Unless noted, these endpoints need a dashboard session cookie and return 401 without one. Every `POST`, `PUT` and `DELETE` also needs an `x-csrf-token` header matching the `claudear_csrf` cookie, which the dashboard sets on every response. Two endpoints also accept an `Authorization: Bearer` API token: `GET /api/identities`, so a service can read the handles it mentions people by, and `PUT /api/directory`, which with Bearer needs no CSRF header. Writes are rate-limited per user and return 429 over the limit.
 
 Every non-2xx response from the users, identities, invite and directory endpoints, including 401 and 403 rejections, is JSON with a human-readable `error`, plus `violations` when specific fields are at fault (most 400 and 409 responses):
 
@@ -1047,7 +1047,7 @@ Typical messages are `"Not authenticated"`, `"Invalid or expired token"` (a bad 
 
 | Endpoint | Who | Result |
 |----------|-----|--------|
-| `GET /api/identities` | Any logged-in user | `UserIdentities[]` for every user; non-admins get others redacted |
+| `GET /api/identities` | Any logged-in user, by session or Bearer | `UserIdentities[]` for every user; non-admins get others redacted |
 | `GET /api/users/{id}/identities` | Any logged-in user | `UserIdentities`; redacted for a non-admin reading someone else. 404 if the user does not exist |
 | `PUT /api/users/{id}/identities` | Admin, or self | Sparse update; returns `UserIdentities`. 400 invalid values, 403 not admin and not self or a non-admin sending `slug`, 404 no such user, 409 a handle or slug belongs to another person |
 | `DELETE /api/users/{id}/identities` | Admin, or self | Drops the console identities (revert to config); returns the now-effective `UserIdentities`. An admin removes the row entirely. A non-admin whose row has an admin-set `slug` other than the config key their login email matches keeps that slug and loses only the identities; otherwise their row is removed too, which keeps the same person key. 403, 404 as above |

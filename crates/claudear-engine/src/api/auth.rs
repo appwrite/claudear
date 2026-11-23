@@ -148,15 +148,15 @@ impl FromRequestParts<ApiState> for AdminUser {
     }
 }
 
-/// An admin authenticated by `Authorization: Bearer <api token>` or, when that header
-/// is absent, by session. With the header present the cookie is never consulted, which
-/// is what makes the CSRF exemption for Bearer requests safe. Failed Bearer attempts
-/// spend the client address's bearer limit; once it is spent every Bearer attempt from
-/// that address is refused before the token is looked up.
+/// A user authenticated by `Authorization: Bearer <api token>` or, when that header is
+/// absent, by session. With the header present the cookie is never consulted, which is
+/// what makes the CSRF exemption for Bearer requests safe. Failed Bearer attempts spend
+/// the client address's bearer limit; once it is spent every Bearer attempt from that
+/// address is refused before the token is looked up.
 #[derive(Debug, Clone)]
-pub(crate) struct AdminCaller(pub AuthUser);
+pub(crate) struct Caller(pub AuthUser);
 
-impl FromRequestParts<ApiState> for AdminCaller {
+impl FromRequestParts<ApiState> for Caller {
     type Rejection = ApiError;
 
     async fn from_request_parts(
@@ -164,8 +164,7 @@ impl FromRequestParts<ApiState> for AdminCaller {
         state: &ApiState,
     ) -> Result<Self, Self::Rejection> {
         let Some(authorization) = parts.headers.get(header::AUTHORIZATION) else {
-            let AdminUser(user) = AdminUser::from_request_parts(parts, state).await?;
-            return Ok(Self(user));
+            return Ok(Self(AuthUser::from_request_parts(parts, state).await?));
         };
         let address = extract_client_ip(&parts.headers);
         if state.limiters.bearer.exhausted(&address) {
@@ -191,6 +190,22 @@ impl FromRequestParts<ApiState> for AdminCaller {
             return Err(ApiError::invalid_token());
         };
         user.identify();
+        Ok(Self(user))
+    }
+}
+
+/// A [`Caller`] whose role is admin.
+#[derive(Debug, Clone)]
+pub(crate) struct AdminCaller(pub AuthUser);
+
+impl FromRequestParts<ApiState> for AdminCaller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ApiState,
+    ) -> Result<Self, Self::Rejection> {
+        let Caller(user) = Caller::from_request_parts(parts, state).await?;
         if !user.is_admin() {
             return Err(ApiError::admin_required());
         }
