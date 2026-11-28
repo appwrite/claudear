@@ -23,7 +23,7 @@
     "caniuse-lite": "^1.0.30001770",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.0",
-    "lucide-react": "^0.575.0",
+    "lucide-react": "^0.577.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^3.7.0",
